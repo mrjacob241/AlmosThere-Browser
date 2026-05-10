@@ -1,0 +1,8065 @@
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use eframe::{App, Frame, NativeOptions, egui};
+use rich_canvas::{
+    BrowserCanvas, BrowserDocument, BrowserStyle, CanvasBlock, CanvasClipObject, CanvasGraph,
+    CanvasImageObject, CanvasInputObject, CanvasMediaObject, CanvasObject, CanvasRectObject,
+    CanvasSvgObject, CanvasTextObject, CssAlignItems, CssBoxStyle, CssDisplay, CssEdges,
+    CssFlexDirection, CssJustifyContent, CssLength, CssPosition, CssTextAlign, ElementStyleKey,
+    HitTarget, ImageBlock, InlineSpan, ResolvedBoxStyle, SvgBlock, SvgShape, computed_box_style,
+    configure_browser_fonts, parse_basic_css_for_viewport, parse_inline_box_style,
+    wrap_browser_textboxes,
+};
+use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
+
+const APP_TITLE: &str = "AlmostThere Browser";
+const DEFAULT_PAGE_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../sample_pages/test_basic_page.html"
+);
+const DEFAULT_URL: &str = "https://latex.vercel.app/elements";
+const BOOKMARKS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bookmarks.txt");
+const DEFAULT_BOOKMARK_TITLE: &str = "AlmostThere Sample Page";
+const DEFAULT_URL_BOOKMARK_TITLE: &str = "HTML5 Test Page";
+const LOCAL_BOOKMARK_TOKEN: &str = "[local]";
+
+fn main() -> eframe::Result<()> {
+    let options = NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1040.0, 720.0])
+            .with_title(APP_TITLE),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        APP_TITLE,
+        options,
+        Box::new(|cc| Ok(Box::new(AlmostThereApp::new(cc)))),
+    )
+}
+
+struct AlmostThereApp {
+    canvas: BrowserCanvas,
+    document: BrowserDocument,
+    url_input: String,
+    bookmarks: Vec<Bookmark>,
+    status: String,
+    telemetry: TelemetrySession,
+    text_metrics_ready: bool,
+    pending_navigation: Option<PendingNavigation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Bookmark {
+    title: String,
+    url: String,
+}
+
+struct PendingNavigation {
+    url: String,
+    fragment: Option<String>,
+    receiver: Receiver<io::Result<LoadedPageSource>>,
+}
+
+struct LoadedPageSource {
+    html: String,
+    source: String,
+}
+
+impl AlmostThereApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        configure_browser_fonts(&cc.egui_ctx);
+        let telemetry = TelemetrySession::start().unwrap_or_else(|_| TelemetrySession::disabled());
+        telemetry.emit("session.started", &[("app", APP_TITLE)]);
+
+        let mut bookmarks = load_bookmarks().unwrap_or_default();
+        let inserted_default_bookmark = ensure_bookmark(&mut bookmarks, default_sample_bookmark())
+            | ensure_bookmark(&mut bookmarks, default_url_bookmark());
+        if inserted_default_bookmark {
+            let _ = save_bookmarks(&bookmarks);
+        }
+
+        let (document, status) = match load_url_document(DEFAULT_URL) {
+            Ok(document) => {
+                telemetry.emit(
+                    "navigation.loaded",
+                    &[
+                        ("url", DEFAULT_URL),
+                        ("title", &document.title),
+                        ("blocks", &document.blocks.len().to_string()),
+                    ],
+                );
+                (document, format!("Loaded {DEFAULT_URL}"))
+            }
+            Err(error) => {
+                telemetry.emit(
+                    "navigation.failed",
+                    &[("url", DEFAULT_URL), ("error", &error.to_string())],
+                );
+                (
+                    BrowserDocument {
+                        title: "Load failed".to_owned(),
+                        source: DEFAULT_URL.to_owned(),
+                        style: Default::default(),
+                        canvas_graph: CanvasGraph::default(),
+                        blocks: vec![CanvasBlock::Paragraph {
+                            text: format!("Failed to load default page {DEFAULT_URL}: {error}"),
+                        }],
+                    },
+                    format!("Failed to load default page {DEFAULT_URL}: {error}"),
+                )
+            }
+        };
+
+        Self {
+            canvas: BrowserCanvas::new(),
+            document,
+            url_input: DEFAULT_URL.to_owned(),
+            bookmarks,
+            status,
+            telemetry,
+            text_metrics_ready: false,
+            pending_navigation: None,
+        }
+    }
+
+    fn load_current_input(&mut self, ctx: &egui::Context) {
+        let input = self.url_input.trim();
+
+        self.telemetry
+            .emit("navigation.requested", &[("url", input)]);
+        self.status = format!("Loading {input}...");
+        ctx.request_repaint();
+
+        self.start_navigation(input.to_owned(), None);
+    }
+
+    fn start_navigation(&mut self, url: String, fragment: Option<String>) {
+        let (sender, receiver) = mpsc::channel();
+        let thread_url = url.clone();
+        thread::spawn(move || {
+            let _ = sender.send(load_url_source(&thread_url));
+        });
+        self.pending_navigation = Some(PendingNavigation {
+            url,
+            fragment,
+            receiver,
+        });
+    }
+
+    fn poll_pending_navigation(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_navigation.as_ref() else {
+            return;
+        };
+
+        match pending.receiver.try_recv() {
+            Ok(result) => {
+                let pending = self.pending_navigation.take().expect("pending navigation");
+                match result {
+                    Ok(source) => {
+                        let document = parse_html_document_with_text_metrics(
+                            &source.html,
+                            &source.source,
+                            Some(ctx),
+                        );
+                        self.telemetry.emit(
+                            "navigation.loaded",
+                            &[
+                                ("url", &pending.url),
+                                ("title", &document.title),
+                                ("blocks", &document.blocks.len().to_string()),
+                            ],
+                        );
+                        self.url_input = document.source.clone();
+                        self.status = format!("Loaded {}", document.source);
+                        self.document = document;
+                        self.canvas.scroll_offset = egui::Vec2::ZERO;
+                        if let Some(fragment) = pending.fragment {
+                            self.scroll_to_fragment(&fragment);
+                        }
+                    }
+                    Err(error) => {
+                        self.telemetry.emit(
+                            "navigation.failed",
+                            &[("url", &pending.url), ("error", &error.to_string())],
+                        );
+                        self.status = format!("Load failed: {error}");
+                    }
+                }
+                ctx.request_repaint();
+            }
+            Err(TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            Err(TryRecvError::Disconnected) => {
+                let pending = self.pending_navigation.take().expect("pending navigation");
+                self.status = format!("Load failed: loader stopped for {}", pending.url);
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    fn current_url(&self) -> String {
+        self.url_input.trim().to_owned()
+    }
+
+    fn current_bookmark_index(&self) -> Option<usize> {
+        let current_url = self.current_url();
+        self.bookmarks
+            .iter()
+            .position(|bookmark| bookmark.url == current_url)
+    }
+
+    fn toggle_current_bookmark(&mut self) {
+        let current_url = self.current_url();
+        if current_url.is_empty() {
+            return;
+        }
+
+        if let Some(index) = self.current_bookmark_index() {
+            let removed = self.bookmarks.remove(index);
+            self.telemetry
+                .emit("bookmark.removed", &[("url", &removed.url)]);
+            self.status = format!("Removed bookmark: {}", removed.title);
+        } else {
+            let title = if self.document.title.trim().is_empty() {
+                current_url.clone()
+            } else {
+                self.document.title.clone()
+            };
+            self.bookmarks.push(Bookmark {
+                title: title.clone(),
+                url: current_url.clone(),
+            });
+            self.telemetry.emit(
+                "bookmark.added",
+                &[("url", &current_url), ("title", &title)],
+            );
+            self.status = format!("Bookmarked: {title}");
+        }
+
+        if let Err(error) = save_bookmarks(&self.bookmarks) {
+            self.status = format!("Bookmark save failed: {error}");
+        }
+    }
+
+    fn open_bookmark(&mut self, index: usize, ctx: &egui::Context) {
+        let Some(bookmark) = self.bookmarks.get(index).cloned() else {
+            return;
+        };
+        self.url_input = bookmark.url;
+        self.telemetry.emit(
+            "bookmark.opened",
+            &[("url", &self.url_input), ("title", &bookmark.title)],
+        );
+        self.load_current_input(ctx);
+    }
+
+    fn open_link(&mut self, href: &str, ctx: &egui::Context) {
+        let href = href.trim();
+        if href.is_empty()
+            || href.starts_with("javascript:")
+            || href.starts_with("mailto:")
+            || href.starts_with("tel:")
+        {
+            self.status = format!("Unsupported link: {href}");
+            return;
+        }
+
+        let resolved = resolve_navigation_url(&self.document.source, href);
+        let fragment = url_fragment(&resolved);
+        if same_document_url(&self.document.source, &resolved) {
+            self.url_input = resolved;
+            if let Some(fragment) = fragment {
+                self.scroll_to_fragment(&fragment);
+                self.status = format!("Jumped to #{fragment}");
+            } else {
+                self.canvas.scroll_offset = egui::Vec2::ZERO;
+                self.status = "Jumped to top".to_owned();
+            }
+            return;
+        }
+
+        self.url_input = resolved.clone();
+        self.telemetry
+            .emit("navigation.requested", &[("url", &resolved)]);
+        self.status = format!("Loading {resolved}...");
+        ctx.request_repaint();
+        self.start_navigation(resolved, fragment);
+    }
+
+    fn scroll_to_fragment(&mut self, fragment: &str) {
+        self.canvas.scroll_offset.y = estimated_fragment_scroll_y(&self.document, fragment);
+    }
+}
+
+fn input_to_path(input: &str) -> PathBuf {
+    strip_url_fragment(input)
+        .strip_prefix("file://")
+        .map(percent_decode_file_path)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(strip_url_fragment(input)))
+}
+
+fn default_sample_bookmark() -> Bookmark {
+    Bookmark {
+        title: DEFAULT_BOOKMARK_TITLE.to_owned(),
+        url: path_to_file_url(Path::new(DEFAULT_PAGE_PATH)),
+    }
+}
+
+fn default_url_bookmark() -> Bookmark {
+    Bookmark {
+        title: DEFAULT_URL_BOOKMARK_TITLE.to_owned(),
+        url: DEFAULT_URL.to_owned(),
+    }
+}
+
+fn ensure_bookmark(bookmarks: &mut Vec<Bookmark>, bookmark: Bookmark) -> bool {
+    if bookmarks
+        .iter()
+        .any(|existing| existing.url == bookmark.url)
+    {
+        return false;
+    }
+
+    bookmarks.push(bookmark);
+    true
+}
+
+fn bookmarks_path() -> PathBuf {
+    PathBuf::from(BOOKMARKS_PATH)
+}
+
+fn load_bookmarks() -> io::Result<Vec<Bookmark>> {
+    let path = bookmarks_path();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let text = fs::read_to_string(path)?;
+    Ok(parse_bookmarks(&text))
+}
+
+fn save_bookmarks(bookmarks: &[Bookmark]) -> io::Result<()> {
+    let path = bookmarks_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut out = String::new();
+    for bookmark in bookmarks {
+        out.push_str(&bookmark.title.replace(['\t', '\n', '\r'], " "));
+        out.push('\t');
+        out.push_str(&portable_bookmark_url(&bookmark.url).replace(['\t', '\n', '\r'], " "));
+        out.push('\n');
+    }
+
+    fs::write(path, out)
+}
+
+fn parse_bookmarks(text: &str) -> Vec<Bookmark> {
+    text.lines()
+        .filter_map(|line| {
+            let (title, url) = line.split_once('\t')?;
+            let title = title.trim();
+            let url = url.trim();
+            if title.is_empty() || url.is_empty() {
+                None
+            } else {
+                Some(Bookmark {
+                    title: title.to_owned(),
+                    url: resolve_bookmark_url(url),
+                })
+            }
+        })
+        .collect()
+}
+
+fn resolve_bookmark_url(url: &str) -> String {
+    url.replace(LOCAL_BOOKMARK_TOKEN, &local_bookmark_path_token())
+}
+
+fn portable_bookmark_url(url: &str) -> String {
+    let local_root = workspace_root_file_url();
+    if url == local_root {
+        return format!("file:///{LOCAL_BOOKMARK_TOKEN}");
+    }
+    url.strip_prefix(&(local_root + "/"))
+        .map(|suffix| format!("file:///{LOCAL_BOOKMARK_TOKEN}/{suffix}"))
+        .unwrap_or_else(|| url.to_owned())
+}
+
+fn local_bookmark_path_token() -> String {
+    let root = workspace_root_file_url();
+    root.strip_prefix("file:///")
+        .unwrap_or_else(|| root.trim_start_matches("file://"))
+        .to_owned()
+}
+
+fn workspace_root_file_url() -> String {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir.parent().unwrap_or(manifest_dir);
+    path_to_file_url(workspace_root)
+}
+
+impl App for AlmostThereApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+        self.poll_pending_navigation(ctx);
+
+        if !self.text_metrics_ready {
+            if let Ok(document) = load_url_document_with_text_metrics(&self.url_input, ctx) {
+                self.document = document;
+            }
+            self.text_metrics_ready = true;
+        }
+
+        ctx.set_visuals(egui::Visuals::light());
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+            "{APP_TITLE} :: {}",
+            self.document.title
+        )));
+
+        egui::TopBottomPanel::top("browser_toolbar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_enabled(false, egui::Button::new("Back"));
+                ui.add_enabled(false, egui::Button::new("Forward"));
+                if ui.button("Reload").clicked() {
+                    self.load_current_input(ctx);
+                }
+                if self.pending_navigation.is_some() {
+                    ui.add(egui::Spinner::new().size(16.0));
+                    ui.label("Loading");
+                }
+                let bookmark_label = if self.current_bookmark_index().is_some() {
+                    "★"
+                } else {
+                    "☆"
+                };
+                if ui.button(bookmark_label).clicked() {
+                    self.toggle_current_bookmark();
+                }
+
+                let mut bookmark_to_open = None;
+                ui.menu_button("Bookmarks", |ui| {
+                    if self.bookmarks.is_empty() {
+                        ui.add_enabled(false, egui::Button::new("No bookmarks"));
+                    } else {
+                        for (index, bookmark) in self.bookmarks.iter().enumerate() {
+                            if ui.button(&bookmark.title).clicked() {
+                                bookmark_to_open = Some(index);
+                                ui.close();
+                            }
+                        }
+                    }
+                });
+                if let Some(index) = bookmark_to_open {
+                    self.open_bookmark(index, ctx);
+                }
+
+                let response = ui.add_sized(
+                    [ui.available_width(), 24.0],
+                    egui::TextEdit::singleline(&mut self.url_input),
+                );
+                if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    self.load_current_input(ctx);
+                }
+            });
+        });
+
+        egui::TopBottomPanel::bottom("browser_status").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if self.pending_navigation.is_some() {
+                    ui.add(egui::Spinner::new().size(14.0));
+                }
+                ui.label(&self.status);
+                ui.separator();
+                ui.label(format!("Telemetry: {}", self.telemetry.display_path()));
+            });
+        });
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(self.document.style.page_background))
+            .show(ctx, |ui| {
+                let response = self.canvas.ui(ui, &mut self.document);
+                for input_change in &response.changed_inputs {
+                    self.telemetry.emit(
+                        "input.changed",
+                        &[
+                            ("label", &input_change.label),
+                            ("value_len", &input_change.value_len.to_string()),
+                        ],
+                    );
+                    self.status = format!(
+                        "Input changed: {} ({} chars)",
+                        input_change.label, input_change.value_len
+                    );
+                }
+                for input_submit in &response.submitted_inputs {
+                    self.telemetry.emit(
+                        "input.submitted",
+                        &[
+                            ("label", &input_submit.label),
+                            ("value", &input_submit.value),
+                        ],
+                    );
+                    if let Some(search_url) =
+                        ecosia_search_url_for_input(&input_submit.label, &input_submit.value)
+                    {
+                        self.open_link(&search_url, ctx);
+                    }
+                }
+                if let Some(target) = response.hovered {
+                    match target {
+                        HitTarget::Link { href } => {
+                            self.status = format!("Link: {href}");
+                        }
+                        HitTarget::Button { text } => {
+                            self.status = format!("Button: {text}");
+                        }
+                        HitTarget::Input { label } => {
+                            self.status = format!("Input: {label}");
+                        }
+                    }
+                }
+                if let Some(target) = response.clicked {
+                    match target {
+                        HitTarget::Link { href } => {
+                            self.telemetry
+                                .emit("hit_test.clicked", &[("target", "link"), ("href", &href)]);
+                            self.open_link(&href, ctx);
+                        }
+                        HitTarget::Button { text } => {
+                            self.telemetry
+                                .emit("hit_test.clicked", &[("target", "button"), ("text", &text)]);
+                            self.status = format!("Clicked button {text}");
+                        }
+                        HitTarget::Input { label } => {
+                            self.telemetry.emit(
+                                "hit_test.clicked",
+                                &[("target", "input"), ("label", &label)],
+                            );
+                        }
+                    }
+                }
+            });
+    }
+}
+
+fn resolve_navigation_url(source: &str, href: &str) -> String {
+    if href.starts_with('#') {
+        return format!("{}{}", strip_url_fragment(source), href);
+    }
+    resolve_resource_url(source, href)
+}
+
+fn ecosia_search_url_for_input(label: &str, value: &str) -> Option<String> {
+    let query = value.trim();
+    if query.is_empty() {
+        return None;
+    }
+    let label = label.to_ascii_lowercase();
+    if !(label.contains("search") || label.contains("web")) {
+        return None;
+    }
+    Some(format!(
+        "https://www.ecosia.org/search?q={}",
+        percent_encode_query(query)
+    ))
+}
+
+fn percent_encode_query(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            b' ' => encoded.push('+'),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn same_document_url(current: &str, target: &str) -> bool {
+    strip_url_fragment(current) == strip_url_fragment(target)
+}
+
+fn strip_url_fragment(input: &str) -> &str {
+    input.split_once('#').map(|(base, _)| base).unwrap_or(input)
+}
+
+fn url_fragment(input: &str) -> Option<String> {
+    input
+        .split_once('#')
+        .map(|(_, fragment)| fragment.to_owned())
+        .filter(|fragment| !fragment.is_empty())
+}
+
+fn estimated_fragment_scroll_y(document: &BrowserDocument, fragment: &str) -> f32 {
+    if fragment.is_empty() {
+        return 0.0;
+    }
+    let fragment_text = fragment.replace(['-', '_'], " ").to_ascii_lowercase();
+    document
+        .blocks
+        .iter()
+        .enumerate()
+        .find_map(|(index, block)| {
+            block_search_text(block)
+                .to_ascii_lowercase()
+                .contains(&fragment_text)
+                .then_some(index as f32 * 150.0)
+        })
+        .unwrap_or(360.0)
+}
+
+fn block_search_text(block: &CanvasBlock) -> String {
+    match block {
+        CanvasBlock::Heading { text, .. }
+        | CanvasBlock::Paragraph { text }
+        | CanvasBlock::Link { text, .. }
+        | CanvasBlock::ListItem { text, .. }
+        | CanvasBlock::Quote { text }
+        | CanvasBlock::Preformatted { text }
+        | CanvasBlock::Media { label: text }
+        | CanvasBlock::Button { text } => text.clone(),
+        CanvasBlock::InlineText { spans } => spans.iter().map(|span| span.text.as_str()).collect(),
+        CanvasBlock::Input { label, value } => format!("{label} {value}"),
+        CanvasBlock::Panel { children } => children
+            .iter()
+            .map(block_search_text)
+            .collect::<Vec<_>>()
+            .join(" "),
+        CanvasBlock::Table { caption, rows } => {
+            let mut text = caption.clone();
+            for row in rows {
+                text.push(' ');
+                text.push_str(&row.join(" "));
+            }
+            text
+        }
+        CanvasBlock::Image { alt, .. } => alt.clone(),
+        CanvasBlock::Svg { .. } => String::new(),
+        CanvasBlock::EcosiaHero { .. } | CanvasBlock::SearchResultsPage { .. } => String::new(),
+        CanvasBlock::Box { children, .. } => children
+            .iter()
+            .map(block_search_text)
+            .collect::<Vec<_>>()
+            .join(" "),
+        CanvasBlock::StyledBox { children, .. } => children
+            .iter()
+            .map(block_search_text)
+            .collect::<Vec<_>>()
+            .join(" "),
+        CanvasBlock::Rule => String::new(),
+    }
+}
+
+fn load_html_document(path: &Path) -> io::Result<BrowserDocument> {
+    load_html_document_with_text_metrics(path, None)
+}
+
+fn load_html_document_with_text_metrics(
+    path: &Path,
+    text_metrics: Option<&egui::Context>,
+) -> io::Result<BrowserDocument> {
+    let html = fs::read_to_string(path)?;
+    Ok(parse_html_document_with_text_metrics(
+        &html,
+        &path_to_file_url(path),
+        text_metrics,
+    ))
+}
+
+fn load_url_document(input: &str) -> io::Result<BrowserDocument> {
+    load_url_document_with_optional_text_metrics(input, None)
+}
+
+fn load_url_document_with_text_metrics(
+    input: &str,
+    text_metrics: &egui::Context,
+) -> io::Result<BrowserDocument> {
+    load_url_document_with_optional_text_metrics(input, Some(text_metrics))
+}
+
+fn load_url_document_with_optional_text_metrics(
+    input: &str,
+    text_metrics: Option<&egui::Context>,
+) -> io::Result<BrowserDocument> {
+    let input = input.trim();
+    if input.starts_with("http://") || input.starts_with("https://") {
+        return load_http_document_with_text_metrics(input, text_metrics);
+    }
+
+    let path = input_to_path(input);
+    load_html_document_with_text_metrics(&path, text_metrics)
+}
+
+fn load_url_source(input: &str) -> io::Result<LoadedPageSource> {
+    let input = input.trim();
+    if input.starts_with("http://") || input.starts_with("https://") {
+        let response = http_client()?.get(input).send().map_err(io::Error::other)?;
+        let final_url = response.url().to_string();
+        let response = response.error_for_status().map_err(io::Error::other)?;
+        let html = response.text().map_err(io::Error::other)?;
+        return Ok(LoadedPageSource {
+            html,
+            source: final_url,
+        });
+    }
+
+    let path = input_to_path(input);
+    Ok(LoadedPageSource {
+        html: fs::read_to_string(&path)?,
+        source: path_to_file_url(&path),
+    })
+}
+
+fn load_render_graph_debug_dump(input: &str) -> io::Result<String> {
+    let input = input.trim();
+    if input.starts_with("http://") || input.starts_with("https://") {
+        let response = http_client()?.get(input).send().map_err(io::Error::other)?;
+        let final_url = response.url().to_string();
+        let response = response.error_for_status().map_err(io::Error::other)?;
+        let html = response.text().map_err(io::Error::other)?;
+        return Ok(parse_render_graph_debug_dump(&html, &final_url));
+    }
+
+    let path = input_to_path(input);
+    let html = fs::read_to_string(&path)?;
+    Ok(parse_render_graph_debug_dump(
+        &html,
+        &path_to_file_url(&path),
+    ))
+}
+
+fn load_http_document(url: &str) -> io::Result<BrowserDocument> {
+    load_http_document_with_text_metrics(url, None)
+}
+
+fn load_http_document_with_text_metrics(
+    url: &str,
+    text_metrics: Option<&egui::Context>,
+) -> io::Result<BrowserDocument> {
+    let response = http_client()?.get(url).send().map_err(io::Error::other)?;
+    let final_url = response.url().to_string();
+    let response = response.error_for_status().map_err(io::Error::other)?;
+    let html = response.text().map_err(io::Error::other)?;
+
+    Ok(parse_html_document_with_text_metrics(
+        &html,
+        &final_url,
+        text_metrics,
+    ))
+}
+
+fn http_client() -> io::Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .user_agent(format!("{APP_TITLE}/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(io::Error::other)
+}
+
+fn load_linked_stylesheets(html: &str, source: &str) -> io::Result<String> {
+    let mut css = String::new();
+    for href in extract_stylesheet_hrefs(html) {
+        let resolved = resolve_resource_url(source, &href);
+        if !resource_allowed_for_document(source, &resolved) {
+            continue;
+        }
+        let stylesheet = if resolved.starts_with("http://") || resolved.starts_with("https://") {
+            http_client()?
+                .get(&resolved)
+                .send()
+                .map_err(io::Error::other)?
+                .error_for_status()
+                .map_err(io::Error::other)?
+                .text()
+                .map_err(io::Error::other)?
+        } else {
+            fs::read_to_string(stylesheet_path_with_local_fallback(&resolved))?
+        };
+        css.push('\n');
+        css.push_str(&stylesheet);
+    }
+    Ok(css)
+}
+
+fn stylesheet_path_with_local_fallback(resolved: &str) -> PathBuf {
+    let path = input_to_path(resolved);
+    if path.exists() {
+        return path;
+    }
+    if path.file_name().and_then(|name| name.to_str()) == Some("style.css") {
+        if let Some(parent) = path.parent() {
+            let cached_latex_style = parent.join("latex_style.css");
+            if cached_latex_style.exists() {
+                return cached_latex_style;
+            }
+        }
+    }
+    path
+}
+
+fn extract_stylesheet_hrefs(html: &str) -> Vec<String> {
+    let mut hrefs = Vec::new();
+    let mut remaining = html;
+    while let Some(index) = remaining.find("<link") {
+        remaining = &remaining[index..];
+        let Some(end) = remaining.find('>') else {
+            break;
+        };
+        let tag = &remaining[..end + 1];
+        if tag.contains("stylesheet") {
+            if let Some(href) = extract_attr(tag, "href") {
+                hrefs.push(href);
+            }
+        }
+        remaining = &remaining[end + 1..];
+    }
+    hrefs
+}
+
+fn resolve_resource_url(source: &str, href: &str) -> String {
+    if href.starts_with("http://") || href.starts_with("https://") || href.starts_with("file://") {
+        return href.to_owned();
+    }
+    if let Ok(base) = reqwest::Url::parse(source) {
+        if let Ok(resolved) = base.join(href) {
+            return resolved.to_string();
+        }
+    }
+    if let Some(parent) = Path::new(source).parent() {
+        return parent.join(href).display().to_string();
+    }
+    href.to_owned()
+}
+
+fn resource_allowed_for_document(source: &str, resource: &str) -> bool {
+    !(is_local_document_source(source) && is_remote_url(resource))
+}
+
+fn is_local_document_source(source: &str) -> bool {
+    source.starts_with("file://") || !is_remote_url(source)
+}
+
+fn is_remote_url(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DomDocument {
+    children: Vec<DomNode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DomNode {
+    Element(DomElement),
+    Text(String),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DomElement {
+    tag_name: String,
+    attributes: Vec<DomAttribute>,
+    children: Vec<DomNode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DomAttribute {
+    name: String,
+    value: String,
+}
+
+impl DomDocument {
+    fn first_descendant_by_tag(&self, tag_name: &str) -> Option<&DomElement> {
+        self.children
+            .iter()
+            .find_map(|child| child.first_descendant_by_tag(tag_name))
+    }
+
+    fn first_element_by_test_id(&self, test_id: &str) -> Option<&DomElement> {
+        self.children
+            .iter()
+            .find_map(|child| child.first_element_by_test_id(test_id))
+    }
+
+    fn elements_by_test_id<'a>(&'a self, test_id: &str, out: &mut Vec<&'a DomElement>) {
+        for child in &self.children {
+            child.elements_by_test_id(test_id, out);
+        }
+    }
+}
+
+impl DomNode {
+    fn first_descendant_by_tag(&self, tag_name: &str) -> Option<&DomElement> {
+        match self {
+            DomNode::Element(element) => element.first_descendant_by_tag(tag_name),
+            DomNode::Text(_) => None,
+        }
+    }
+
+    fn first_element_by_test_id(&self, test_id: &str) -> Option<&DomElement> {
+        match self {
+            DomNode::Element(element) => element.first_element_by_test_id(test_id),
+            DomNode::Text(_) => None,
+        }
+    }
+
+    fn elements_by_test_id<'a>(&'a self, test_id: &str, out: &mut Vec<&'a DomElement>) {
+        if let DomNode::Element(element) = self {
+            element.elements_by_test_id(test_id, out);
+        }
+    }
+}
+
+impl DomElement {
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attributes
+            .iter()
+            .find(|attr| attr.name.eq_ignore_ascii_case(name))
+            .map(|attr| attr.value.as_str())
+    }
+
+    fn has_attr(&self, name: &str) -> bool {
+        self.attr(name).is_some()
+    }
+
+    fn first_descendant_by_tag(&self, tag_name: &str) -> Option<&DomElement> {
+        if self.tag_name.eq_ignore_ascii_case(tag_name) {
+            return Some(self);
+        }
+        self.children
+            .iter()
+            .find_map(|child| child.first_descendant_by_tag(tag_name))
+    }
+
+    fn first_element_by_test_id(&self, test_id: &str) -> Option<&DomElement> {
+        if self
+            .attr("data-test-id")
+            .is_some_and(|value| value.eq_ignore_ascii_case(test_id))
+        {
+            return Some(self);
+        }
+        self.children
+            .iter()
+            .find_map(|child| child.first_element_by_test_id(test_id))
+    }
+
+    fn elements_by_test_id<'a>(&'a self, test_id: &str, out: &mut Vec<&'a DomElement>) {
+        if self
+            .attr("data-test-id")
+            .is_some_and(|value| value.eq_ignore_ascii_case(test_id))
+        {
+            out.push(self);
+        }
+        for child in &self.children {
+            child.elements_by_test_id(test_id, out);
+        }
+    }
+
+    fn first_descendant_by_tag_with_attr(&self, tag_name: &str, attr: &str) -> Option<&DomElement> {
+        if self.tag_name.eq_ignore_ascii_case(tag_name) && self.has_attr(attr) {
+            return Some(self);
+        }
+        self.children.iter().find_map(|child| match child {
+            DomNode::Element(element) => element.first_descendant_by_tag_with_attr(tag_name, attr),
+            DomNode::Text(_) => None,
+        })
+    }
+
+    fn text_content(&self) -> String {
+        let mut out = String::new();
+        push_dom_text(&self.children, &mut out);
+        normalize_ws(&decode_basic_entities(&out))
+    }
+}
+
+fn push_dom_text(nodes: &[DomNode], out: &mut String) {
+    for node in nodes {
+        match node {
+            DomNode::Text(text) => {
+                out.push_str(text);
+                out.push(' ');
+            }
+            DomNode::Element(element) if dom_element_text_is_visible(element) => {
+                push_dom_text(&element.children, out);
+            }
+            DomNode::Element(_) => {}
+        }
+    }
+}
+
+fn dom_element_text_is_visible(element: &DomElement) -> bool {
+    if element.has_attr("hidden") {
+        return false;
+    }
+    if element
+        .attr("aria-hidden")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        return false;
+    }
+    if element.attr("class").is_some_and(|classes| {
+        classes
+            .split_whitespace()
+            .any(|class| class == "sr-only" || class == "visually-hidden")
+    }) {
+        return false;
+    }
+    !element.attr("style").is_some_and(|style| {
+        let style = style.to_ascii_lowercase().replace(' ', "");
+        style.contains("display:none") || style.contains("visibility:hidden")
+    })
+}
+
+fn parse_dom_document(html: &str) -> DomDocument {
+    let (children, _) = parse_dom_nodes(html, None);
+    DomDocument { children }
+}
+
+fn parse_dom_nodes<'a>(mut html: &'a str, closing_tag: Option<&str>) -> (Vec<DomNode>, &'a str) {
+    let mut children = Vec::new();
+
+    while !html.is_empty() {
+        if let Some(text_end) = html.find('<') {
+            if text_end > 0 {
+                children.push(DomNode::Text(html[..text_end].to_owned()));
+                html = &html[text_end..];
+            }
+        } else {
+            children.push(DomNode::Text(html.to_owned()));
+            return (children, "");
+        }
+
+        if html.starts_with("<!--") {
+            let Some(end) = html.find("-->") else {
+                return (children, "");
+            };
+            html = &html[end + 3..];
+            continue;
+        }
+
+        if html.starts_with("<!") || html.starts_with("<?") {
+            let Some(end) = html.find('>') else {
+                return (children, "");
+            };
+            html = &html[end + 1..];
+            continue;
+        }
+
+        if let Some(after_close) = html.strip_prefix("</") {
+            let Some(end) = after_close.find('>') else {
+                return (children, "");
+            };
+            let found_tag = after_close[..end].trim();
+            html = &after_close[end + 1..];
+            if closing_tag.is_some_and(|tag| found_tag.eq_ignore_ascii_case(tag)) {
+                return (children, html);
+            }
+            continue;
+        }
+
+        let Some((open_tag, after_open)) = parse_dom_open_tag(html) else {
+            children.push(DomNode::Text("<".to_owned()));
+            html = &html[1..];
+            continue;
+        };
+        html = after_open;
+
+        let tag_name = open_tag.tag_name.clone();
+        let mut element = DomElement {
+            tag_name: tag_name.clone(),
+            attributes: open_tag.attributes,
+            children: Vec::new(),
+        };
+
+        if !open_tag.self_closing && !is_void_tag(&tag_name) {
+            let (nested, after_nested) = parse_dom_nodes(html, Some(&tag_name));
+            element.children = nested;
+            html = after_nested;
+        }
+
+        children.push(DomNode::Element(element));
+    }
+
+    (children, html)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DomOpenTag {
+    tag_name: String,
+    attributes: Vec<DomAttribute>,
+    self_closing: bool,
+}
+
+fn parse_dom_open_tag(html: &str) -> Option<(DomOpenTag, &str)> {
+    let after_open = html.strip_prefix('<')?;
+    let end = find_tag_end(after_open)?;
+    let raw = &after_open[..end];
+    let after_tag = &after_open[end + 1..];
+    let self_closing = raw.trim_end().ends_with('/');
+    let raw = raw.trim().trim_end_matches('/').trim_end();
+    let name_end = raw
+        .find(|ch: char| ch.is_whitespace() || ch == '/')
+        .unwrap_or(raw.len());
+    let tag_name = raw[..name_end].trim().to_ascii_lowercase();
+    if tag_name.is_empty() {
+        return None;
+    }
+    let attributes = parse_dom_attributes(&raw[name_end..]);
+    Some((
+        DomOpenTag {
+            tag_name,
+            attributes,
+            self_closing,
+        },
+        after_tag,
+    ))
+}
+
+fn find_tag_end(input: &str) -> Option<usize> {
+    let mut quote = None;
+    for (index, ch) in input.char_indices() {
+        match quote {
+            Some(active) if ch == active => quote = None,
+            Some(_) => {}
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if ch == '>' => return Some(index),
+            None => {}
+        }
+    }
+    None
+}
+
+fn parse_dom_attributes(mut input: &str) -> Vec<DomAttribute> {
+    let mut attributes = Vec::new();
+
+    loop {
+        input = input.trim_start();
+        if input.is_empty() {
+            return attributes;
+        }
+
+        let name_end = input
+            .find(|ch: char| ch.is_whitespace() || ch == '=' || ch == '/' || ch == '>')
+            .unwrap_or(input.len());
+        let name = input[..name_end].trim().to_ascii_lowercase();
+        input = &input[name_end..];
+        if name.is_empty() {
+            return attributes;
+        }
+
+        input = input.trim_start();
+        let value = if let Some(after_equals) = input.strip_prefix('=') {
+            input = after_equals.trim_start();
+            if let Some(quote) = input.chars().next().filter(|ch| *ch == '"' || *ch == '\'') {
+                let after_quote = &input[quote.len_utf8()..];
+                if let Some(value_end) = after_quote.find(quote) {
+                    input = &after_quote[value_end + quote.len_utf8()..];
+                    decode_basic_entities(&after_quote[..value_end])
+                } else {
+                    let value = decode_basic_entities(after_quote);
+                    input = "";
+                    value
+                }
+            } else {
+                let value_end = input
+                    .find(|ch: char| ch.is_whitespace() || ch == '>')
+                    .unwrap_or(input.len());
+                let value = decode_basic_entities(&input[..value_end]);
+                input = &input[value_end..];
+                value
+            }
+        } else {
+            String::new()
+        };
+
+        attributes.push(DomAttribute { name, value });
+    }
+}
+
+fn parse_html_document(html: &str, source: &str) -> BrowserDocument {
+    parse_html_document_with_text_metrics(html, source, None)
+}
+
+fn parse_html_document_with_text_metrics(
+    html: &str,
+    source: &str,
+    text_metrics: Option<&egui::Context>,
+) -> BrowserDocument {
+    let html = remove_html_comments(html);
+    let dom = parse_dom_document(&html);
+    let title = dom
+        .first_descendant_by_tag("title")
+        .map(DomElement::text_content)
+        .or_else(|| extract_tag_text(&html, "title"))
+        .unwrap_or_else(|| "Untitled".to_owned())
+        .trim()
+        .to_owned();
+    let mut css = extract_tag_inner(&html, "style").unwrap_or("").to_owned();
+    css.push_str(&load_linked_stylesheets(&html, source).unwrap_or_default());
+    let style = parse_basic_css_for_viewport(&css, 1280.0);
+    let render_graph = build_render_graph(&dom, &style);
+    let canvas_graph =
+        render_graph_to_canvas_graph(&render_graph, source, style.image_height_auto, text_metrics);
+    let blocks = render_graph_to_blocks(&render_graph, source, style.image_height_auto);
+
+    BrowserDocument {
+        title,
+        source: source.to_owned(),
+        style,
+        canvas_graph,
+        blocks,
+    }
+}
+
+fn parse_render_graph_debug_dump(html: &str, source: &str) -> String {
+    let html = remove_html_comments(html);
+    let dom = parse_dom_document(&html);
+    let mut css = extract_tag_inner(&html, "style").unwrap_or("").to_owned();
+    css.push_str(&load_linked_stylesheets(&html, source).unwrap_or_default());
+    let style = parse_basic_css_for_viewport(&css, 1280.0);
+    let render_graph = build_render_graph(&dom, &style);
+    render_graph_debug_string(&render_graph)
+}
+
+#[derive(Clone, Debug)]
+struct RenderGraph {
+    root: RenderNode,
+}
+
+#[derive(Clone, Debug)]
+struct RenderNode {
+    kind: RenderNodeKind,
+    style: ResolvedBoxStyle,
+    children: Vec<RenderNode>,
+}
+
+#[derive(Clone, Debug)]
+enum RenderNodeKind {
+    Document,
+    Element(DomElement),
+    Text(String),
+}
+
+fn build_render_graph(dom: &DomDocument, document_style: &BrowserStyle) -> RenderGraph {
+    let root_style = root_resolved_style(document_style);
+    let root_children = dom
+        .first_descendant_by_tag("body")
+        .map(|body| {
+            vec![build_render_element(
+                body,
+                None,
+                None,
+                &root_style,
+                document_style,
+            )]
+        })
+        .unwrap_or_else(|| build_render_children(&dom.children, None, &root_style, document_style));
+
+    RenderGraph {
+        root: RenderNode {
+            kind: RenderNodeKind::Document,
+            style: root_style,
+            children: root_children,
+        },
+    }
+}
+
+fn build_render_node(
+    node: &DomNode,
+    parent_element: Option<&DomElement>,
+    previous_element_sibling: Option<&DomElement>,
+    parent_style: &ResolvedBoxStyle,
+    document_style: &BrowserStyle,
+) -> Option<RenderNode> {
+    match node {
+        DomNode::Text(text) => Some(RenderNode {
+            kind: RenderNodeKind::Text(text.clone()),
+            style: inherited_style_for_text(parent_style),
+            children: Vec::new(),
+        }),
+        DomNode::Element(element) => Some(build_render_element(
+            element,
+            parent_element,
+            previous_element_sibling,
+            parent_style,
+            document_style,
+        )),
+    }
+}
+
+fn inherited_style_for_text(parent: &ResolvedBoxStyle) -> ResolvedBoxStyle {
+    ResolvedBoxStyle {
+        display: CssDisplay::Inline,
+        color: parent.color,
+        font_size: parent.font_size,
+        font_weight_bold: parent.font_weight_bold,
+        font_style_italic: parent.font_style_italic,
+        text_decoration_underline: parent.text_decoration_underline,
+        text_decoration_strikethrough: parent.text_decoration_strikethrough,
+        text_background: parent.text_background,
+        text_align: parent.text_align,
+        ..ResolvedBoxStyle::default()
+    }
+}
+
+fn build_render_element(
+    element: &DomElement,
+    parent_element: Option<&DomElement>,
+    previous_element_sibling: Option<&DomElement>,
+    parent_style: &ResolvedBoxStyle,
+    document_style: &BrowserStyle,
+) -> RenderNode {
+    let style = compute_render_style(
+        element,
+        parent_element,
+        previous_element_sibling,
+        parent_style,
+        document_style,
+    );
+    let children = build_render_children(&element.children, Some(element), &style, document_style);
+
+    RenderNode {
+        kind: RenderNodeKind::Element(element.clone()),
+        style,
+        children,
+    }
+}
+
+fn build_render_children(
+    children: &[DomNode],
+    parent_element: Option<&DomElement>,
+    parent_style: &ResolvedBoxStyle,
+    document_style: &BrowserStyle,
+) -> Vec<RenderNode> {
+    let mut out = Vec::new();
+    let mut previous_element_sibling = None;
+    for child in children {
+        if let Some(node) = build_render_node(
+            child,
+            parent_element,
+            previous_element_sibling,
+            parent_style,
+            document_style,
+        ) {
+            out.push(node);
+        }
+        if let DomNode::Element(element) = child {
+            previous_element_sibling = Some(element);
+        }
+    }
+    out
+}
+
+fn root_resolved_style(style: &BrowserStyle) -> ResolvedBoxStyle {
+    ResolvedBoxStyle {
+        color: style.text_color,
+        background: style.page_background,
+        font_size: style.body_font_size,
+        ..ResolvedBoxStyle::default()
+    }
+}
+
+fn compute_render_style(
+    element: &DomElement,
+    parent_element: Option<&DomElement>,
+    previous_element_sibling: Option<&DomElement>,
+    parent: &ResolvedBoxStyle,
+    document_style: &BrowserStyle,
+) -> ResolvedBoxStyle {
+    let mut out = inherited_style_for_element(element, parent, document_style);
+    let key = element_style_key_with_context(element, parent_element, previous_element_sibling);
+    let matched = computed_box_style(document_style, &key);
+    apply_css_box_style(&mut out, &matched, parent, document_style);
+    if let Some(inline) = element.attr("style").and_then(parse_inline_box_style) {
+        apply_css_box_style(&mut out, &inline, parent, document_style);
+    }
+    if (!dom_element_text_is_visible(element) && !dom_element_is_visual_replaced_content(element))
+        || matches!(
+            element.tag_name.as_str(),
+            "script" | "style" | "template" | "noscript"
+        )
+    {
+        out.display = CssDisplay::None;
+    }
+    normalize_heading_margins(&element.tag_name, &mut out);
+    out
+}
+
+fn dom_element_is_visual_replaced_content(element: &DomElement) -> bool {
+    matches!(
+        element.tag_name.as_str(),
+        "img" | "svg" | "audio" | "video" | "canvas" | "meter" | "progress" | "iframe"
+    )
+}
+
+fn normalize_heading_margins(tag_name: &str, style: &mut ResolvedBoxStyle) {
+    if !matches!(tag_name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
+        return;
+    }
+    let max_top = style.font_size.max(1.0);
+    let max_bottom = (style.font_size * 0.5).max(1.0);
+    if style.margin.top > max_top {
+        style.margin.top = max_top;
+    }
+    if style.margin.bottom > max_bottom {
+        style.margin.bottom = max_bottom;
+    }
+}
+
+fn inherited_style_for_element(
+    element: &DomElement,
+    parent: &ResolvedBoxStyle,
+    document_style: &BrowserStyle,
+) -> ResolvedBoxStyle {
+    let mut style = ResolvedBoxStyle {
+        display: default_display_for_tag(&element.tag_name),
+        color: parent.color,
+        background: egui::Color32::TRANSPARENT,
+        font_size: parent.font_size,
+        font_weight_bold: parent.font_weight_bold,
+        font_style_italic: parent.font_style_italic,
+        text_decoration_underline: parent.text_decoration_underline,
+        text_decoration_strikethrough: parent.text_decoration_strikethrough,
+        text_background: parent.text_background,
+        text_align: parent.text_align,
+        ..ResolvedBoxStyle::default()
+    };
+
+    match element.tag_name.as_str() {
+        "body" => {
+            style.background = document_style.page_background;
+            style.padding = CssEdges {
+                top: document_style.main_padding_y,
+                right: document_style.main_padding_x,
+                bottom: document_style.main_padding_y,
+                left: document_style.main_padding_x,
+            };
+        }
+        "h1" => {
+            style.font_size = document_style.h1_font_size;
+            style.font_weight_bold = true;
+            style.margin = CssEdges {
+                top: style.font_size * 0.67,
+                right: 0.0,
+                bottom: style.font_size * 0.67,
+                left: 0.0,
+            };
+        }
+        "h2" => {
+            style.font_size = document_style.h2_font_size;
+            style.font_weight_bold = true;
+            style.margin = CssEdges {
+                top: style.font_size * 0.83,
+                right: 0.0,
+                bottom: style.font_size * 0.83,
+                left: 0.0,
+            };
+        }
+        "h3" => {
+            style.font_size = 20.0;
+            style.font_weight_bold = true;
+            style.margin = CssEdges {
+                top: style.font_size,
+                right: 0.0,
+                bottom: style.font_size * 0.5,
+                left: 0.0,
+            };
+        }
+        "h4" => {
+            style.font_size = 18.0;
+            style.font_weight_bold = true;
+            style.margin = CssEdges {
+                top: style.font_size * 1.33,
+                right: 0.0,
+                bottom: style.font_size * 0.5,
+                left: 0.0,
+            };
+        }
+        "h5" | "h6" | "strong" | "b" | "th" => {
+            style.font_weight_bold = true;
+            if element.tag_name == "h5" || element.tag_name == "h6" {
+                style.margin = CssEdges {
+                    top: style.font_size * 1.67,
+                    right: 0.0,
+                    bottom: style.font_size * 0.5,
+                    left: 0.0,
+                };
+            }
+        }
+        "p" => {
+            style.margin = CssEdges {
+                top: style.font_size,
+                right: 0.0,
+                bottom: style.font_size,
+                left: 0.0,
+            };
+        }
+        "em" | "i" | "cite" | "dfn" | "var" => style.font_style_italic = true,
+        "u" | "ins" => style.text_decoration_underline = true,
+        "del" | "s" => style.text_decoration_strikethrough = true,
+        "mark" => style.text_background = egui::Color32::from_rgb(255, 245, 157),
+        "a" => {
+            style.color = document_style.link_color;
+            style.text_decoration_underline = true;
+        }
+        _ => {}
+    }
+
+    style
+}
+
+fn default_display_for_tag(tag: &str) -> CssDisplay {
+    match tag {
+        "span" | "a" | "strong" | "b" | "em" | "i" | "small" | "code" | "kbd" | "samp" | "var"
+        | "abbr" | "time" | "sub" | "sup" | "mark" | "del" | "s" | "ins" => CssDisplay::Inline,
+        "img" | "input" | "textarea" | "select" | "button" | "svg" => CssDisplay::InlineBlock,
+        "li" => CssDisplay::ListItem,
+        "table" => CssDisplay::Table,
+        "script" | "style" | "template" | "noscript" => CssDisplay::None,
+        _ => CssDisplay::Block,
+    }
+}
+
+fn apply_css_box_style(
+    target: &mut ResolvedBoxStyle,
+    source: &CssBoxStyle,
+    parent: &ResolvedBoxStyle,
+    document_style: &BrowserStyle,
+) {
+    let parent_width = parent
+        .width
+        .or(parent.max_width)
+        .unwrap_or(document_style.main_max_width);
+
+    if let Some(display) = source.display {
+        target.display = display;
+    }
+    if let Some(color) = source.color {
+        target.color = color;
+    }
+    if let Some(background) = source.background {
+        target.background = background;
+    }
+    if let Some(margin) = source.margin {
+        target.margin = margin;
+    }
+    if let Some(margin_top) = source.margin_top {
+        target.margin.top = margin_top;
+    }
+    if let Some(margin_right) = source.margin_right {
+        target.margin.right = margin_right;
+    }
+    if let Some(margin_bottom) = source.margin_bottom {
+        target.margin.bottom = margin_bottom;
+    }
+    if let Some(margin_left) = source.margin_left {
+        target.margin.left = margin_left;
+    }
+    if let Some(padding) = source.padding {
+        target.padding = padding;
+    }
+    if let Some(padding_top) = source.padding_top {
+        target.padding.top = padding_top;
+    }
+    if let Some(padding_right) = source.padding_right {
+        target.padding.right = padding_right;
+    }
+    if let Some(padding_bottom) = source.padding_bottom {
+        target.padding.bottom = padding_bottom;
+    }
+    if let Some(padding_left) = source.padding_left {
+        target.padding.left = padding_left;
+    }
+    if let Some(width) = source.border_width {
+        target.border_width = width;
+    }
+    if let Some(color) = source.border_color {
+        target.border_color = color;
+    }
+    if let Some(radius) = source.border_radius {
+        target.border_radius = radius;
+    }
+    if let Some(width) = source.width {
+        target.width = Some(resolve_css_length(width, parent_width));
+    }
+    if let Some(max_width) = source.max_width {
+        target.max_width = match max_width {
+            CssLength::Percent(percent) if percent >= 99.0 => None,
+            _ => Some(resolve_css_length(max_width, parent_width)),
+        };
+    }
+    if let Some(min_width) = source.min_width {
+        target.min_width = Some(resolve_css_length(min_width, parent_width));
+    }
+    if let Some(height) = source.height {
+        target.height = Some(height);
+    }
+    if let Some(min_height) = source.min_height {
+        target.min_height = Some(min_height);
+    }
+    if let Some(font_size) = source.font_size {
+        target.font_size = font_size;
+    }
+    if let Some(font_weight_bold) = source.font_weight_bold {
+        target.font_weight_bold = font_weight_bold;
+    }
+    if let Some(font_style_italic) = source.font_style_italic {
+        target.font_style_italic = font_style_italic;
+    }
+    if let Some(text_decoration_underline) = source.text_decoration_underline {
+        target.text_decoration_underline = text_decoration_underline;
+    }
+    if let Some(text_decoration_strikethrough) = source.text_decoration_strikethrough {
+        target.text_decoration_strikethrough = text_decoration_strikethrough;
+    }
+    if let Some(text_background) = source.text_background {
+        target.text_background = text_background;
+    }
+    if let Some(text_align) = source.text_align {
+        target.text_align = text_align;
+    }
+    if let Some(flex_grow) = source.flex_grow {
+        target.flex_grow = flex_grow;
+    }
+    if let Some(flex_direction) = source.flex_direction {
+        target.flex_direction = flex_direction;
+    }
+    if let Some(justify_content) = source.justify_content {
+        target.justify_content = justify_content;
+    }
+    if let Some(align_items) = source.align_items {
+        target.align_items = align_items;
+    }
+    if let Some(grid_template_columns) = source.grid_template_columns {
+        target.grid_template_columns = Some(grid_template_columns);
+    }
+    if let Some(gap) = source.gap {
+        target.gap = gap;
+    }
+    if let Some(overflow_hidden) = source.overflow_hidden {
+        target.overflow_hidden = overflow_hidden;
+    }
+    if let Some(position) = source.position {
+        target.position = position;
+    }
+    if let Some(inset) = source.inset {
+        target.inset = Some(inset);
+    }
+    if source.inset_sides.top.is_some() {
+        target.inset_sides.top = source.inset_sides.top;
+    }
+    if source.inset_sides.right.is_some() {
+        target.inset_sides.right = source.inset_sides.right;
+    }
+    if source.inset_sides.bottom.is_some() {
+        target.inset_sides.bottom = source.inset_sides.bottom;
+    }
+    if source.inset_sides.left.is_some() {
+        target.inset_sides.left = source.inset_sides.left;
+    }
+    if let Some(object_fit) = source.object_fit {
+        target.object_fit = object_fit;
+    }
+}
+
+fn resolve_css_length(length: CssLength, parent_width: f32) -> f32 {
+    match length {
+        CssLength::Px(px) => px,
+        CssLength::Percent(percent) => parent_width * percent / 100.0,
+    }
+}
+
+fn render_graph_to_blocks(
+    graph: &RenderGraph,
+    source: &str,
+    image_height_auto: bool,
+) -> Vec<CanvasBlock> {
+    render_children_to_blocks(&graph.root.children, source, image_height_auto)
+}
+
+#[derive(Clone, Debug)]
+struct CanvasLayoutCursor {
+    x: f32,
+    y: f32,
+    width: f32,
+    list_depth: usize,
+    list_stack: Vec<CanvasListContext>,
+}
+
+#[derive(Clone, Debug)]
+struct CanvasListContext {
+    ordered: bool,
+    next_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CanvasInlineRun {
+    text: String,
+    style: ResolvedBoxStyle,
+    href: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CanvasLineFragment {
+    text: String,
+    style: ResolvedBoxStyle,
+    href: Option<String>,
+    size: egui::Vec2,
+    x_offset: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CanvasLineBox {
+    fragments: Vec<CanvasLineFragment>,
+    width: f32,
+    height: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CssLayoutKind {
+    Document,
+    Block,
+    AnonymousBlock,
+    Inline,
+    Text,
+}
+
+#[derive(Clone, Debug)]
+struct CssLayoutBox<'a> {
+    kind: CssLayoutKind,
+    node: Option<&'a RenderNode>,
+    style: ResolvedBoxStyle,
+    children: Vec<CssLayoutBox<'a>>,
+    dimensions: CssLayoutDimensions,
+    text: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CssLayoutDimensions {
+    content: egui::Rect,
+    margin: CssEdges,
+    border: CssEdges,
+    padding: CssEdges,
+}
+
+impl Default for CssLayoutDimensions {
+    fn default() -> Self {
+        Self {
+            content: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::ZERO),
+            margin: CssEdges::default(),
+            border: CssEdges::default(),
+            padding: CssEdges::default(),
+        }
+    }
+}
+
+fn build_css_layout_tree(root: &RenderNode) -> CssLayoutBox<'_> {
+    let mut root_box = CssLayoutBox {
+        kind: CssLayoutKind::Document,
+        node: Some(root),
+        style: root.style.clone(),
+        children: root
+            .children
+            .iter()
+            .flat_map(build_css_layout_boxes)
+            .collect(),
+        dimensions: CssLayoutDimensions::default(),
+        text: None,
+    };
+    root_box.children = fix_css_anonymous_blocks(root_box.children, &root_box.style);
+    root_box
+}
+
+fn build_css_layout_boxes(node: &RenderNode) -> Vec<CssLayoutBox<'_>> {
+    if node.style.display == CssDisplay::None {
+        return Vec::new();
+    }
+
+    match &node.kind {
+        RenderNodeKind::Document => node
+            .children
+            .iter()
+            .flat_map(build_css_layout_boxes)
+            .collect(),
+        RenderNodeKind::Text(text) => {
+            let text = decode_basic_entities(text);
+            if normalize_ws(&text).is_empty() {
+                Vec::new()
+            } else {
+                vec![CssLayoutBox {
+                    kind: CssLayoutKind::Text,
+                    node: Some(node),
+                    style: node.style.clone(),
+                    children: Vec::new(),
+                    dimensions: CssLayoutDimensions::default(),
+                    text: Some(text),
+                }]
+            }
+        }
+        RenderNodeKind::Element(_) => {
+            let kind = css_layout_kind_from_display(node.style.display);
+            let raw_children = node
+                .children
+                .iter()
+                .flat_map(build_css_layout_boxes)
+                .collect();
+            let children = if css_layout_box_is_block_container(kind) {
+                fix_css_anonymous_blocks(raw_children, &node.style)
+            } else {
+                raw_children
+            };
+            vec![CssLayoutBox {
+                kind,
+                node: Some(node),
+                style: node.style.clone(),
+                children,
+                dimensions: CssLayoutDimensions::default(),
+                text: None,
+            }]
+        }
+    }
+}
+
+fn css_layout_kind_from_display(display: CssDisplay) -> CssLayoutKind {
+    match display {
+        CssDisplay::Inline | CssDisplay::InlineBlock => CssLayoutKind::Inline,
+        CssDisplay::None => CssLayoutKind::Block,
+        CssDisplay::Block
+        | CssDisplay::Flex
+        | CssDisplay::Grid
+        | CssDisplay::Table
+        | CssDisplay::ListItem => CssLayoutKind::Block,
+    }
+}
+
+fn css_layout_box_is_block_container(kind: CssLayoutKind) -> bool {
+    matches!(
+        kind,
+        CssLayoutKind::Document | CssLayoutKind::Block | CssLayoutKind::AnonymousBlock
+    )
+}
+
+fn fix_css_anonymous_blocks<'a>(
+    children: Vec<CssLayoutBox<'a>>,
+    parent_style: &ResolvedBoxStyle,
+) -> Vec<CssLayoutBox<'a>> {
+    let has_block = children.iter().any(css_layout_box_is_block_level);
+    let has_inline = children.iter().any(css_layout_box_is_inline_level);
+    if !(has_block && has_inline) {
+        return children;
+    }
+
+    let mut result = Vec::new();
+    let mut inline_run = Vec::new();
+    for child in children {
+        if css_layout_box_is_block_level(&child) {
+            flush_css_anonymous_inline_run(&mut result, &mut inline_run, parent_style);
+            result.push(child);
+        } else {
+            inline_run.push(child);
+        }
+    }
+    flush_css_anonymous_inline_run(&mut result, &mut inline_run, parent_style);
+    result
+}
+
+fn flush_css_anonymous_inline_run<'a>(
+    result: &mut Vec<CssLayoutBox<'a>>,
+    inline_run: &mut Vec<CssLayoutBox<'a>>,
+    parent_style: &ResolvedBoxStyle,
+) {
+    if inline_run.is_empty() {
+        return;
+    }
+    result.push(CssLayoutBox {
+        kind: CssLayoutKind::AnonymousBlock,
+        node: None,
+        style: parent_style.clone(),
+        children: std::mem::take(inline_run),
+        dimensions: CssLayoutDimensions::default(),
+        text: None,
+    });
+}
+
+fn css_layout_box_is_block_level(box_: &CssLayoutBox<'_>) -> bool {
+    matches!(
+        box_.kind,
+        CssLayoutKind::Document | CssLayoutKind::Block | CssLayoutKind::AnonymousBlock
+    )
+}
+
+fn css_layout_box_is_inline_level(box_: &CssLayoutBox<'_>) -> bool {
+    matches!(box_.kind, CssLayoutKind::Inline | CssLayoutKind::Text)
+}
+
+fn layout_css_layout_tree(
+    root: &mut CssLayoutBox<'_>,
+    viewport_width: f32,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+) {
+    root.dimensions.content =
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(viewport_width.max(1.0), 0.0));
+    let height = layout_css_block_children(root, source, image_height_auto, text_metrics);
+    root.dimensions.content.max.y = root.dimensions.content.min.y + height;
+}
+
+fn layout_css_block_children(
+    parent: &mut CssLayoutBox<'_>,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    let mut cursor_y = parent.dimensions.content.top();
+    for child in &mut parent.children {
+        if css_layout_box_is_out_of_flow(child) {
+            continue;
+        }
+        layout_css_box(
+            child,
+            parent.dimensions.content.left(),
+            cursor_y,
+            parent.dimensions.content.width().max(1.0),
+            parent.dimensions.content.height().max(0.0),
+            source,
+            image_height_auto,
+            text_metrics,
+        );
+        cursor_y = css_margin_box(child).bottom();
+    }
+    (cursor_y - parent.dimensions.content.top()).max(0.0)
+}
+
+fn layout_css_box(
+    box_: &mut CssLayoutBox<'_>,
+    containing_x: f32,
+    cursor_y: f32,
+    containing_width: f32,
+    containing_height: f32,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+) {
+    box_.dimensions.margin = box_.style.margin;
+    box_.dimensions.padding = box_.style.padding;
+    box_.dimensions.border = CssEdges {
+        top: box_.style.border_width,
+        right: box_.style.border_width,
+        bottom: box_.style.border_width,
+        left: box_.style.border_width,
+    };
+
+    let horizontal_non_content = box_.dimensions.margin.left
+        + box_.dimensions.margin.right
+        + box_.dimensions.border.left
+        + box_.dimensions.border.right
+        + box_.dimensions.padding.left
+        + box_.dimensions.padding.right;
+    let mut content_width = if let Some(width) = box_.style.width.or(box_.style.max_width) {
+        width
+    } else if matches!(box_.kind, CssLayoutKind::Inline)
+        && (box_.style.flex_grow > 0.0 || css_layout_box_contains_text_form_control(box_))
+    {
+        (containing_width - horizontal_non_content).max(1.0)
+    } else if matches!(box_.kind, CssLayoutKind::Inline) {
+        css_layout_preferred_content_width(box_, text_metrics)
+    } else {
+        (containing_width - horizontal_non_content).max(1.0)
+    }
+    .min(containing_width)
+    .max(box_.style.min_width.unwrap_or(1.0));
+    if box_.style.width.is_none()
+        && box_.style.max_width.is_none()
+        && let Some(node) = box_.node
+        && let RenderNodeKind::Element(element) = &node.kind
+        && element.tag_name == "svg"
+    {
+        let block = replaced_content_from_dom_element(element, source, image_height_auto);
+        content_width = replaced_content_size(&block, content_width, box_.style.font_size)
+            .x
+            .min((containing_width - horizontal_non_content).max(1.0))
+            .max(box_.style.min_width.unwrap_or(1.0));
+    }
+
+    let mut content_x = containing_x
+        + box_.dimensions.margin.left
+        + box_.dimensions.border.left
+        + box_.dimensions.padding.left;
+    if box_.style.width.is_none()
+        && box_.style.max_width.is_some()
+        && content_width + horizontal_non_content < containing_width
+    {
+        content_x += ((containing_width - content_width - horizontal_non_content) * 0.5).max(0.0);
+    }
+    let content_y = cursor_y
+        + box_.dimensions.margin.top
+        + box_.dimensions.border.top
+        + box_.dimensions.padding.top;
+    box_.dimensions.content = egui::Rect::from_min_size(
+        egui::pos2(content_x, content_y),
+        egui::vec2(content_width, 0.0),
+    );
+
+    let intrinsic_height = match box_.kind {
+        CssLayoutKind::Document => {
+            layout_css_block_children(box_, source, image_height_auto, text_metrics)
+        }
+        CssLayoutKind::AnonymousBlock => {
+            measure_css_inline_children_height(&box_.children, content_width, text_metrics)
+        }
+        CssLayoutKind::Text => box_
+            .text
+            .as_deref()
+            .map(|text| {
+                wrap_browser_textboxes(text_metrics, text, content_width, &box_.style)
+                    .iter()
+                    .map(|line| line.size.y.max((box_.style.font_size * 1.35).max(1.0)))
+                    .sum::<f32>()
+            })
+            .unwrap_or(0.0),
+        CssLayoutKind::Inline => {
+            if let Some(node) = box_.node {
+                if css_layout_node_is_replaced_or_special(node) {
+                    estimate_special_css_box_height(
+                        node,
+                        content_width,
+                        source,
+                        image_height_auto,
+                        text_metrics,
+                    )
+                } else {
+                    measure_css_inline_children_height(&box_.children, content_width, text_metrics)
+                        .max((box_.style.font_size * 1.35).max(1.0))
+                }
+            } else {
+                measure_css_inline_children_height(&box_.children, content_width, text_metrics)
+                    .max((box_.style.font_size * 1.35).max(1.0))
+            }
+        }
+        CssLayoutKind::Block => {
+            if box_.style.display == CssDisplay::Flex {
+                layout_css_flex_children(box_, source, image_height_auto, text_metrics)
+            } else if box_.style.display == CssDisplay::Grid {
+                layout_css_grid_children(box_, source, image_height_auto, text_metrics)
+            } else if let Some(node) = box_.node {
+                if css_layout_node_is_replaced_or_special(node) {
+                    estimate_special_css_box_height(
+                        node,
+                        content_width,
+                        source,
+                        image_height_auto,
+                        text_metrics,
+                    )
+                } else if !box_.children.is_empty()
+                    && box_.children.iter().all(css_layout_box_is_inline_level)
+                    && !box_
+                        .children
+                        .iter()
+                        .any(css_layout_box_contains_replaced_or_special)
+                {
+                    measure_css_inline_children_height(&box_.children, content_width, text_metrics)
+                } else {
+                    layout_css_block_children(box_, source, image_height_auto, text_metrics)
+                }
+            } else {
+                layout_css_block_children(box_, source, image_height_auto, text_metrics)
+            }
+        }
+    };
+
+    let content_height = css_resolve_used_height(
+        intrinsic_height,
+        &box_.style,
+        containing_height,
+        content_width,
+    );
+    box_.dimensions.content.max.y = box_.dimensions.content.min.y + content_height.max(0.0);
+    layout_css_out_of_flow_children(box_, source, image_height_auto, text_metrics);
+}
+
+fn layout_css_flex_children(
+    container: &mut CssLayoutBox<'_>,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    let is_row = container.style.flex_direction == CssFlexDirection::Row;
+    let gap = container.style.gap.max(0.0);
+    let content = container.dimensions.content;
+    let flow_indices = container
+        .children
+        .iter()
+        .enumerate()
+        .filter_map(|(index, child)| (!css_layout_box_is_out_of_flow(child)).then_some(index))
+        .collect::<Vec<_>>();
+    let child_count = flow_indices.len();
+    if child_count == 0 {
+        layout_css_out_of_flow_children(container, source, image_height_auto, text_metrics);
+        return 0.0;
+    }
+
+    let item_widths = if is_row {
+        css_flex_row_item_widths(
+            &flow_indices
+                .iter()
+                .map(|index| &container.children[*index])
+                .collect::<Vec<_>>(),
+            content.width(),
+            gap,
+            text_metrics,
+        )
+    } else {
+        flow_indices
+            .iter()
+            .map(|index| {
+                let child = &container.children[*index];
+                child
+                    .style
+                    .width
+                    .or(child.style.max_width)
+                    .unwrap_or(content.width())
+                    .min(content.width())
+                    .max(child.style.min_width.unwrap_or(1.0))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut item_sizes = Vec::with_capacity(child_count);
+    for (index, item_width) in flow_indices.iter().zip(item_widths) {
+        let child = &mut container.children[*index];
+        layout_css_box(
+            child,
+            0.0,
+            0.0,
+            item_width.max(1.0),
+            content.height().max(0.0),
+            source,
+            image_height_auto,
+            text_metrics,
+        );
+        item_sizes.push(css_margin_box(child).size());
+    }
+
+    let total_main = item_sizes
+        .iter()
+        .map(|size| if is_row { size.x } else { size.y })
+        .sum::<f32>()
+        + gap * child_count.saturating_sub(1) as f32;
+    let cross_size = item_sizes
+        .iter()
+        .map(|size| if is_row { size.y } else { size.x })
+        .fold(0.0, f32::max);
+    let available_cross = if is_row {
+        css_definite_box_height(&container.style, content.width())
+            .unwrap_or(cross_size)
+            .max(cross_size)
+    } else {
+        content.width().max(cross_size)
+    };
+    let available_main = if is_row {
+        content.width()
+    } else {
+        css_definite_box_height(&container.style, content.width())
+            .unwrap_or(total_main)
+            .max(total_main)
+    };
+    let free_space = (available_main - total_main).max(0.0);
+    let mut main_cursor = match container.style.justify_content {
+        CssJustifyContent::Center => free_space * 0.5,
+        CssJustifyContent::FlexStart | CssJustifyContent::SpaceBetween => 0.0,
+    };
+    let distributed_gap =
+        if container.style.justify_content == CssJustifyContent::SpaceBetween && child_count > 1 {
+            gap + free_space / (child_count - 1) as f32
+        } else {
+            gap
+        };
+
+    for (slot, index) in flow_indices.iter().enumerate() {
+        let child = &mut container.children[*index];
+        let size = item_sizes[slot];
+        let child_margin = child.dimensions.margin;
+        let child_border = child.dimensions.border;
+        let child_padding = child.dimensions.padding;
+        let cross_offset = match container.style.align_items {
+            CssAlignItems::Center => {
+                ((available_cross - if is_row { size.y } else { size.x }) * 0.5).max(0.0)
+            }
+            CssAlignItems::Stretch | CssAlignItems::FlexStart => 0.0,
+        };
+
+        let content_x = if is_row {
+            content.left()
+                + main_cursor
+                + child_margin.left
+                + child_border.left
+                + child_padding.left
+        } else {
+            content.left()
+                + cross_offset
+                + child_margin.left
+                + child_border.left
+                + child_padding.left
+        };
+        let content_y = if is_row {
+            content.top() + cross_offset + child_margin.top + child_border.top + child_padding.top
+        } else {
+            content.top() + main_cursor + child_margin.top + child_border.top + child_padding.top
+        };
+        let current_min = child.dimensions.content.min;
+        let new_min = egui::pos2(content_x, content_y);
+        translate_css_layout_box(child, new_min - current_min);
+        main_cursor += if is_row { size.x } else { size.y } + distributed_gap;
+    }
+
+    layout_css_out_of_flow_children(container, source, image_height_auto, text_metrics);
+    if is_row { available_cross } else { total_main }
+}
+
+fn css_flex_row_item_widths(
+    children: &[&CssLayoutBox<'_>],
+    available_width: f32,
+    gap: f32,
+    text_metrics: Option<&egui::Context>,
+) -> Vec<f32> {
+    let child_count = children.len();
+    let gap_total = gap * child_count.saturating_sub(1) as f32;
+    let available_for_items = (available_width - gap_total).max(1.0);
+    let total_grow = children
+        .iter()
+        .map(|child| css_flex_item_effective_grow(child))
+        .sum::<f32>();
+    let base_widths = children
+        .iter()
+        .map(|child| css_flex_item_base_width(child, available_width, text_metrics))
+        .collect::<Vec<_>>();
+
+    if total_grow <= 0.0 {
+        let mut widths = children
+            .iter()
+            .zip(base_widths.iter())
+            .map(|(child, width)| {
+                width
+                    .min(available_for_items)
+                    .max(css_flex_item_min_width(child))
+            })
+            .collect::<Vec<_>>();
+        shrink_css_flex_row_item_widths(&mut widths, children, available_for_items);
+        return widths;
+    }
+
+    let fixed_total = children
+        .iter()
+        .zip(base_widths.iter())
+        .filter(|(child, _)| css_flex_item_effective_grow(child) <= 0.0)
+        .map(|(_, width)| *width)
+        .sum::<f32>();
+    let grow_available = (available_for_items - fixed_total).max(1.0);
+
+    let mut widths = children
+        .iter()
+        .zip(base_widths.iter())
+        .map(|(child, base_width)| {
+            let grow = css_flex_item_effective_grow(child);
+            if grow > 0.0 {
+                (grow_available * grow / total_grow).max(css_flex_item_min_width(child))
+            } else {
+                base_width.max(css_flex_item_min_width(child))
+            }
+        })
+        .collect::<Vec<_>>();
+    shrink_css_flex_row_item_widths(&mut widths, children, available_for_items);
+    widths
+}
+
+fn shrink_css_flex_row_item_widths(
+    widths: &mut [f32],
+    children: &[&CssLayoutBox<'_>],
+    available_for_items: f32,
+) {
+    let total = widths.iter().sum::<f32>();
+    if total <= available_for_items {
+        return;
+    }
+    let shrinkable_total = widths
+        .iter()
+        .zip(children)
+        .map(|(width, child)| (*width - css_flex_item_shrink_floor(child, *width)).max(0.0))
+        .sum::<f32>();
+    if shrinkable_total <= 0.0 {
+        return;
+    }
+    let overflow = total - available_for_items;
+    for (width, child) in widths.iter_mut().zip(children) {
+        let min_width = css_flex_item_shrink_floor(child, *width);
+        let shrinkable = (*width - min_width).max(0.0);
+        *width = (*width - overflow * shrinkable / shrinkable_total)
+            .max(min_width)
+            .max(1.0);
+    }
+}
+
+fn css_flex_item_effective_grow(child: &CssLayoutBox<'_>) -> f32 {
+    if child.style.flex_grow > 0.0 {
+        return child.style.flex_grow;
+    }
+    if child.style.width.is_none()
+        && child.style.max_width.is_none()
+        && css_layout_box_contains_text_form_control(child)
+    {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+fn css_flex_item_min_width(child: &CssLayoutBox<'_>) -> f32 {
+    if css_layout_box_contains_text_form_control(child) {
+        child.style.min_width.unwrap_or(0.0)
+    } else {
+        child.style.min_width.unwrap_or(1.0)
+    }
+}
+
+fn css_flex_item_shrink_floor(child: &CssLayoutBox<'_>, base_width: f32) -> f32 {
+    if css_layout_box_contains_text_form_control(child) {
+        css_flex_item_min_width(child)
+    } else {
+        base_width.max(css_flex_item_min_width(child))
+    }
+}
+
+fn css_flex_item_base_width(
+    child: &CssLayoutBox<'_>,
+    available_width: f32,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    if let Some(width) = child.style.width.or(child.style.max_width) {
+        return width.min(available_width).max(1.0);
+    }
+
+    let content_width = css_layout_preferred_content_width(child, text_metrics)
+        .min(available_width)
+        .max(1.0);
+    let horizontal_non_content = child.style.margin.left
+        + child.style.margin.right
+        + child.style.border_width * 2.0
+        + child.style.padding.left
+        + child.style.padding.right;
+    (content_width + horizontal_non_content)
+        .min(available_width)
+        .max(1.0)
+}
+
+fn css_layout_preferred_content_width(
+    box_: &CssLayoutBox<'_>,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    match box_.kind {
+        CssLayoutKind::Text => box_
+            .text
+            .as_deref()
+            .map(|text| measure_canvas_text_run(text_metrics, &normalize_ws(text), &box_.style).x)
+            .unwrap_or(1.0),
+        CssLayoutKind::Inline | CssLayoutKind::AnonymousBlock | CssLayoutKind::Block => {
+            if box_
+                .node
+                .is_some_and(css_layout_node_is_replaced_or_special)
+            {
+                let text_width = box_
+                    .node
+                    .map(render_node_text_content)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| measure_canvas_text_run(text_metrics, &text, &box_.style).x)
+                    .unwrap_or(0.0);
+                return text_width.max(box_.style.font_size * 1.35).max(1.0);
+            }
+            box_.children
+                .iter()
+                .map(|child| css_layout_preferred_content_width(child, text_metrics))
+                .sum::<f32>()
+                .max(1.0)
+        }
+        CssLayoutKind::Document => box_
+            .children
+            .iter()
+            .map(|child| css_layout_preferred_content_width(child, text_metrics))
+            .fold(0.0, f32::max)
+            .max(1.0),
+    }
+}
+
+fn css_definite_box_height(style: &ResolvedBoxStyle, containing_width: f32) -> Option<f32> {
+    style
+        .height
+        .or(style.min_height)
+        .map(|height| resolve_css_box_length(height, 0.0, containing_width))
+}
+
+fn translate_css_layout_box(box_: &mut CssLayoutBox<'_>, delta: egui::Vec2) {
+    if delta == egui::Vec2::ZERO {
+        return;
+    }
+    box_.dimensions.content = box_.dimensions.content.translate(delta);
+    for child in &mut box_.children {
+        translate_css_layout_box(child, delta);
+    }
+}
+
+fn layout_css_grid_children(
+    container: &mut CssLayoutBox<'_>,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    let flow_count = container
+        .children
+        .iter()
+        .filter(|child| !css_layout_box_is_out_of_flow(child))
+        .count();
+    if flow_count == 0 {
+        return 0.0;
+    }
+
+    let gap = container.style.gap.max(0.0);
+    let content = container.dimensions.content;
+    let columns = container
+        .style
+        .grid_template_columns
+        .unwrap_or(flow_count)
+        .clamp(1, flow_count);
+    let auto_width =
+        ((content.width() - gap * columns.saturating_sub(1) as f32) / columns as f32).max(1.0);
+    let mut column = 0usize;
+    let mut cursor_y = content.top();
+    let mut row_height: f32 = 0.0;
+    let mut max_bottom = content.top();
+
+    for child in &mut container.children {
+        if css_layout_box_is_out_of_flow(child) {
+            continue;
+        }
+        if column >= columns {
+            cursor_y += row_height + gap;
+            column = 0;
+            row_height = 0.0;
+        }
+        let cursor_x = content.left() + column as f32 * (auto_width + gap);
+        let item_width = child
+            .style
+            .width
+            .or(child.style.max_width)
+            .unwrap_or(auto_width)
+            .min(auto_width)
+            .max(child.style.min_width.unwrap_or(1.0));
+        layout_css_box(
+            child,
+            cursor_x,
+            cursor_y,
+            item_width,
+            content.height().max(0.0),
+            source,
+            image_height_auto,
+            text_metrics,
+        );
+        let margin_box = css_margin_box(child);
+        row_height = row_height.max(margin_box.height());
+        max_bottom = max_bottom.max(margin_box.bottom());
+        column += 1;
+    }
+
+    (max_bottom - content.top()).max(0.0)
+}
+
+fn css_layout_box_is_out_of_flow(box_: &CssLayoutBox<'_>) -> bool {
+    if matches!(
+        box_.style.position,
+        CssPosition::Absolute | CssPosition::Fixed
+    ) {
+        return true;
+    }
+    false
+}
+
+fn css_resolve_used_height(
+    intrinsic_height: f32,
+    style: &ResolvedBoxStyle,
+    containing_height: f32,
+    containing_width: f32,
+) -> f32 {
+    let mut height = style
+        .height
+        .map(|height| resolve_css_box_length(height, containing_height, containing_width))
+        .unwrap_or(intrinsic_height);
+    if let Some(min_height) = style.min_height {
+        height = height.max(resolve_css_box_length(
+            min_height,
+            containing_height,
+            containing_width,
+        ));
+    }
+    height.max(0.0)
+}
+
+fn resolve_css_box_length(length: CssLength, percent_basis: f32, fallback_basis: f32) -> f32 {
+    match length {
+        CssLength::Px(px) => px,
+        CssLength::Percent(percent) => {
+            let basis = if percent_basis > 0.0 {
+                percent_basis
+            } else {
+                fallback_basis
+            };
+            basis * percent / 100.0
+        }
+    }
+}
+
+fn layout_css_out_of_flow_children(
+    parent: &mut CssLayoutBox<'_>,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+) {
+    let containing = parent.dimensions.content;
+    if containing.width() <= 0.0 || containing.height() <= 0.0 {
+        return;
+    }
+
+    for child in &mut parent.children {
+        if !css_layout_box_is_out_of_flow(child) {
+            continue;
+        }
+        let inset = child.style.inset.unwrap_or_default();
+        let left = child.style.inset_sides.left;
+        let right = child.style.inset_sides.right;
+        let top = child.style.inset_sides.top;
+        let bottom = child.style.inset_sides.bottom;
+        let containing_width = if left.is_some() && right.is_some() {
+            (containing.width() - inset.left - inset.right).max(1.0)
+        } else {
+            containing.width().max(1.0)
+        };
+        let containing_height = (containing.height() - inset.top - inset.bottom).max(0.0);
+        layout_css_box(
+            child,
+            containing.left() + left.unwrap_or(0.0),
+            containing.top() + top.unwrap_or(0.0),
+            containing_width,
+            containing_height,
+            source,
+            image_height_auto,
+            text_metrics,
+        );
+        let child_margin_box = css_margin_box(child);
+        let mut delta = egui::Vec2::ZERO;
+        if let (Some(right), None) = (right, left) {
+            delta.x = containing.right() - right - child_margin_box.right();
+        }
+        if let (Some(bottom), None) = (bottom, top) {
+            delta.y = containing.bottom() - bottom - child_margin_box.bottom();
+        }
+        if delta != egui::Vec2::ZERO {
+            translate_css_layout_box(child, delta);
+        }
+    }
+}
+
+fn measure_css_inline_children_height(
+    children: &[CssLayoutBox<'_>],
+    width: f32,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    let mut runs = Vec::new();
+    let mut pending_space = false;
+    for child in children {
+        collect_canvas_layout_inline_runs(child, None, &mut pending_space, &mut runs);
+    }
+    build_canvas_line_boxes(runs, text_metrics, width)
+        .iter()
+        .map(|line| line.height.max(1.0))
+        .sum::<f32>()
+}
+
+fn css_layout_node_is_replaced_or_special(node: &RenderNode) -> bool {
+    matches!(
+        &node.kind,
+        RenderNodeKind::Element(element)
+            if matches!(
+                element.tag_name.as_str(),
+                "img"
+                    | "input"
+                    | "textarea"
+                    | "select"
+                    | "button"
+                    | "table"
+                    | "svg"
+                    | "audio"
+                    | "video"
+                    | "canvas"
+                    | "meter"
+                    | "progress"
+                    | "iframe"
+            )
+    )
+}
+
+fn estimate_special_css_box_height(
+    node: &RenderNode,
+    width: f32,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    let RenderNodeKind::Element(element) = &node.kind else {
+        return (node.style.font_size * 1.35).max(1.0);
+    };
+    match element.tag_name.as_str() {
+        "img" => match image_block_from_dom_element(element, source, image_height_auto) {
+            CanvasBlock::Image { image, .. } => image.size.y,
+            _ => (node.style.font_size * 3.0).max(48.0),
+        },
+        "table" => collect_table_rows(node)
+            .iter()
+            .map(|row| {
+                let columns = row.len().max(1) as f32;
+                table_row_height(row, (width / columns).max(24.0), 6.0, 5.0, text_metrics)
+            })
+            .sum::<f32>()
+            .max((node.style.font_size * 1.35).max(1.0)),
+        "svg" => {
+            let block = replaced_content_from_dom_element(element, source, image_height_auto);
+            replaced_content_size(&block, width, node.style.font_size).y
+        }
+        "input" | "textarea" | "select" | "button" => (node.style.font_size * 1.35).max(1.0),
+        _ => (node.style.font_size * 3.0).max(48.0),
+    }
+}
+
+fn css_padding_box(dimensions: &CssLayoutDimensions) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(
+            dimensions.content.left() - dimensions.padding.left,
+            dimensions.content.top() - dimensions.padding.top,
+        ),
+        egui::pos2(
+            dimensions.content.right() + dimensions.padding.right,
+            dimensions.content.bottom() + dimensions.padding.bottom,
+        ),
+    )
+}
+
+fn css_border_box(dimensions: &CssLayoutDimensions) -> egui::Rect {
+    let padding = css_padding_box(dimensions);
+    egui::Rect::from_min_max(
+        egui::pos2(
+            padding.left() - dimensions.border.left,
+            padding.top() - dimensions.border.top,
+        ),
+        egui::pos2(
+            padding.right() + dimensions.border.right,
+            padding.bottom() + dimensions.border.bottom,
+        ),
+    )
+}
+
+fn css_margin_box(box_: &CssLayoutBox<'_>) -> egui::Rect {
+    let border = css_border_box(&box_.dimensions);
+    egui::Rect::from_min_max(
+        egui::pos2(
+            border.left() - box_.dimensions.margin.left,
+            border.top() - box_.dimensions.margin.top,
+        ),
+        egui::pos2(
+            border.right() + box_.dimensions.margin.right,
+            border.bottom() + box_.dimensions.margin.bottom,
+        ),
+    )
+}
+
+fn render_graph_to_canvas_graph(
+    graph: &RenderGraph,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+) -> CanvasGraph {
+    let viewport = egui::vec2(graph.root.style.max_width.unwrap_or(1280.0), 0.0);
+    let mut layout_root = build_css_layout_tree(&graph.root);
+    let mut canvas_graph = CanvasGraph {
+        viewport,
+        objects: Vec::new(),
+    };
+    let mut cursor = CanvasLayoutCursor {
+        x: 0.0,
+        y: 0.0,
+        width: viewport.x,
+        list_depth: 0,
+        list_stack: Vec::new(),
+    };
+    layout_css_layout_tree(
+        &mut layout_root,
+        viewport.x,
+        source,
+        image_height_auto,
+        text_metrics,
+    );
+
+    for child in &layout_root.children {
+        push_canvas_graph_layout_box(
+            child,
+            source,
+            image_height_auto,
+            text_metrics,
+            None,
+            &mut cursor,
+            &mut canvas_graph,
+        );
+    }
+    canvas_graph.viewport.y = cursor.y.max(layout_root.dimensions.content.height());
+    canvas_graph
+}
+
+fn push_canvas_graph_layout_box(
+    box_: &CssLayoutBox<'_>,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+    inherited_href: Option<&str>,
+    cursor: &mut CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    match box_.kind {
+        CssLayoutKind::Document => {
+            for child in &box_.children {
+                push_canvas_graph_layout_box(
+                    child,
+                    source,
+                    image_height_auto,
+                    text_metrics,
+                    inherited_href,
+                    cursor,
+                    graph,
+                );
+            }
+        }
+        CssLayoutKind::AnonymousBlock => {
+            if !box_.children.is_empty()
+                && box_
+                    .children
+                    .iter()
+                    .all(css_layout_box_contains_visual_replaced_content)
+            {
+                push_canvas_graph_layout_children_at_used_positions(
+                    &box_.children,
+                    source,
+                    image_height_auto,
+                    text_metrics,
+                    inherited_href,
+                    cursor,
+                    graph,
+                );
+            } else {
+                push_canvas_graph_layout_inline_children(
+                    &box_.children,
+                    text_metrics,
+                    inherited_href,
+                    cursor,
+                    graph,
+                );
+            }
+        }
+        CssLayoutKind::Text => {
+            if let Some(text) = &box_.text {
+                push_canvas_graph_text(
+                    text,
+                    &box_.style,
+                    text_metrics,
+                    inherited_href,
+                    cursor,
+                    graph,
+                );
+            }
+        }
+        CssLayoutKind::Inline => {
+            if let Some(node) = box_.node {
+                push_canvas_graph_node(
+                    node,
+                    source,
+                    image_height_auto,
+                    text_metrics,
+                    inherited_href,
+                    cursor,
+                    graph,
+                );
+            }
+        }
+        CssLayoutKind::Block => {
+            let Some(node) = box_.node else {
+                return;
+            };
+            if let RenderNodeKind::Element(element) = &node.kind {
+                let href = if element.tag_name == "a" {
+                    element.attr("href").or(inherited_href)
+                } else {
+                    inherited_href
+                };
+                match element.tag_name.as_str() {
+                    "ul" | "ol" => {
+                        cursor.list_stack.push(CanvasListContext {
+                            ordered: element.tag_name == "ol",
+                            next_index: 1,
+                        });
+                        cursor.list_depth = cursor.list_stack.len().saturating_sub(1);
+                        push_canvas_graph_layout_children_at_used_positions(
+                            &box_.children,
+                            source,
+                            image_height_auto,
+                            text_metrics,
+                            href,
+                            cursor,
+                            graph,
+                        );
+                        cursor.list_stack.pop();
+                        cursor.list_depth = cursor.list_stack.len().saturating_sub(1);
+                        cursor.y = css_margin_box(box_).bottom();
+                        return;
+                    }
+                    "li" => {
+                        let previous_x = cursor.x;
+                        let previous_y = cursor.y;
+                        let previous_width = cursor.width;
+                        cursor.x = box_.dimensions.content.left();
+                        cursor.y = box_.dimensions.content.top();
+                        cursor.width = box_.dimensions.content.width().max(1.0);
+                        push_canvas_graph_list_item(
+                            node,
+                            source,
+                            image_height_auto,
+                            text_metrics,
+                            href,
+                            cursor,
+                            graph,
+                        );
+                        for child in &box_.children {
+                            if let Some(child_node) = child.node {
+                                if matches!(
+                                    &child_node.kind,
+                                    RenderNodeKind::Element(element)
+                                        if element.tag_name == "ul" || element.tag_name == "ol"
+                                ) {
+                                    push_canvas_graph_layout_box(
+                                        child,
+                                        source,
+                                        image_height_auto,
+                                        text_metrics,
+                                        href,
+                                        cursor,
+                                        graph,
+                                    );
+                                }
+                            }
+                        }
+                        cursor.x = previous_x;
+                        cursor.width = previous_width;
+                        cursor.y = previous_y.max(css_margin_box(box_).bottom());
+                        return;
+                    }
+                    "img" | "input" | "textarea" | "select" | "button" | "table" | "audio"
+                    | "video" | "canvas" | "meter" | "progress" | "iframe" | "svg" => {
+                        let previous_x = cursor.x;
+                        let previous_y = cursor.y;
+                        let previous_width = cursor.width;
+                        cursor.x = box_.dimensions.content.left();
+                        cursor.y = box_.dimensions.content.top();
+                        cursor.width = box_.dimensions.content.width().max(1.0);
+                        push_canvas_graph_layout_replaced_or_special(
+                            box_,
+                            node,
+                            source,
+                            image_height_auto,
+                            text_metrics,
+                            inherited_href,
+                            cursor,
+                            graph,
+                        );
+                        cursor.x = previous_x;
+                        cursor.width = previous_width;
+                        cursor.y = previous_y.max(css_margin_box(box_).bottom());
+                        return;
+                    }
+                    _ => {
+                        let previous_x = cursor.x;
+                        let previous_y = cursor.y;
+                        let previous_width = cursor.width;
+                        cursor.x = box_.dimensions.content.left();
+                        cursor.y = box_.dimensions.content.top();
+                        cursor.width = box_.dimensions.content.width().max(1.0);
+                        push_canvas_graph_layout_box_background(box_, graph);
+                        let clips_children = push_canvas_graph_layout_clip_start(box_, graph);
+
+                        if box_.style.display == CssDisplay::Flex {
+                            push_canvas_graph_layout_children_at_used_positions(
+                                &box_.children,
+                                source,
+                                image_height_auto,
+                                text_metrics,
+                                href,
+                                cursor,
+                                graph,
+                            );
+                            cursor.y = css_margin_box(box_).bottom();
+                        } else if !box_.children.is_empty()
+                            && box_.children.iter().all(css_layout_box_is_inline_level)
+                            && !box_
+                                .children
+                                .iter()
+                                .any(css_layout_box_contains_replaced_or_special)
+                        {
+                            push_canvas_graph_layout_inline_children(
+                                &box_.children,
+                                text_metrics,
+                                href,
+                                cursor,
+                                graph,
+                            );
+                        } else {
+                            push_canvas_graph_layout_children_at_used_positions(
+                                &box_.children,
+                                source,
+                                image_height_auto,
+                                text_metrics,
+                                href,
+                                cursor,
+                                graph,
+                            );
+                        }
+
+                        if clips_children {
+                            graph.objects.push(CanvasObject::ClipEnd);
+                        }
+                        cursor.x = previous_x;
+                        cursor.width = previous_width;
+                        cursor.y = previous_y.max(css_margin_box(box_).bottom());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn push_canvas_graph_layout_clip_start(box_: &CssLayoutBox<'_>, graph: &mut CanvasGraph) -> bool {
+    if !box_.style.overflow_hidden && box_.style.border_radius == 0 {
+        return false;
+    }
+    graph
+        .objects
+        .push(CanvasObject::ClipStart(CanvasClipObject {
+            rect: css_border_box(&box_.dimensions),
+            border_radius: box_.style.border_radius,
+        }));
+    true
+}
+
+fn push_canvas_graph_layout_box_background(box_: &CssLayoutBox<'_>, graph: &mut CanvasGraph) {
+    if box_.style.background != egui::Color32::TRANSPARENT || box_.style.border_width > 0.0 {
+        graph.objects.push(CanvasObject::Rect(CanvasRectObject {
+            rect: css_border_box(&box_.dimensions),
+            fill: box_.style.background,
+            border_color: box_.style.border_color,
+            border_width: box_.style.border_width,
+            border_radius: box_.style.border_radius,
+        }));
+    }
+}
+
+fn push_canvas_graph_layout_replaced_or_special(
+    box_: &CssLayoutBox<'_>,
+    node: &RenderNode,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+    inherited_href: Option<&str>,
+    cursor: &mut CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    let RenderNodeKind::Element(element) = &node.kind else {
+        return;
+    };
+    match element.tag_name.as_str() {
+        "img" | "svg" => {
+            let content = replaced_content_from_dom_element(element, source, image_height_auto);
+            push_canvas_graph_replaced_content_in_rect(
+                &content,
+                &node.style,
+                box_.dimensions.content,
+                graph,
+            );
+        }
+        "button" => {
+            push_canvas_graph_layout_box_background(box_, graph);
+            if box_.children.is_empty() {
+                let text = render_node_text_content(node);
+                push_canvas_graph_text(
+                    &text,
+                    &node.style,
+                    text_metrics,
+                    inherited_href,
+                    cursor,
+                    graph,
+                );
+            } else {
+                push_canvas_graph_layout_children_at_used_positions(
+                    &box_.children,
+                    source,
+                    image_height_auto,
+                    text_metrics,
+                    inherited_href,
+                    cursor,
+                    graph,
+                );
+            }
+        }
+        _ => push_canvas_graph_node(
+            node,
+            source,
+            image_height_auto,
+            text_metrics,
+            inherited_href,
+            cursor,
+            graph,
+        ),
+    }
+}
+
+fn css_layout_box_contains_replaced_or_special(box_: &CssLayoutBox<'_>) -> bool {
+    box_.node
+        .is_some_and(css_layout_node_is_replaced_or_special)
+        || box_
+            .children
+            .iter()
+            .any(css_layout_box_contains_replaced_or_special)
+}
+
+fn css_layout_box_contains_text_form_control(box_: &CssLayoutBox<'_>) -> bool {
+    box_.node.is_some_and(|node| {
+        matches!(
+            &node.kind,
+            RenderNodeKind::Element(element)
+                if matches!(element.tag_name.as_str(), "input" | "textarea" | "select")
+        )
+    }) || box_
+        .children
+        .iter()
+        .any(css_layout_box_contains_text_form_control)
+}
+
+fn css_layout_box_contains_visual_replaced_content(box_: &CssLayoutBox<'_>) -> bool {
+    box_.node
+        .is_some_and(css_layout_node_is_visual_replaced_content)
+        || box_
+            .children
+            .iter()
+            .any(css_layout_box_contains_visual_replaced_content)
+}
+
+fn css_layout_node_is_visual_replaced_content(node: &RenderNode) -> bool {
+    matches!(
+        &node.kind,
+        RenderNodeKind::Element(element)
+            if matches!(
+                element.tag_name.as_str(),
+                "img" | "svg" | "audio" | "video" | "canvas" | "meter" | "progress" | "iframe"
+            )
+    )
+}
+
+fn push_canvas_graph_layout_children_at_used_positions(
+    children: &[CssLayoutBox<'_>],
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+    inherited_href: Option<&str>,
+    cursor: &mut CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    let previous_x = cursor.x;
+    let previous_y = cursor.y;
+    let previous_width = cursor.width;
+    for child in children {
+        let margin_box = css_margin_box(child);
+        if css_layout_box_is_block_level(child) {
+            cursor.x = margin_box.left();
+            cursor.y = margin_box.top();
+            cursor.width = margin_box.width().max(1.0);
+        } else {
+            cursor.x = child.dimensions.content.left();
+            cursor.y = child.dimensions.content.top();
+            cursor.width = child.dimensions.content.width().max(1.0);
+        }
+        push_canvas_graph_layout_box(
+            child,
+            source,
+            image_height_auto,
+            text_metrics,
+            inherited_href,
+            cursor,
+            graph,
+        );
+    }
+    cursor.x = previous_x;
+    cursor.y = previous_y;
+    cursor.width = previous_width;
+}
+
+fn push_canvas_graph_node(
+    node: &RenderNode,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+    inherited_href: Option<&str>,
+    cursor: &mut CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    if node.style.display == CssDisplay::None {
+        return;
+    }
+
+    match &node.kind {
+        RenderNodeKind::Document => {
+            for child in &node.children {
+                push_canvas_graph_node(
+                    child,
+                    source,
+                    image_height_auto,
+                    text_metrics,
+                    inherited_href,
+                    cursor,
+                    graph,
+                );
+            }
+        }
+        RenderNodeKind::Text(text) => {
+            push_canvas_graph_text(
+                text,
+                &node.style,
+                text_metrics,
+                inherited_href,
+                cursor,
+                graph,
+            );
+        }
+        RenderNodeKind::Element(element) => {
+            push_canvas_graph_element(
+                node,
+                element,
+                source,
+                image_height_auto,
+                text_metrics,
+                inherited_href,
+                cursor,
+                graph,
+            );
+        }
+    }
+}
+
+fn push_canvas_graph_element(
+    node: &RenderNode,
+    element: &DomElement,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+    inherited_href: Option<&str>,
+    cursor: &mut CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    let href = if element.tag_name == "a" {
+        element.attr("href").or(inherited_href)
+    } else {
+        inherited_href
+    };
+
+    match element.tag_name.as_str() {
+        "img" => {
+            push_canvas_graph_image(
+                element,
+                &node.style,
+                source,
+                image_height_auto,
+                cursor,
+                graph,
+            );
+        }
+        "input" | "textarea" | "select" => {
+            if element
+                .attr("type")
+                .is_some_and(|value| value.eq_ignore_ascii_case("hidden"))
+            {
+                return;
+            }
+            let block = input_block_from_dom_element(element);
+            if let CanvasBlock::Input { label, value } = block {
+                graph.objects.push(CanvasObject::Input(CanvasInputObject {
+                    label,
+                    value,
+                    rect: egui::Rect::from_min_size(
+                        egui::pos2(cursor.x, cursor.y),
+                        egui::vec2(
+                            cursor.width.max(1.0),
+                            (node.style.font_size * 1.35).max(1.0),
+                        ),
+                    ),
+                    font_size: node.style.font_size,
+                }));
+            }
+        }
+        "button" => {
+            if node.children.is_empty() {
+                let text = render_node_text_content(node);
+                push_canvas_graph_text(&text, &node.style, text_metrics, href, cursor, graph);
+            } else {
+                for child in &node.children {
+                    push_canvas_graph_node(
+                        child,
+                        source,
+                        image_height_auto,
+                        text_metrics,
+                        href,
+                        cursor,
+                        graph,
+                    );
+                }
+            }
+        }
+        "table" => {
+            push_canvas_graph_table(node, text_metrics, cursor, graph);
+        }
+        "ul" | "ol" => {
+            cursor.list_stack.push(CanvasListContext {
+                ordered: element.tag_name == "ol",
+                next_index: 1,
+            });
+            cursor.list_depth = cursor.list_stack.len().saturating_sub(1);
+            for child in &node.children {
+                push_canvas_graph_node(
+                    child,
+                    source,
+                    image_height_auto,
+                    text_metrics,
+                    href,
+                    cursor,
+                    graph,
+                );
+            }
+            cursor.list_stack.pop();
+            cursor.list_depth = cursor.list_stack.len().saturating_sub(1);
+        }
+        "svg" => {
+            push_canvas_graph_replaced_content(
+                &replaced_content_from_dom_element(element, source, image_height_auto),
+                &node.style,
+                cursor,
+                graph,
+            );
+        }
+        "audio" | "video" | "canvas" | "meter" | "progress" | "iframe" => {
+            push_canvas_graph_media(
+                element
+                    .attr("alt")
+                    .or_else(|| element.attr("src"))
+                    .unwrap_or(element.tag_name.as_str()),
+                &node.style,
+                cursor,
+                graph,
+            );
+        }
+        "li" => {
+            push_canvas_graph_list_item(
+                node,
+                source,
+                image_height_auto,
+                text_metrics,
+                href,
+                cursor,
+                graph,
+            );
+            for child in &node.children {
+                if let RenderNodeKind::Element(child_element) = &child.kind {
+                    if child_element.tag_name == "ul" || child_element.tag_name == "ol" {
+                        cursor.list_depth += 1;
+                        push_canvas_graph_node(
+                            child,
+                            source,
+                            image_height_auto,
+                            text_metrics,
+                            inherited_href,
+                            cursor,
+                            graph,
+                        );
+                        cursor.list_depth = cursor.list_depth.saturating_sub(1);
+                    }
+                }
+            }
+        }
+        _ => {
+            push_canvas_graph_box_start(&node.style, cursor, graph);
+            let previous_x = cursor.x;
+            let previous_width = cursor.width;
+            cursor.x += node.style.margin.left + node.style.padding.left;
+            cursor.width = (cursor.width
+                - node.style.margin.left
+                - node.style.margin.right
+                - node.style.padding.left
+                - node.style.padding.right)
+                .max(1.0);
+
+            if !node.children.is_empty() && children_are_inline_flow(&node.children) {
+                push_canvas_graph_inline_children(
+                    &node.children,
+                    text_metrics,
+                    href,
+                    cursor,
+                    graph,
+                );
+            } else {
+                for child in &node.children {
+                    push_canvas_graph_node(
+                        child,
+                        source,
+                        image_height_auto,
+                        text_metrics,
+                        href,
+                        cursor,
+                        graph,
+                    );
+                }
+            }
+
+            cursor.x = previous_x;
+            cursor.width = previous_width;
+            cursor.y += node.style.padding.bottom + node.style.margin.bottom;
+        }
+    }
+}
+
+fn push_canvas_graph_box_start(
+    style: &ResolvedBoxStyle,
+    cursor: &mut CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    cursor.y += style.margin.top + style.padding.top;
+    if style.background != egui::Color32::TRANSPARENT || style.border_width > 0.0 {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(cursor.x + style.margin.left, cursor.y - style.padding.top),
+            egui::vec2(
+                style
+                    .width
+                    .or(style.max_width)
+                    .unwrap_or(cursor.width)
+                    .min(cursor.width)
+                    .max(1.0),
+                (style.padding.top + style.padding.bottom + style.font_size * 1.4).max(1.0),
+            ),
+        );
+        graph.objects.push(CanvasObject::Rect(CanvasRectObject {
+            rect,
+            fill: style.background,
+            border_color: style.border_color,
+            border_width: style.border_width,
+            border_radius: style.border_radius,
+        }));
+    }
+}
+
+fn push_canvas_graph_text(
+    text: &str,
+    style: &ResolvedBoxStyle,
+    text_metrics: Option<&egui::Context>,
+    href: Option<&str>,
+    cursor: &mut CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    let text = normalize_ws(&decode_basic_entities(text));
+    if text.is_empty() {
+        return;
+    }
+    for line in wrap_browser_textboxes(text_metrics, &text, cursor.width, style) {
+        let line_height = line.size.y.max((style.font_size * 1.35).max(1.0));
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(cursor.x, cursor.y),
+            egui::vec2(line.size.x.min(cursor.width).max(1.0), line_height),
+        );
+        push_canvas_graph_text_object(line.text, rect, style, href, graph);
+        cursor.y += line_height;
+    }
+}
+
+fn push_canvas_graph_text_object(
+    text: String,
+    rect: egui::Rect,
+    style: &ResolvedBoxStyle,
+    href: Option<&str>,
+    graph: &mut CanvasGraph,
+) {
+    graph.objects.push(CanvasObject::Text(CanvasTextObject {
+        text,
+        rect,
+        color: style.color,
+        font_size: style.font_size,
+        font_weight_bold: style.font_weight_bold,
+        font_style_italic: style.font_style_italic,
+        text_decoration_underline: style.text_decoration_underline,
+        text_decoration_strikethrough: style.text_decoration_strikethrough,
+        text_background: style.text_background,
+        text_align: style.text_align,
+        href: href.map(str::to_owned),
+    }));
+}
+
+fn children_are_inline_flow(children: &[RenderNode]) -> bool {
+    children.iter().all(is_inline_flow_node)
+}
+
+fn is_inline_flow_node(node: &RenderNode) -> bool {
+    match &node.kind {
+        RenderNodeKind::Text(text) => !normalize_ws(text).is_empty(),
+        RenderNodeKind::Element(element) => {
+            if matches!(
+                element.tag_name.as_str(),
+                "br" | "img" | "input" | "textarea" | "select" | "button" | "svg"
+            ) {
+                return false;
+            }
+            node.style.display == CssDisplay::Inline && children_are_inline_flow(&node.children)
+        }
+        RenderNodeKind::Document => children_are_inline_flow(&node.children),
+    }
+}
+
+fn push_canvas_graph_layout_inline_children(
+    children: &[CssLayoutBox<'_>],
+    text_metrics: Option<&egui::Context>,
+    inherited_href: Option<&str>,
+    cursor: &mut CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    let mut runs = Vec::new();
+    let mut pending_space = false;
+    for child in children {
+        collect_canvas_layout_inline_runs(child, inherited_href, &mut pending_space, &mut runs);
+    }
+    push_canvas_line_boxes(runs, text_metrics, cursor, graph);
+}
+
+fn collect_canvas_layout_inline_runs(
+    box_: &CssLayoutBox<'_>,
+    inherited_href: Option<&str>,
+    pending_space: &mut bool,
+    runs: &mut Vec<CanvasInlineRun>,
+) {
+    match box_.kind {
+        CssLayoutKind::Text => {
+            let Some(text) = &box_.text else {
+                return;
+            };
+            let has_leading_space = text.chars().next().is_some_and(char::is_whitespace);
+            let has_trailing_space = text.chars().last().is_some_and(char::is_whitespace);
+            let mut text = normalize_ws(text);
+            if text.is_empty() {
+                if has_leading_space || has_trailing_space {
+                    *pending_space = true;
+                }
+                return;
+            }
+            if !runs.is_empty() && (*pending_space || has_leading_space) {
+                text.insert(0, ' ');
+            }
+            runs.push(CanvasInlineRun {
+                text,
+                style: box_.style.clone(),
+                href: inherited_href.map(str::to_owned),
+            });
+            *pending_space = has_trailing_space;
+        }
+        CssLayoutKind::Inline => {
+            let href = box_.node.and_then(|node| {
+                if let RenderNodeKind::Element(element) = &node.kind {
+                    if element.tag_name == "a" {
+                        return element.attr("href").or(inherited_href);
+                    }
+                }
+                inherited_href
+            });
+            for child in &box_.children {
+                collect_canvas_layout_inline_runs(child, href, pending_space, runs);
+            }
+        }
+        CssLayoutKind::AnonymousBlock | CssLayoutKind::Document | CssLayoutKind::Block => {
+            for child in &box_.children {
+                collect_canvas_layout_inline_runs(child, inherited_href, pending_space, runs);
+            }
+        }
+    }
+}
+
+fn push_canvas_graph_inline_children(
+    children: &[RenderNode],
+    text_metrics: Option<&egui::Context>,
+    inherited_href: Option<&str>,
+    cursor: &mut CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    let mut runs = Vec::new();
+    let mut pending_space = false;
+    for child in children {
+        collect_canvas_inline_runs(child, inherited_href, &mut pending_space, &mut runs);
+    }
+    push_canvas_line_boxes(runs, text_metrics, cursor, graph);
+}
+
+fn collect_canvas_inline_runs(
+    node: &RenderNode,
+    inherited_href: Option<&str>,
+    pending_space: &mut bool,
+    runs: &mut Vec<CanvasInlineRun>,
+) {
+    if node.style.display == CssDisplay::None {
+        return;
+    }
+
+    match &node.kind {
+        RenderNodeKind::Text(text) => {
+            let decoded = decode_basic_entities(text);
+            let has_leading_space = decoded.chars().next().is_some_and(char::is_whitespace);
+            let has_trailing_space = decoded.chars().last().is_some_and(char::is_whitespace);
+            let mut text = normalize_ws(&decoded);
+            if text.is_empty() {
+                if decoded.chars().any(char::is_whitespace) && !runs.is_empty() {
+                    *pending_space = true;
+                }
+                return;
+            }
+            if !runs.is_empty() && (*pending_space || has_leading_space) {
+                text.insert(0, ' ');
+            }
+            runs.push(CanvasInlineRun {
+                text,
+                style: node.style.clone(),
+                href: inherited_href.map(str::to_owned),
+            });
+            *pending_space = has_trailing_space;
+        }
+        RenderNodeKind::Element(element) => {
+            let href = if element.tag_name == "a" {
+                element.attr("href").or(inherited_href)
+            } else {
+                inherited_href
+            };
+
+            if is_inline_flow_node(node) {
+                for child in &node.children {
+                    collect_canvas_inline_runs(child, href, pending_space, runs);
+                }
+            }
+        }
+        RenderNodeKind::Document => {
+            for child in &node.children {
+                collect_canvas_inline_runs(child, inherited_href, pending_space, runs);
+            }
+        }
+    }
+}
+
+fn push_canvas_line_boxes(
+    runs: Vec<CanvasInlineRun>,
+    text_metrics: Option<&egui::Context>,
+    cursor: &mut CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    let line_boxes = build_canvas_line_boxes(runs, text_metrics, cursor.width);
+    if line_boxes.is_empty() {
+        return;
+    }
+
+    for mut line in line_boxes {
+        coalesce_canvas_line_fragments(&mut line);
+        let align_offset = line_align_offset(&line, cursor.width);
+        for fragment in line.fragments {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(cursor.x + align_offset + fragment.x_offset, cursor.y),
+                egui::vec2(fragment.size.x.max(1.0), line.height.max(1.0)),
+            );
+            push_canvas_graph_text_object(
+                fragment.text,
+                rect,
+                &fragment.style,
+                fragment.href.as_deref(),
+                graph,
+            );
+        }
+        cursor.y += line.height.max(1.0);
+    }
+}
+
+fn coalesce_canvas_line_fragments(line: &mut CanvasLineBox) {
+    let mut coalesced: Vec<CanvasLineFragment> = Vec::new();
+    for fragment in line.fragments.drain(..) {
+        if let Some(last) = coalesced.last_mut() {
+            if canvas_line_fragments_can_merge(last, &fragment) {
+                last.text.push_str(&fragment.text);
+                last.size.x += fragment.size.x;
+                last.size.y = last.size.y.max(fragment.size.y);
+                continue;
+            }
+        }
+        coalesced.push(fragment);
+    }
+    line.fragments = coalesced;
+}
+
+fn canvas_line_fragments_can_merge(a: &CanvasLineFragment, b: &CanvasLineFragment) -> bool {
+    a.href == b.href
+        && a.style.color == b.style.color
+        && a.style.font_size == b.style.font_size
+        && a.style.font_weight_bold == b.style.font_weight_bold
+        && a.style.font_style_italic == b.style.font_style_italic
+        && a.style.text_decoration_underline == b.style.text_decoration_underline
+        && a.style.text_decoration_strikethrough == b.style.text_decoration_strikethrough
+        && a.style.text_background == b.style.text_background
+        && a.style.text_align == b.style.text_align
+}
+
+fn build_canvas_line_boxes(
+    runs: Vec<CanvasInlineRun>,
+    text_metrics: Option<&egui::Context>,
+    max_width: f32,
+) -> Vec<CanvasLineBox> {
+    let max_width = max_width.max(1.0);
+    let mut lines = Vec::new();
+    let mut current = CanvasLineBox::default();
+
+    for run in runs {
+        push_line_run(&mut lines, &mut current, &run, text_metrics, max_width);
+    }
+
+    if !current.fragments.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn push_line_run(
+    lines: &mut Vec<CanvasLineBox>,
+    current: &mut CanvasLineBox,
+    run: &CanvasInlineRun,
+    text_metrics: Option<&egui::Context>,
+    max_width: f32,
+) {
+    let text = if current.fragments.is_empty() {
+        run.text.trim_start().to_owned()
+    } else {
+        run.text.clone()
+    };
+    if text.is_empty() {
+        return;
+    }
+
+    let size = measure_canvas_text_run(text_metrics, &text, &run.style);
+    if current.fragments.is_empty() {
+        if size.x <= max_width {
+            push_line_fragment(current, run, text, size);
+            return;
+        }
+        push_line_run_tokens(lines, current, run, text, text_metrics, max_width);
+        return;
+    }
+
+    if current.width + size.x <= max_width {
+        push_line_fragment(current, run, text, size);
+        return;
+    }
+
+    lines.push(std::mem::take(current));
+    let text = text.trim_start().to_owned();
+    if text.is_empty() {
+        return;
+    }
+    let size = measure_canvas_text_run(text_metrics, &text, &run.style);
+    if size.x <= max_width {
+        push_line_fragment(current, run, text, size);
+    } else {
+        push_line_run_tokens(lines, current, run, text, text_metrics, max_width);
+    }
+}
+
+fn push_line_run_tokens(
+    lines: &mut Vec<CanvasLineBox>,
+    current: &mut CanvasLineBox,
+    run: &CanvasInlineRun,
+    text: String,
+    text_metrics: Option<&egui::Context>,
+    max_width: f32,
+) {
+    for token in split_inline_run_tokens(&text) {
+        if token.is_empty() {
+            continue;
+        }
+        push_line_token(lines, current, run, token, text_metrics, max_width);
+    }
+}
+
+fn push_line_token(
+    lines: &mut Vec<CanvasLineBox>,
+    current: &mut CanvasLineBox,
+    run: &CanvasInlineRun,
+    token: String,
+    text_metrics: Option<&egui::Context>,
+    max_width: f32,
+) {
+    let token = if current.fragments.is_empty() {
+        token.trim_start().to_owned()
+    } else {
+        token
+    };
+    if token.is_empty() {
+        return;
+    }
+
+    let size = measure_canvas_text_run(text_metrics, &token, &run.style);
+    if !current.fragments.is_empty() && current.width + size.x > max_width {
+        lines.push(std::mem::take(current));
+        push_line_token(
+            lines,
+            current,
+            run,
+            token.trim_start().to_owned(),
+            text_metrics,
+            max_width,
+        );
+        return;
+    }
+
+    if size.x <= max_width || token.chars().count() <= 1 {
+        push_line_fragment(current, run, token, size);
+        return;
+    }
+
+    for character in token.chars() {
+        let fragment = character.to_string();
+        let size = measure_canvas_text_run(text_metrics, &fragment, &run.style);
+        if !current.fragments.is_empty() && current.width + size.x > max_width {
+            lines.push(std::mem::take(current));
+        }
+        push_line_fragment(current, run, fragment, size);
+    }
+}
+
+fn push_line_fragment(
+    line: &mut CanvasLineBox,
+    run: &CanvasInlineRun,
+    text: String,
+    size: egui::Vec2,
+) {
+    let height = size.y.max((run.style.font_size * 1.35).max(1.0));
+    line.fragments.push(CanvasLineFragment {
+        text,
+        style: run.style.clone(),
+        href: run.href.clone(),
+        size,
+        x_offset: line.width,
+    });
+    line.width += size.x;
+    line.height = line.height.max(height);
+}
+
+fn split_inline_run_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut previous_was_space = false;
+
+    for character in text.chars() {
+        if character.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            previous_was_space = true;
+        } else {
+            if previous_was_space && !tokens.is_empty() {
+                current.push(' ');
+            }
+            current.push(character);
+            previous_was_space = false;
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn line_align_offset(line: &CanvasLineBox, width: f32) -> f32 {
+    let align = line
+        .fragments
+        .first()
+        .map(|fragment| fragment.style.text_align)
+        .unwrap_or(CssTextAlign::Left);
+    match align {
+        CssTextAlign::Left => 0.0,
+        CssTextAlign::Center => ((width - line.width) * 0.5).max(0.0),
+        CssTextAlign::Right => (width - line.width).max(0.0),
+    }
+}
+
+fn push_canvas_graph_list_item(
+    node: &RenderNode,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+    href: Option<&str>,
+    cursor: &mut CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    let previous_x = cursor.x;
+    let previous_width = cursor.width;
+    let depth_indent = cursor.list_depth as f32 * 22.0;
+    let marker_width = 18.0;
+    let content_x = cursor.x + depth_indent + marker_width;
+    let content_width = (cursor.width - depth_indent - marker_width).max(1.0);
+    let line_height = (node.style.font_size * 1.35).max(1.0);
+
+    let marker_rect = egui::Rect::from_min_size(
+        egui::pos2(cursor.x + depth_indent, cursor.y),
+        egui::vec2(marker_width, line_height),
+    );
+    let marker = next_canvas_list_marker(cursor);
+    push_canvas_graph_text_object(marker, marker_rect, &node.style, None, graph);
+
+    cursor.x = content_x;
+    cursor.width = content_width;
+    let inline_children: Vec<RenderNode> = node
+        .children
+        .iter()
+        .filter(|child| {
+            !matches!(
+                &child.kind,
+                RenderNodeKind::Element(element)
+                    if element.tag_name == "ul" || element.tag_name == "ol"
+            )
+        })
+        .cloned()
+        .collect();
+    if inline_children.is_empty() {
+        cursor.y += line_height;
+    } else if children_are_inline_flow(&inline_children) {
+        push_canvas_graph_inline_children(&inline_children, text_metrics, href, cursor, graph);
+    } else {
+        for child in &inline_children {
+            push_canvas_graph_node(
+                child,
+                source,
+                image_height_auto,
+                text_metrics,
+                href,
+                cursor,
+                graph,
+            );
+        }
+    }
+    cursor.x = previous_x;
+    cursor.width = previous_width;
+}
+
+fn next_canvas_list_marker(cursor: &mut CanvasLayoutCursor) -> String {
+    if let Some(context) = cursor.list_stack.last_mut() {
+        if context.ordered {
+            let marker = format!("{}.", context.next_index);
+            context.next_index += 1;
+            marker
+        } else {
+            "•".to_owned()
+        }
+    } else {
+        "•".to_owned()
+    }
+}
+
+fn measure_canvas_text_run(
+    text_metrics: Option<&egui::Context>,
+    text: &str,
+    style: &ResolvedBoxStyle,
+) -> egui::Vec2 {
+    wrap_browser_textboxes(text_metrics, text, f32::INFINITY, style)
+        .first()
+        .map(|line| line.size)
+        .unwrap_or_else(|| egui::vec2(1.0, (style.font_size * 1.35).max(1.0)))
+}
+
+fn push_canvas_graph_table(
+    node: &RenderNode,
+    text_metrics: Option<&egui::Context>,
+    cursor: &mut CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    let rows = collect_table_rows(node);
+    if rows.is_empty() {
+        return;
+    }
+
+    let table_width = cursor.width.max(1.0);
+    let column_count = rows.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    let cell_width = (table_width / column_count as f32).max(24.0);
+    let cell_padding_x = 6.0;
+    let cell_padding_y = 5.0;
+    let border_color = if node.style.border_color == egui::Color32::TRANSPARENT {
+        egui::Color32::from_rgb(178, 187, 196)
+    } else {
+        node.style.border_color
+    };
+    let border_width = node.style.border_width.max(1.0);
+
+    cursor.y += node.style.margin.top + node.style.padding.top;
+
+    if let Some(caption) = table_caption_text(node) {
+        push_canvas_graph_text(&caption, &node.style, text_metrics, None, cursor, graph);
+        cursor.y += 4.0;
+    }
+
+    for (row_index, row) in rows.iter().enumerate() {
+        let row_height = table_row_height(
+            row,
+            cell_width,
+            cell_padding_x,
+            cell_padding_y,
+            text_metrics,
+        );
+        for column_index in 0..column_count {
+            let cell = row.get(column_index);
+            let cell_style = cell.map(|cell| &cell.style).unwrap_or(&node.style);
+            let is_header = cell.is_some_and(|cell| is_table_header_cell(cell));
+            let fill = table_cell_fill(cell_style, row_index, is_header);
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(cursor.x + column_index as f32 * cell_width, cursor.y),
+                egui::vec2(cell_width, row_height),
+            );
+            graph.objects.push(CanvasObject::Rect(CanvasRectObject {
+                rect,
+                fill,
+                border_color,
+                border_width,
+                border_radius: 0,
+            }));
+
+            let Some(cell) = cell else {
+                continue;
+            };
+            let text = render_node_text_content(cell);
+            let text_width = (cell_width - cell_padding_x * 2.0).max(1.0);
+            let line_height = (cell.style.font_size * 1.35).max(1.0);
+            for (line_index, line) in
+                wrap_browser_textboxes(text_metrics, &text, text_width, &cell.style)
+                    .into_iter()
+                    .enumerate()
+            {
+                let line_height = line.size.y.max(line_height);
+                let text_rect = egui::Rect::from_min_size(
+                    egui::pos2(
+                        rect.left() + cell_padding_x,
+                        rect.top() + cell_padding_y + line_index as f32 * line_height,
+                    ),
+                    egui::vec2(text_width, line_height),
+                );
+                push_canvas_graph_text_object(line.text, text_rect, &cell.style, None, graph);
+            }
+        }
+        cursor.y += row_height;
+    }
+
+    cursor.y += node.style.padding.bottom + node.style.margin.bottom;
+}
+
+fn collect_table_rows(node: &RenderNode) -> Vec<Vec<&RenderNode>> {
+    let mut rows = Vec::new();
+    collect_table_rows_inner(node, &mut rows);
+    rows
+}
+
+fn collect_table_rows_inner<'a>(node: &'a RenderNode, rows: &mut Vec<Vec<&'a RenderNode>>) {
+    if let RenderNodeKind::Element(element) = &node.kind {
+        if element.tag_name == "tr" {
+            let cells = node
+                .children
+                .iter()
+                .filter(|child| {
+                    matches!(
+                        &child.kind,
+                        RenderNodeKind::Element(element)
+                            if element.tag_name == "th" || element.tag_name == "td"
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !cells.is_empty() {
+                rows.push(cells);
+            }
+            return;
+        }
+    }
+
+    for child in &node.children {
+        collect_table_rows_inner(child, rows);
+    }
+}
+
+fn table_caption_text(node: &RenderNode) -> Option<String> {
+    node.children.iter().find_map(|child| {
+        if matches!(
+            &child.kind,
+            RenderNodeKind::Element(element) if element.tag_name == "caption"
+        ) {
+            let text = render_node_text_content(child);
+            if text.is_empty() { None } else { Some(text) }
+        } else {
+            None
+        }
+    })
+}
+
+fn table_row_height(
+    row: &[&RenderNode],
+    cell_width: f32,
+    padding_x: f32,
+    padding_y: f32,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    row.iter()
+        .map(|cell| {
+            let text_width = (cell_width - padding_x * 2.0).max(1.0);
+            let lines = wrap_browser_textboxes(
+                text_metrics,
+                &render_node_text_content(cell),
+                text_width,
+                &cell.style,
+            );
+            let text_height = lines
+                .iter()
+                .map(|line| line.size.y.max((cell.style.font_size * 1.35).max(1.0)))
+                .sum::<f32>()
+                .max((cell.style.font_size * 1.35).max(1.0));
+            padding_y * 2.0 + text_height
+        })
+        .fold(0.0, f32::max)
+        .max(28.0)
+}
+
+fn is_table_header_cell(node: &RenderNode) -> bool {
+    matches!(
+        &node.kind,
+        RenderNodeKind::Element(element) if element.tag_name == "th"
+    )
+}
+
+fn table_cell_fill(style: &ResolvedBoxStyle, row_index: usize, is_header: bool) -> egui::Color32 {
+    if style.background != egui::Color32::TRANSPARENT {
+        style.background
+    } else if is_header {
+        egui::Color32::from_rgb(231, 236, 242)
+    } else if row_index % 2 == 1 {
+        egui::Color32::from_rgb(248, 250, 252)
+    } else {
+        egui::Color32::TRANSPARENT
+    }
+}
+
+fn push_canvas_graph_image(
+    element: &DomElement,
+    style: &ResolvedBoxStyle,
+    source: &str,
+    image_height_auto: bool,
+    cursor: &mut CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    let content = replaced_content_from_dom_element(element, source, image_height_auto);
+    push_canvas_graph_replaced_content(&content, style, cursor, graph);
+}
+
+fn push_canvas_graph_replaced_content(
+    content: &CanvasBlock,
+    style: &ResolvedBoxStyle,
+    cursor: &mut CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    match content {
+        CanvasBlock::Image { alt, src, image } => {
+            let rect = egui::Rect::from_min_size(egui::pos2(cursor.x, cursor.y), image.size);
+            cursor.y += image.size.y.max(style.font_size * 1.35);
+            graph.objects.push(CanvasObject::Image(CanvasImageObject {
+                rect,
+                src: src.clone(),
+                alt: alt.clone(),
+                image: image.clone(),
+                object_fit: style.object_fit,
+            }));
+        }
+        CanvasBlock::Svg { svg } => {
+            let rect = egui::Rect::from_min_size(egui::pos2(cursor.x, cursor.y), svg.size);
+            cursor.y += svg.size.y.max(style.font_size * 1.35);
+            graph.objects.push(CanvasObject::Svg(CanvasSvgObject {
+                rect,
+                svg: svg.clone(),
+            }));
+        }
+        CanvasBlock::Media { label } => push_canvas_graph_media(label, style, cursor, graph),
+        _ => {}
+    }
+}
+
+fn push_canvas_graph_replaced_content_in_rect(
+    content: &CanvasBlock,
+    style: &ResolvedBoxStyle,
+    rect: egui::Rect,
+    graph: &mut CanvasGraph,
+) {
+    match content {
+        CanvasBlock::Image { alt, src, image } => {
+            let rect = expand_zero_replaced_rect(rect, image.size);
+            graph.objects.push(CanvasObject::Image(CanvasImageObject {
+                rect,
+                src: src.clone(),
+                alt: alt.clone(),
+                image: image.clone(),
+                object_fit: style.object_fit,
+            }));
+        }
+        CanvasBlock::Svg { svg } => {
+            let rect = expand_zero_replaced_rect(rect, svg.size);
+            graph.objects.push(CanvasObject::Svg(CanvasSvgObject {
+                rect,
+                svg: svg.clone(),
+            }));
+        }
+        CanvasBlock::Media { label } => {
+            graph.objects.push(CanvasObject::Media(CanvasMediaObject {
+                rect,
+                label: label.clone(),
+            }));
+        }
+        _ => {}
+    }
+}
+
+fn push_canvas_graph_media(
+    label: &str,
+    style: &ResolvedBoxStyle,
+    cursor: &mut CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    let height = (style.font_size * 3.0).max(48.0);
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(cursor.x, cursor.y),
+        egui::vec2(cursor.width.max(1.0), height),
+    );
+    graph.objects.push(CanvasObject::Media(CanvasMediaObject {
+        rect,
+        label: label.to_owned(),
+    }));
+    cursor.y += height;
+}
+
+fn render_graph_debug_string(graph: &RenderGraph) -> String {
+    let mut out = String::new();
+    push_render_node_debug(&graph.root, 0, &mut out);
+    out
+}
+
+fn push_render_node_debug(node: &RenderNode, depth: usize, out: &mut String) {
+    use std::fmt::Write as _;
+
+    let indent = "  ".repeat(depth);
+    match &node.kind {
+        RenderNodeKind::Document => {
+            let _ = writeln!(
+                out,
+                "{indent}Document {} children={}",
+                resolved_style_debug(&node.style),
+                node.children.len()
+            );
+        }
+        RenderNodeKind::Element(element) => {
+            let _ = writeln!(
+                out,
+                "{indent}Element <{}{}> {} children={}",
+                element.tag_name,
+                element_attr_debug(element),
+                resolved_style_debug(&node.style),
+                node.children.len()
+            );
+        }
+        RenderNodeKind::Text(text) => {
+            let _ = writeln!(
+                out,
+                "{indent}Text \"{}\" {}",
+                shorten_debug_text(&decode_basic_entities(text)),
+                resolved_style_debug(&node.style)
+            );
+        }
+    }
+
+    for child in &node.children {
+        push_render_node_debug(child, depth + 1, out);
+    }
+}
+
+fn resolved_style_debug(style: &ResolvedBoxStyle) -> String {
+    format!(
+        "style(display={:?}, color={}, bg={}, margin={}, padding={}, border_width={:.1}, border_color={}, radius={:.1}, width={}, min_width={}, max_width={}, font_size={:.1}, bold={}, align={:?}, overflow_hidden={})",
+        style.display,
+        color_debug(style.color),
+        color_debug(style.background),
+        edges_debug(style.margin),
+        edges_debug(style.padding),
+        style.border_width,
+        color_debug(style.border_color),
+        style.border_radius,
+        optional_f32_debug(style.width),
+        optional_f32_debug(style.min_width),
+        optional_f32_debug(style.max_width),
+        style.font_size,
+        style.font_weight_bold,
+        style.text_align,
+        style.overflow_hidden
+    )
+}
+
+fn element_attr_debug(element: &DomElement) -> String {
+    let mut attrs = Vec::new();
+    for name in ["id", "class", "href", "src", "type", "name", "role"] {
+        if let Some(value) = element.attr(name) {
+            attrs.push(format!(r#" {name}="{}""#, shorten_debug_text(value)));
+        }
+    }
+    attrs.concat()
+}
+
+fn edges_debug(edges: CssEdges) -> String {
+    format!(
+        "{:.1}/{:.1}/{:.1}/{:.1}",
+        edges.top, edges.right, edges.bottom, edges.left
+    )
+}
+
+fn color_debug(color: egui::Color32) -> String {
+    format!(
+        "#{:02x}{:02x}{:02x}{:02x}",
+        color.r(),
+        color.g(),
+        color.b(),
+        color.a()
+    )
+}
+
+fn optional_f32_debug(value: Option<f32>) -> String {
+    value
+        .map(|value| format!("{value:.1}"))
+        .unwrap_or_else(|| "auto".to_owned())
+}
+
+fn shorten_debug_text(value: &str) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() > 120 {
+        compact.chars().take(117).collect::<String>() + "..."
+    } else {
+        compact
+    }
+}
+
+fn render_children_to_blocks(
+    children: &[RenderNode],
+    source: &str,
+    image_height_auto: bool,
+) -> Vec<CanvasBlock> {
+    let mut blocks = Vec::new();
+    for child in children {
+        blocks.extend(render_node_to_blocks(child, source, image_height_auto));
+    }
+    blocks
+}
+
+fn render_node_to_blocks(
+    node: &RenderNode,
+    source: &str,
+    image_height_auto: bool,
+) -> Vec<CanvasBlock> {
+    if node.style.display == CssDisplay::None {
+        return Vec::new();
+    }
+
+    match &node.kind {
+        RenderNodeKind::Document => {
+            render_children_to_blocks(&node.children, source, image_height_auto)
+        }
+        RenderNodeKind::Text(text) => {
+            let text = normalize_ws(&decode_basic_entities(text));
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![CanvasBlock::Paragraph { text }]
+            }
+        }
+        RenderNodeKind::Element(element) => {
+            render_element_to_blocks(node, element, source, image_height_auto)
+        }
+    }
+}
+
+fn render_element_to_blocks(
+    node: &RenderNode,
+    element: &DomElement,
+    source: &str,
+    image_height_auto: bool,
+) -> Vec<CanvasBlock> {
+    match element.tag_name.as_str() {
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+            let text = render_node_text_content(node);
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![CanvasBlock::Heading {
+                    level: element.tag_name[1..].parse::<u8>().unwrap_or(1),
+                    text,
+                }]
+            }
+        }
+        "p" => paragraph_blocks_from_render_node(node, source, image_height_auto),
+        "a" => {
+            let text = render_node_text_content(node);
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![CanvasBlock::Link {
+                    text,
+                    href: element.attr("href").unwrap_or_default().to_owned(),
+                }]
+            }
+        }
+        "ul" => render_list_blocks(node, source, image_height_auto, false, 0),
+        "ol" => render_list_blocks(node, source, image_height_auto, true, 0),
+        "blockquote" => {
+            let text = render_node_text_content(node);
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![CanvasBlock::Quote { text }]
+            }
+        }
+        "pre" => {
+            let text = render_node_text_content(node);
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![CanvasBlock::Preformatted { text }]
+            }
+        }
+        "hr" => vec![CanvasBlock::Rule],
+        "img" => vec![image_block_from_dom_element(
+            element,
+            source,
+            image_height_auto,
+        )],
+        "input"
+            if element
+                .attr("type")
+                .is_some_and(|value| value.eq_ignore_ascii_case("hidden")) =>
+        {
+            Vec::new()
+        }
+        "input" | "textarea" | "select" => vec![input_block_from_dom_element(element)],
+        "button" => {
+            let text = render_node_text_content(node);
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![CanvasBlock::Button { text }]
+            }
+        }
+        "svg" => vec![svg_block_from_dom_element(element)],
+        "audio" | "video" | "canvas" | "meter" | "progress" | "iframe" => {
+            vec![CanvasBlock::Media {
+                label: element
+                    .attr("alt")
+                    .or_else(|| element.attr("src"))
+                    .unwrap_or(element.tag_name.as_str())
+                    .to_owned(),
+            }]
+        }
+        "table" => dom_table_block(element).into_iter().collect(),
+        "li" => {
+            let text = render_node_own_inline_text(node);
+            let mut blocks = if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![CanvasBlock::ListItem {
+                    depth: 0,
+                    ordered: false,
+                    text,
+                    href: element_href(element),
+                }]
+            };
+            blocks.extend(render_inline_embedded_blocks_from_render_node(
+                node,
+                source,
+                image_height_auto,
+            ));
+            blocks.extend(render_children_to_blocks(
+                &node.children,
+                source,
+                image_height_auto,
+            ));
+            blocks
+        }
+        _ => {
+            let children = render_children_to_blocks(&node.children, source, image_height_auto);
+            if children.is_empty() {
+                Vec::new()
+            } else {
+                vec![CanvasBlock::StyledBox {
+                    style: node.style.clone(),
+                    children,
+                }]
+            }
+        }
+    }
+}
+
+fn render_node_text_content(node: &RenderNode) -> String {
+    let mut out = String::new();
+    push_render_node_text(node, &mut out);
+    normalize_ws(&decode_basic_entities(&out))
+}
+
+fn render_node_own_inline_text(node: &RenderNode) -> String {
+    let mut out = String::new();
+    push_render_node_own_inline_text(node, &mut out);
+    normalize_ws(&decode_basic_entities(&out))
+}
+
+fn push_render_node_text(node: &RenderNode, out: &mut String) {
+    if node.style.display == CssDisplay::None {
+        return;
+    }
+    match &node.kind {
+        RenderNodeKind::Text(text) => {
+            out.push_str(text);
+            out.push(' ');
+        }
+        RenderNodeKind::Document | RenderNodeKind::Element(_) => {
+            for child in &node.children {
+                push_render_node_text(child, out);
+            }
+        }
+    }
+}
+
+fn push_render_node_own_inline_text(node: &RenderNode, out: &mut String) {
+    if node.style.display == CssDisplay::None {
+        return;
+    }
+    match &node.kind {
+        RenderNodeKind::Text(text) => {
+            out.push_str(text);
+            out.push(' ');
+        }
+        RenderNodeKind::Document => {
+            for child in &node.children {
+                push_render_node_own_inline_text(child, out);
+            }
+        }
+        RenderNodeKind::Element(_) if is_block_boundary(node) => {}
+        RenderNodeKind::Element(_) => {
+            for child in &node.children {
+                push_render_node_own_inline_text(child, out);
+            }
+        }
+    }
+}
+
+fn is_block_boundary(node: &RenderNode) -> bool {
+    matches!(
+        node.style.display,
+        CssDisplay::Block | CssDisplay::Flex | CssDisplay::Grid | CssDisplay::Table
+    )
+}
+
+fn paragraph_blocks_from_render_node(
+    node: &RenderNode,
+    source: &str,
+    image_height_auto: bool,
+) -> Vec<CanvasBlock> {
+    let links = render_node_links(node);
+    let paragraph = render_node_text_content(node);
+    let embedded = render_inline_embedded_blocks_from_render_node(node, source, image_height_auto);
+    if paragraph.is_empty() {
+        return embedded;
+    }
+    if links.len() == 1 && links[0].0 == paragraph {
+        let mut blocks = vec![CanvasBlock::Link {
+            text: links[0].0.clone(),
+            href: links[0].1.clone(),
+        }];
+        blocks.extend(embedded);
+        return blocks;
+    }
+    let mut blocks = vec![CanvasBlock::Paragraph { text: paragraph }];
+    blocks.extend(embedded);
+    blocks
+}
+
+fn render_inline_embedded_blocks_from_render_node(
+    node: &RenderNode,
+    source: &str,
+    image_height_auto: bool,
+) -> Vec<CanvasBlock> {
+    let mut blocks = Vec::new();
+    collect_inline_embedded_blocks(node, true, source, image_height_auto, &mut blocks);
+    blocks
+}
+
+fn collect_inline_embedded_blocks(
+    node: &RenderNode,
+    is_root: bool,
+    source: &str,
+    image_height_auto: bool,
+    blocks: &mut Vec<CanvasBlock>,
+) {
+    if node.style.display == CssDisplay::None {
+        return;
+    }
+    let RenderNodeKind::Element(element) = &node.kind else {
+        return;
+    };
+
+    if !is_root && is_block_boundary(node) {
+        return;
+    }
+
+    if is_embedded_inline_element(element) {
+        blocks.extend(render_element_to_blocks(
+            node,
+            element,
+            source,
+            image_height_auto,
+        ));
+        return;
+    }
+
+    for child in &node.children {
+        collect_inline_embedded_blocks(child, false, source, image_height_auto, blocks);
+    }
+}
+
+fn is_embedded_inline_element(element: &DomElement) -> bool {
+    matches!(
+        element.tag_name.as_str(),
+        "img"
+            | "input"
+            | "textarea"
+            | "select"
+            | "button"
+            | "svg"
+            | "audio"
+            | "video"
+            | "canvas"
+            | "meter"
+            | "progress"
+            | "iframe"
+    )
+}
+
+fn render_node_links(node: &RenderNode) -> Vec<(String, String)> {
+    let mut links = Vec::new();
+    collect_render_node_links(node, &mut links);
+    links
+}
+
+fn collect_render_node_links(node: &RenderNode, links: &mut Vec<(String, String)>) {
+    if node.style.display == CssDisplay::None {
+        return;
+    }
+    if let RenderNodeKind::Element(element) = &node.kind {
+        if element.tag_name.eq_ignore_ascii_case("a") {
+            let text = render_node_text_content(node);
+            if !text.is_empty() {
+                links.push((text, element.attr("href").unwrap_or_default().to_owned()));
+            }
+        }
+    }
+    for child in &node.children {
+        collect_render_node_links(child, links);
+    }
+}
+
+fn render_list_blocks(
+    node: &RenderNode,
+    source: &str,
+    image_height_auto: bool,
+    ordered: bool,
+    depth: usize,
+) -> Vec<CanvasBlock> {
+    let mut blocks = Vec::new();
+    for child in &node.children {
+        let RenderNodeKind::Element(item) = &child.kind else {
+            continue;
+        };
+        if item.tag_name != "li" {
+            blocks.extend(render_node_to_blocks(child, source, image_height_auto));
+            continue;
+        }
+        let text = render_node_own_inline_text(child);
+        if !text.is_empty() {
+            blocks.push(CanvasBlock::ListItem {
+                depth,
+                ordered,
+                text,
+                href: element_href(item),
+            });
+        }
+        blocks.extend(render_inline_embedded_blocks_from_render_node(
+            child,
+            source,
+            image_height_auto,
+        ));
+        for nested in &child.children {
+            if let RenderNodeKind::Element(nested_element) = &nested.kind {
+                if nested_element.tag_name == "ul" || nested_element.tag_name == "ol" {
+                    blocks.extend(render_list_blocks(
+                        nested,
+                        source,
+                        image_height_auto,
+                        nested_element.tag_name == "ol",
+                        depth + 1,
+                    ));
+                }
+            }
+        }
+    }
+    blocks
+}
+
+fn dom_children_to_blocks(
+    children: &[DomNode],
+    source: &str,
+    image_height_auto: bool,
+) -> Vec<CanvasBlock> {
+    let mut blocks = Vec::new();
+    for child in children {
+        match child {
+            DomNode::Text(text) => {
+                let text = normalize_ws(&decode_basic_entities(text));
+                if !text.is_empty() {
+                    blocks.push(CanvasBlock::Paragraph { text });
+                }
+            }
+            DomNode::Element(element) => {
+                blocks.extend(dom_element_to_blocks(element, source, image_height_auto));
+            }
+        }
+    }
+    blocks
+}
+
+fn dom_element_to_blocks(
+    element: &DomElement,
+    source: &str,
+    image_height_auto: bool,
+) -> Vec<CanvasBlock> {
+    if !dom_element_text_is_visible(element)
+        || matches!(
+            element.tag_name.as_str(),
+            "script" | "style" | "template" | "noscript"
+        )
+    {
+        return Vec::new();
+    }
+
+    match element.tag_name.as_str() {
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+            let text = element.text_content();
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![CanvasBlock::Heading {
+                    level: element.tag_name[1..].parse::<u8>().unwrap_or(1),
+                    text,
+                }]
+            }
+        }
+        "p" => paragraph_blocks_from_dom(element),
+        "a" => {
+            let text = element.text_content();
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![CanvasBlock::Link {
+                    text,
+                    href: element.attr("href").unwrap_or_default().to_owned(),
+                }]
+            }
+        }
+        "ul" => dom_list_blocks(element, source, image_height_auto, false, 0),
+        "ol" => dom_list_blocks(element, source, image_height_auto, true, 0),
+        "blockquote" => {
+            let text = element.text_content();
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![CanvasBlock::Quote { text }]
+            }
+        }
+        "pre" => {
+            let text = element.text_content();
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![CanvasBlock::Preformatted { text }]
+            }
+        }
+        "hr" => vec![CanvasBlock::Rule],
+        "img" => vec![image_block_from_dom_element(
+            element,
+            source,
+            image_height_auto,
+        )],
+        "input"
+            if element
+                .attr("type")
+                .is_some_and(|value| value.eq_ignore_ascii_case("hidden")) =>
+        {
+            Vec::new()
+        }
+        "input" | "textarea" | "select" => vec![input_block_from_dom_element(element)],
+        "button" => {
+            let text = element.text_content();
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![CanvasBlock::Button { text }]
+            }
+        }
+        "svg" => vec![svg_block_from_dom_element(element)],
+        "audio" | "video" | "canvas" | "meter" | "progress" | "iframe" => {
+            vec![CanvasBlock::Media {
+                label: element
+                    .attr("alt")
+                    .or_else(|| element.attr("src"))
+                    .unwrap_or(element.tag_name.as_str())
+                    .to_owned(),
+            }]
+        }
+        "table" => dom_table_block(element).into_iter().collect(),
+        "li" => {
+            let text = element.text_content();
+            let mut blocks = if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![CanvasBlock::ListItem {
+                    depth: 0,
+                    ordered: false,
+                    text,
+                    href: element_href(element),
+                }]
+            };
+            blocks.extend(dom_children_to_blocks(
+                &element.children,
+                source,
+                image_height_auto,
+            ));
+            blocks
+        }
+        _ => {
+            let children = dom_children_to_blocks(&element.children, source, image_height_auto);
+            if children.is_empty() {
+                Vec::new()
+            } else {
+                vec![CanvasBlock::Box {
+                    style_key: element_style_key(element),
+                    children,
+                }]
+            }
+        }
+    }
+}
+
+fn paragraph_blocks_from_dom(element: &DomElement) -> Vec<CanvasBlock> {
+    let links = element_links(element);
+    let paragraph = element.text_content();
+    if paragraph.is_empty() {
+        return Vec::new();
+    }
+    if links.len() == 1 && links[0].0 == paragraph {
+        return vec![CanvasBlock::Link {
+            text: links[0].0.clone(),
+            href: links[0].1.clone(),
+        }];
+    }
+    vec![CanvasBlock::Paragraph { text: paragraph }]
+}
+
+fn dom_list_blocks(
+    element: &DomElement,
+    source: &str,
+    image_height_auto: bool,
+    ordered: bool,
+    depth: usize,
+) -> Vec<CanvasBlock> {
+    let mut blocks = Vec::new();
+    for child in &element.children {
+        let DomNode::Element(item) = child else {
+            continue;
+        };
+        if item.tag_name != "li" {
+            blocks.extend(dom_element_to_blocks(item, source, image_height_auto));
+            continue;
+        }
+        let text = item.text_content();
+        if !text.is_empty() {
+            blocks.push(CanvasBlock::ListItem {
+                depth,
+                ordered,
+                text,
+                href: element_href(item),
+            });
+        }
+        for nested in &item.children {
+            if let DomNode::Element(nested) = nested {
+                if nested.tag_name == "ul" || nested.tag_name == "ol" {
+                    blocks.extend(dom_list_blocks(
+                        nested,
+                        source,
+                        image_height_auto,
+                        nested.tag_name == "ol",
+                        depth + 1,
+                    ));
+                }
+            }
+        }
+    }
+    blocks
+}
+
+fn element_style_key(element: &DomElement) -> ElementStyleKey {
+    element_style_key_with_context(element, None, None)
+}
+
+fn element_style_key_with_context(
+    element: &DomElement,
+    parent: Option<&DomElement>,
+    previous_sibling: Option<&DomElement>,
+) -> ElementStyleKey {
+    ElementStyleKey {
+        tag: element.tag_name.clone(),
+        id: element.attr("id").map(str::to_owned),
+        classes: element
+            .attr("class")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect(),
+        attributes: element
+            .attributes
+            .iter()
+            .map(|attribute| attribute.name.to_ascii_lowercase())
+            .collect(),
+        parent: parent.map(|parent| Box::new(element_style_key(parent))),
+        previous_sibling: previous_sibling.map(|previous| Box::new(element_style_key(previous))),
+    }
+}
+
+fn image_block_from_dom_element(
+    element: &DomElement,
+    source: &str,
+    image_height_auto: bool,
+) -> CanvasBlock {
+    replaced_content_from_dom_element(element, source, image_height_auto)
+}
+
+fn replaced_content_from_dom_element(
+    element: &DomElement,
+    source: &str,
+    image_height_auto: bool,
+) -> CanvasBlock {
+    if element.tag_name == "svg" {
+        return svg_block_from_dom_element(element);
+    }
+
+    let label = element
+        .attr("alt")
+        .or_else(|| element.attr("src"))
+        .unwrap_or("image")
+        .to_owned();
+    let Some(src) = element.attr("src").filter(|src| !src.is_empty()) else {
+        return CanvasBlock::Media { label };
+    };
+    let resolved = resolve_resource_url(source, src);
+    if !resource_allowed_for_document(source, &resolved) {
+        return CanvasBlock::Media { label };
+    }
+    let requested_size = requested_image_size_from_dom(element);
+    match load_image_resource(&resolved, requested_size, image_height_auto) {
+        Ok(image) => CanvasBlock::Image {
+            alt: element.attr("alt").unwrap_or_default().to_owned(),
+            src: resolved,
+            image,
+        },
+        Err(_) => CanvasBlock::Media { label },
+    }
+}
+
+fn replaced_content_size(
+    block: &CanvasBlock,
+    fallback_width: f32,
+    fallback_font_size: f32,
+) -> egui::Vec2 {
+    match block {
+        CanvasBlock::Image { image, .. } => image.size,
+        CanvasBlock::Svg { svg } => svg.size,
+        CanvasBlock::Media { .. } => egui::vec2(
+            fallback_width.max(1.0),
+            (fallback_font_size * 3.0).max(48.0),
+        ),
+        _ => egui::vec2(
+            fallback_width.max(1.0),
+            (fallback_font_size * 1.35).max(1.0),
+        ),
+    }
+}
+
+fn expand_zero_replaced_rect(rect: egui::Rect, size: egui::Vec2) -> egui::Rect {
+    if rect.width() > 0.0 && rect.height() > 0.0 {
+        return rect;
+    }
+    egui::Rect::from_min_size(rect.min, egui::vec2(size.x.max(1.0), size.y.max(1.0)))
+}
+
+fn requested_image_size_from_dom(element: &DomElement) -> Option<egui::Vec2> {
+    let width = element.attr("width").and_then(parse_html_dimension);
+    let height = element.attr("height").and_then(parse_html_dimension);
+    match (width, height) {
+        (Some(width), Some(height)) => Some(egui::vec2(width, height)),
+        _ => None,
+    }
+}
+
+fn svg_block_from_dom_element(element: &DomElement) -> CanvasBlock {
+    let (width, height) = svg_size_from_dom_element(element);
+    if let Some(image) = rasterized_svg_image_from_dom_element(element, width, height) {
+        return image;
+    }
+
+    let mut shapes = Vec::new();
+    collect_dom_svg_shapes(element, &mut shapes);
+    if shapes.is_empty() && dom_svg_contains_path(element) {
+        shapes.push(SvgShape::PathFallback {
+            fill: element_style_current_color(element).unwrap_or(egui::Color32::WHITE),
+        });
+    }
+    if shapes.is_empty() {
+        CanvasBlock::Media {
+            label: element.attr("aria-label").unwrap_or("svg").to_owned(),
+        }
+    } else {
+        CanvasBlock::Svg {
+            svg: SvgBlock::new(egui::vec2(width, height), shapes),
+        }
+    }
+}
+
+fn svg_size_from_dom_element(element: &DomElement) -> (f32, f32) {
+    let width = element.attr("width").and_then(parse_html_dimension);
+    let height = element.attr("height").and_then(parse_html_dimension);
+    if let (Some(width), Some(height)) = (width, height) {
+        return (width, height);
+    }
+    if let Some((_, _, view_width, view_height)) =
+        element.attr("viewBox").and_then(parse_svg_view_box)
+    {
+        return (
+            width.unwrap_or(view_width.max(1.0)),
+            height.unwrap_or(view_height.max(1.0)),
+        );
+    }
+    (width.unwrap_or(100.0), height.unwrap_or(100.0))
+}
+
+fn parse_svg_view_box(value: &str) -> Option<(f32, f32, f32, f32)> {
+    let values: Vec<f32> = value
+        .split(|character: char| character.is_ascii_whitespace() || character == ',')
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<f32>().ok())
+        .collect();
+    match values.as_slice() {
+        [min_x, min_y, width, height] if *width > 0.0 && *height > 0.0 => {
+            Some((*min_x, *min_y, *width, *height))
+        }
+        _ => None,
+    }
+}
+
+fn rasterized_svg_image_from_dom_element(
+    element: &DomElement,
+    width: f32,
+    height: f32,
+) -> Option<CanvasBlock> {
+    let mut paths = Vec::new();
+    collect_dom_svg_paths(
+        element,
+        element_style_current_color(element).unwrap_or(egui::Color32::WHITE),
+        &mut paths,
+    );
+    if paths.is_empty() {
+        return None;
+    }
+
+    let raster_width = width.round().clamp(1.0, 512.0) as u32;
+    let raster_height = height.round().clamp(1.0, 512.0) as u32;
+    let mut pixmap = Pixmap::new(raster_width, raster_height)?;
+    let (min_x, min_y, view_width, view_height) = element
+        .attr("viewBox")
+        .and_then(parse_svg_view_box)
+        .unwrap_or((0.0, 0.0, width.max(1.0), height.max(1.0)));
+    let transform = Transform::from_row(
+        raster_width as f32 / view_width.max(1.0),
+        0.0,
+        0.0,
+        raster_height as f32 / view_height.max(1.0),
+        -min_x * raster_width as f32 / view_width.max(1.0),
+        -min_y * raster_height as f32 / view_height.max(1.0),
+    );
+
+    let mut painted = false;
+    for path in paths {
+        let Some(tiny_path) = parse_svg_path_to_tiny_path(&path.data) else {
+            continue;
+        };
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(path.fill.r(), path.fill.g(), path.fill.b(), path.fill.a());
+        let fill_rule = if path.even_odd {
+            FillRule::EvenOdd
+        } else {
+            FillRule::Winding
+        };
+        pixmap.fill_path(&tiny_path, &paint, fill_rule, transform, None);
+        painted = true;
+    }
+    if !painted {
+        return None;
+    }
+
+    let color_image = egui::ColorImage::from_rgba_premultiplied(
+        [raster_width as usize, raster_height as usize],
+        pixmap.data(),
+    );
+    let image = ImageBlock::from_color_image(
+        PathBuf::from(format!(
+            "inline-svg-raster-{}x{}.png",
+            raster_width, raster_height
+        )),
+        egui::vec2(width, height),
+        color_image,
+    );
+    Some(CanvasBlock::Image {
+        alt: element.attr("aria-label").unwrap_or("svg").to_owned(),
+        src: "inline-svg-raster".to_owned(),
+        image,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct SvgPathPaint {
+    data: String,
+    fill: egui::Color32,
+    even_odd: bool,
+}
+
+fn collect_dom_svg_paths(
+    element: &DomElement,
+    inherited_fill: egui::Color32,
+    paths: &mut Vec<SvgPathPaint>,
+) {
+    let fill = element
+        .attr("fill")
+        .and_then(|value| parse_svg_fill_color(value, inherited_fill))
+        .unwrap_or(inherited_fill);
+    if element.tag_name == "path" {
+        if let Some(data) = element.attr("d").filter(|data| !data.trim().is_empty()) {
+            paths.push(SvgPathPaint {
+                data: data.to_owned(),
+                fill,
+                even_odd: element
+                    .attr("fill-rule")
+                    .is_some_and(|rule| rule.eq_ignore_ascii_case("evenodd")),
+            });
+        }
+    }
+    for child in &element.children {
+        if let DomNode::Element(child) = child {
+            collect_dom_svg_paths(child, fill, paths);
+        }
+    }
+}
+
+fn parse_svg_fill_color(value: &str, current_color: egui::Color32) -> Option<egui::Color32> {
+    if value.trim().eq_ignore_ascii_case("currentColor") {
+        return Some(current_color);
+    }
+    parse_svg_color(value)
+}
+
+fn element_style_current_color(element: &DomElement) -> Option<egui::Color32> {
+    element.attr("color").and_then(parse_svg_color).or_else(|| {
+        element.attr("style").and_then(|style| {
+            style.split(';').find_map(|declaration| {
+                let (name, value) = declaration.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("color")
+                    .then(|| parse_svg_color(value))
+                    .flatten()
+            })
+        })
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SvgPathToken {
+    Command(char),
+    Number(f32),
+}
+
+fn parse_svg_path_to_tiny_path(data: &str) -> Option<tiny_skia::Path> {
+    let tokens = tokenize_svg_path(data);
+    let mut index = 0;
+    let mut command = None;
+    let mut builder = PathBuilder::new();
+    let mut current = (0.0, 0.0);
+    let mut subpath_start = (0.0, 0.0);
+    let mut last_cubic_control = None;
+    let mut last_quad_control = None;
+
+    while index < tokens.len() {
+        if let Some(next) = svg_path_command_at(&tokens, index) {
+            command = Some(next);
+            index += 1;
+        }
+        let command = command?;
+        let relative = command.is_ascii_lowercase();
+        match command.to_ascii_uppercase() {
+            'M' => {
+                let mut first = true;
+                while svg_path_number_at(&tokens, index).is_some() {
+                    let x = next_svg_path_number(&tokens, &mut index)?;
+                    let y = next_svg_path_number(&tokens, &mut index)?;
+                    let point = svg_path_point(x, y, relative, current);
+                    if first {
+                        builder.move_to(point.0, point.1);
+                        subpath_start = point;
+                        first = false;
+                    } else {
+                        builder.line_to(point.0, point.1);
+                    }
+                    current = point;
+                    last_cubic_control = None;
+                    last_quad_control = None;
+                }
+            }
+            'L' => {
+                while svg_path_number_at(&tokens, index).is_some() {
+                    let x = next_svg_path_number(&tokens, &mut index)?;
+                    let y = next_svg_path_number(&tokens, &mut index)?;
+                    current = svg_path_point(x, y, relative, current);
+                    builder.line_to(current.0, current.1);
+                    last_cubic_control = None;
+                    last_quad_control = None;
+                }
+            }
+            'H' => {
+                while let Some(x) = svg_path_number_at(&tokens, index) {
+                    index += 1;
+                    current.0 = if relative { current.0 + x } else { x };
+                    builder.line_to(current.0, current.1);
+                    last_cubic_control = None;
+                    last_quad_control = None;
+                }
+            }
+            'V' => {
+                while let Some(y) = svg_path_number_at(&tokens, index) {
+                    index += 1;
+                    current.1 = if relative { current.1 + y } else { y };
+                    builder.line_to(current.0, current.1);
+                    last_cubic_control = None;
+                    last_quad_control = None;
+                }
+            }
+            'C' => {
+                while svg_path_number_at(&tokens, index).is_some() {
+                    let c1 = svg_path_point(
+                        next_svg_path_number(&tokens, &mut index)?,
+                        next_svg_path_number(&tokens, &mut index)?,
+                        relative,
+                        current,
+                    );
+                    let c2 = svg_path_point(
+                        next_svg_path_number(&tokens, &mut index)?,
+                        next_svg_path_number(&tokens, &mut index)?,
+                        relative,
+                        current,
+                    );
+                    let point = svg_path_point(
+                        next_svg_path_number(&tokens, &mut index)?,
+                        next_svg_path_number(&tokens, &mut index)?,
+                        relative,
+                        current,
+                    );
+                    builder.cubic_to(c1.0, c1.1, c2.0, c2.1, point.0, point.1);
+                    current = point;
+                    last_cubic_control = Some(c2);
+                    last_quad_control = None;
+                }
+            }
+            'S' => {
+                while svg_path_number_at(&tokens, index).is_some() {
+                    let c1 = last_cubic_control
+                        .map(|control| (current.0 * 2.0 - control.0, current.1 * 2.0 - control.1))
+                        .unwrap_or(current);
+                    let c2 = svg_path_point(
+                        next_svg_path_number(&tokens, &mut index)?,
+                        next_svg_path_number(&tokens, &mut index)?,
+                        relative,
+                        current,
+                    );
+                    let point = svg_path_point(
+                        next_svg_path_number(&tokens, &mut index)?,
+                        next_svg_path_number(&tokens, &mut index)?,
+                        relative,
+                        current,
+                    );
+                    builder.cubic_to(c1.0, c1.1, c2.0, c2.1, point.0, point.1);
+                    current = point;
+                    last_cubic_control = Some(c2);
+                    last_quad_control = None;
+                }
+            }
+            'Q' => {
+                while svg_path_number_at(&tokens, index).is_some() {
+                    let control = svg_path_point(
+                        next_svg_path_number(&tokens, &mut index)?,
+                        next_svg_path_number(&tokens, &mut index)?,
+                        relative,
+                        current,
+                    );
+                    let point = svg_path_point(
+                        next_svg_path_number(&tokens, &mut index)?,
+                        next_svg_path_number(&tokens, &mut index)?,
+                        relative,
+                        current,
+                    );
+                    builder.quad_to(control.0, control.1, point.0, point.1);
+                    current = point;
+                    last_quad_control = Some(control);
+                    last_cubic_control = None;
+                }
+            }
+            'T' => {
+                while svg_path_number_at(&tokens, index).is_some() {
+                    let control = last_quad_control
+                        .map(|control| (current.0 * 2.0 - control.0, current.1 * 2.0 - control.1))
+                        .unwrap_or(current);
+                    let point = svg_path_point(
+                        next_svg_path_number(&tokens, &mut index)?,
+                        next_svg_path_number(&tokens, &mut index)?,
+                        relative,
+                        current,
+                    );
+                    builder.quad_to(control.0, control.1, point.0, point.1);
+                    current = point;
+                    last_quad_control = Some(control);
+                    last_cubic_control = None;
+                }
+            }
+            'A' => {
+                while svg_path_number_at(&tokens, index).is_some() {
+                    for _ in 0..5 {
+                        next_svg_path_number(&tokens, &mut index)?;
+                    }
+                    let point = svg_path_point(
+                        next_svg_path_number(&tokens, &mut index)?,
+                        next_svg_path_number(&tokens, &mut index)?,
+                        relative,
+                        current,
+                    );
+                    current = point;
+                    builder.line_to(current.0, current.1);
+                    last_cubic_control = None;
+                    last_quad_control = None;
+                }
+            }
+            'Z' => {
+                builder.close();
+                current = subpath_start;
+                last_cubic_control = None;
+                last_quad_control = None;
+            }
+            _ => return None,
+        }
+    }
+
+    builder.finish()
+}
+
+fn tokenize_svg_path(data: &str) -> Vec<SvgPathToken> {
+    let mut tokens = Vec::new();
+    let bytes = data.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let character = data[index..].chars().next().unwrap_or_default();
+        if character.is_ascii_whitespace() || character == ',' {
+            index += character.len_utf8();
+        } else if is_svg_path_command(character) {
+            tokens.push(SvgPathToken::Command(character));
+            index += character.len_utf8();
+        } else {
+            let start = index;
+            index += character.len_utf8();
+            while index < bytes.len() {
+                let next = data[index..].chars().next().unwrap_or_default();
+                if next == '.' && data[start..index].chars().any(|character| character == '.') {
+                    break;
+                }
+                if next.is_ascii_digit()
+                    || next == '.'
+                    || next == '-'
+                    || next == '+'
+                    || next == 'e'
+                    || next == 'E'
+                {
+                    let previous = data[..index].chars().next_back().unwrap_or_default();
+                    if (next == '-' || next == '+') && previous != 'e' && previous != 'E' {
+                        break;
+                    }
+                    index += next.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            if let Ok(number) = data[start..index].parse::<f32>() {
+                tokens.push(SvgPathToken::Number(number));
+            }
+        }
+    }
+    tokens
+}
+
+fn is_svg_path_command(character: char) -> bool {
+    matches!(
+        character,
+        'M' | 'm'
+            | 'L'
+            | 'l'
+            | 'H'
+            | 'h'
+            | 'V'
+            | 'v'
+            | 'C'
+            | 'c'
+            | 'S'
+            | 's'
+            | 'Q'
+            | 'q'
+            | 'T'
+            | 't'
+            | 'A'
+            | 'a'
+            | 'Z'
+            | 'z'
+    )
+}
+
+fn svg_path_command_at(tokens: &[SvgPathToken], index: usize) -> Option<char> {
+    match tokens.get(index) {
+        Some(SvgPathToken::Command(command)) => Some(*command),
+        _ => None,
+    }
+}
+
+fn svg_path_number_at(tokens: &[SvgPathToken], index: usize) -> Option<f32> {
+    match tokens.get(index) {
+        Some(SvgPathToken::Number(number)) => Some(*number),
+        _ => None,
+    }
+}
+
+fn next_svg_path_number(tokens: &[SvgPathToken], index: &mut usize) -> Option<f32> {
+    let number = svg_path_number_at(tokens, *index)?;
+    *index += 1;
+    Some(number)
+}
+
+fn svg_path_point(x: f32, y: f32, relative: bool, current: (f32, f32)) -> (f32, f32) {
+    if relative {
+        (current.0 + x, current.1 + y)
+    } else {
+        (x, y)
+    }
+}
+
+fn collect_dom_svg_shapes(element: &DomElement, shapes: &mut Vec<SvgShape>) {
+    if element.tag_name == "circle" {
+        if let (Some(cx), Some(cy), Some(r)) = (
+            element.attr("cx").and_then(parse_html_dimension),
+            element.attr("cy").and_then(parse_html_dimension),
+            element.attr("r").and_then(parse_html_dimension),
+        ) {
+            shapes.push(SvgShape::Circle {
+                cx,
+                cy,
+                r,
+                fill: element
+                    .attr("fill")
+                    .and_then(parse_svg_color)
+                    .unwrap_or(egui::Color32::BLACK),
+                stroke: element.attr("stroke").and_then(parse_svg_color),
+                stroke_width: element
+                    .attr("stroke-width")
+                    .and_then(parse_html_dimension)
+                    .unwrap_or(1.0),
+            });
+        }
+    }
+    for child in &element.children {
+        if let DomNode::Element(child) = child {
+            collect_dom_svg_shapes(child, shapes);
+        }
+    }
+}
+
+fn dom_svg_contains_path(element: &DomElement) -> bool {
+    element.tag_name == "path"
+        || element.children.iter().any(|child| match child {
+            DomNode::Element(child) => dom_svg_contains_path(child),
+            DomNode::Text(_) => false,
+        })
+}
+
+fn input_block_from_dom_element(element: &DomElement) -> CanvasBlock {
+    let value = element
+        .attr("value")
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            if element.tag_name.eq_ignore_ascii_case("textarea") {
+                let text = element.text_content();
+                (!text.is_empty()).then_some(text)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    CanvasBlock::Input {
+        label: element
+            .attr("aria-label")
+            .or_else(|| element.attr("placeholder"))
+            .or_else(|| element.attr("name"))
+            .or_else(|| element.attr("id"))
+            .map(labelize_input_name)
+            .unwrap_or_else(|| "Input".to_owned()),
+        value,
+    }
+}
+
+fn labelize_input_name(value: &str) -> String {
+    let value = value
+        .split_once(|ch: char| ch == '-' || ch == '_')
+        .map(|(first, _)| first)
+        .unwrap_or(value);
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return "Input".to_owned();
+    };
+    first.to_uppercase().collect::<String>() + chars.as_str()
+}
+
+fn dom_table_block(element: &DomElement) -> Option<CanvasBlock> {
+    let mut rows = Vec::new();
+    collect_dom_table_rows(element, &mut rows);
+    (!rows.is_empty()).then_some(CanvasBlock::Table {
+        caption: element
+            .first_descendant_by_tag("caption")
+            .map(DomElement::text_content)
+            .unwrap_or_default(),
+        rows,
+    })
+}
+
+fn collect_dom_table_rows(element: &DomElement, rows: &mut Vec<Vec<String>>) {
+    if element.tag_name == "tr" {
+        let row = element
+            .children
+            .iter()
+            .filter_map(|child| match child {
+                DomNode::Element(cell) if cell.tag_name == "td" || cell.tag_name == "th" => {
+                    Some(cell.text_content())
+                }
+                _ => None,
+            })
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>();
+        if !row.is_empty() {
+            rows.push(row);
+        }
+    }
+    for child in &element.children {
+        if let DomNode::Element(child) = child {
+            collect_dom_table_rows(child, rows);
+        }
+    }
+}
+
+fn element_href(element: &DomElement) -> Option<String> {
+    element
+        .first_descendant_by_tag_with_attr("a", "href")
+        .and_then(|link| link.attr("href"))
+        .map(str::to_owned)
+}
+
+fn element_links(element: &DomElement) -> Vec<(String, String)> {
+    let mut links = Vec::new();
+    collect_element_links(element, &mut links);
+    links
+}
+
+fn collect_element_links(element: &DomElement, links: &mut Vec<(String, String)>) {
+    if element.tag_name.eq_ignore_ascii_case("a") {
+        let text = element.text_content();
+        if !text.is_empty() {
+            links.push((text, element.attr("href").unwrap_or_default().to_owned()));
+        }
+    }
+    for child in &element.children {
+        if let DomNode::Element(child) = child {
+            collect_element_links(child, links);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ParseState {
+    source: String,
+    image_height_auto: bool,
+    last_label: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct InlineStyleState {
+    href: Option<String>,
+    strong: bool,
+    emphasis: bool,
+    underline: bool,
+    strikethrough: bool,
+    code: bool,
+    small: bool,
+    raised: bool,
+    lowered: bool,
+    highlight: bool,
+}
+
+fn inline_span_has_style(span: &InlineSpan) -> bool {
+    span.href.is_some()
+        || span.strong
+        || span.emphasis
+        || span.underline
+        || span.strikethrough
+        || span.code
+        || span.small
+        || span.raised
+        || span.lowered
+        || span.highlight
+}
+
+fn parse_inline_spans(html: &str) -> Vec<InlineSpan> {
+    let mut spans = Vec::new();
+    let mut style = InlineStyleState::default();
+    parse_inline_into(html, &mut style, &mut spans);
+    merge_inline_spans(spans)
+}
+
+fn parse_inline_into(html: &str, style: &mut InlineStyleState, spans: &mut Vec<InlineSpan>) {
+    let mut remaining = html;
+    while let Some(open_index) = remaining.find('<') {
+        push_inline_text(&remaining[..open_index], style, spans);
+        let after_open = &remaining[open_index..];
+        let Some(open_end) = after_open.find('>') else {
+            push_inline_text(after_open, style, spans);
+            return;
+        };
+        let open_tag = &after_open[..open_end + 1];
+        let Some(tag) = tag_name(open_tag) else {
+            remaining = &after_open[open_end + 1..];
+            continue;
+        };
+        let after_content = &after_open[open_end + 1..];
+
+        if is_void_tag(tag) {
+            remaining = after_content;
+            continue;
+        }
+
+        let Some(close_index) = find_matching_close(after_content, tag) else {
+            remaining = after_content;
+            continue;
+        };
+        let content = &after_content[..close_index];
+        let mut nested = style.clone();
+        apply_inline_tag(&mut nested, tag, open_tag);
+        parse_inline_into(content, &mut nested, spans);
+        remaining = &after_content[close_index + tag.len() + 3..];
+    }
+    push_inline_text(remaining, style, spans);
+}
+
+fn push_inline_text(text: &str, style: &InlineStyleState, spans: &mut Vec<InlineSpan>) {
+    let text = normalize_inline_ws(&decode_basic_entities(text));
+    if text.is_empty() {
+        return;
+    }
+    spans.push(InlineSpan {
+        text,
+        href: style.href.clone(),
+        strong: style.strong,
+        emphasis: style.emphasis,
+        underline: style.underline,
+        strikethrough: style.strikethrough,
+        code: style.code,
+        small: style.small,
+        raised: style.raised,
+        lowered: style.lowered,
+        highlight: style.highlight,
+    });
+}
+
+fn normalize_inline_ws(text: &str) -> String {
+    let has_leading_ws = text.chars().next().is_some_and(char::is_whitespace);
+    let has_trailing_ws = text.chars().last().is_some_and(char::is_whitespace);
+    let core = normalize_ws(text);
+    if core.is_empty() {
+        return if has_leading_ws || has_trailing_ws {
+            " ".to_owned()
+        } else {
+            String::new()
+        };
+    }
+
+    let mut out = String::new();
+    if has_leading_ws {
+        out.push(' ');
+    }
+    out.push_str(&core);
+    if has_trailing_ws {
+        out.push(' ');
+    }
+    out
+}
+
+fn apply_inline_tag(style: &mut InlineStyleState, tag: &str, open_tag: &str) {
+    match tag {
+        "a" => style.href = extract_attr(open_tag, "href"),
+        "strong" | "b" => style.strong = true,
+        "em" | "i" | "cite" | "dfn" | "var" => style.emphasis = true,
+        "u" | "ins" => style.underline = true,
+        "del" | "s" => style.strikethrough = true,
+        "code" | "kbd" | "samp" => style.code = true,
+        "small" => style.small = true,
+        "sup" => style.raised = true,
+        "sub" => style.lowered = true,
+        "mark" => style.highlight = true,
+        "abbr" | "q" | "time" => {}
+        _ => {}
+    }
+}
+
+fn merge_inline_spans(spans: Vec<InlineSpan>) -> Vec<InlineSpan> {
+    let mut merged: Vec<InlineSpan> = Vec::new();
+    for span in spans {
+        if let Some(last) = merged.last_mut() {
+            if same_inline_style(last, &span) {
+                last.text.push_str(&span.text);
+                continue;
+            }
+        }
+        merged.push(span);
+    }
+    merged
+}
+
+fn same_inline_style(a: &InlineSpan, b: &InlineSpan) -> bool {
+    a.href == b.href
+        && a.strong == b.strong
+        && a.emphasis == b.emphasis
+        && a.underline == b.underline
+        && a.strikethrough == b.strikethrough
+        && a.code == b.code
+        && a.small == b.small
+        && a.raised == b.raised
+        && a.lowered == b.lowered
+        && a.highlight == b.highlight
+}
+
+fn tag_name(open_tag: &str) -> Option<&str> {
+    let tag = open_tag.trim_start_matches('<').trim_start_matches('/');
+    let end = tag
+        .find(|ch: char| ch.is_whitespace() || ch == '>' || ch == '/')
+        .unwrap_or(tag.len());
+    let tag = &tag[..end];
+    if tag.is_empty() { None } else { Some(tag) }
+}
+
+fn is_void_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}
+
+fn parse_container_blocks(
+    html: &str,
+    state: &mut ParseState,
+    list_depth: usize,
+) -> Vec<CanvasBlock> {
+    let mut blocks = Vec::new();
+    let mut remaining = html;
+
+    while let Some((tag, index)) = next_render_tag(remaining) {
+        remaining = &remaining[index..];
+        let Some(open_end) = remaining.find('>') else {
+            break;
+        };
+        let open_tag = &remaining[..open_end + 1];
+
+        if tag == "hr" {
+            blocks.push(CanvasBlock::Rule);
+            remaining = &remaining[open_end + 1..];
+            continue;
+        }
+
+        if tag == "img" {
+            blocks.push(image_block_from_tag(open_tag, state));
+            remaining = &remaining[open_end + 1..];
+            continue;
+        }
+
+        if tag == "input" {
+            push_input_block(open_tag, state, &mut blocks);
+            remaining = &remaining[open_end + 1..];
+            continue;
+        }
+
+        let close = format!("</{tag}>");
+        let content_start = open_end + 1;
+        let after_content_start = &remaining[content_start..];
+        let Some(close_index) = find_matching_close(after_content_start, tag) else {
+            remaining = &remaining[open_end + 1..];
+            continue;
+        };
+        let content = &after_content_start[..close_index];
+
+        match tag {
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                let text = strip_tags(content);
+                if !text.is_empty() {
+                    blocks.push(CanvasBlock::Heading {
+                        level: tag[1..].parse::<u8>().unwrap_or(1),
+                        text,
+                    });
+                }
+            }
+            "p" => {
+                let paragraph = strip_tags(content);
+                let links = extract_links(content);
+                let link_text = normalize_ws(
+                    &links
+                        .iter()
+                        .map(|(text, _)| text.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+                if !paragraph.is_empty() && (links.is_empty() || paragraph != link_text) {
+                    let spans = parse_inline_spans(content);
+                    if spans.len() > 1 || spans.iter().any(inline_span_has_style) {
+                        blocks.push(CanvasBlock::InlineText { spans });
+                    } else {
+                        blocks.push(CanvasBlock::Paragraph {
+                            text: paragraph.clone(),
+                        });
+                    }
+                }
+                if paragraph == link_text {
+                    for (text, href) in links {
+                        blocks.push(CanvasBlock::Link { text, href });
+                    }
+                }
+                blocks.extend(parse_media_only_blocks(content, state, list_depth));
+            }
+            "a" => {
+                let text = strip_tags(content);
+                if !text.is_empty() {
+                    blocks.push(CanvasBlock::Link {
+                        text,
+                        href: extract_attr(open_tag, "href").unwrap_or_default(),
+                    });
+                }
+            }
+            "ul" | "ol" => {
+                blocks.extend(parse_list_blocks(content, state, list_depth, tag == "ol"));
+            }
+            "li" => {
+                let text = strip_tags_without_nested_lists(content);
+                if !text.is_empty() {
+                    blocks.push(CanvasBlock::ListItem {
+                        depth: list_depth,
+                        ordered: false,
+                        href: list_item_href(content),
+                        text,
+                    });
+                }
+                blocks.extend(parse_container_blocks(content, state, list_depth + 1));
+            }
+            "blockquote" => {
+                let text = strip_tags(content);
+                if !text.is_empty() {
+                    blocks.push(CanvasBlock::Quote { text });
+                }
+            }
+            "pre" => {
+                let text = decode_basic_entities(content).trim().to_owned();
+                if !text.is_empty() {
+                    blocks.push(CanvasBlock::Preformatted { text });
+                }
+            }
+            "table" => {
+                if let Some(table) = parse_table(content) {
+                    blocks.push(table);
+                }
+            }
+            "label" => {
+                let text = strip_tags(content);
+                if !text.is_empty() {
+                    state.last_label = Some(text.clone());
+                    if !content.contains("<input") {
+                        blocks.push(CanvasBlock::Paragraph { text });
+                    }
+                }
+                blocks.extend(parse_container_blocks(content, state, list_depth));
+            }
+            "button" => {
+                let text = strip_tags(content);
+                if !text.is_empty() {
+                    blocks.push(CanvasBlock::Button { text });
+                }
+            }
+            "select" => {
+                let value = extract_tag_text(content, "option").unwrap_or_default();
+                blocks.push(CanvasBlock::Input {
+                    label: state
+                        .last_label
+                        .clone()
+                        .unwrap_or_else(|| "Select".to_owned()),
+                    value,
+                });
+            }
+            "span" | "abbr" | "q" | "time" | "mark" | "del" | "s" | "ins" | "var" | "sup"
+            | "sub" => {
+                let spans = parse_inline_spans(content);
+                if !spans.is_empty() {
+                    if spans.len() > 1 || spans.iter().any(inline_span_has_style) {
+                        blocks.push(CanvasBlock::InlineText { spans });
+                    } else {
+                        blocks.push(CanvasBlock::Paragraph {
+                            text: strip_tags(content),
+                        });
+                    }
+                }
+                blocks.extend(parse_media_only_blocks(content, state, list_depth));
+            }
+            "textarea" => {
+                let value = extract_attr(open_tag, "placeholder")
+                    .or_else(|| Some(strip_tags(content)))
+                    .unwrap_or_default();
+                blocks.push(CanvasBlock::Input {
+                    label: state
+                        .last_label
+                        .clone()
+                        .unwrap_or_else(|| "Textarea".to_owned()),
+                    value,
+                });
+            }
+            "svg" => {
+                blocks.push(svg_block_from_tag(open_tag, content));
+            }
+            "audio" | "video" | "canvas" | "meter" | "progress" | "iframe" => {
+                blocks.push(CanvasBlock::Media {
+                    label: media_label(open_tag, tag),
+                });
+            }
+            "section" if open_tag.contains("panel") => {
+                let children = parse_container_blocks(content, state, list_depth);
+                if !children.is_empty() {
+                    blocks.push(CanvasBlock::Panel { children });
+                }
+            }
+            "header" | "nav" | "main" | "section" | "article" | "div" | "footer" | "form"
+            | "fieldset" | "figure" | "figcaption" | "dl" | "dt" | "dd" | "strong" | "em" | "b"
+            | "i" | "u" | "small" | "cite" | "code" | "kbd" | "samp" | "legend" => {
+                blocks.extend(parse_container_blocks(content, state, list_depth));
+            }
+            _ => {}
+        }
+
+        remaining = &after_content_start[close_index + close.len()..];
+    }
+
+    if blocks.is_empty() {
+        let text = strip_tags(html);
+        if !text.is_empty() {
+            blocks.push(CanvasBlock::Paragraph { text });
+        }
+    }
+
+    blocks
+}
+
+fn parse_list_blocks(
+    html: &str,
+    state: &mut ParseState,
+    list_depth: usize,
+    ordered: bool,
+) -> Vec<CanvasBlock> {
+    let mut blocks = Vec::new();
+    let mut remaining = html;
+
+    while let Some(index) = remaining.find("<li") {
+        remaining = &remaining[index..];
+        let Some(open_end) = remaining.find('>') else {
+            break;
+        };
+        let content_start = open_end + 1;
+        let after_content_start = &remaining[content_start..];
+        let Some(close_index) = find_matching_close(after_content_start, "li") else {
+            break;
+        };
+        let content = &after_content_start[..close_index];
+        let text = strip_tags_without_nested_lists(content);
+        if !text.is_empty() {
+            blocks.push(CanvasBlock::ListItem {
+                depth: list_depth,
+                ordered,
+                href: list_item_href(content),
+                text,
+            });
+        }
+        blocks.extend(parse_nested_lists(content, state, list_depth + 1));
+
+        remaining = &after_content_start[close_index + "</li>".len()..];
+    }
+
+    blocks
+}
+
+fn parse_nested_lists(html: &str, state: &mut ParseState, list_depth: usize) -> Vec<CanvasBlock> {
+    let mut blocks = Vec::new();
+    let mut remaining = html;
+    while let Some((tag, index)) = ["ul", "ol"]
+        .into_iter()
+        .filter_map(|tag| remaining.find(&format!("<{tag}")).map(|index| (tag, index)))
+        .min_by_key(|(_, index)| *index)
+    {
+        remaining = &remaining[index..];
+        let Some(open_end) = remaining.find('>') else {
+            break;
+        };
+        let close = format!("</{tag}>");
+        let after_open = &remaining[open_end + 1..];
+        let Some(close_index) = find_matching_close(after_open, tag) else {
+            break;
+        };
+        blocks.extend(parse_list_blocks(
+            &after_open[..close_index],
+            state,
+            list_depth,
+            tag == "ol",
+        ));
+        remaining = &after_open[close_index + close.len()..];
+    }
+    blocks
+}
+
+fn list_item_href(content: &str) -> Option<String> {
+    let first_link = extract_links(strip_nested_lists_raw(content))
+        .into_iter()
+        .next()?;
+    let item_text = strip_tags_without_nested_lists(content);
+    if first_link.0 == item_text {
+        Some(first_link.1)
+    } else {
+        None
+    }
+}
+
+fn strip_nested_lists_raw(html: &str) -> &str {
+    let first_nested = ["<ul", "<ol"]
+        .into_iter()
+        .filter_map(|pattern| html.find(pattern))
+        .min()
+        .unwrap_or(html.len());
+    &html[..first_nested]
+}
+
+fn find_matching_close(html_after_open: &str, tag: &str) -> Option<usize> {
+    let open_pattern = format!("<{tag}");
+    let close_pattern = format!("</{tag}>");
+    let mut depth = 1usize;
+    let mut offset = 0usize;
+
+    loop {
+        let rest = &html_after_open[offset..];
+        let next_open = rest.find(&open_pattern);
+        let next_close = rest.find(&close_pattern)?;
+
+        if let Some(open_index) = next_open {
+            if open_index < next_close {
+                depth += 1;
+                offset += open_index + open_pattern.len();
+                continue;
+            }
+        }
+
+        depth -= 1;
+        if depth == 0 {
+            return Some(offset + next_close);
+        }
+        offset += next_close + close_pattern.len();
+    }
+}
+
+fn parse_media_only_blocks(
+    html: &str,
+    state: &mut ParseState,
+    list_depth: usize,
+) -> Vec<CanvasBlock> {
+    let mut blocks = Vec::new();
+    for tag in ["img", "input"] {
+        if html.contains(&format!("<{tag}")) {
+            blocks.extend(parse_container_blocks(html, state, list_depth));
+            break;
+        }
+    }
+    blocks
+}
+
+fn next_render_tag(html: &str) -> Option<(&'static str, usize)> {
+    [
+        "blockquote",
+        "fieldset",
+        "figcaption",
+        "figure",
+        "progress",
+        "section",
+        "article",
+        "header",
+        "footer",
+        "button",
+        "select",
+        "textarea",
+        "strong",
+        "legend",
+        "audio",
+        "video",
+        "canvas",
+        "meter",
+        "iframe",
+        "main",
+        "form",
+        "nav",
+        "div",
+        "pre",
+        "table",
+        "label",
+        "input",
+        "img",
+        "code",
+        "kbd",
+        "samp",
+        "cite",
+        "small",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "ul",
+        "ol",
+        "li",
+        "dl",
+        "dt",
+        "dd",
+        "hr",
+        "svg",
+        "p",
+        "a",
+        "span",
+        "abbr",
+        "time",
+        "mark",
+        "del",
+        "s",
+        "ins",
+        "var",
+        "sup",
+        "sub",
+        "q",
+        "em",
+        "b",
+        "i",
+        "u",
+    ]
+    .into_iter()
+    .filter_map(|tag| html.find(&format!("<{tag}")).map(|index| (tag, index)))
+    .min_by_key(|(_, index)| *index)
+}
+
+fn push_input_block(open_tag: &str, state: &mut ParseState, blocks: &mut Vec<CanvasBlock>) {
+    let input_type = extract_attr(open_tag, "type").unwrap_or_else(|| "text".to_owned());
+    let value = extract_attr(open_tag, "value")
+        .or_else(|| extract_attr(open_tag, "placeholder"))
+        .unwrap_or_default();
+
+    match input_type.as_str() {
+        "hidden" => {}
+        "submit" | "button" | "reset" => blocks.push(CanvasBlock::Button {
+            text: if value.is_empty() { input_type } else { value },
+        }),
+        "checkbox" | "radio" => blocks.push(CanvasBlock::ListItem {
+            depth: 1,
+            ordered: false,
+            href: None,
+            text: state
+                .last_label
+                .clone()
+                .filter(|label| !label.is_empty())
+                .unwrap_or_else(|| input_type.clone()),
+        }),
+        "range" => blocks.push(CanvasBlock::Media {
+            label: format!("{} range", current_label(state, "Range input")),
+        }),
+        "color" => blocks.push(CanvasBlock::Media {
+            label: format!("{} {}", current_label(state, "Color input"), value),
+        }),
+        _ => blocks.push(CanvasBlock::Input {
+            label: current_label(state, "Input"),
+            value,
+        }),
+    }
+}
+
+fn current_label(state: &ParseState, fallback: &str) -> String {
+    state
+        .last_label
+        .clone()
+        .filter(|label| !label.is_empty())
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn media_label(open_tag: &str, fallback: &str) -> String {
+    extract_attr(open_tag, "alt")
+        .or_else(|| extract_attr(open_tag, "src"))
+        .filter(|label| !label.is_empty())
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn image_block_from_tag(open_tag: &str, state: &ParseState) -> CanvasBlock {
+    let label = media_label(open_tag, "image");
+    let Some(src) = extract_attr(open_tag, "src").filter(|src| !src.is_empty()) else {
+        return CanvasBlock::Media { label };
+    };
+    let resolved = resolve_resource_url(&state.source, &src);
+    if !resource_allowed_for_document(&state.source, &resolved) {
+        return CanvasBlock::Media { label };
+    }
+    let requested_size = requested_image_size(open_tag);
+
+    match load_image_resource(&resolved, requested_size, state.image_height_auto) {
+        Ok(image) => CanvasBlock::Image {
+            alt: extract_attr(open_tag, "alt").unwrap_or_default(),
+            src: resolved,
+            image,
+        },
+        Err(_) => CanvasBlock::Media { label },
+    }
+}
+
+fn svg_block_from_tag(open_tag: &str, content: &str) -> CanvasBlock {
+    let width = extract_attr(open_tag, "width")
+        .and_then(|value| parse_html_dimension(&value))
+        .unwrap_or(100.0);
+    let height = extract_attr(open_tag, "height")
+        .and_then(|value| parse_html_dimension(&value))
+        .unwrap_or(100.0);
+    let mut shapes = parse_svg_shapes(content);
+    if shapes.is_empty() && content.contains("<path") {
+        shapes.push(SvgShape::Rect {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+            fill: egui::Color32::WHITE,
+        });
+    }
+
+    if shapes.is_empty() {
+        CanvasBlock::Media {
+            label: media_label(open_tag, "svg"),
+        }
+    } else {
+        CanvasBlock::Svg {
+            svg: SvgBlock::new(egui::vec2(width, height), shapes),
+        }
+    }
+}
+
+fn parse_svg_shapes(content: &str) -> Vec<SvgShape> {
+    let mut shapes = Vec::new();
+    let mut remaining = content;
+
+    while let Some(index) = remaining.find("<circle") {
+        remaining = &remaining[index..];
+        let Some(end) = remaining.find('>') else {
+            break;
+        };
+        let tag = &remaining[..end + 1];
+        if let Some(shape) = parse_svg_circle(tag) {
+            shapes.push(shape);
+        }
+        remaining = &remaining[end + 1..];
+    }
+
+    shapes
+}
+
+fn parse_svg_circle(tag: &str) -> Option<SvgShape> {
+    let cx = extract_attr(tag, "cx").and_then(|value| parse_html_dimension(&value))?;
+    let cy = extract_attr(tag, "cy").and_then(|value| parse_html_dimension(&value))?;
+    let r = extract_attr(tag, "r").and_then(|value| parse_html_dimension(&value))?;
+    let fill = extract_attr(tag, "fill")
+        .and_then(|value| parse_svg_color(&value))
+        .unwrap_or(egui::Color32::BLACK);
+    let stroke = extract_attr(tag, "stroke").and_then(|value| parse_svg_color(&value));
+    let stroke_width = extract_attr(tag, "stroke-width")
+        .and_then(|value| parse_html_dimension(&value))
+        .unwrap_or(1.0);
+
+    Some(SvgShape::Circle {
+        cx,
+        cy,
+        r,
+        fill,
+        stroke,
+        stroke_width,
+    })
+}
+
+fn parse_svg_color(value: &str) -> Option<egui::Color32> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let hex = value.strip_prefix('#')?;
+    match hex.len() {
+        3 => {
+            let mut chars = hex.chars();
+            let r = chars.next()?.to_digit(16)? as u8 * 17;
+            let g = chars.next()?.to_digit(16)? as u8 * 17;
+            let b = chars.next()?.to_digit(16)? as u8 * 17;
+            Some(egui::Color32::from_rgb(r, g, b))
+        }
+        6 => {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            Some(egui::Color32::from_rgb(r, g, b))
+        }
+        _ => None,
+    }
+}
+
+fn requested_image_size(open_tag: &str) -> Option<egui::Vec2> {
+    let width = extract_attr(open_tag, "width").and_then(|value| parse_html_dimension(&value));
+    let height = extract_attr(open_tag, "height").and_then(|value| parse_html_dimension(&value));
+    match (width, height) {
+        (Some(width), Some(height)) => Some(egui::vec2(width, height)),
+        _ => None,
+    }
+}
+
+fn parse_html_dimension(value: &str) -> Option<f32> {
+    let value = value.trim().trim_end_matches("px");
+    value.parse::<f32>().ok().filter(|value| *value > 0.0)
+}
+
+fn load_image_resource(
+    url: &str,
+    requested_size: Option<egui::Vec2>,
+    preserve_aspect: bool,
+) -> io::Result<ImageBlock> {
+    let bytes = if url.starts_with("http://") || url.starts_with("https://") {
+        http_client()?
+            .get(url)
+            .send()
+            .map_err(io::Error::other)?
+            .error_for_status()
+            .map_err(io::Error::other)?
+            .bytes()
+            .map_err(io::Error::other)?
+            .to_vec()
+    } else {
+        fs::read(input_to_path(url))?
+    };
+
+    ImageBlock::from_encoded_bytes_with_aspect(
+        PathBuf::from(url),
+        &bytes,
+        requested_size,
+        preserve_aspect,
+    )
+    .map_err(io::Error::other)
+}
+
+fn parse_table(html: &str) -> Option<CanvasBlock> {
+    let caption = extract_tag_text(html, "caption").unwrap_or_default();
+    let mut rows = Vec::new();
+    let mut remaining = html;
+    while let Some(index) = remaining.find("<tr") {
+        remaining = &remaining[index..];
+        let open_end = remaining.find('>')?;
+        let after_open = &remaining[open_end + 1..];
+        let close_index = after_open.find("</tr>")?;
+        let row_html = &after_open[..close_index];
+        let row = extract_table_cells(row_html);
+        if !row.is_empty() {
+            rows.push(row);
+        }
+        remaining = &after_open[close_index + "</tr>".len()..];
+    }
+
+    if rows.is_empty() {
+        None
+    } else {
+        Some(CanvasBlock::Table { caption, rows })
+    }
+}
+
+fn extract_table_cells(row_html: &str) -> Vec<String> {
+    let mut cells = Vec::new();
+    let mut remaining = row_html;
+    while let Some((tag, index)) = ["th", "td"]
+        .into_iter()
+        .filter_map(|tag| remaining.find(&format!("<{tag}")).map(|index| (tag, index)))
+        .min_by_key(|(_, index)| *index)
+    {
+        remaining = &remaining[index..];
+        let Some(open_end) = remaining.find('>') else {
+            break;
+        };
+        let close = format!("</{tag}>");
+        let after_open = &remaining[open_end + 1..];
+        let Some(close_index) = after_open.find(&close) else {
+            break;
+        };
+        let cell = strip_tags(&after_open[..close_index]);
+        if !cell.is_empty() {
+            cells.push(cell);
+        }
+        remaining = &after_open[close_index + close.len()..];
+    }
+    cells
+}
+
+fn strip_tags_without_nested_lists(html: &str) -> String {
+    let mut text_html = html.to_owned();
+    for tag in ["ul", "ol"] {
+        while let Some(start) = text_html.find(&format!("<{tag}")) {
+            let Some(after_open) = text_html[start..].find('>') else {
+                break;
+            };
+            let content_start = start + after_open + 1;
+            let Some(close_rel) = text_html[content_start..].find(&format!("</{tag}>")) else {
+                break;
+            };
+            let end = content_start + close_rel + tag.len() + 3;
+            text_html.replace_range(start..end, "");
+        }
+    }
+    strip_tags(&text_html)
+}
+
+fn extract_tag_text(html: &str, tag: &str) -> Option<String> {
+    extract_tag_inner(html, tag).map(strip_tags)
+}
+
+fn extract_tag_inner<'a>(html: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let open_index = html.find(&open)?;
+    let after_open = &html[open_index..];
+    let open_end = after_open.find('>')?;
+    let content_start = open_index + open_end + 1;
+    let after_content_start = &html[content_start..];
+    let close_index = after_content_start.find(&close)?;
+    Some(&after_content_start[..close_index])
+}
+
+fn extract_links(html: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut remaining = html;
+
+    while let Some(open_index) = remaining.find("<a") {
+        let after_open = &remaining[open_index..];
+        let Some(open_end) = after_open.find('>') else {
+            break;
+        };
+        let tag = &after_open[..open_end + 1];
+        let href = extract_attr(tag, "href").unwrap_or_default();
+        let content_start = open_index + open_end + 1;
+        let after_content_start = &remaining[content_start..];
+        let Some(close_index) = after_content_start.find("</a>") else {
+            break;
+        };
+        let text = normalize_ws(&strip_tags(&after_content_start[..close_index]));
+        if !text.is_empty() {
+            out.push((text, href));
+        }
+        remaining = &after_content_start[close_index + "</a>".len()..];
+    }
+
+    out
+}
+
+fn extract_attr(tag: &str, name: &str) -> Option<String> {
+    let mut remaining = tag.trim_start_matches('<');
+    if let Some(end) = remaining.find(|ch: char| ch.is_whitespace() || ch == '>' || ch == '/') {
+        remaining = &remaining[end..];
+    }
+
+    loop {
+        remaining = remaining.trim_start();
+        if remaining.is_empty() || remaining.starts_with('>') || remaining.starts_with("/>") {
+            return None;
+        }
+
+        let name_end = remaining
+            .find(|ch: char| ch.is_whitespace() || ch == '=' || ch == '>' || ch == '/')
+            .unwrap_or(remaining.len());
+        let attr_name = &remaining[..name_end];
+        remaining = &remaining[name_end..];
+        if attr_name.is_empty() {
+            return None;
+        }
+
+        remaining = remaining.trim_start();
+        let value = if let Some(after_equals) = remaining.strip_prefix('=') {
+            let after_equals = after_equals.trim_start();
+            if let Some(quote) = after_equals
+                .chars()
+                .next()
+                .filter(|ch| *ch == '"' || *ch == '\'')
+            {
+                let after_quote = &after_equals[quote.len_utf8()..];
+                let end = after_quote.find(quote)?;
+                remaining = &after_quote[end + quote.len_utf8()..];
+                after_quote[..end].to_owned()
+            } else {
+                let end = after_equals
+                    .find(|ch: char| ch.is_whitespace() || ch == '>' || ch == '/')
+                    .unwrap_or(after_equals.len());
+                remaining = &after_equals[end..];
+                after_equals[..end].to_owned()
+            }
+        } else {
+            String::new()
+        };
+
+        if attr_name.eq_ignore_ascii_case(name) {
+            return Some(value);
+        }
+    }
+}
+
+fn has_attr(tag: &str, name: &str) -> bool {
+    extract_attr(tag, name).is_some()
+}
+
+fn find_tag_with_class<'a>(html: &'a str, tag: &str, class_name: &str) -> Option<&'a str> {
+    let open = format!("<{tag}");
+    let mut remaining = html;
+    while let Some(index) = remaining.find(&open) {
+        remaining = &remaining[index..];
+        let Some(end) = remaining.find('>') else {
+            return None;
+        };
+        let candidate = &remaining[..end + 1];
+        if extract_attr(candidate, "class")
+            .is_some_and(|classes| classes.split_whitespace().any(|class| class == class_name))
+        {
+            return Some(candidate);
+        }
+        remaining = &remaining[end + 1..];
+    }
+    None
+}
+
+fn extract_search_placeholder(html: &str) -> Option<String> {
+    let marker = html.find("omnibox-search-form-input")?;
+    let prefix = &html[..marker];
+    let tag_start = prefix.rfind("<textarea")?;
+    let tag_end = html[marker..].find('>')? + marker;
+    extract_attr(&html[tag_start..=tag_end], "placeholder")
+}
+
+fn extract_counter(html: &str, test_id: &str) -> Option<(String, String)> {
+    let start = html.find(&format!("data-test-id=\"{test_id}\""))?;
+    let segment = &html[start..html.len().min(start + 6_000)];
+    let count = extract_text_near_test_id(segment, "counter-count")?;
+    let description = extract_text_near_test_id(segment, "counter-description")?;
+    Some((count, description))
+}
+
+fn extract_text_near_test_id(html: &str, test_id: &str) -> Option<String> {
+    let start = html.find(&format!("data-test-id=\"{test_id}\""))?;
+    let after_marker = &html[start..];
+    let tag_end = after_marker.find('>')? + 1;
+    let content = &after_marker[tag_end..];
+    let end = content
+        .find("</")
+        .or_else(|| content.find('<'))
+        .unwrap_or(content.len());
+    let text = strip_tags(&content[..end]);
+    if text.is_empty() { None } else { Some(text) }
+}
+
+fn strip_tags(html: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    normalize_ws(&decode_basic_entities(&out))
+}
+
+fn remove_html_comments(html: &str) -> String {
+    let mut out = String::new();
+    let mut remaining = html;
+    while let Some(start) = remaining.find("<!--") {
+        out.push_str(&remaining[..start]);
+        let after_start = &remaining[start + 4..];
+        let Some(end) = after_start.find("-->") else {
+            return out;
+        };
+        remaining = &after_start[end + 3..];
+    }
+    out.push_str(remaining);
+    out
+}
+
+fn remove_non_rendered_elements(html: &str) -> String {
+    let mut cleaned = html.to_owned();
+    for tag in ["script", "style", "template", "noscript"] {
+        cleaned = remove_elements_by_tag(&cleaned, tag);
+    }
+    remove_hidden_elements(&cleaned)
+}
+
+fn remove_elements_by_tag(html: &str, tag: &str) -> String {
+    let mut out = String::new();
+    let mut remaining = html;
+    let open = format!("<{tag}");
+
+    while let Some(index) = remaining.find(&open) {
+        if !is_tag_boundary(remaining, index + open.len()) {
+            out.push_str(&remaining[..index + open.len()]);
+            remaining = &remaining[index + open.len()..];
+            continue;
+        }
+
+        out.push_str(&remaining[..index]);
+        let candidate = &remaining[index..];
+        let Some(open_end) = candidate.find('>') else {
+            return out;
+        };
+        let after_open = &candidate[open_end + 1..];
+        let Some(close_index) = find_matching_close(after_open, tag) else {
+            remaining = after_open;
+            continue;
+        };
+        let close = format!("</{tag}>");
+        remaining = &after_open[close_index + close.len()..];
+    }
+
+    out.push_str(remaining);
+    out
+}
+
+fn remove_hidden_elements(html: &str) -> String {
+    let mut out = String::new();
+    let mut remaining = html;
+
+    while let Some(index) = remaining.find('<') {
+        out.push_str(&remaining[..index]);
+        let candidate = &remaining[index..];
+        let Some(open_end) = candidate.find('>') else {
+            out.push_str(candidate);
+            return out;
+        };
+        let open_tag = &candidate[..open_end + 1];
+        let Some(tag) = tag_name(open_tag).map(str::to_owned) else {
+            out.push_str(open_tag);
+            remaining = &candidate[open_end + 1..];
+            continue;
+        };
+
+        if is_void_tag(&tag) {
+            if !tag_is_hidden(open_tag) {
+                out.push_str(open_tag);
+            }
+            remaining = &candidate[open_end + 1..];
+            continue;
+        }
+
+        if tag_is_hidden(open_tag) {
+            let after_open = &candidate[open_end + 1..];
+            let Some(close_index) = find_matching_close(after_open, &tag) else {
+                remaining = after_open;
+                continue;
+            };
+            let close = format!("</{tag}>");
+            remaining = &after_open[close_index + close.len()..];
+        } else {
+            out.push_str(open_tag);
+            remaining = &candidate[open_end + 1..];
+        }
+    }
+
+    out.push_str(remaining);
+    out
+}
+
+fn tag_is_hidden(open_tag: &str) -> bool {
+    if has_attr(open_tag, "hidden") {
+        return true;
+    }
+    if extract_attr(open_tag, "aria-hidden").is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        return true;
+    }
+    extract_attr(open_tag, "style").is_some_and(|style| {
+        let style = style.to_ascii_lowercase().replace(' ', "");
+        style.contains("display:none") || style.contains("visibility:hidden")
+    })
+}
+
+fn is_tag_boundary(text: &str, index: usize) -> bool {
+    text[index..]
+        .chars()
+        .next()
+        .is_none_or(|ch| ch.is_whitespace() || ch == '>' || ch == '/')
+}
+
+fn normalize_ws(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn decode_basic_entities(text: &str) -> String {
+    text.replace("&amp;", "&")
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+fn path_to_file_url(path: &Path) -> String {
+    let absolute = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .replace(' ', "%20");
+    format!("file://{absolute}")
+}
+
+fn percent_decode_file_path(path: &str) -> String {
+    let mut out = String::new();
+    let mut chars = path.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            let high = chars.next();
+            let low = chars.next();
+            if let (Some(high), Some(low)) = (high, low) {
+                let hex = [high, low].iter().collect::<String>();
+                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                    out.push(byte as char);
+                    continue;
+                }
+                out.push('%');
+                out.push(high);
+                out.push(low);
+            } else {
+                out.push('%');
+                if let Some(high) = high {
+                    out.push(high);
+                }
+                if let Some(low) = low {
+                    out.push(low);
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+struct TelemetrySession {
+    session_id: String,
+    session_path: Option<PathBuf>,
+}
+
+impl TelemetrySession {
+    fn start() -> io::Result<Self> {
+        let now = unix_ms();
+        let session_id = format!("{now}_{}", std::process::id());
+        let session_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../appdata/telemetry/sessions")
+            .join(&session_id);
+        fs::create_dir_all(&session_path)?;
+        File::create(session_path.join("session.jsonl"))?;
+        fs::write(
+            session_path.join("summary.json"),
+            format!(
+                "{{\"schema_version\":1,\"session_id\":\"{}\",\"status\":\"started\"}}\n",
+                json_escape(&session_id)
+            ),
+        )?;
+        Ok(Self {
+            session_id,
+            session_path: Some(session_path),
+        })
+    }
+
+    fn disabled() -> Self {
+        Self {
+            session_id: "disabled".to_owned(),
+            session_path: None,
+        }
+    }
+
+    fn emit(&self, event: &str, fields: &[(&str, &str)]) {
+        let Some(path) = &self.session_path else {
+            return;
+        };
+        let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.join("session.jsonl"))
+        else {
+            return;
+        };
+
+        let mut line = format!(
+            "{{\"schema_version\":1,\"session_id\":\"{}\",\"timestamp_ms\":{},\"event\":\"{}\"",
+            json_escape(&self.session_id),
+            unix_ms(),
+            json_escape(event)
+        );
+        for (key, value) in fields {
+            line.push_str(&format!(
+                ",\"{}\":\"{}\"",
+                json_escape(key),
+                json_escape(value)
+            ));
+        }
+        line.push_str("}\n");
+        let _ = file.write_all(line.as_bytes());
+    }
+
+    fn display_path(&self) -> String {
+        self.session_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "disabled".to_owned())
+    }
+}
+
+impl Drop for TelemetrySession {
+    fn drop(&mut self) {
+        self.emit("session.ended", &[]);
+        if let Some(path) = &self.session_path {
+            let _ = fs::write(
+                path.join("summary.json"),
+                format!(
+                    "{{\"schema_version\":1,\"session_id\":\"{}\",\"status\":\"ended\"}}\n",
+                    json_escape(&self.session_id)
+                ),
+            );
+        }
+    }
+}
+
+fn unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn json_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dom_parser_preserves_nested_elements_text_and_attributes() {
+        let document = parse_dom_document(
+            r#"<!doctype html><html><head><title>DOM &amp; Browser</title></head>
+            <body><main data-test-id='main'><h1>Hello <em>world</em><span class="sr-only">noise</span></h1><img src=local.png hidden></main></body></html>"#,
+        );
+
+        let title = document.first_descendant_by_tag("title").unwrap();
+        assert_eq!(title.text_content(), "DOM & Browser");
+
+        let main = document.first_descendant_by_tag("main").unwrap();
+        assert_eq!(main.attr("data-test-id"), Some("main"));
+        assert_eq!(main.text_content(), "Hello world");
+
+        let image = document.first_descendant_by_tag("img").unwrap();
+        assert_eq!(image.attr("src"), Some("local.png"));
+        assert!(image.has_attr("hidden"));
+        assert!(image.children.is_empty());
+    }
+
+    #[test]
+    fn dom_parser_keeps_angle_brackets_inside_quoted_attributes() {
+        let document = parse_dom_document(
+            r#"<html><body><input type="submit" value="<input type=submit>"><p>After</p></body></html>"#,
+        );
+
+        let input = document.first_descendant_by_tag("input").unwrap();
+        assert_eq!(input.attr("value"), Some("<input type=submit>"));
+        assert_eq!(
+            document
+                .first_descendant_by_tag("body")
+                .unwrap()
+                .text_content(),
+            "After"
+        );
+    }
+
+    #[test]
+    fn dom_parser_treats_source_as_void_element() {
+        let document = parse_dom_document(
+            r#"<html><body><picture><source srcset="wide.avif"><source srcset="small.avif"><img src="fallback.avif"></picture><p>After</p></body></html>"#,
+        );
+        let picture = document.first_descendant_by_tag("picture").unwrap();
+
+        assert_eq!(picture.children.len(), 3);
+        assert_eq!(
+            picture
+                .children
+                .iter()
+                .filter(|child| matches!(child, DomNode::Element(element) if element.tag_name == "source"))
+                .count(),
+            2
+        );
+        assert!(document.first_descendant_by_tag("p").is_some());
+    }
+
+    #[test]
+    fn dom_backed_document_title_reuses_tree_text_content() {
+        let document = parse_html_document(
+            "<html><head><title>Hello <span>DOM</span></title></head><body><p>Body</p></body></html>",
+            "https://example.test/",
+        );
+
+        assert_eq!(document.title, "Hello DOM");
+    }
+
+    #[test]
+    fn render_graph_computes_inherited_and_relative_box_styles() {
+        let html = r#"
+            <html>
+              <head>
+                <style>
+                  body { color: #112233; font-size: 20px; }
+                  .box { padding: 4px 8px; width: 50%; }
+                  #leaf { color: #445566; }
+                </style>
+              </head>
+              <body>
+                <div class="box"><span id="leaf">Text</span></div>
+              </body>
+            </html>
+        "#;
+        let html = remove_html_comments(html);
+        let dom = parse_dom_document(&html);
+        let style = rich_canvas::parse_basic_css(extract_tag_inner(&html, "style").unwrap_or(""));
+        let graph = build_render_graph(&dom, &style);
+        let div = find_render_element_by_class(&graph.root, "box").unwrap();
+        let leaf = find_render_element_by_id(&graph.root, "leaf").unwrap();
+
+        assert_eq!(div.style.color, egui::Color32::from_rgb(17, 34, 51));
+        assert_eq!(div.style.font_size, 20.0);
+        assert_eq!(div.style.padding.left, 8.0);
+        assert_eq!(div.style.padding.top, 4.0);
+        assert_eq!(div.style.width, Some(380.0));
+        assert_eq!(leaf.style.color, egui::Color32::from_rgb(68, 85, 102));
+        assert_eq!(leaf.style.font_size, 20.0);
+    }
+
+    #[test]
+    fn render_graph_applies_browser_default_paragraph_margins() {
+        let html = remove_html_comments(
+            r##"<html><body><p id="top-link"><a href="#top">[Top]</a></p></body></html>"##,
+        );
+        let dom = parse_dom_document(&html);
+        let style = rich_canvas::parse_basic_css("");
+        let graph = build_render_graph(&dom, &style);
+        let paragraph = find_render_element_by_id(&graph.root, "top-link").unwrap();
+
+        assert!(paragraph.style.margin.top > 0.0);
+        assert!(paragraph.style.margin.bottom > 0.0);
+    }
+
+    #[test]
+    fn render_graph_matches_child_adjacent_sibling_margin_selectors() {
+        let html = r#"
+            <html>
+              <head><style>article > * + * { margin-top: 1em; }</style></head>
+              <body>
+                <article>
+                  <header id="first">First</header>
+                  <footer id="second">Second</footer>
+                </article>
+              </body>
+            </html>
+        "#;
+        let html = remove_html_comments(html);
+        let dom = parse_dom_document(&html);
+        let style = rich_canvas::parse_basic_css(extract_tag_inner(&html, "style").unwrap_or(""));
+        let graph = build_render_graph(&dom, &style);
+        let first = find_render_element_by_id(&graph.root, "first").unwrap();
+        let second = find_render_element_by_id(&graph.root, "second").unwrap();
+
+        assert_eq!(first.style.margin.top, 0.0);
+        assert_eq!(second.style.margin.top, 16.0);
+    }
+
+    #[test]
+    fn render_graph_merges_side_specific_margin_rules() {
+        let html = r#"
+            <html>
+              <head>
+                <style>
+                  h2 { margin-top: 3rem; }
+                  h2, h3 { margin-bottom: 0.8rem; }
+                </style>
+              </head>
+              <body><h2 id="heading">Heading</h2></body>
+            </html>
+        "#;
+        let html = remove_html_comments(html);
+        let dom = parse_dom_document(&html);
+        let style = rich_canvas::parse_basic_css(extract_tag_inner(&html, "style").unwrap_or(""));
+        let graph = build_render_graph(&dom, &style);
+        let heading = find_render_element_by_id(&graph.root, "heading").unwrap();
+
+        assert_eq!(heading.style.margin.top, heading.style.font_size);
+        assert_eq!(heading.style.margin.bottom, heading.style.font_size * 0.5);
+    }
+
+    #[test]
+    fn cached_latex_page_uses_saved_stylesheet_when_style_css_is_missing() {
+        let cache_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../sample_pages/cache");
+        let missing_style = cache_dir.join("style.css");
+
+        assert!(!missing_style.exists());
+        assert_eq!(
+            stylesheet_path_with_local_fallback(missing_style.to_str().unwrap()),
+            cache_dir.join("latex_style.css")
+        );
+
+        let document = load_html_document(&cache_dir.join("latex_elements.html")).unwrap();
+
+        assert_eq!(document.style.main_max_width, 640.0);
+        assert_eq!(
+            document.style.text_color,
+            egui::Color32::from_rgb(27, 24, 24)
+        );
+        assert_eq!(
+            document.style.page_background,
+            egui::Color32::from_rgb(249, 250, 251)
+        );
+    }
+
+    #[test]
+    fn canvas_graph_keeps_resolved_text_attributes_and_coordinates() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head><style>.box { color: #445566; font-size: 20px; padding: 10px; }</style></head>
+              <body><div class="box"><span>Hello graph</span><em>italic</em><u>under</u><del>gone</del><mark>marked</mark></div></body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let text = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Text(text) if text.text == "Hello graph" => Some(text),
+                _ => None,
+            })
+            .expect("expected CanvasGraph text object");
+
+        assert_eq!(text.color, egui::Color32::from_rgb(68, 85, 102));
+        assert_eq!(text.font_size, 20.0);
+        assert!(text.rect.min.x >= 10.0);
+        assert!(text.rect.min.y >= 10.0);
+
+        assert!(document.canvas_graph.objects.iter().any(|object| matches!(
+            object,
+            CanvasObject::Text(text) if text.text == "italic" && text.font_style_italic
+        )));
+        assert!(document.canvas_graph.objects.iter().any(|object| matches!(
+            object,
+            CanvasObject::Text(text) if text.text == "under" && text.text_decoration_underline
+        )));
+        assert!(document.canvas_graph.objects.iter().any(|object| matches!(
+            object,
+            CanvasObject::Text(text) if text.text == "gone" && text.text_decoration_strikethrough
+        )));
+        assert!(
+            document
+                .canvas_graph
+                .objects
+                .iter()
+                .any(|object| matches!(
+                    object,
+                    CanvasObject::Text(text) if text.text == "marked" && text.text_background != egui::Color32::TRANSPARENT
+                ))
+        );
+    }
+
+    #[test]
+    fn render_graph_text_nodes_are_inline_and_lists_do_not_flatten_nested_text() {
+        let html = r##"
+            <html>
+              <body>
+                <ul>
+                  <li><a href="#text">Text</a><ul><li><a href="#headings">Headings</a></li></ul></li>
+                </ul>
+              </body>
+            </html>
+        "##;
+        let html = remove_html_comments(html);
+        let dom = parse_dom_document(&html);
+        let style = rich_canvas::parse_basic_css("");
+        let graph = build_render_graph(&dom, &style);
+        let text_node = find_render_text(&graph.root, "Text").unwrap();
+
+        assert_eq!(text_node.style.display, CssDisplay::Inline);
+
+        let document = parse_html_document(html.as_str(), "https://example.test/");
+        let mut list_items = Vec::new();
+        collect_list_item_text(&document.blocks, &mut list_items);
+
+        assert_eq!(list_items, vec!["Text".to_owned(), "Headings".to_owned()]);
+        assert!(!list_items.iter().any(|text| text.contains("Text Headings")));
+    }
+
+    #[test]
+    fn canvas_graph_flows_inline_text_lists_and_tables() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <body>
+                <p>One <a href="#two">two</a> three</p>
+                <ul><li><a href="#item">Item link</a></li></ul>
+                <table>
+                  <tr><th>Head A</th><th>Head B</th></tr>
+                  <tr><td>Cell A</td><td>Cell B</td></tr>
+                </table>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let one = find_canvas_text(&document.canvas_graph, "One").expect("expected first run");
+        let two = find_canvas_text(&document.canvas_graph, " two").expect("expected link run");
+        let three = find_canvas_text(&document.canvas_graph, " three").expect("expected third run");
+        assert_eq!(one.rect.top(), two.rect.top());
+        assert_eq!(two.rect.top(), three.rect.top());
+        assert_eq!(two.href.as_deref(), Some("#two"));
+
+        let marker = find_canvas_text(&document.canvas_graph, "•").expect("expected list marker");
+        let item =
+            find_canvas_text(&document.canvas_graph, "Item link").expect("expected list text");
+        assert!(marker.rect.left() < item.rect.left());
+        assert_eq!(marker.rect.top(), item.rect.top());
+        assert_eq!(item.href.as_deref(), Some("#item"));
+
+        let table_rects = document
+            .canvas_graph
+            .objects
+            .iter()
+            .filter(|object| matches!(object, CanvasObject::Rect(_)))
+            .count();
+        assert!(table_rects >= 4);
+        assert!(
+            find_canvas_text(&document.canvas_graph, "Head A")
+                .is_some_and(|text| text.font_weight_bold)
+        );
+        assert!(find_canvas_text(&document.canvas_graph, "Cell B").is_some());
+    }
+
+    #[test]
+    fn canvas_graph_lays_out_nested_lists_with_real_child_widths() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <body>
+                <nav>
+                  <ul>
+                    <li>
+                      <a href="#text">Text</a>
+                      <ul><li><a href="#headings">Headings</a></li></ul>
+                    </li>
+                  </ul>
+                </nav>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let parent =
+            find_canvas_text(&document.canvas_graph, "Text").expect("expected parent link");
+        let child =
+            find_canvas_text(&document.canvas_graph, "Headings").expect("expected nested link");
+
+        assert_eq!(parent.href.as_deref(), Some("#text"));
+        assert_eq!(child.href.as_deref(), Some("#headings"));
+        assert!(child.rect.width() > 40.0);
+        assert!(child.rect.top() > parent.rect.top());
+    }
+
+    #[test]
+    fn canvas_graph_uses_ordered_list_markers() {
+        let document = parse_html_document(
+            r#"<html><body><ol><li>One</li><li>Two</li></ol></body></html>"#,
+            "https://example.test/",
+        );
+
+        let one = find_canvas_text(&document.canvas_graph, "1.").expect("expected first marker");
+        let two = find_canvas_text(&document.canvas_graph, "2.").expect("expected second marker");
+        let one_text =
+            find_canvas_text(&document.canvas_graph, "One").expect("expected first item");
+        let two_text =
+            find_canvas_text(&document.canvas_graph, "Two").expect("expected second item");
+
+        assert!(one.rect.left() < one_text.rect.left());
+        assert!(two.rect.left() < two_text.rect.left());
+        assert!(two.rect.top() > one.rect.top());
+    }
+
+    #[test]
+    fn canvas_graph_emits_inline_svg_replaced_content() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <body>
+                <div>
+                  <svg width="100px" height="80px" aria-label="chart">
+                    <circle cx="50" cy="40" r="20" fill="#ff0000"></circle>
+                  </svg>
+                </div>
+                <h3>After SVG</h3>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let svg_rect = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Svg(svg) => Some(svg.rect),
+                _ => None,
+            })
+            .expect("expected CanvasGraph SVG object");
+        let after =
+            find_canvas_text(&document.canvas_graph, "After SVG").expect("expected text after SVG");
+
+        assert!((svg_rect.width() - 100.0).abs() < 0.1);
+        assert!((svg_rect.height() - 80.0).abs() < 0.1);
+        assert!(svg_rect.top() > 0.0);
+        assert!(after.rect.top() >= svg_rect.bottom());
+    }
+
+    #[test]
+    fn canvas_graph_emits_path_only_svg_as_visible_icon() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <body>
+                <svg width="16" height="16" aria-label="search">
+                  <path fill="currentColor" d="M1 1h14v14H1z"></path>
+                </svg>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let image_rect = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Image(image) if image.src == "inline-svg-raster" => Some(image.rect),
+                _ => None,
+            })
+            .expect("expected path-only SVG to rasterize into a visible image");
+
+        assert!(
+            (image_rect.width() - 16.0).abs() < 0.1,
+            "expected 16px rasterized svg width, got {}",
+            image_rect.width()
+        );
+        assert!((image_rect.height() - 16.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn flex_textarea_wrapper_grows_between_button_sections() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .search { display: flex; align-items: center; width: 360px; gap: 8px; }
+                  .left { width: 32px; }
+                  .middle { display: flex; min-width: 0; }
+                  .middle textarea { width: 100%; }
+                  .right { width: 80px; }
+                </style>
+              </head>
+              <body>
+                <div class="search">
+                  <div class="left">S</div>
+                  <div class="middle"><textarea placeholder="Search the web..."></textarea></div>
+                  <div class="right"><button>AI Chat</button></div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let icon = find_canvas_text(&document.canvas_graph, "S").expect("expected left section");
+        let placeholder =
+            find_canvas_input(&document.canvas_graph, "Search the web...").expect("expected input");
+        let ai_chat =
+            find_canvas_text(&document.canvas_graph, "AI Chat").expect("expected AI button");
+
+        assert!(placeholder.rect.left() > icon.rect.right());
+        assert!(ai_chat.rect.left() > placeholder.rect.right());
+        assert!((icon.rect.center().y - ai_chat.rect.center().y).abs() < 6.0);
+    }
+
+    #[test]
+    fn grid_template_columns_wraps_items_by_declared_column_count() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; width: 300px; }
+                </style>
+              </head>
+              <body>
+                <div class="grid">
+                  <div>One</div>
+                  <div>Two</div>
+                  <div>Three</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let one = find_canvas_text(&document.canvas_graph, "One").expect("expected one");
+        let two = find_canvas_text(&document.canvas_graph, "Two").expect("expected two");
+        let three = find_canvas_text(&document.canvas_graph, "Three").expect("expected three");
+
+        assert_eq!(one.rect.top(), two.rect.top());
+        assert!(two.rect.left() > one.rect.right());
+        assert!(three.rect.top() > one.rect.top());
+        assert!(three.rect.left() <= one.rect.left() + 1.0);
+    }
+
+    #[test]
+    fn canvas_graph_uses_flex_row_positions_from_layout_tree() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  .row { display: flex; flex-direction: row; gap: 24px; }
+                  .item { width: 120px; }
+                </style>
+              </head>
+              <body>
+                <div class="row">
+                  <div class="item">First</div>
+                  <div class="item">Second</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let first = find_canvas_text(&document.canvas_graph, "First").expect("expected first item");
+        let second =
+            find_canvas_text(&document.canvas_graph, "Second").expect("expected second item");
+
+        assert_eq!(first.rect.top(), second.rect.top());
+        assert!(second.rect.left() - first.rect.left() >= 120.0);
+    }
+
+    #[test]
+    fn flex_placeholder_span_and_button_render_horizontally() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  .hero-search {
+                    display: flex;
+                    align-items: center;
+                    gap: 16px;
+                    width: 600px;
+                    height: 56px;
+                    padding: 0 14px 0 20px;
+                  }
+                  .placeholder {
+                    flex: 1;
+                    font-size: 18px;
+                  }
+                  .hero-search button {
+                    color: #ffffff;
+                    font-weight: 700;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="hero-search">
+                  <span class="search-icon">Search icon</span>
+                  <span class="placeholder">Search the web...</span>
+                  <button>AI Chat</button>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let icon =
+            find_canvas_text(&document.canvas_graph, "Search icon").expect("expected icon span");
+        let placeholder = find_canvas_text(&document.canvas_graph, "Search the web...")
+            .expect("expected placeholder span");
+        let ai_chat =
+            find_canvas_text(&document.canvas_graph, "AI Chat").expect("expected button text");
+
+        assert!((icon.rect.center().y - placeholder.rect.center().y).abs() < 4.0);
+        assert!((placeholder.rect.center().y - ai_chat.rect.center().y).abs() < 4.0);
+        assert!(placeholder.rect.left() > icon.rect.right());
+        assert!(ai_chat.rect.left() > placeholder.rect.right());
+        assert_eq!(ai_chat.color, egui::Color32::WHITE);
+        assert!(ai_chat.font_weight_bold);
+    }
+
+    #[test]
+    fn textarea_placeholder_renders_as_placeholder_not_value() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <body>
+                <textarea placeholder="Search the web..." name="q"></textarea>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "Search the web...").is_some());
+        assert!(
+            find_canvas_text(
+                &document.canvas_graph,
+                "Search the web...: Search the web..."
+            )
+            .is_none()
+        );
+        assert!(contains_block(&document.blocks, |block| matches!(
+            block,
+            CanvasBlock::Input { label, value } if label == "Search the web..." && value.is_empty()
+        )));
+    }
+
+    #[test]
+    fn anonymous_inline_replaced_content_is_lowered_to_canvas_graph() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <body>
+                <picture>
+                  <source srcset="test_2x2.avif" type="image/avif">
+                  <img src="test_2x2.avif" alt="hero" width="40" height="40">
+                </picture>
+              </body>
+            </html>
+            "#,
+            &path_to_file_url(Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../sample_pages/anonymous_picture.html"
+            ))),
+        );
+
+        assert!(document.canvas_graph.objects.iter().any(|object| matches!(
+            object,
+            CanvasObject::Image(image)
+                if image.alt == "hero" && image.image.color_image.size == [2, 2]
+        )));
+    }
+
+    #[test]
+    fn text_container_lowering_preserves_inline_form_controls() {
+        let document = parse_html_document(
+            r#"<html><body><form><p><label for="name">Name</label><input id="name" value="Ada"></p><p><button>Save</button></p></form></body></html>"#,
+            "https://example.test/",
+        );
+
+        assert!(contains_block(&document.blocks, |block| matches!(
+            block,
+            CanvasBlock::Input { label, value } if label == "Name" && value == "Ada"
+        )));
+        assert!(contains_block(&document.blocks, |block| matches!(
+            block,
+            CanvasBlock::Button { text } if text == "Save"
+        )));
+    }
+
+    #[test]
+    fn fragment_links_resolve_against_current_document_without_reloading_path_fragment() {
+        let source = "file:///tmp/test_basic_page.html";
+
+        assert_eq!(
+            resolve_navigation_url(source, "#form-section"),
+            "file:///tmp/test_basic_page.html#form-section"
+        );
+        assert!(same_document_url(
+            source,
+            "file:///tmp/test_basic_page.html#form-section"
+        ));
+        assert_eq!(
+            input_to_path("file:///tmp/test_basic_page.html#form-section"),
+            PathBuf::from("/tmp/test_basic_page.html")
+        );
+    }
+
+    #[test]
+    fn default_fixture_parses_browser_blocks() {
+        let document = load_html_document(Path::new(DEFAULT_PAGE_PATH)).unwrap();
+
+        assert_eq!(document.title, "AlmostThere Sample Page");
+        assert!(contains_block(&document.blocks, |block| matches!(
+            block,
+            CanvasBlock::Heading { text, .. } if text == "AlmostThere Sample Page"
+        )));
+        assert!(contains_block(&document.blocks, |block| matches!(
+            block,
+            CanvasBlock::StyledBox { style, .. } if style.padding.left == 16.0
+        )));
+        assert!(contains_block(&document.blocks, |block| matches!(
+            block,
+            CanvasBlock::Link { href, .. } if href == "#form-section"
+        )));
+        assert!(contains_block(&document.blocks, |block| matches!(
+            block,
+            CanvasBlock::Button { text } if text == "Test Button"
+        )));
+        assert!(contains_block(&document.blocks, |block| matches!(
+            block,
+            CanvasBlock::Input { label, value } if label == "Name" && value == "AlmostThere"
+        )));
+    }
+
+    #[test]
+    fn parses_bookmark_file_lines() {
+        let bookmarks = parse_bookmarks(
+            "AlmostThere\tfile:///tmp/test.html\ninvalid\nDocs\thttps://example.com\n",
+        );
+
+        assert_eq!(
+            bookmarks,
+            vec![
+                Bookmark {
+                    title: "AlmostThere".to_owned(),
+                    url: "file:///tmp/test.html".to_owned(),
+                },
+                Bookmark {
+                    title: "Docs".to_owned(),
+                    url: "https://example.com".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn bookmark_local_token_resolves_at_runtime() {
+        let bookmarks =
+            parse_bookmarks("Local\tfile:///[local]/sample_pages/test_basic_page.html\n");
+        let expected = format!(
+            "file:///{}/sample_pages/test_basic_page.html",
+            local_bookmark_path_token()
+        );
+
+        assert_eq!(
+            bookmarks,
+            vec![Bookmark {
+                title: "Local".to_owned(),
+                url: expected,
+            }]
+        );
+    }
+
+    #[test]
+    fn bookmark_urls_are_saved_with_local_token_when_inside_workspace() {
+        let url = format!(
+            "file:///{}/sample_pages/test_basic_page.html",
+            local_bookmark_path_token()
+        );
+
+        assert_eq!(
+            portable_bookmark_url(&url),
+            "file:///[local]/sample_pages/test_basic_page.html"
+        );
+    }
+
+    #[test]
+    fn ensure_bookmark_adds_default_without_duplicates() {
+        let mut bookmarks = vec![Bookmark {
+            title: "Docs".to_owned(),
+            url: "https://example.com".to_owned(),
+        }];
+
+        assert!(ensure_bookmark(
+            &mut bookmarks,
+            Bookmark {
+                title: DEFAULT_BOOKMARK_TITLE.to_owned(),
+                url: "file:///tmp/sample.html".to_owned(),
+            }
+        ));
+        assert!(!ensure_bookmark(
+            &mut bookmarks,
+            Bookmark {
+                title: DEFAULT_BOOKMARK_TITLE.to_owned(),
+                url: "file:///tmp/sample.html".to_owned(),
+            }
+        ));
+        assert_eq!(bookmarks.len(), 2);
+    }
+
+    #[test]
+    fn default_url_bookmark_is_seeded_separately() {
+        let mut bookmarks = vec![default_sample_bookmark()];
+
+        assert!(ensure_bookmark(&mut bookmarks, default_url_bookmark()));
+        assert!(!ensure_bookmark(&mut bookmarks, default_url_bookmark()));
+        assert!(bookmarks.iter().any(|bookmark| bookmark.url == DEFAULT_URL));
+    }
+
+    #[test]
+    fn inline_elements_parse_to_styled_spans() {
+        let spans = parse_inline_spans(
+            r##"<a href="#!">link</a> <strong>strong</strong> <em>em</em>
+            <u>under</u> <del>deleted</del> <ins>inserted</ins> <s>strike</s>
+            H<sub>2</sub>O sup<sup>R</sup> <small>small</small>
+            <code>code</code> <kbd>Cmd</kbd> <samp>out</samp>
+            <mark>mark</mark> <var>x</var> <time>now</time>"##,
+        );
+
+        assert!(spans.iter().any(|span| span.href.as_deref() == Some("#!")));
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text == "strong" && span.strong)
+        );
+        assert!(spans.iter().any(|span| span.text == "em" && span.emphasis));
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text == "under" && span.underline)
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text == "deleted" && span.strikethrough)
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text == "inserted" && span.underline)
+        );
+        assert!(spans.iter().any(|span| span.text == "2" && span.lowered));
+        assert!(spans.iter().any(|span| span.text == "R" && span.raised));
+        assert!(spans.iter().any(|span| span.text == "small" && span.small));
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text.contains("code") && span.code)
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text.contains("Cmd") && span.code)
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text.contains("out") && span.code)
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text == "mark" && span.highlight)
+        );
+        assert!(spans.iter().any(|span| span.text == "x" && span.emphasis));
+        assert!(spans.iter().any(|span| span.text.trim() == "now"));
+    }
+
+    #[test]
+    fn inline_parser_preserves_boundaries_around_script_and_variable_spans() {
+        let superscript = parse_inline_spans("Superscript<sup>®</sup>.");
+        assert_eq!(superscript[0].text, "Superscript");
+        assert!(superscript[1].raised);
+        assert_eq!(superscript[1].text, "®");
+        assert_eq!(superscript[2].text, ".");
+
+        let subscript = parse_inline_spans("Subscript for things like H<sub>2</sub>O.");
+        assert_eq!(subscript[0].text, "Subscript for things like H");
+        assert!(subscript[1].lowered);
+        assert_eq!(subscript[1].text, "2");
+        assert_eq!(subscript[2].text, "O.");
+
+        let variables = parse_inline_spans(
+            "The <var>variable element</var>, such as <var>x</var> = <var>y</var>.",
+        );
+        assert_eq!(variables[0].text, "The ");
+        assert!(variables[1].emphasis);
+        assert_eq!(variables[1].text, "variable element");
+        assert_eq!(variables[2].text, ", such as ");
+        assert!(variables[3].emphasis);
+        assert_eq!(variables[3].text, "x");
+        assert_eq!(variables[4].text, " = ");
+        assert!(variables[5].emphasis);
+        assert_eq!(variables[5].text, "y");
+        assert_eq!(variables[6].text, ".");
+    }
+
+    #[test]
+    fn img_tags_load_local_image_blocks() {
+        let html = r#"
+            <html>
+              <body>
+                <img src="../V0/sample_docs/sample-image.jpg" alt="Sample image" width="64" height="32">
+              </body>
+            </html>
+        "#;
+        let source = path_to_file_url(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../sample_pages/test_image_page.html"
+        )));
+        let document = parse_html_document(html, &source);
+
+        assert!(contains_block(&document.blocks, |block| matches!(
+            block,
+            CanvasBlock::Image { alt, src, image }
+                if alt == "Sample image"
+                    && src.ends_with("/V0/sample_docs/sample-image.jpg")
+                    && image.size == egui::vec2(64.0, 32.0)
+                    && image.color_image.size[0] > 0
+                    && image.color_image.size[1] > 0
+        )));
+    }
+
+    #[test]
+    fn image_handler_loads_local_avif_images() {
+        let html = r#"
+            <html>
+              <body>
+                <img src="test_2x2.avif" alt="AVIF sample" width="40" height="40">
+              </body>
+            </html>
+        "#;
+        let source = path_to_file_url(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../sample_pages/avif_test_page.html"
+        )));
+        let document = parse_html_document(html, &source);
+
+        assert!(contains_block(&document.blocks, |block| matches!(
+            block,
+            CanvasBlock::Image { alt, src, image }
+                if alt == "AVIF sample"
+                    && src.ends_with("/sample_pages/test_2x2.avif")
+                    && image.size == egui::vec2(40.0, 40.0)
+                    && image.color_image.size == [2, 2]
+        )));
+        assert!(document.canvas_graph.objects.iter().any(|object| matches!(
+            object,
+            CanvasObject::Image(image)
+                if image.alt == "AVIF sample"
+                    && image.src.ends_with("/sample_pages/test_2x2.avif")
+                    && image.image.color_image.size == [2, 2]
+        )));
+    }
+
+    #[test]
+    fn css_height_auto_preserves_image_aspect_ratio() {
+        let html = r#"
+            <html>
+              <head><style>img { max-width: 100%; height: auto; display: block; }</style></head>
+              <body>
+                <img src="../V0/sample_docs/sample-image.jpg" alt="Sample image" width="64" height="32">
+              </body>
+            </html>
+        "#;
+        let source = path_to_file_url(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../sample_pages/test_image_page.html"
+        )));
+        let document = parse_html_document(html, &source);
+
+        let Some(image) = find_image_block(&document.blocks) else {
+            panic!("expected decoded image block");
+        };
+        assert_eq!(image.size.x, 64.0);
+        assert!((41.0..=42.0).contains(&image.size.y));
+    }
+
+    #[test]
+    fn hidden_inputs_do_not_render_as_text_fields() {
+        let html = r#"
+            <html>
+              <body>
+                <input type="hidden" name="method" value="index">
+                <input type="text" value="visible">
+              </body>
+            </html>
+        "#;
+        let document = parse_html_document(html, "https://example.test/");
+
+        assert_eq!(count_inputs(&document.blocks), 1);
+    }
+
+    #[test]
+    fn parser_skips_non_rendered_and_hidden_content() {
+        let html = r#"
+            <html>
+              <body>
+                <script>document.write("script text")</script>
+                <style>.hidden { display: none; }</style>
+                <template>template text</template>
+                <div hidden>hidden attr text</div>
+                <div style="display: none">display none text</div>
+                <div aria-hidden="true">aria hidden text</div>
+                <p>Visible text</p>
+              </body>
+            </html>
+        "#;
+        let document = parse_html_document(html, "https://example.test/");
+        let rendered_text = format!("{:?}", document.blocks);
+
+        assert!(rendered_text.contains("Visible text"));
+        assert!(!rendered_text.contains("script text"));
+        assert!(!rendered_text.contains("template text"));
+        assert!(!rendered_text.contains("hidden attr text"));
+        assert!(!rendered_text.contains("display none text"));
+        assert!(!rendered_text.contains("aria hidden text"));
+    }
+
+    #[test]
+    fn attributes_parse_single_quoted_unquoted_and_boolean_forms() {
+        assert_eq!(
+            extract_attr("<a href='/local'>", "href").as_deref(),
+            Some("/local")
+        );
+        assert_eq!(
+            extract_attr("<input type=hidden value=index>", "value").as_deref(),
+            Some("index")
+        );
+        assert!(has_attr("<div hidden>", "hidden"));
+    }
+
+    #[test]
+    fn local_documents_do_not_fetch_remote_subresources() {
+        let html = r#"
+            <html>
+              <head>
+                <link rel="stylesheet" href="https://www.ecosia.org/remote.css">
+              </head>
+              <body>
+                <img src="https://www.ecosia.org/image.jpg" alt="remote image">
+              </body>
+            </html>
+        "#;
+        let source = path_to_file_url(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../sample_pages/offline_debug.html"
+        )));
+        let document = parse_html_document(html, &source);
+
+        assert_eq!(
+            document.style.body_font_size,
+            rich_canvas::BrowserStyle::default().body_font_size
+        );
+        assert!(contains_block(&document.blocks, |block| matches!(
+            block,
+            CanvasBlock::Media { label } if label == "remote image"
+        )));
+    }
+
+    #[test]
+    fn generic_inline_wrappers_render_text_without_page_specific_rules() {
+        let html = r#"
+            <html>
+              <body>
+                <div><span>Plain span text</span><mark>marked</mark><time>now</time></div>
+              </body>
+            </html>
+        "#;
+        let document = parse_html_document(html, "https://example.test/");
+        let rendered_text = format!("{:?}", document.blocks);
+
+        assert!(rendered_text.contains("Plain span text"));
+        assert!(rendered_text.contains("marked"));
+        assert!(rendered_text.contains("now"));
+    }
+
+    #[test]
+    fn inline_svg_circle_parses_to_svg_block() {
+        let html = r##"
+            <html>
+              <body>
+                <svg width="100px" height="100px">
+                  <circle cx="100" cy="100" r="100" fill="#1fa3ec"></circle>
+                </svg>
+              </body>
+            </html>
+        "##;
+        let document = parse_html_document(html, "https://latex.vercel.app/elements");
+
+        let Some(svg) = find_svg_block(&document.blocks) else {
+            panic!("expected parsed SVG block");
+        };
+        assert_eq!(svg.size, egui::vec2(100.0, 100.0));
+        assert_eq!(svg.shapes.len(), 1);
+    }
+
+    #[test]
+    fn file_url_input_decodes_spaces_for_local_paths() {
+        assert_eq!(
+            input_to_path("file:///tmp/AlmostThere%20Browser/page.html"),
+            PathBuf::from("/tmp/AlmostThere Browser/page.html")
+        );
+    }
+
+    fn contains_block(
+        blocks: &[CanvasBlock],
+        predicate: impl Copy + Fn(&CanvasBlock) -> bool,
+    ) -> bool {
+        blocks.iter().any(|block| {
+            predicate(block)
+                || matches!(
+                    block,
+                    CanvasBlock::Panel { children } if contains_block(children, predicate)
+                )
+                || matches!(
+                    block,
+                    CanvasBlock::Box { children, .. } if contains_block(children, predicate)
+                )
+                || matches!(
+                    block,
+                    CanvasBlock::StyledBox { children, .. } if contains_block(children, predicate)
+                )
+        })
+    }
+
+    fn find_image_block(blocks: &[CanvasBlock]) -> Option<&ImageBlock> {
+        blocks.iter().find_map(|block| match block {
+            CanvasBlock::Image { image, .. } => Some(image),
+            CanvasBlock::Panel { children }
+            | CanvasBlock::Box { children, .. }
+            | CanvasBlock::StyledBox { children, .. } => find_image_block(children),
+            _ => None,
+        })
+    }
+
+    fn find_svg_block(blocks: &[CanvasBlock]) -> Option<&SvgBlock> {
+        blocks.iter().find_map(|block| match block {
+            CanvasBlock::Svg { svg } => Some(svg),
+            CanvasBlock::Panel { children }
+            | CanvasBlock::Box { children, .. }
+            | CanvasBlock::StyledBox { children, .. } => find_svg_block(children),
+            _ => None,
+        })
+    }
+
+    fn find_canvas_text<'a>(graph: &'a CanvasGraph, value: &str) -> Option<&'a CanvasTextObject> {
+        graph.objects.iter().find_map(|object| match object {
+            CanvasObject::Text(text) if text.text == value => Some(text),
+            _ => None,
+        })
+    }
+
+    fn find_canvas_input<'a>(graph: &'a CanvasGraph, label: &str) -> Option<&'a CanvasInputObject> {
+        graph.objects.iter().find_map(|object| match object {
+            CanvasObject::Input(input) if input.label == label => Some(input),
+            _ => None,
+        })
+    }
+
+    fn count_inputs(blocks: &[CanvasBlock]) -> usize {
+        blocks
+            .iter()
+            .map(|block| match block {
+                CanvasBlock::Input { .. } => 1,
+                CanvasBlock::Panel { children }
+                | CanvasBlock::Box { children, .. }
+                | CanvasBlock::StyledBox { children, .. } => count_inputs(children),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    fn collect_list_item_text(blocks: &[CanvasBlock], out: &mut Vec<String>) {
+        for block in blocks {
+            match block {
+                CanvasBlock::ListItem { text, .. } => out.push(text.clone()),
+                CanvasBlock::Panel { children }
+                | CanvasBlock::Box { children, .. }
+                | CanvasBlock::StyledBox { children, .. } => collect_list_item_text(children, out),
+                _ => {}
+            }
+        }
+    }
+
+    fn find_render_text<'a>(node: &'a RenderNode, text: &str) -> Option<&'a RenderNode> {
+        if let RenderNodeKind::Text(value) = &node.kind {
+            if normalize_ws(value) == text {
+                return Some(node);
+            }
+        }
+        node.children
+            .iter()
+            .find_map(|child| find_render_text(child, text))
+    }
+
+    fn find_render_element_by_id<'a>(node: &'a RenderNode, id: &str) -> Option<&'a RenderNode> {
+        if let RenderNodeKind::Element(element) = &node.kind {
+            if element.attr("id") == Some(id) {
+                return Some(node);
+            }
+        }
+        node.children
+            .iter()
+            .find_map(|child| find_render_element_by_id(child, id))
+    }
+
+    fn find_render_element_by_class<'a>(
+        node: &'a RenderNode,
+        class_name: &str,
+    ) -> Option<&'a RenderNode> {
+        if let RenderNodeKind::Element(element) = &node.kind {
+            if element
+                .attr("class")
+                .is_some_and(|classes| classes.split_whitespace().any(|class| class == class_name))
+            {
+                return Some(node);
+            }
+        }
+        node.children
+            .iter()
+            .find_map(|child| find_render_element_by_class(child, class_name))
+    }
+}

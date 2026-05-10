@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AlmostThere Sample Page</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      line-height: 1.5;
+      color: #1f2933;
+      background: #f5f7fa;
+    }
+
+    main {
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 32px 20px;
+    }
+
+    header,
+    section {
+      margin-bottom: 24px;
+    }
+
+    .panel {
+      padding: 16px;
+      border: 1px solid #ccd6e0;
+      border-radius: 8px;
+      background: #ffffff;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 32px;
+    }
+
+    h2 {
+      margin: 0 0 8px;
+      font-size: 22px;
+    }
+
+    a,
+    button {
+      color: #075985;
+    }
+
+    button {
+      padding: 8px 12px;
+      border: 1px solid #075985;
+      border-radius: 4px;
+      background: #e0f2fe;
+      cursor: pointer;
+    }
+
+    label {
+      display: block;
+      margin-bottom: 6px;
+      font-weight: bold;
+    }
+
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 8px;
+      border: 1px solid #9aa6b2;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header data-testid="page-header">
+      <h1>AlmostThere Sample Page</h1>
+      <p>This is the first local HTML fixture for build and rendering tests.</p>
+    </header>
+
+    <section class="panel" data-testid="content-panel">
+      <h2>Basic Content</h2>
+      <p>The page includes headings, paragraphs, a link, a button, and a form field.</p>
+      <p><a href="#form-section" data-testid="sample-link">Jump to the form</a></p>
+      <p><a href="https://it.wikipedia.org/wiki/Hello_world" data-testid="wiki-link">Wikipedia "Hello World" page</a></p>
+      <button type="button" data-testid="sample-button">Test Button</button>
+    </section>
+
+    <section id="form-section" class="panel" data-testid="form-panel">
+      <h2>Simple Form</h2>
+      <form action="#" method="get">
+        <label for="name">Name</label>
+        <input id="name" name="name" type="text" value="AlmostThere">
+      </form>
+    </section>
+  </main>
+</body>
+</html>

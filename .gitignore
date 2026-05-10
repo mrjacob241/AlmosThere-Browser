@@ -1,0 +1,17 @@
+target/
+appdata/
+
+# Downloaded/generated third-party page captures and assets.
+sample_pages/cache/
+sample_pages/temp_outputs/
+sample_pages/*_files/
+sample_pages/Ecosia - Offline.html
+sample_pages/Ecosia - Online.html
+sample_pages/hello world - Ecosia.html
+sample_pages/Hello world - Wikipedia.html
+sample_pages/Ecosia_Offline_Test/
+sample_pages/ecosia_*.png
+sample_pages/ecosia_*.pdf
+sample_pages/hello_world_screenshot.png
+sample_pages/wiki_hello_world.png
+sample_pages/vercel_test_page.pdf

@@ -1,0 +1,13 @@
+[package]
+name = "almostthere_browser"
+edition.workspace = true
+version.workspace = true
+default-run = "almostthere_browser"
+
+[dependencies]
+eframe.workspace = true
+egui.workspace = true
+image.workspace = true
+reqwest.workspace = true
+rich_canvas = { path = "../rich_canvas" }
+tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
