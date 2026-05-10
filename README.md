@@ -4,7 +4,7 @@
 
 **AlmosThere Browser** is a Browser that is Almost There to be an actual Browser, but we all know that it will never be! 
 
-At the moment I wouldn't define it a Browser, it's just a Rust Demo...
+At the moment I wouldn't define it a Browser, it's just a Rust Demo Vibe Coded in Codex...
 
 ## ⚠️ DISCLAIMER!!! ⚠️
 
