@@ -10,7 +10,7 @@ At the moment I wouldn't define it a Browser, it's just a Rust Demo...
 
 This project has been built from scratch in Rust and it is not related or endorsed in any case and in any way by more famous Browsers.
 
-![App Screenshot](panels_figs/sample_image.png)
+![App Screenshot](panels_fig/sample_image.png)
 
 ## 🚧 Planned Features 🚧 
 
