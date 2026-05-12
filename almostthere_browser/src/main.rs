@@ -10,12 +10,12 @@ use std::{
 use eframe::{App, Frame, NativeOptions, egui};
 use rich_canvas::{
     BrowserCanvas, BrowserCanvasResponse, BrowserDocument, BrowserStyle, CanvasBlock,
-    CanvasClipObject, CanvasGraph, CanvasImageObject, CanvasInputObject, CanvasMediaObject,
-    CanvasObject, CanvasRectObject, CanvasSvgObject, CanvasTextObject, CssAlignItems, CssBoxStyle,
-    CssDisplay, CssEdges, CssFlexDirection, CssJustifyContent, CssLength, CssObjectFit,
-    CssPosition, CssTextAlign, ElementStyleKey, HitTarget, ImageBlock, InlineSpan,
-    ResolvedBoxStyle, SvgBlock, SvgShape, computed_box_style, configure_browser_fonts,
-    parse_basic_css_for_viewport, parse_inline_box_style, wrap_browser_textboxes,
+    CanvasButtonObject, CanvasClipObject, CanvasGraph, CanvasImageObject, CanvasInputObject,
+    CanvasMediaObject, CanvasObject, CanvasRectObject, CanvasSvgObject, CanvasTextObject,
+    CssAlignItems, CssBoxStyle, CssDisplay, CssEdges, CssFlexDirection, CssJustifyContent,
+    CssLength, CssObjectFit, CssPosition, CssTextAlign, ElementStyleKey, HitTarget, ImageBlock,
+    InlineSpan, ResolvedBoxStyle, SvgBlock, SvgShape, computed_box_style, configure_browser_fonts,
+    parse_basic_css_for_viewport_with_root_classes, parse_inline_box_style, wrap_browser_textboxes,
 };
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
 
@@ -367,6 +367,7 @@ fn close_truncated_canvas_clips(objects: &mut Vec<CanvasObject>) {
             }
             CanvasObject::Text(_)
             | CanvasObject::Rect(_)
+            | CanvasObject::Button(_)
             | CanvasObject::Input(_)
             | CanvasObject::Image(_)
             | CanvasObject::Svg(_)
@@ -413,12 +414,23 @@ fn canvas_graph_debug_string(graph: &CanvasGraph) -> String {
                     rect.border_radius
                 );
             }
+            CanvasObject::Button(button) => {
+                let _ = writeln!(
+                    out,
+                    "{index:04} Button rect={} type={} form={} text=\"{}\"",
+                    rect_debug(button.rect),
+                    button.button_type,
+                    button.form_id.as_deref().unwrap_or(""),
+                    shorten_debug_text(&button.text)
+                );
+            }
             CanvasObject::Input(input) => {
                 let _ = writeln!(
                     out,
-                    "{index:04} Input rect={} font_size={:.1} label=\"{}\" value_len={}",
+                    "{index:04} Input rect={} font_size={:.1} color={} label=\"{}\" value_len={}",
                     rect_debug(input.rect),
                     input.font_size,
+                    color_debug(input.color),
                     shorten_debug_text(&input.label),
                     input.value.chars().count()
                 );
@@ -909,6 +921,7 @@ fn rasterize_canvas_graph_debug_frame(graph: &CanvasGraph) -> image::RgbaImage {
                 clip = clip_stack.pop().unwrap_or(canvas);
             }
             CanvasObject::Rect(rect) => draw_canvas_rect(&mut image, rect, clip),
+            CanvasObject::Button(_) => {}
             CanvasObject::Input(input) => draw_canvas_input(&mut image, input, clip),
             CanvasObject::Image(canvas_image) => draw_canvas_image(&mut image, canvas_image, clip),
             CanvasObject::Svg(svg) => draw_canvas_svg(&mut image, svg, clip),
@@ -2257,7 +2270,8 @@ fn parse_html_document_with_text_metrics(
         .to_owned();
     let mut css = extract_tag_inner(&html, "style").unwrap_or("").to_owned();
     css.push_str(&load_linked_stylesheets(&html, source).unwrap_or_default());
-    let style = parse_basic_css_for_viewport(&css, 1280.0);
+    let root_classes = document_theme_root_classes(&dom, text_metrics);
+    let style = parse_basic_css_for_viewport_with_root_classes(&css, 1280.0, &root_classes);
     let render_graph = build_render_graph(&dom, &style);
     let canvas_graph =
         render_graph_to_canvas_graph(&render_graph, source, style.image_height_auto, text_metrics);
@@ -2277,9 +2291,39 @@ fn parse_render_graph_debug_dump(html: &str, source: &str) -> String {
     let dom = parse_dom_document(&html);
     let mut css = extract_tag_inner(&html, "style").unwrap_or("").to_owned();
     css.push_str(&load_linked_stylesheets(&html, source).unwrap_or_default());
-    let style = parse_basic_css_for_viewport(&css, 1280.0);
+    let root_classes = document_theme_root_classes(&dom, None);
+    let style = parse_basic_css_for_viewport_with_root_classes(&css, 1280.0, &root_classes);
     let render_graph = build_render_graph(&dom, &style);
     render_graph_debug_string(&render_graph)
+}
+
+fn document_theme_root_classes(
+    dom: &DomDocument,
+    text_metrics: Option<&egui::Context>,
+) -> Vec<String> {
+    let mut classes: Vec<String> = dom
+        .first_descendant_by_tag("html")
+        .and_then(|element| element.attr("class"))
+        .map(|classes| {
+            classes
+                .split_ascii_whitespace()
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let has_explicit_theme = classes
+        .iter()
+        .any(|class| matches!(class.as_str(), "dark" | "light"));
+    if !has_explicit_theme {
+        if let Some(ctx) = text_metrics {
+            classes.push(if ctx.style().visuals.dark_mode {
+                "dark".to_owned()
+            } else {
+                "light".to_owned()
+            });
+        }
+    }
+    classes
 }
 
 #[derive(Clone, Debug)]
@@ -2653,6 +2697,10 @@ fn apply_css_box_style(
         target.border_radius = radius;
     }
     if let Some(width) = source.width {
+        target.width_percent = match width {
+            CssLength::Percent(percent) => Some(percent),
+            _ => None,
+        };
         target.width = resolve_css_width(width, parent_width);
     }
     if let Some(max_width) = source.max_width {
@@ -2763,7 +2811,6 @@ fn resolve_optional_css_length(length: CssLength, parent_width: f32) -> Option<f
 fn resolve_css_width(length: CssLength, parent_width: f32) -> Option<f32> {
     match length {
         CssLength::Auto => None,
-        CssLength::Percent(percent) if percent >= 99.0 => None,
         _ => Some(resolve_css_length(length, parent_width)),
     }
 }
@@ -2783,12 +2830,19 @@ struct CanvasLayoutCursor {
     width: f32,
     list_depth: usize,
     list_stack: Vec<CanvasListContext>,
+    form_stack: Vec<CanvasFormContext>,
+    next_form_index: usize,
 }
 
 #[derive(Clone, Debug)]
 struct CanvasListContext {
     ordered: bool,
     next_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CanvasFormContext {
+    id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -3057,19 +3111,24 @@ fn layout_css_box(
         + box_.dimensions.border.right
         + box_.dimensions.padding.left
         + box_.dimensions.padding.right;
-    let mut content_width = if let Some(width) = box_.style.width.or(box_.style.max_width) {
-        width
-    } else if matches!(box_.kind, CssLayoutKind::Inline)
-        && (box_.style.flex_grow > 0.0 || css_layout_box_contains_text_form_control(box_))
-    {
-        (containing_width - horizontal_non_content).max(1.0)
-    } else if matches!(box_.kind, CssLayoutKind::Inline) {
-        css_layout_preferred_content_width(box_, text_metrics)
-    } else {
-        (containing_width - horizontal_non_content).max(1.0)
-    }
-    .min(containing_width)
-    .max(box_.style.min_width.unwrap_or(1.0));
+    let percent_width = box_
+        .style
+        .width_percent
+        .map(|percent| (containing_width * percent / 100.0 - horizontal_non_content).max(1.0));
+    let mut content_width =
+        if let Some(width) = percent_width.or(box_.style.width).or(box_.style.max_width) {
+            width
+        } else if matches!(box_.kind, CssLayoutKind::Inline)
+            && (box_.style.flex_grow > 0.0 || css_layout_box_contains_text_form_control(box_))
+        {
+            (containing_width - horizontal_non_content).max(1.0)
+        } else if matches!(box_.kind, CssLayoutKind::Inline) {
+            css_layout_preferred_content_width(box_, text_metrics)
+        } else {
+            (containing_width - horizontal_non_content).max(1.0)
+        }
+        .min(containing_width)
+        .max(box_.style.min_width.unwrap_or(1.0));
     if box_.style.width.is_none()
         && box_.style.max_width.is_none()
         && let Some(node) = box_.node
@@ -3121,7 +3180,10 @@ fn layout_css_box(
             .unwrap_or(0.0),
         CssLayoutKind::Inline => {
             if let Some(node) = box_.node {
-                if css_layout_node_is_replaced_or_special(node) {
+                if css_layout_node_is_button(node) {
+                    layout_css_block_children(box_, source, image_height_auto, text_metrics)
+                        .max((box_.style.font_size * 1.35).max(1.0))
+                } else if css_layout_node_is_replaced_or_special(node) {
                     estimate_special_css_box_height(
                         node,
                         content_width,
@@ -3144,7 +3206,10 @@ fn layout_css_box(
             } else if box_.style.display == CssDisplay::Grid {
                 layout_css_grid_children(box_, source, image_height_auto, text_metrics)
             } else if let Some(node) = box_.node {
-                if css_layout_node_is_replaced_or_special(node) {
+                if css_layout_node_is_button(node) {
+                    layout_css_block_children(box_, source, image_height_auto, text_metrics)
+                        .max((box_.style.font_size * 1.35).max(1.0))
+                } else if css_layout_node_is_replaced_or_special(node) {
                     estimate_special_css_box_height(
                         node,
                         content_width,
@@ -3176,7 +3241,54 @@ fn layout_css_box(
         content_width,
     );
     box_.dimensions.content.max.y = box_.dimensions.content.min.y + content_height.max(0.0);
+    if box_.node.is_some_and(css_layout_node_is_button) {
+        center_css_button_children(box_);
+    }
     layout_css_out_of_flow_children(box_, source, image_height_auto, text_metrics);
+}
+
+fn css_layout_node_is_button(node: &RenderNode) -> bool {
+    matches!(
+        &node.kind,
+        RenderNodeKind::Element(element) if element.tag_name == "button"
+    )
+}
+
+fn center_css_button_children(box_: &mut CssLayoutBox<'_>) {
+    if box_.children.is_empty() {
+        return;
+    }
+    let mut bounds: Option<egui::Rect> = None;
+    for child in &box_.children {
+        if css_layout_box_is_out_of_flow(child) {
+            continue;
+        }
+        let child_rect = css_margin_box(child);
+        bounds = Some(match bounds {
+            Some(bounds) => bounds.union(child_rect),
+            None => child_rect,
+        });
+    }
+    let Some(bounds) = bounds else {
+        return;
+    };
+    let content = box_.dimensions.content;
+    let delta = egui::vec2(
+        if box_.style.text_align == CssTextAlign::Center {
+            content.center().x - bounds.center().x
+        } else {
+            0.0
+        },
+        content.center().y - bounds.center().y,
+    );
+    if delta == egui::Vec2::ZERO {
+        return;
+    }
+    for child in &mut box_.children {
+        if !css_layout_box_is_out_of_flow(child) {
+            translate_css_layout_box(child, delta);
+        }
+    }
 }
 
 fn layout_css_flex_children(
@@ -3688,47 +3800,94 @@ fn layout_css_out_of_flow_children(
     image_height_auto: bool,
     text_metrics: Option<&egui::Context>,
 ) {
-    let containing = parent.dimensions.content;
-    if containing.width() <= 0.0 || containing.height() <= 0.0 {
+    let containing = css_padding_box(&parent.dimensions);
+    if containing.width() <= 0.0 {
         return;
     }
 
     for child in &mut parent.children {
         if !css_layout_box_is_out_of_flow(child) {
+            if child.style.position == CssPosition::Static {
+                layout_css_out_of_flow_descendants_for_containing_block(
+                    child,
+                    containing,
+                    source,
+                    image_height_auto,
+                    text_metrics,
+                );
+            }
             continue;
         }
-        let inset = child.style.inset.unwrap_or_default();
-        let left = child.style.inset_sides.left;
-        let right = child.style.inset_sides.right;
-        let top = child.style.inset_sides.top;
-        let bottom = child.style.inset_sides.bottom;
-        let containing_width = if left.is_some() && right.is_some() {
-            (containing.width() - inset.left - inset.right).max(1.0)
-        } else {
-            containing.width().max(1.0)
-        };
-        let containing_height = (containing.height() - inset.top - inset.bottom).max(0.0);
-        layout_css_box(
-            child,
-            containing.left() + left.unwrap_or(0.0),
-            containing.top() + top.unwrap_or(0.0),
-            containing_width,
-            containing_height,
-            source,
-            image_height_auto,
-            text_metrics,
-        );
-        let child_margin_box = css_margin_box(child);
-        let mut delta = egui::Vec2::ZERO;
-        if let (Some(right), None) = (right, left) {
-            delta.x = containing.right() - right - child_margin_box.right();
+        layout_css_out_of_flow_child(child, containing, source, image_height_auto, text_metrics);
+    }
+}
+
+fn layout_css_out_of_flow_descendants_for_containing_block(
+    box_: &mut CssLayoutBox<'_>,
+    containing: egui::Rect,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+) {
+    for child in &mut box_.children {
+        if css_layout_box_is_out_of_flow(child) {
+            layout_css_out_of_flow_child(
+                child,
+                containing,
+                source,
+                image_height_auto,
+                text_metrics,
+            );
+        } else if child.style.position == CssPosition::Static {
+            layout_css_out_of_flow_descendants_for_containing_block(
+                child,
+                containing,
+                source,
+                image_height_auto,
+                text_metrics,
+            );
         }
-        if let (Some(bottom), None) = (bottom, top) {
-            delta.y = containing.bottom() - bottom - child_margin_box.bottom();
-        }
-        if delta != egui::Vec2::ZERO {
-            translate_css_layout_box(child, delta);
-        }
+    }
+}
+
+fn layout_css_out_of_flow_child(
+    child: &mut CssLayoutBox<'_>,
+    containing: egui::Rect,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+) {
+    let inset = child.style.inset.unwrap_or_default();
+    let left = child.style.inset_sides.left;
+    let right = child.style.inset_sides.right;
+    let top = child.style.inset_sides.top;
+    let bottom = child.style.inset_sides.bottom;
+    let containing_width = if left.is_some() && right.is_some() {
+        (containing.width() - inset.left - inset.right).max(1.0)
+    } else {
+        containing.width().max(1.0)
+    };
+    let containing_height = (containing.height() - inset.top - inset.bottom).max(0.0);
+    layout_css_box(
+        child,
+        containing.left() + left.unwrap_or(0.0),
+        containing.top() + top.unwrap_or(0.0),
+        containing_width,
+        containing_height,
+        source,
+        image_height_auto,
+        text_metrics,
+    );
+    let child_margin_box = css_margin_box(child);
+    let mut delta = egui::Vec2::ZERO;
+    if let (Some(right), None) = (right, left) {
+        delta.x = containing.right() - right - child_margin_box.right();
+    }
+    if let (Some(bottom), None) = (bottom, top) {
+        delta.y = containing.bottom() - bottom - child_margin_box.bottom();
+    }
+    if delta != egui::Vec2::ZERO {
+        translate_css_layout_box(child, delta);
     }
 }
 
@@ -3862,6 +4021,8 @@ fn render_graph_to_canvas_graph(
         width: viewport.x,
         list_depth: 0,
         list_stack: Vec::new(),
+        form_stack: Vec::new(),
+        next_form_index: 0,
     };
     layout_css_layout_tree(
         &mut layout_root,
@@ -3895,6 +4056,7 @@ fn push_canvas_graph_layout_box(
     cursor: &mut CanvasLayoutCursor,
     graph: &mut CanvasGraph,
 ) {
+    let pushed_form = push_canvas_form_context_for_layout_box(box_, cursor);
     match box_.kind {
         CssLayoutKind::Document => {
             for child in &box_.children {
@@ -4163,6 +4325,35 @@ fn push_canvas_graph_layout_box(
             }
         }
     }
+    if pushed_form {
+        cursor.form_stack.pop();
+    }
+}
+
+fn push_canvas_form_context_for_layout_box(
+    box_: &CssLayoutBox<'_>,
+    cursor: &mut CanvasLayoutCursor,
+) -> bool {
+    let Some(node) = box_.node else {
+        return false;
+    };
+    let RenderNodeKind::Element(element) = &node.kind else {
+        return false;
+    };
+    if element.tag_name != "form" {
+        return false;
+    }
+    let id = element
+        .attr("id")
+        .or_else(|| element.attr("name"))
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let id = format!("form-{}", cursor.next_form_index);
+            cursor.next_form_index += 1;
+            id
+        });
+    cursor.form_stack.push(CanvasFormContext { id });
+    true
 }
 
 fn push_canvas_graph_layout_clip_start(box_: &CssLayoutBox<'_>, graph: &mut CanvasGraph) -> bool {
@@ -4236,6 +4427,13 @@ fn push_canvas_graph_layout_replaced_or_special(
                     graph,
                 );
             }
+            push_canvas_graph_button_hit_target(
+                element,
+                node,
+                css_border_box(&box_.dimensions),
+                cursor,
+                graph,
+            );
         }
         _ => push_canvas_graph_node(
             node,
@@ -4403,6 +4601,7 @@ fn push_canvas_graph_element(
     } else {
         inherited_href
     };
+    let pushed_form = push_canvas_form_context_for_element(element, cursor);
 
     match element.tag_name.as_str() {
         "img" => {
@@ -4426,6 +4625,7 @@ fn push_canvas_graph_element(
             if let CanvasBlock::Input { label, value } = block {
                 graph.objects.push(CanvasObject::Input(CanvasInputObject {
                     label,
+                    default_value: value.clone(),
                     value,
                     rect: egui::Rect::from_min_size(
                         egui::pos2(cursor.x, cursor.y),
@@ -4435,10 +4635,19 @@ fn push_canvas_graph_element(
                         ),
                     ),
                     font_size: node.style.font_size,
+                    color: node.style.color,
+                    form_id: current_canvas_form_id(cursor),
                 }));
             }
         }
         "button" => {
+            let button_rect = egui::Rect::from_min_size(
+                egui::pos2(cursor.x, cursor.y),
+                egui::vec2(
+                    cursor.width.max(1.0),
+                    (node.style.font_size * 1.35).max(1.0),
+                ),
+            );
             if node.children.is_empty() {
                 let text = render_node_text_content(node);
                 push_canvas_graph_text(&text, &node.style, text_metrics, href, cursor, graph);
@@ -4455,6 +4664,7 @@ fn push_canvas_graph_element(
                     );
                 }
             }
+            push_canvas_graph_button_hit_target(element, node, button_rect, cursor, graph);
         }
         "table" => {
             push_canvas_graph_table(node, text_metrics, cursor, graph);
@@ -4565,6 +4775,66 @@ fn push_canvas_graph_element(
             cursor.y += node.style.padding.bottom + node.style.margin.bottom;
         }
     }
+    if pushed_form {
+        cursor.form_stack.pop();
+    }
+}
+
+fn push_canvas_form_context_for_element(
+    element: &DomElement,
+    cursor: &mut CanvasLayoutCursor,
+) -> bool {
+    if element.tag_name != "form" {
+        return false;
+    }
+    let id = element
+        .attr("id")
+        .or_else(|| element.attr("name"))
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let id = format!("form-{}", cursor.next_form_index);
+            cursor.next_form_index += 1;
+            id
+        });
+    cursor.form_stack.push(CanvasFormContext { id });
+    true
+}
+
+fn current_canvas_form_id(cursor: &CanvasLayoutCursor) -> Option<String> {
+    cursor.form_stack.last().map(|form| form.id.clone())
+}
+
+fn push_canvas_graph_button_hit_target(
+    element: &DomElement,
+    node: &RenderNode,
+    rect: egui::Rect,
+    cursor: &CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    graph.objects.push(CanvasObject::Button(CanvasButtonObject {
+        text: canvas_button_label(element, node),
+        rect,
+        button_type: element.attr("type").unwrap_or("submit").to_owned(),
+        form_id: current_canvas_form_id(cursor),
+    }));
+}
+
+fn canvas_button_label(element: &DomElement, node: &RenderNode) -> String {
+    element
+        .attr("aria-label")
+        .or_else(|| element.attr("title"))
+        .or_else(|| element.attr("value"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let text = render_node_text_content(node).trim().to_owned();
+            if text.is_empty() {
+                "Button".to_owned()
+            } else {
+                text
+            }
+        })
 }
 
 fn push_canvas_graph_box_start(
@@ -8643,6 +8913,199 @@ mod tests {
             header_index > hero_index,
             "expected z-index header to paint after hero, got header={header_index}, hero={hero_index}"
         );
+    }
+
+    #[test]
+    fn absolute_icon_button_in_zero_height_wrapper_keeps_button_rect() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .search { display: flex; width: 120px; height: 56px; background: #333333; }
+                  .left { position: relative; width: 40px; }
+                  button {
+                    position: absolute;
+                    top: 12px;
+                    right: 0;
+                    min-width: 32px;
+                    height: 32px;
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    border-radius: 9999px;
+                    background: #deded9;
+                    border: 0;
+                  }
+                  svg { width: 16px; height: 16px; }
+                </style>
+              </head>
+              <body>
+                <div class="search">
+                  <div class="left">
+                    <button type="submit" aria-label="Search">
+                      <svg viewBox="0 0 16 16" aria-hidden="true">
+                        <path fill="#ffffff" d="M1 1h14v14H1z"></path>
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let button_rect = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0xde, 0xde, 0xd9) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("expected positioned button background");
+        let icon_rect = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Image(image) if image.src == "inline-svg-raster" => Some(image.rect),
+                _ => None,
+            })
+            .expect("expected positioned button icon");
+
+        assert!(
+            button_rect.width() >= 32.0,
+            "expected non-zero button width, got {:?}",
+            button_rect
+        );
+        assert!(
+            button_rect.height() >= 32.0,
+            "expected non-zero button height, got {:?}",
+            button_rect
+        );
+        assert!(
+            button_rect.contains_rect(icon_rect),
+            "expected icon {:?} to be inside button {:?}",
+            icon_rect,
+            button_rect
+        );
+    }
+
+    #[test]
+    fn form_textbox_and_submit_button_share_canvas_form_id() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <body>
+                <form id="search-form">
+                  <input name="q" placeholder="Search the web..." value="trees">
+                  <button type="submit" aria-label="Search">
+                    <svg viewBox="0 0 16 16"><path d="M1 1h14v14H1z"></path></svg>
+                  </button>
+                </form>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let input = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Input(input) if input.label == "Search the web..." => Some(input),
+                _ => None,
+            })
+            .expect("expected form textbox");
+        let button = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Button(button) if button.text == "Search" => Some(button),
+                _ => None,
+            })
+            .expect("expected form submit button");
+
+        assert_eq!(input.form_id.as_deref(), Some("search-form"));
+        assert_eq!(button.form_id.as_deref(), Some("search-form"));
+        assert_eq!(button.button_type, "submit");
+    }
+
+    #[test]
+    fn absolute_child_positions_from_padding_box_not_content_box() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .hero {
+                    position: relative;
+                    padding-top: 64px;
+                    width: 400px;
+                    height: 200px;
+                    overflow: hidden;
+                  }
+                  svg {
+                    position: absolute;
+                    top: 0;
+                    left: 0;
+                    width: 100%;
+                    height: 100%;
+                    object-fit: cover;
+                  }
+                </style>
+              </head>
+              <body>
+                <section class="hero">
+                  <picture>
+                    <svg viewBox="0 0 16 16"><path d="M0 0h16v16H0z"></path></svg>
+                  </picture>
+                </section>
+              </body>
+            </html>
+            "##,
+            "file:///tmp/test.html",
+        );
+
+        let image = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Image(image) if image.src == "inline-svg-raster" => Some(image),
+                _ => None,
+            })
+            .expect("expected absolute image");
+
+        assert_eq!(image.rect.top(), 0.0);
+        assert!(
+            (image.rect.width() - 400.0).abs() < 0.1,
+            "expected absolute image to fill the positioned section width, got {:?}",
+            image.rect
+        );
+        assert!(
+            (image.rect.height() - 264.0).abs() < 0.1,
+            "expected absolute image to fill the positioned section padding box, got {:?}",
+            image.rect
+        );
+    }
+
+    #[test]
+    fn document_without_explicit_theme_uses_context_dark_root_class() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let dom = parse_dom_document("<html><body>Dark inferred</body></html>");
+
+        assert_eq!(document_theme_root_classes(&dom, Some(&ctx)), vec!["dark"]);
     }
 
     #[test]
