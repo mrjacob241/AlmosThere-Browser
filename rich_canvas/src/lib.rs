@@ -195,6 +195,7 @@ pub struct ResolvedBoxStyle {
     pub border_color: Color32,
     pub border_radius: u8,
     pub width: Option<f32>,
+    pub width_percent: Option<f32>,
     pub max_width: Option<f32>,
     pub min_width: Option<f32>,
     pub height: Option<CssLength>,
@@ -233,6 +234,7 @@ impl Default for ResolvedBoxStyle {
             border_color: Color32::TRANSPARENT,
             border_radius: 0,
             width: None,
+            width_percent: None,
             max_width: None,
             min_width: None,
             height: None,
@@ -364,6 +366,7 @@ pub struct CanvasGraph {
 pub enum CanvasObject {
     Text(CanvasTextObject),
     Rect(CanvasRectObject),
+    Button(CanvasButtonObject),
     Input(CanvasInputObject),
     Image(CanvasImageObject),
     Svg(CanvasSvgObject),
@@ -403,11 +406,22 @@ pub struct CanvasRectObject {
 }
 
 #[derive(Clone, Debug)]
+pub struct CanvasButtonObject {
+    pub text: String,
+    pub rect: Rect,
+    pub button_type: String,
+    pub form_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct CanvasInputObject {
     pub label: String,
     pub value: String,
+    pub default_value: String,
     pub rect: Rect,
     pub font_size: f32,
+    pub color: Color32,
+    pub form_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1093,6 +1107,8 @@ fn paint_canvas_graph(
     let (canvas_rect, _) = ui.allocate_exact_size(graph_size, Sense::hover());
     let mut painter = ui.painter().with_clip_rect(canvas_rect);
     let mut clip_stack = Vec::new();
+    let mut submitted_forms: Vec<Option<String>> = Vec::new();
+    let mut reset_forms: Vec<Option<String>> = Vec::new();
 
     for (index, object) in graph.objects.iter_mut().enumerate() {
         match object {
@@ -1175,6 +1191,31 @@ fn paint_canvas_graph(
                     egui::StrokeKind::Outside,
                 );
             }
+            CanvasObject::Button(button) => {
+                let rect = canvas_object_rect(canvas_rect.min, button.rect, scale);
+                let response = ui
+                    .interact(
+                        rect,
+                        ui.make_persistent_id(("canvas_graph_button", index)),
+                        Sense::click(),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if response.hovered() {
+                    canvas_response.hovered = Some(HitTarget::Button {
+                        text: button.text.clone(),
+                    });
+                }
+                if response.clicked() {
+                    canvas_response.clicked = Some(HitTarget::Button {
+                        text: button.text.clone(),
+                    });
+                    if button.button_type.eq_ignore_ascii_case("submit") {
+                        submitted_forms.push(button.form_id.clone());
+                    } else if button.button_type.eq_ignore_ascii_case("reset") {
+                        reset_forms.push(button.form_id.clone());
+                    }
+                }
+            }
             CanvasObject::Input(input) => {
                 let rect = canvas_object_rect(canvas_rect.min, input.rect, scale);
                 let mut value = input.value.clone();
@@ -1187,7 +1228,7 @@ fn paint_canvas_graph(
                             input.font_size * scale,
                             browser_regular_family(),
                         ))
-                        .text_color(Color32::WHITE),
+                        .text_color(input.color),
                 );
                 if response.hovered() {
                     canvas_response.hovered = Some(HitTarget::Input {
@@ -1241,6 +1282,60 @@ fn paint_canvas_graph(
                 );
             }
         }
+    }
+    for form_id in reset_forms {
+        reset_inputs_for_form(&mut graph.objects, form_id.as_deref(), canvas_response);
+    }
+    for form_id in submitted_forms {
+        push_submitted_inputs_for_form(&graph.objects, form_id.as_deref(), canvas_response);
+    }
+}
+
+fn reset_inputs_for_form(
+    objects: &mut [CanvasObject],
+    form_id: Option<&str>,
+    canvas_response: &mut BrowserCanvasResponse,
+) {
+    for object in objects {
+        let CanvasObject::Input(input) = object else {
+            continue;
+        };
+        if !canvas_input_belongs_to_form(input, form_id) {
+            continue;
+        }
+        if input.value != input.default_value {
+            input.value = input.default_value.clone();
+            canvas_response.changed_inputs.push(InputChange {
+                label: input.label.clone(),
+                value_len: input.value.chars().count(),
+            });
+        }
+    }
+}
+
+fn push_submitted_inputs_for_form(
+    objects: &[CanvasObject],
+    form_id: Option<&str>,
+    canvas_response: &mut BrowserCanvasResponse,
+) {
+    for object in objects {
+        let CanvasObject::Input(input) = object else {
+            continue;
+        };
+        if canvas_input_belongs_to_form(input, form_id) {
+            canvas_response.submitted_inputs.push(InputSubmit {
+                label: input.label.clone(),
+                value: input.value.clone(),
+            });
+        }
+    }
+}
+
+fn canvas_input_belongs_to_form(input: &CanvasInputObject, form_id: Option<&str>) -> bool {
+    match (form_id, input.form_id.as_deref()) {
+        (Some(expected), Some(actual)) => expected == actual,
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -2848,14 +2943,26 @@ pub fn page_background_color() -> Color32 {
 }
 
 pub fn parse_basic_css(css: &str) -> BrowserStyle {
-    parse_basic_css_inner(css, None)
+    parse_basic_css_inner(css, None, &[])
 }
 
 pub fn parse_basic_css_for_viewport(css: &str, viewport_width: f32) -> BrowserStyle {
-    parse_basic_css_inner(css, Some(viewport_width))
+    parse_basic_css_inner(css, Some(viewport_width), &[])
 }
 
-fn parse_basic_css_inner(css: &str, viewport_width: Option<f32>) -> BrowserStyle {
+pub fn parse_basic_css_for_viewport_with_root_classes(
+    css: &str,
+    viewport_width: f32,
+    root_classes: &[String],
+) -> BrowserStyle {
+    parse_basic_css_inner(css, Some(viewport_width), root_classes)
+}
+
+fn parse_basic_css_inner(
+    css: &str,
+    viewport_width: Option<f32>,
+    root_classes: &[String],
+) -> BrowserStyle {
     let mut style = BrowserStyle::default();
     let css = strip_css_comments(css);
     let css = if let Some(viewport_width) = viewport_width {
@@ -2863,7 +2970,7 @@ fn parse_basic_css_inner(css: &str, viewport_width: Option<f32>) -> BrowserStyle
     } else {
         strip_unsupported_css_at_rule_blocks(&css)
     };
-    style.css_variables = collect_css_custom_properties(&css);
+    style.css_variables = collect_css_custom_properties(&css, root_classes);
     for (order, rule) in css.split('}').enumerate() {
         let Some((selectors, declarations)) = rule.split_once('{') else {
             continue;
@@ -2886,13 +2993,13 @@ fn parse_basic_css_inner(css: &str, viewport_width: Option<f32>) -> BrowserStyle
     style
 }
 
-fn collect_css_custom_properties(css: &str) -> HashMap<String, String> {
+fn collect_css_custom_properties(css: &str, root_classes: &[String]) -> HashMap<String, String> {
     let mut variables = HashMap::new();
     for rule in css.split('}') {
         let Some((selectors, declarations)) = rule.split_once('{') else {
             continue;
         };
-        if !selector_list_contains_root(selectors) {
+        if !selector_list_contains_root(selectors, root_classes) {
             continue;
         }
         for declaration in declarations.split(';') {
@@ -2908,10 +3015,23 @@ fn collect_css_custom_properties(css: &str) -> HashMap<String, String> {
     variables
 }
 
-fn selector_list_contains_root(selectors: &str) -> bool {
+fn selector_list_contains_root(selectors: &str, root_classes: &[String]) -> bool {
     selectors.split(',').any(|selector| {
         let selector = selector.trim();
-        selector == ":root" || selector == "html" || selector == ".dark" || selector == "html.dark"
+        if selector == ":root" || selector == "html" {
+            return true;
+        }
+        if let Some(class_name) = selector.strip_prefix('.') {
+            return root_classes
+                .iter()
+                .any(|root_class| root_class == class_name);
+        }
+        if let Some(class_name) = selector.strip_prefix("html.") {
+            return root_classes
+                .iter()
+                .any(|root_class| root_class == class_name);
+        }
+        false
     })
 }
 
@@ -3670,6 +3790,7 @@ fn normalize_css_selector(selector: &str) -> Option<String> {
         || selector.contains(":before")
         || selector.contains(":after")
         || selector.contains(":not(")
+        || selector_contains_dynamic_pseudo_class(selector)
     {
         return None;
     }
@@ -3697,6 +3818,28 @@ fn normalize_css_selector(selector: &str) -> Option<String> {
     }
     let normalized = normalized.trim().to_owned();
     (!normalized.is_empty()).then_some(normalized)
+}
+
+fn selector_contains_dynamic_pseudo_class(selector: &str) -> bool {
+    [
+        ":active",
+        ":checked",
+        ":disabled",
+        ":enabled",
+        ":focus",
+        ":focus-visible",
+        ":focus-within",
+        ":hover",
+        ":invalid",
+        ":optional",
+        ":placeholder-shown",
+        ":required",
+        ":target",
+        ":valid",
+        ":visited",
+    ]
+    .iter()
+    .any(|pseudo| selector.contains(pseudo))
 }
 
 fn split_selector_once(selector: &str, combinator: char) -> Option<(&str, &str)> {
@@ -4903,6 +5046,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_basic_css_ignores_dynamic_pseudo_classes_instead_of_broadening_them() {
+        let style = parse_basic_css(
+            r#"
+            .button { color: #333333; }
+            .button:hover { background-color: #deded9; }
+            .button:active { color: #ffffff; }
+            .button.force-hover { background-color: #4c4c4c; }
+            "#,
+        );
+        let button = ElementStyleKey {
+            tag: "button".to_owned(),
+            classes: vec!["button".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let forced = ElementStyleKey {
+            tag: "button".to_owned(),
+            classes: vec!["button".to_owned(), "force-hover".to_owned()],
+            ..ElementStyleKey::default()
+        };
+
+        let button_style = computed_box_style(&style, &button);
+        assert_eq!(
+            button_style.color,
+            Some(Color32::from_rgb(0x33, 0x33, 0x33))
+        );
+        assert_eq!(button_style.background, None);
+
+        assert_eq!(
+            computed_box_style(&style, &forced).background,
+            Some(Color32::from_rgb(0x4c, 0x4c, 0x4c))
+        );
+    }
+
+    #[test]
     fn parse_basic_css_carries_grid_template_column_count() {
         let style = parse_basic_css(
             ".counter { display: grid; grid-template-columns: 1fr auto 1fr; } .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }",
@@ -5042,6 +5219,64 @@ mod tests {
         );
         assert_eq!(computed.color, Some(Color32::from_rgb(18, 52, 86)));
         assert_eq!(computed.width, Some(CssLength::Px(180.0)));
+    }
+
+    #[test]
+    fn css_custom_properties_do_not_apply_dark_tokens_without_dark_root() {
+        let style = parse_basic_css(
+            r#"
+            :root {
+                --button-content: #333333;
+            }
+            .dark {
+                --button-content: #ffffff;
+            }
+            button {
+                color: var(--button-content);
+            }
+            "#,
+        );
+        let key = ElementStyleKey {
+            tag: "button".to_owned(),
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &key);
+
+        assert_eq!(computed.color, Some(Color32::from_rgb(0x33, 0x33, 0x33)));
+    }
+
+    #[test]
+    fn css_custom_properties_apply_dark_tokens_for_dark_root() {
+        let style = parse_basic_css_for_viewport_with_root_classes(
+            r#"
+            :root {
+                --button-content: #333333;
+            }
+            .dark {
+                --button-content: #ffffff;
+            }
+            html.dark {
+                --button-background: #222222;
+            }
+            button {
+                color: var(--button-content);
+                background-color: var(--button-background);
+            }
+            "#,
+            1280.0,
+            &["dark".to_owned()],
+        );
+        let key = ElementStyleKey {
+            tag: "button".to_owned(),
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &key);
+
+        assert_eq!(computed.color, Some(Color32::WHITE));
+        assert_eq!(
+            computed.background,
+            Some(Color32::from_rgb(0x22, 0x22, 0x22))
+        );
     }
 
     #[test]
