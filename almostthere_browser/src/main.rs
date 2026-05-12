@@ -9,13 +9,13 @@ use std::{
 
 use eframe::{App, Frame, NativeOptions, egui};
 use rich_canvas::{
-    BrowserCanvas, BrowserDocument, BrowserStyle, CanvasBlock, CanvasClipObject, CanvasGraph,
-    CanvasImageObject, CanvasInputObject, CanvasMediaObject, CanvasObject, CanvasRectObject,
-    CanvasSvgObject, CanvasTextObject, CssAlignItems, CssBoxStyle, CssDisplay, CssEdges,
-    CssFlexDirection, CssJustifyContent, CssLength, CssPosition, CssTextAlign, ElementStyleKey,
-    HitTarget, ImageBlock, InlineSpan, ResolvedBoxStyle, SvgBlock, SvgShape, computed_box_style,
-    configure_browser_fonts, parse_basic_css_for_viewport, parse_inline_box_style,
-    wrap_browser_textboxes,
+    BrowserCanvas, BrowserCanvasResponse, BrowserDocument, BrowserStyle, CanvasBlock,
+    CanvasClipObject, CanvasGraph, CanvasImageObject, CanvasInputObject, CanvasMediaObject,
+    CanvasObject, CanvasRectObject, CanvasSvgObject, CanvasTextObject, CssAlignItems, CssBoxStyle,
+    CssDisplay, CssEdges, CssFlexDirection, CssJustifyContent, CssLength, CssObjectFit,
+    CssPosition, CssTextAlign, ElementStyleKey, HitTarget, ImageBlock, InlineSpan,
+    ResolvedBoxStyle, SvgBlock, SvgShape, computed_box_style, configure_browser_fonts,
+    parse_basic_css_for_viewport, parse_inline_box_style, wrap_browser_textboxes,
 };
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
 
@@ -26,6 +26,8 @@ const DEFAULT_PAGE_PATH: &str = concat!(
 );
 const DEFAULT_URL: &str = "https://latex.vercel.app/elements";
 const BOOKMARKS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bookmarks.txt");
+const DEBUG_EXPORT_DIR: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../target/render_debug_export");
 const DEFAULT_BOOKMARK_TITLE: &str = "AlmostThere Sample Page";
 const DEFAULT_URL_BOOKMARK_TITLE: &str = "HTML5 Test Page";
 const LOCAL_BOOKMARK_TOKEN: &str = "[local]";
@@ -47,13 +49,17 @@ fn main() -> eframe::Result<()> {
 
 struct AlmostThereApp {
     canvas: BrowserCanvas,
+    debug_canvas: BrowserCanvas,
     document: BrowserDocument,
+    current_html: String,
+    render_graph_debug_text: String,
     url_input: String,
     bookmarks: Vec<Bookmark>,
     status: String,
     telemetry: TelemetrySession,
     text_metrics_ready: bool,
     pending_navigation: Option<PendingNavigation>,
+    render_debug: PageRenderDebugState,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,6 +79,21 @@ struct LoadedPageSource {
     source: String,
 }
 
+#[derive(Clone, Debug, Default)]
+struct PageRenderDebugState {
+    open: bool,
+    object_limit: usize,
+    active_tab: DebugPanelTab,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+enum DebugPanelTab {
+    #[default]
+    RenderGraph,
+    CanvasGraph,
+    Html,
+}
+
 impl AlmostThereApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_browser_fonts(&cc.egui_ctx);
@@ -86,25 +107,34 @@ impl AlmostThereApp {
             let _ = save_bookmarks(&bookmarks);
         }
 
-        let (document, status) = match load_url_document(DEFAULT_URL) {
-            Ok(document) => {
-                telemetry.emit(
-                    "navigation.loaded",
-                    &[
-                        ("url", DEFAULT_URL),
-                        ("title", &document.title),
-                        ("blocks", &document.blocks.len().to_string()),
-                    ],
-                );
-                (document, format!("Loaded {DEFAULT_URL}"))
-            }
-            Err(error) => {
-                telemetry.emit(
-                    "navigation.failed",
-                    &[("url", DEFAULT_URL), ("error", &error.to_string())],
-                );
-                (
-                    BrowserDocument {
+        let (document, current_html, render_graph_debug_text, status) =
+            match load_url_source(DEFAULT_URL) {
+                Ok(source) => {
+                    let document =
+                        parse_html_document_with_text_metrics(&source.html, &source.source, None);
+                    let render_graph_debug_text =
+                        parse_render_graph_debug_dump(&source.html, &source.source);
+                    telemetry.emit(
+                        "navigation.loaded",
+                        &[
+                            ("url", DEFAULT_URL),
+                            ("title", &document.title),
+                            ("blocks", &document.blocks.len().to_string()),
+                        ],
+                    );
+                    (
+                        document,
+                        source.html,
+                        render_graph_debug_text,
+                        format!("Loaded {DEFAULT_URL}"),
+                    )
+                }
+                Err(error) => {
+                    telemetry.emit(
+                        "navigation.failed",
+                        &[("url", DEFAULT_URL), ("error", &error.to_string())],
+                    );
+                    let document = BrowserDocument {
                         title: "Load failed".to_owned(),
                         source: DEFAULT_URL.to_owned(),
                         style: Default::default(),
@@ -112,21 +142,35 @@ impl AlmostThereApp {
                         blocks: vec![CanvasBlock::Paragraph {
                             text: format!("Failed to load default page {DEFAULT_URL}: {error}"),
                         }],
-                    },
-                    format!("Failed to load default page {DEFAULT_URL}: {error}"),
-                )
-            }
+                    };
+                    (
+                        document,
+                        String::new(),
+                        String::new(),
+                        format!("Failed to load default page {DEFAULT_URL}: {error}"),
+                    )
+                }
+            };
+
+        let render_debug = PageRenderDebugState {
+            open: false,
+            object_limit: document.canvas_graph.objects.len(),
+            active_tab: DebugPanelTab::RenderGraph,
         };
 
         Self {
             canvas: BrowserCanvas::new(),
+            debug_canvas: BrowserCanvas::new(),
             document,
+            current_html,
+            render_graph_debug_text,
             url_input: DEFAULT_URL.to_owned(),
             bookmarks,
             status,
             telemetry,
             text_metrics_ready: false,
             pending_navigation: None,
+            render_debug,
         }
     }
 
@@ -164,6 +208,9 @@ impl AlmostThereApp {
                 let pending = self.pending_navigation.take().expect("pending navigation");
                 match result {
                     Ok(source) => {
+                        self.current_html = source.html.clone();
+                        self.render_graph_debug_text =
+                            parse_render_graph_debug_dump(&source.html, &source.source);
                         let document = parse_html_document_with_text_metrics(
                             &source.html,
                             &source.source,
@@ -181,6 +228,8 @@ impl AlmostThereApp {
                         self.status = format!("Loaded {}", document.source);
                         self.document = document;
                         self.canvas.scroll_offset = egui::Vec2::ZERO;
+                        self.debug_canvas.scroll_offset = egui::Vec2::ZERO;
+                        self.render_debug.object_limit = self.document.canvas_graph.objects.len();
                         if let Some(fragment) = pending.fragment {
                             self.scroll_to_fragment(&fragment);
                         }
@@ -298,6 +347,869 @@ impl AlmostThereApp {
     fn scroll_to_fragment(&mut self, fragment: &str) {
         self.canvas.scroll_offset.y = estimated_fragment_scroll_y(&self.document, fragment);
     }
+
+    fn debug_canvas_graph(&self) -> CanvasGraph {
+        let mut graph = self.document.canvas_graph.clone();
+        let limit = self.render_debug.object_limit.min(graph.objects.len());
+        graph.objects.truncate(limit);
+        close_truncated_canvas_clips(&mut graph.objects);
+        graph
+    }
+}
+
+fn close_truncated_canvas_clips(objects: &mut Vec<CanvasObject>) {
+    let mut open_clips = 0usize;
+    for object in objects.iter() {
+        match object {
+            CanvasObject::ClipStart(_) => open_clips += 1,
+            CanvasObject::ClipEnd => {
+                open_clips = open_clips.saturating_sub(1);
+            }
+            CanvasObject::Text(_)
+            | CanvasObject::Rect(_)
+            | CanvasObject::Input(_)
+            | CanvasObject::Image(_)
+            | CanvasObject::Svg(_)
+            | CanvasObject::Media(_) => {}
+        }
+    }
+    objects.extend((0..open_clips).map(|_| CanvasObject::ClipEnd));
+}
+
+fn canvas_graph_debug_string(graph: &CanvasGraph) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "CanvasGraph viewport={:.1}x{:.1} objects={}",
+        graph.viewport.x,
+        graph.viewport.y,
+        graph.objects.len()
+    );
+    for (index, object) in graph.objects.iter().enumerate() {
+        match object {
+            CanvasObject::Text(text) => {
+                let _ = writeln!(
+                    out,
+                    "{index:04} Text rect={} size={:.1} bold={} italic={} underline={} href={} text=\"{}\"",
+                    rect_debug(text.rect),
+                    text.font_size,
+                    text.font_weight_bold,
+                    text.font_style_italic,
+                    text.text_decoration_underline,
+                    text.href.as_deref().unwrap_or(""),
+                    shorten_debug_text(&text.text)
+                );
+            }
+            CanvasObject::Rect(rect) => {
+                let _ = writeln!(
+                    out,
+                    "{index:04} Rect rect={} fill={} border={} border_width={:.1} radius={}",
+                    rect_debug(rect.rect),
+                    color_debug(rect.fill),
+                    color_debug(rect.border_color),
+                    rect.border_width,
+                    rect.border_radius
+                );
+            }
+            CanvasObject::Input(input) => {
+                let _ = writeln!(
+                    out,
+                    "{index:04} Input rect={} font_size={:.1} label=\"{}\" value_len={}",
+                    rect_debug(input.rect),
+                    input.font_size,
+                    shorten_debug_text(&input.label),
+                    input.value.chars().count()
+                );
+            }
+            CanvasObject::Image(image) => {
+                let _ = writeln!(
+                    out,
+                    "{index:04} Image rect={} fit={:?} src=\"{}\" alt=\"{}\" intrinsic={:.1}x{:.1}",
+                    rect_debug(image.rect),
+                    image.object_fit,
+                    shorten_debug_text(&image.src),
+                    shorten_debug_text(&image.alt),
+                    image.image.size.x,
+                    image.image.size.y
+                );
+            }
+            CanvasObject::Svg(svg) => {
+                let _ = writeln!(
+                    out,
+                    "{index:04} Svg rect={} intrinsic={:.1}x{:.1} shapes={}",
+                    rect_debug(svg.rect),
+                    svg.svg.size.x,
+                    svg.svg.size.y,
+                    svg.svg.shapes.len()
+                );
+            }
+            CanvasObject::Media(media) => {
+                let _ = writeln!(
+                    out,
+                    "{index:04} Media rect={} label=\"{}\"",
+                    rect_debug(media.rect),
+                    shorten_debug_text(&media.label)
+                );
+            }
+            CanvasObject::ClipStart(clip) => {
+                let _ = writeln!(
+                    out,
+                    "{index:04} ClipStart rect={} radius={}",
+                    rect_debug(clip.rect),
+                    clip.border_radius
+                );
+            }
+            CanvasObject::ClipEnd => {
+                let _ = writeln!(out, "{index:04} ClipEnd");
+            }
+        }
+    }
+    out
+}
+
+fn rect_debug(rect: egui::Rect) -> String {
+    format!(
+        "({:.1},{:.1}) {:.1}x{:.1}",
+        rect.left(),
+        rect.top(),
+        rect.width(),
+        rect.height()
+    )
+}
+
+fn paint_alternating_debug_text(ui: &mut egui::Ui, text: &str) {
+    paint_alternating_debug_text_with_canvas_thumbs(ui, text, None);
+}
+
+fn paint_alternating_debug_text_with_canvas_thumbs(
+    ui: &mut egui::Ui,
+    text: &str,
+    canvas_graph: Option<&CanvasGraph>,
+) {
+    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+    let row_height = ui.text_style_height(&egui::TextStyle::Monospace).max(18.0);
+    let char_width = ui.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap("0".to_owned(), font_id.clone(), egui::Color32::WHITE)
+            .size()
+            .x
+            .max(1.0)
+    });
+    let text_color = ui.visuals().text_color();
+    let even_fill = egui::Color32::from_rgb(248, 249, 251);
+    let odd_fill = egui::Color32::from_rgb(237, 240, 244);
+    let width = ui.available_width().max(1.0);
+    let mut in_quote = false;
+
+    for (index, line) in text.lines().enumerate() {
+        let thumb = canvas_graph.and_then(|graph| debug_line_thumbnail(graph, line));
+        let thumb_slot_width = if thumb.is_some() { 42.0 } else { 0.0 };
+        let text_width = (width - 12.0 - thumb_slot_width).max(1.0);
+        let chars_per_line = (text_width / char_width).floor().max(1.0) as usize;
+        let visual_lines = wrap_debug_line(line, chars_per_line);
+        let text_height = row_height * visual_lines.len().max(1) as f32;
+        let height = if thumb.is_some() {
+            text_height.max(38.0)
+        } else {
+            text_height
+        };
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+        let fill = if index % 2 == 0 { even_fill } else { odd_fill };
+        ui.painter().rect_filled(rect, 0.0, fill);
+        response.context_menu(|ui| {
+            if ui.button("Copy Line").clicked() {
+                ui.ctx().copy_text(line.to_owned());
+                ui.close();
+            }
+        });
+        for (line_index, visual_line) in visual_lines.iter().enumerate() {
+            let display_line = debug_line_with_color_spacing(visual_line);
+            let text_pos =
+                rect.left_top() + egui::vec2(6.0, row_height * (line_index as f32 + 0.5));
+            paint_debug_colored_line(
+                ui,
+                &display_line,
+                text_pos,
+                &font_id,
+                text_color,
+                char_width,
+                &mut in_quote,
+            );
+            paint_debug_hex_swatches(
+                ui,
+                &display_line,
+                text_pos,
+                row_height,
+                char_width,
+                font_id.size * 0.2,
+            );
+        }
+        if let Some(thumb) = thumb {
+            paint_debug_line_thumbnail(ui, rect, thumb);
+        }
+    }
+
+    if text.is_empty() {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 0.0, even_fill);
+    }
+}
+
+enum DebugLineThumbnail<'a> {
+    Image {
+        index: usize,
+        src: &'a str,
+        image: &'a ImageBlock,
+    },
+    Svg(&'a SvgBlock),
+}
+
+fn debug_line_thumbnail<'a>(graph: &'a CanvasGraph, line: &str) -> Option<DebugLineThumbnail<'a>> {
+    let index = parse_canvas_debug_line_index(line)?;
+    match graph.objects.get(index)? {
+        CanvasObject::Image(image) => Some(DebugLineThumbnail::Image {
+            index,
+            src: &image.src,
+            image: &image.image,
+        }),
+        CanvasObject::Svg(svg) => Some(DebugLineThumbnail::Svg(&svg.svg)),
+        _ => None,
+    }
+}
+
+fn parse_canvas_debug_line_index(line: &str) -> Option<usize> {
+    let prefix = line.get(0..4)?;
+    if !prefix.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    if line.as_bytes().get(4).is_some_and(|byte| *byte != b' ') {
+        return None;
+    }
+    prefix.parse().ok()
+}
+
+fn paint_debug_line_thumbnail(
+    ui: &mut egui::Ui,
+    row_rect: egui::Rect,
+    thumb: DebugLineThumbnail<'_>,
+) {
+    let size = egui::vec2(34.0, 28.0);
+    let rect = egui::Rect::from_center_size(
+        egui::pos2(row_rect.right() - 24.0, row_rect.center().y),
+        size,
+    );
+    ui.painter().rect_filled(
+        rect.expand(2.0),
+        3.0,
+        egui::Color32::from_rgb(225, 229, 235),
+    );
+    ui.painter().rect_stroke(
+        rect.expand(2.0),
+        3.0,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 158, 168)),
+        egui::StrokeKind::Outside,
+    );
+
+    match thumb {
+        DebugLineThumbnail::Image { index, src, image } => {
+            let texture = ui.ctx().load_texture(
+                format!("render-debug-thumb-{index}-{src}"),
+                image.color_image.clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            let image_rect = fit_rect_into(image.size, rect);
+            ui.painter().image(
+                texture.id(),
+                image_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+        DebugLineThumbnail::Svg(svg) => {
+            let svg_rect = fit_rect_into(svg.size, rect);
+            svg.paint_in_rect(ui, svg_rect);
+        }
+    }
+}
+
+fn fit_rect_into(content_size: egui::Vec2, bounds: egui::Rect) -> egui::Rect {
+    let content_size = content_size.max(egui::Vec2::splat(1.0));
+    let scale = (bounds.width() / content_size.x)
+        .min(bounds.height() / content_size.y)
+        .min(1.0)
+        .max(0.01);
+    egui::Rect::from_center_size(bounds.center(), content_size * scale)
+}
+
+fn paint_debug_colored_line(
+    ui: &mut egui::Ui,
+    line: &str,
+    text_pos: egui::Pos2,
+    font_id: &egui::FontId,
+    default_color: egui::Color32,
+    char_width: f32,
+    in_quote: &mut bool,
+) {
+    let quote_color = egui::Color32::from_rgb(190, 35, 45);
+    let mut segment_start = 0usize;
+    let mut segment_start_char = 0usize;
+
+    for (byte_index, character) in line.char_indices() {
+        if character != '"' {
+            continue;
+        }
+
+        if *in_quote {
+            let end = byte_index + character.len_utf8();
+            paint_debug_line_segment(
+                ui,
+                &line[segment_start..end],
+                text_pos,
+                font_id,
+                quote_color,
+                segment_start_char,
+                char_width,
+            );
+            segment_start = end;
+            segment_start_char = line[..end].chars().count();
+            *in_quote = false;
+        } else {
+            paint_debug_line_segment(
+                ui,
+                &line[segment_start..byte_index],
+                text_pos,
+                font_id,
+                default_color,
+                segment_start_char,
+                char_width,
+            );
+            segment_start = byte_index;
+            segment_start_char = line[..byte_index].chars().count();
+            *in_quote = true;
+        }
+    }
+
+    if segment_start < line.len() {
+        paint_debug_line_segment(
+            ui,
+            &line[segment_start..],
+            text_pos,
+            font_id,
+            if *in_quote {
+                quote_color
+            } else {
+                default_color
+            },
+            segment_start_char,
+            char_width,
+        );
+    }
+}
+
+fn paint_debug_line_segment(
+    ui: &mut egui::Ui,
+    segment: &str,
+    text_pos: egui::Pos2,
+    font_id: &egui::FontId,
+    color: egui::Color32,
+    start_char: usize,
+    char_width: f32,
+) {
+    if segment.is_empty() {
+        return;
+    }
+    ui.painter().text(
+        text_pos + egui::vec2(start_char as f32 * char_width, 0.0),
+        egui::Align2::LEFT_CENTER,
+        segment,
+        font_id.clone(),
+        color,
+    );
+}
+
+fn wrap_debug_line(line: &str, chars_per_line: usize) -> Vec<String> {
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut wrapped = Vec::new();
+    let mut current = String::new();
+    for character in line.chars() {
+        if current.chars().count() >= chars_per_line {
+            wrapped.push(current);
+            current = String::new();
+        }
+        current.push(character);
+    }
+    if !current.is_empty() {
+        wrapped.push(current);
+    }
+    wrapped
+}
+
+fn debug_line_with_color_spacing(line: &str) -> String {
+    let mut out = String::new();
+    let mut byte_index = 0usize;
+
+    while byte_index < line.len() {
+        let Some(relative_index) = line[byte_index..].find('#') else {
+            out.push_str(&line[byte_index..]);
+            break;
+        };
+        let start = byte_index + relative_index;
+        out.push_str(&line[byte_index..start]);
+        let candidate = &line[start..];
+        let Some((hex_len, _)) = parse_debug_hex_color(candidate) else {
+            out.push('#');
+            byte_index = start + 1;
+            continue;
+        };
+
+        out.push_str(&line[start..start + hex_len]);
+        out.push(' ');
+        byte_index = start + hex_len;
+    }
+
+    out
+}
+
+fn paint_debug_hex_swatches(
+    ui: &mut egui::Ui,
+    line: &str,
+    text_pos: egui::Pos2,
+    row_height: f32,
+    char_width: f32,
+    swatch_margin: f32,
+) {
+    let swatch_height = (row_height - 9.0).clamp(6.0, 11.0);
+    let swatch_width = swatch_height * 0.75;
+    let mut byte_index = 0usize;
+
+    while let Some(relative_index) = line[byte_index..].find('#') {
+        let start = byte_index + relative_index;
+        let candidate = &line[start..];
+        let Some((hex_len, color)) = parse_debug_hex_color(candidate) else {
+            byte_index = start + 1;
+            continue;
+        };
+
+        let before_chars = line[..start].chars().count() as f32;
+        let token_chars = line[start..start + hex_len].chars().count() as f32;
+        let left = text_pos.x + (before_chars + token_chars) * char_width + swatch_margin;
+        let top = text_pos.y - swatch_height * 0.5;
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(left, top),
+            egui::vec2(swatch_width, swatch_height),
+        );
+        ui.painter().rect_filled(rect, 2.0, color);
+        ui.painter().rect_stroke(
+            rect,
+            2.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 96, 104)),
+            egui::StrokeKind::Outside,
+        );
+
+        byte_index = start + hex_len;
+    }
+}
+
+fn parse_debug_hex_color(candidate: &str) -> Option<(usize, egui::Color32)> {
+    let hex_digits: String = candidate
+        .chars()
+        .skip(1)
+        .take_while(|character| character.is_ascii_hexdigit())
+        .take(8)
+        .collect();
+    let len = hex_digits.len();
+    if !matches!(len, 3 | 4 | 6 | 8) {
+        return None;
+    }
+
+    let next = candidate.chars().nth(len + 1);
+    if next.is_some_and(|character| character.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let parse_pair = |value: &str| u8::from_str_radix(value, 16).ok();
+    let double_digit = |character: char| -> Option<u8> {
+        let mut value = String::new();
+        value.push(character);
+        value.push(character);
+        parse_pair(&value)
+    };
+
+    let color = match len {
+        3 | 4 => {
+            let mut chars = hex_digits.chars();
+            let r = double_digit(chars.next()?)?;
+            let g = double_digit(chars.next()?)?;
+            let b = double_digit(chars.next()?)?;
+            let a = if len == 4 {
+                double_digit(chars.next()?)?
+            } else {
+                255
+            };
+            egui::Color32::from_rgba_unmultiplied(r, g, b, a)
+        }
+        6 | 8 => {
+            let r = parse_pair(&hex_digits[0..2])?;
+            let g = parse_pair(&hex_digits[2..4])?;
+            let b = parse_pair(&hex_digits[4..6])?;
+            let a = if len == 8 {
+                parse_pair(&hex_digits[6..8])?
+            } else {
+                255
+            };
+            egui::Color32::from_rgba_unmultiplied(r, g, b, a)
+        }
+        _ => return None,
+    };
+
+    Some((len + 1, color))
+}
+
+fn export_render_debug_steps(graph: &CanvasGraph) -> io::Result<usize> {
+    let output_dir = Path::new(DEBUG_EXPORT_DIR);
+    if output_dir.exists() {
+        fs::remove_dir_all(output_dir)?;
+    }
+    fs::create_dir_all(output_dir)?;
+
+    for object_limit in 0..=graph.objects.len() {
+        let mut frame_graph = graph.clone();
+        frame_graph.objects.truncate(object_limit);
+        close_truncated_canvas_clips(&mut frame_graph.objects);
+        let image = rasterize_canvas_graph_debug_frame(&frame_graph);
+        let path = output_dir.join(format!("render_debug_{object_limit:04}.png"));
+        image.save(&path).map_err(io::Error::other)?;
+    }
+
+    Ok(graph.objects.len() + 1)
+}
+
+fn rasterize_canvas_graph_debug_frame(graph: &CanvasGraph) -> image::RgbaImage {
+    let width = graph.viewport.x.ceil().max(1.0) as u32;
+    let height = graph.viewport.y.ceil().max(1.0) as u32;
+    let mut image = image::RgbaImage::from_pixel(width, height, image::Rgba([255, 255, 255, 255]));
+    let canvas =
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width as f32, height as f32));
+    let mut clip_stack = Vec::new();
+    let mut clip = canvas;
+
+    for object in &graph.objects {
+        match object {
+            CanvasObject::ClipStart(clip_object) => {
+                clip_stack.push(clip);
+                clip = clip.intersect(clip_object.rect);
+            }
+            CanvasObject::ClipEnd => {
+                clip = clip_stack.pop().unwrap_or(canvas);
+            }
+            CanvasObject::Rect(rect) => draw_canvas_rect(&mut image, rect, clip),
+            CanvasObject::Input(input) => draw_canvas_input(&mut image, input, clip),
+            CanvasObject::Image(canvas_image) => draw_canvas_image(&mut image, canvas_image, clip),
+            CanvasObject::Svg(svg) => draw_canvas_svg(&mut image, svg, clip),
+            CanvasObject::Media(media) => draw_canvas_media(&mut image, media, clip),
+            CanvasObject::Text(text) => draw_canvas_text_placeholder(&mut image, text, clip),
+        }
+    }
+
+    image
+}
+
+fn draw_canvas_rect(image: &mut image::RgbaImage, rect: &CanvasRectObject, clip: egui::Rect) {
+    draw_filled_rect(image, rect.rect, rect.fill, clip);
+    if rect.border_width > 0.0 {
+        draw_rect_border(image, rect.rect, rect.border_color, rect.border_width, clip);
+    }
+}
+
+fn draw_canvas_input(image: &mut image::RgbaImage, input: &CanvasInputObject, clip: egui::Rect) {
+    draw_filled_rect(image, input.rect, egui::Color32::WHITE, clip);
+    draw_rect_border(
+        image,
+        input.rect,
+        egui::Color32::from_rgb(170, 180, 190),
+        1.0,
+        clip,
+    );
+    draw_text_marker(image, input.rect.shrink(4.0), input.font_size, clip);
+}
+
+fn draw_canvas_image(
+    image: &mut image::RgbaImage,
+    canvas_image: &CanvasImageObject,
+    clip: egui::Rect,
+) {
+    let src_size = canvas_image.image.color_image.size;
+    if src_size[0] == 0 || src_size[1] == 0 || canvas_image.image.color_image.pixels.is_empty() {
+        draw_canvas_media(
+            image,
+            &CanvasMediaObject {
+                rect: canvas_image.rect,
+                label: canvas_image.alt.clone(),
+            },
+            clip,
+        );
+        return;
+    }
+
+    let dest = canvas_image.rect.intersect(clip);
+    let min_x = dest.left().floor().max(0.0) as u32;
+    let min_y = dest.top().floor().max(0.0) as u32;
+    let max_x = dest.right().ceil().min(image.width() as f32) as u32;
+    let max_y = dest.bottom().ceil().min(image.height() as f32) as u32;
+    if min_x >= max_x || min_y >= max_y {
+        return;
+    }
+
+    let uv = match canvas_image.object_fit {
+        CssObjectFit::Cover => {
+            cover_debug_image_uv(canvas_image.image.size, canvas_image.rect.size())
+        }
+        CssObjectFit::Contain | CssObjectFit::Fill => {
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0))
+        }
+    };
+    let dest_width = canvas_image.rect.width().max(1.0);
+    let dest_height = canvas_image.rect.height().max(1.0);
+
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            let tx = ((x as f32 + 0.5 - canvas_image.rect.left()) / dest_width).clamp(0.0, 1.0);
+            let ty = ((y as f32 + 0.5 - canvas_image.rect.top()) / dest_height).clamp(0.0, 1.0);
+            let sx = (uv.left() + uv.width() * tx) * (src_size[0].saturating_sub(1) as f32);
+            let sy = (uv.top() + uv.height() * ty) * (src_size[1].saturating_sub(1) as f32);
+            let source_index = sy.round() as usize * src_size[0] + sx.round() as usize;
+            if let Some(color) = canvas_image.image.color_image.pixels.get(source_index) {
+                image.put_pixel(x, y, color_to_rgba(*color));
+            }
+        }
+    }
+}
+
+fn draw_canvas_svg(image: &mut image::RgbaImage, svg: &CanvasSvgObject, clip: egui::Rect) {
+    let scale_x = svg.rect.width() / svg.svg.size.x.max(1.0);
+    let scale_y = svg.rect.height() / svg.svg.size.y.max(1.0);
+    for shape in &svg.svg.shapes {
+        match shape {
+            SvgShape::Rect {
+                x,
+                y,
+                width,
+                height,
+                fill,
+            } => {
+                let rect = egui::Rect::from_min_size(
+                    egui::Pos2::new(svg.rect.left() + x * scale_x, svg.rect.top() + y * scale_y),
+                    egui::vec2(width * scale_x, height * scale_y),
+                );
+                draw_filled_rect(image, rect, *fill, clip);
+            }
+            SvgShape::Circle {
+                cx,
+                cy,
+                r,
+                fill,
+                stroke,
+                stroke_width,
+            } => {
+                let center = egui::Pos2::new(
+                    svg.rect.left() + cx * scale_x,
+                    svg.rect.top() + cy * scale_y,
+                );
+                draw_filled_circle(image, center, r * scale_x.min(scale_y), *fill, clip);
+                if let Some(stroke) = stroke {
+                    let border_rect = egui::Rect::from_center_size(
+                        center,
+                        egui::vec2(r * 2.0 * scale_x, r * 2.0 * scale_y),
+                    );
+                    draw_rect_border(image, border_rect, *stroke, *stroke_width, clip);
+                }
+            }
+            SvgShape::PathFallback { fill } => {
+                draw_filled_circle(
+                    image,
+                    svg.rect.center(),
+                    svg.rect.width().min(svg.rect.height()) * 0.14,
+                    *fill,
+                    clip,
+                );
+            }
+        }
+    }
+}
+
+fn draw_canvas_media(image: &mut image::RgbaImage, media: &CanvasMediaObject, clip: egui::Rect) {
+    draw_filled_rect(
+        image,
+        media.rect,
+        egui::Color32::from_rgb(238, 241, 245),
+        clip,
+    );
+    draw_rect_border(
+        image,
+        media.rect,
+        egui::Color32::from_rgb(195, 205, 215),
+        1.0,
+        clip,
+    );
+    draw_text_marker(image, media.rect.shrink(8.0), 14.0, clip);
+}
+
+fn draw_canvas_text_placeholder(
+    image: &mut image::RgbaImage,
+    text: &CanvasTextObject,
+    clip: egui::Rect,
+) {
+    if text.text_background != egui::Color32::TRANSPARENT {
+        draw_filled_rect(image, text.rect, text.text_background, clip);
+    }
+    draw_text_marker(image, text.rect, text.font_size, clip);
+}
+
+fn draw_text_marker(
+    image: &mut image::RgbaImage,
+    rect: egui::Rect,
+    font_size: f32,
+    clip: egui::Rect,
+) {
+    let marker_height = (font_size * 0.12).round().clamp(1.0, 3.0);
+    let marker_top = rect.center().y - marker_height * 0.5;
+    let marker = egui::Rect::from_min_max(
+        egui::Pos2::new(rect.left(), marker_top),
+        egui::Pos2::new(rect.right(), marker_top + marker_height),
+    );
+    draw_filled_rect(image, marker, egui::Color32::from_rgb(45, 50, 58), clip);
+}
+
+fn draw_filled_rect(
+    image: &mut image::RgbaImage,
+    rect: egui::Rect,
+    color: egui::Color32,
+    clip: egui::Rect,
+) {
+    if color == egui::Color32::TRANSPARENT {
+        return;
+    }
+    let rect = rect.intersect(clip);
+    let min_x = rect.left().floor().max(0.0) as u32;
+    let min_y = rect.top().floor().max(0.0) as u32;
+    let max_x = rect.right().ceil().min(image.width() as f32) as u32;
+    let max_y = rect.bottom().ceil().min(image.height() as f32) as u32;
+    let color = color_to_rgba(color);
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            image.put_pixel(x, y, color);
+        }
+    }
+}
+
+fn draw_rect_border(
+    image: &mut image::RgbaImage,
+    rect: egui::Rect,
+    color: egui::Color32,
+    width: f32,
+    clip: egui::Rect,
+) {
+    if color == egui::Color32::TRANSPARENT || width <= 0.0 {
+        return;
+    }
+    let width = width.ceil().max(1.0);
+    draw_filled_rect(
+        image,
+        egui::Rect::from_min_max(
+            rect.left_top(),
+            egui::Pos2::new(rect.right(), rect.top() + width),
+        ),
+        color,
+        clip,
+    );
+    draw_filled_rect(
+        image,
+        egui::Rect::from_min_max(
+            egui::Pos2::new(rect.left(), rect.bottom() - width),
+            rect.right_bottom(),
+        ),
+        color,
+        clip,
+    );
+    draw_filled_rect(
+        image,
+        egui::Rect::from_min_max(
+            rect.left_top(),
+            egui::Pos2::new(rect.left() + width, rect.bottom()),
+        ),
+        color,
+        clip,
+    );
+    draw_filled_rect(
+        image,
+        egui::Rect::from_min_max(
+            egui::Pos2::new(rect.right() - width, rect.top()),
+            rect.right_bottom(),
+        ),
+        color,
+        clip,
+    );
+}
+
+fn draw_filled_circle(
+    image: &mut image::RgbaImage,
+    center: egui::Pos2,
+    radius: f32,
+    color: egui::Color32,
+    clip: egui::Rect,
+) {
+    if color == egui::Color32::TRANSPARENT || radius <= 0.0 {
+        return;
+    }
+    let bounds =
+        egui::Rect::from_center_size(center, egui::Vec2::splat(radius * 2.0)).intersect(clip);
+    let min_x = bounds.left().floor().max(0.0) as u32;
+    let min_y = bounds.top().floor().max(0.0) as u32;
+    let max_x = bounds.right().ceil().min(image.width() as f32) as u32;
+    let max_y = bounds.bottom().ceil().min(image.height() as f32) as u32;
+    let radius_sq = radius * radius;
+    let color = color_to_rgba(color);
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            let dx = x as f32 + 0.5 - center.x;
+            let dy = y as f32 + 0.5 - center.y;
+            if dx * dx + dy * dy <= radius_sq {
+                image.put_pixel(x, y, color);
+            }
+        }
+    }
+}
+
+fn cover_debug_image_uv(source_size: egui::Vec2, target_size: egui::Vec2) -> egui::Rect {
+    let source_size = source_size.max(egui::Vec2::splat(1.0));
+    let target_size = target_size.max(egui::Vec2::splat(1.0));
+    let source_ratio = source_size.x / source_size.y;
+    let target_ratio = target_size.x / target_size.y;
+    if source_ratio > target_ratio {
+        let visible_width = target_ratio / source_ratio;
+        let left = (1.0 - visible_width) * 0.5;
+        egui::Rect::from_min_max(
+            egui::Pos2::new(left, 0.0),
+            egui::Pos2::new(left + visible_width, 1.0),
+        )
+    } else {
+        let visible_height = source_ratio / target_ratio;
+        let top = (1.0 - visible_height) * 0.5;
+        egui::Rect::from_min_max(
+            egui::Pos2::new(0.0, top),
+            egui::Pos2::new(1.0, top + visible_height),
+        )
+    }
+}
+
+fn color_to_rgba(color: egui::Color32) -> image::Rgba<u8> {
+    image::Rgba([color.r(), color.g(), color.b(), color.a()])
 }
 
 fn input_to_path(input: &str) -> PathBuf {
@@ -417,6 +1329,11 @@ impl App for AlmostThereApp {
         if !self.text_metrics_ready {
             if let Ok(document) = load_url_document_with_text_metrics(&self.url_input, ctx) {
                 self.document = document;
+                self.render_debug.object_limit = self.document.canvas_graph.objects.len();
+                if !self.current_html.is_empty() {
+                    self.render_graph_debug_text =
+                        parse_render_graph_debug_dump(&self.current_html, &self.document.source);
+                }
             }
             self.text_metrics_ready = true;
         }
@@ -433,6 +1350,17 @@ impl App for AlmostThereApp {
                 ui.add_enabled(false, egui::Button::new("Forward"));
                 if ui.button("Reload").clicked() {
                     self.load_current_input(ctx);
+                }
+                let debug_label = if self.render_debug.open {
+                    "Close Render Debug"
+                } else {
+                    "Render Debug"
+                };
+                if ui.button(debug_label).clicked() {
+                    self.render_debug.open = !self.render_debug.open;
+                    if self.render_debug.open {
+                        self.render_debug.object_limit = self.document.canvas_graph.objects.len();
+                    }
                 }
                 if self.pending_navigation.is_some() {
                     ui.add(egui::Spinner::new().size(16.0));
@@ -485,10 +1413,130 @@ impl App for AlmostThereApp {
             });
         });
 
+        if self.render_debug.open {
+            egui::SidePanel::right("render_debug_inspector")
+                .resizable(true)
+                .default_width(380.0)
+                .width_range(260.0..=720.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.render_debug.active_tab,
+                            DebugPanelTab::RenderGraph,
+                            "RenderGraph",
+                        );
+                        ui.selectable_value(
+                            &mut self.render_debug.active_tab,
+                            DebugPanelTab::CanvasGraph,
+                            "CanvasGraph",
+                        );
+                        ui.selectable_value(
+                            &mut self.render_debug.active_tab,
+                            DebugPanelTab::Html,
+                            "HTML",
+                        );
+                    });
+                    ui.separator();
+
+                    let text = match self.render_debug.active_tab {
+                        DebugPanelTab::RenderGraph => self.render_graph_debug_text.clone(),
+                        DebugPanelTab::CanvasGraph => {
+                            canvas_graph_debug_string(&self.document.canvas_graph)
+                        }
+                        DebugPanelTab::Html => self.current_html.clone(),
+                    };
+
+                    egui::ScrollArea::both()
+                        .id_salt(("render_debug_text", self.render_debug.active_tab))
+                        .auto_shrink(false)
+                        .show(ui, |ui| {
+                            if self.render_debug.active_tab == DebugPanelTab::CanvasGraph {
+                                paint_alternating_debug_text_with_canvas_thumbs(
+                                    ui,
+                                    &text,
+                                    Some(&self.document.canvas_graph),
+                                );
+                            } else {
+                                paint_alternating_debug_text(ui, &text);
+                            }
+                        });
+                });
+        }
+
+        let central_frame = if self.render_debug.open {
+            egui::Frame::new()
+                .fill(self.document.style.page_background)
+                .inner_margin(egui::Margin::same(0))
+        } else {
+            egui::Frame::new().fill(self.document.style.page_background)
+        };
+
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(self.document.style.page_background))
+            .frame(central_frame)
             .show(ctx, |ui| {
-                let response = self.canvas.ui(ui, &mut self.document);
+                let response = if self.render_debug.open {
+                    ui.horizontal(|ui| {
+                        ui.label("RenderGraph -> CanvasGraph");
+                        ui.separator();
+                        ui.label(format!(
+                            "{} / {} canvas objects",
+                            self.render_debug.object_limit,
+                            self.document.canvas_graph.objects.len()
+                        ));
+                        ui.separator();
+                        if ui.button("Export Debug").clicked() {
+                            match export_render_debug_steps(&self.document.canvas_graph) {
+                                Ok(count) => {
+                                    self.status = format!(
+                                        "Exported {count} debug frames to {}",
+                                        Path::new(DEBUG_EXPORT_DIR).display()
+                                    );
+                                }
+                                Err(error) => {
+                                    self.status = format!("Debug export failed: {error}");
+                                }
+                            }
+                        }
+                        ui.separator();
+                        if let Some(pointer) = ui.ctx().pointer_hover_pos() {
+                            ui.label(format!("Mouse x={:.0} y={:.0}", pointer.x, pointer.y));
+                        } else {
+                            ui.label("Mouse outside window");
+                        }
+                    });
+                    let max_objects = self.document.canvas_graph.objects.len();
+                    ui.scope(|ui| {
+                        let slider_margin = 8.0;
+                        let slider_width = (ui.available_width() - slider_margin * 2.0).max(280.0);
+                        ui.spacing_mut().slider_width = slider_width;
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.horizontal(|ui| {
+                            ui.add_space(slider_margin);
+                            ui.add_sized(
+                                [slider_width, 32.0],
+                                egui::Slider::new(
+                                    &mut self.render_debug.object_limit,
+                                    0..=max_objects,
+                                )
+                                .show_value(false),
+                            );
+                            ui.add_space(slider_margin);
+                        });
+                    });
+                    self.render_debug.object_limit =
+                        self.render_debug.object_limit.min(max_objects);
+                    ui.separator();
+
+                    let mut debug_graph = self.debug_canvas_graph();
+                    let _ = self.debug_canvas.canvas_graph_ui(
+                        ui,
+                        &self.document.style,
+                        &mut debug_graph,
+                    );
+                    BrowserCanvasResponse::default()
+                } else {
+                    self.canvas.ui(ui, &mut self.document)
+                };
                 for input_change in &response.changed_inputs {
                     self.telemetry.emit(
                         "input.changed",
@@ -1556,6 +2604,18 @@ fn apply_css_box_style(
     if let Some(margin) = source.margin {
         target.margin = margin;
     }
+    if let Some(auto) = source.margin_auto.top {
+        target.margin_auto.top = auto;
+    }
+    if let Some(auto) = source.margin_auto.right {
+        target.margin_auto.right = auto;
+    }
+    if let Some(auto) = source.margin_auto.bottom {
+        target.margin_auto.bottom = auto;
+    }
+    if let Some(auto) = source.margin_auto.left {
+        target.margin_auto.left = auto;
+    }
     if let Some(margin_top) = source.margin_top {
         target.margin.top = margin_top;
     }
@@ -1593,22 +2653,29 @@ fn apply_css_box_style(
         target.border_radius = radius;
     }
     if let Some(width) = source.width {
-        target.width = Some(resolve_css_length(width, parent_width));
+        target.width = resolve_css_width(width, parent_width);
     }
     if let Some(max_width) = source.max_width {
         target.max_width = match max_width {
+            CssLength::Auto => None,
             CssLength::Percent(percent) if percent >= 99.0 => None,
             _ => Some(resolve_css_length(max_width, parent_width)),
         };
     }
     if let Some(min_width) = source.min_width {
-        target.min_width = Some(resolve_css_length(min_width, parent_width));
+        target.min_width = resolve_optional_css_length(min_width, parent_width);
     }
     if let Some(height) = source.height {
-        target.height = Some(height);
+        target.height = match height {
+            CssLength::Auto => None,
+            _ => Some(height),
+        };
     }
     if let Some(min_height) = source.min_height {
-        target.min_height = Some(min_height);
+        target.min_height = match min_height {
+            CssLength::Auto => None,
+            _ => Some(min_height),
+        };
     }
     if let Some(font_size) = source.font_size {
         target.font_size = font_size;
@@ -1655,6 +2722,9 @@ fn apply_css_box_style(
     if let Some(position) = source.position {
         target.position = position;
     }
+    if let Some(z_index) = source.z_index {
+        target.z_index = Some(z_index);
+    }
     if let Some(inset) = source.inset {
         target.inset = Some(inset);
     }
@@ -1677,8 +2747,24 @@ fn apply_css_box_style(
 
 fn resolve_css_length(length: CssLength, parent_width: f32) -> f32 {
     match length {
+        CssLength::Auto => parent_width,
         CssLength::Px(px) => px,
         CssLength::Percent(percent) => parent_width * percent / 100.0,
+    }
+}
+
+fn resolve_optional_css_length(length: CssLength, parent_width: f32) -> Option<f32> {
+    match length {
+        CssLength::Auto => None,
+        _ => Some(resolve_css_length(length, parent_width)),
+    }
+}
+
+fn resolve_css_width(length: CssLength, parent_width: f32) -> Option<f32> {
+    match length {
+        CssLength::Auto => None,
+        CssLength::Percent(percent) if percent >= 99.0 => None,
+        _ => Some(resolve_css_length(length, parent_width)),
     }
 }
 
@@ -1816,7 +2902,9 @@ fn build_css_layout_boxes(node: &RenderNode) -> Vec<CssLayoutBox<'_>> {
                 .iter()
                 .flat_map(build_css_layout_boxes)
                 .collect();
-            let children = if css_layout_box_is_block_container(kind) {
+            let children = if matches!(node.style.display, CssDisplay::Flex | CssDisplay::Grid) {
+                raw_children
+            } else if css_layout_box_is_block_container(kind) {
                 fix_css_anonymous_blocks(raw_children, &node.style)
             } else {
                 raw_children
@@ -2178,16 +3266,44 @@ fn layout_css_flex_children(
             .max(total_main)
     };
     let free_space = (available_main - total_main).max(0.0);
-    let mut main_cursor = match container.style.justify_content {
-        CssJustifyContent::Center => free_space * 0.5,
-        CssJustifyContent::FlexStart | CssJustifyContent::SpaceBetween => 0.0,
+    let main_auto_margin_count = if is_row {
+        flow_indices
+            .iter()
+            .map(|index| {
+                let auto = container.children[*index].style.margin_auto;
+                auto.left as usize + auto.right as usize
+            })
+            .sum::<usize>()
+    } else {
+        flow_indices
+            .iter()
+            .map(|index| {
+                let auto = container.children[*index].style.margin_auto;
+                auto.top as usize + auto.bottom as usize
+            })
+            .sum::<usize>()
     };
-    let distributed_gap =
-        if container.style.justify_content == CssJustifyContent::SpaceBetween && child_count > 1 {
-            gap + free_space / (child_count - 1) as f32
-        } else {
-            gap
-        };
+    let auto_margin_share = if main_auto_margin_count > 0 {
+        free_space / main_auto_margin_count as f32
+    } else {
+        0.0
+    };
+    let mut main_cursor = if main_auto_margin_count > 0 {
+        0.0
+    } else {
+        match container.style.justify_content {
+            CssJustifyContent::Center => free_space * 0.5,
+            CssJustifyContent::FlexStart | CssJustifyContent::SpaceBetween => 0.0,
+        }
+    };
+    let distributed_gap = if main_auto_margin_count == 0
+        && container.style.justify_content == CssJustifyContent::SpaceBetween
+        && child_count > 1
+    {
+        gap + free_space / (child_count - 1) as f32
+    } else {
+        gap
+    };
 
     for (slot, index) in flow_indices.iter().enumerate() {
         let child = &mut container.children[*index];
@@ -2195,6 +3311,20 @@ fn layout_css_flex_children(
         let child_margin = child.dimensions.margin;
         let child_border = child.dimensions.border;
         let child_padding = child.dimensions.padding;
+        let main_auto_before = if is_row && child.style.margin_auto.left {
+            auto_margin_share
+        } else if !is_row && child.style.margin_auto.top {
+            auto_margin_share
+        } else {
+            0.0
+        };
+        let main_auto_after = if is_row && child.style.margin_auto.right {
+            auto_margin_share
+        } else if !is_row && child.style.margin_auto.bottom {
+            auto_margin_share
+        } else {
+            0.0
+        };
         let cross_offset = match container.style.align_items {
             CssAlignItems::Center => {
                 ((available_cross - if is_row { size.y } else { size.x }) * 0.5).max(0.0)
@@ -2205,6 +3335,7 @@ fn layout_css_flex_children(
         let content_x = if is_row {
             content.left()
                 + main_cursor
+                + main_auto_before
                 + child_margin.left
                 + child_border.left
                 + child_padding.left
@@ -2218,12 +3349,20 @@ fn layout_css_flex_children(
         let content_y = if is_row {
             content.top() + cross_offset + child_margin.top + child_border.top + child_padding.top
         } else {
-            content.top() + main_cursor + child_margin.top + child_border.top + child_padding.top
+            content.top()
+                + main_cursor
+                + main_auto_before
+                + child_margin.top
+                + child_border.top
+                + child_padding.top
         };
         let current_min = child.dimensions.content.min;
         let new_min = egui::pos2(content_x, content_y);
         translate_css_layout_box(child, new_min - current_min);
-        main_cursor += if is_row { size.x } else { size.y } + distributed_gap;
+        main_cursor += main_auto_before
+            + if is_row { size.x } else { size.y }
+            + main_auto_after
+            + distributed_gap;
     }
 
     layout_css_out_of_flow_children(container, source, image_height_auto, text_metrics);
@@ -2380,6 +3519,9 @@ fn css_layout_preferred_content_width(
                 .node
                 .is_some_and(css_layout_node_is_replaced_or_special)
             {
+                if let Some(width) = box_.style.width.or(box_.style.max_width) {
+                    return width.max(box_.style.min_width.unwrap_or(1.0)).max(1.0);
+                }
                 let text_width = box_
                     .node
                     .map(render_node_text_content)
@@ -2390,24 +3532,40 @@ fn css_layout_preferred_content_width(
             }
             box_.children
                 .iter()
-                .map(|child| css_layout_preferred_content_width(child, text_metrics))
+                .map(|child| css_layout_preferred_outer_width(child, text_metrics))
                 .sum::<f32>()
                 .max(1.0)
         }
         CssLayoutKind::Document => box_
             .children
             .iter()
-            .map(|child| css_layout_preferred_content_width(child, text_metrics))
+            .map(|child| css_layout_preferred_outer_width(child, text_metrics))
             .fold(0.0, f32::max)
             .max(1.0),
     }
 }
 
+fn css_layout_preferred_outer_width(
+    box_: &CssLayoutBox<'_>,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    css_layout_preferred_content_width(box_, text_metrics)
+        + box_.style.margin.left
+        + box_.style.margin.right
+        + box_.style.border_width * 2.0
+        + box_.style.padding.left
+        + box_.style.padding.right
+}
+
 fn css_definite_box_height(style: &ResolvedBoxStyle, containing_width: f32) -> Option<f32> {
-    style
-        .height
-        .or(style.min_height)
-        .map(|height| resolve_css_box_length(height, 0.0, containing_width))
+    let _ = containing_width;
+    [style.height, style.min_height]
+        .into_iter()
+        .flatten()
+        .find_map(|height| match height {
+            CssLength::Px(px) => Some(px),
+            CssLength::Auto | CssLength::Percent(_) => None,
+        })
 }
 
 fn translate_css_layout_box(box_: &mut CssLayoutBox<'_>, delta: egui::Vec2) {
@@ -2501,31 +3659,26 @@ fn css_resolve_used_height(
     containing_height: f32,
     containing_width: f32,
 ) -> f32 {
+    let _ = containing_width;
     let mut height = style
         .height
-        .map(|height| resolve_css_box_length(height, containing_height, containing_width))
+        .and_then(|height| resolve_css_used_height_length(height, containing_height))
         .unwrap_or(intrinsic_height);
-    if let Some(min_height) = style.min_height {
-        height = height.max(resolve_css_box_length(
-            min_height,
-            containing_height,
-            containing_width,
-        ));
+    if let Some(min_height) = style
+        .min_height
+        .and_then(|height| resolve_css_used_height_length(height, containing_height))
+    {
+        height = height.max(min_height);
     }
     height.max(0.0)
 }
 
-fn resolve_css_box_length(length: CssLength, percent_basis: f32, fallback_basis: f32) -> f32 {
+fn resolve_css_used_height_length(length: CssLength, percent_basis: f32) -> Option<f32> {
     match length {
-        CssLength::Px(px) => px,
-        CssLength::Percent(percent) => {
-            let basis = if percent_basis > 0.0 {
-                percent_basis
-            } else {
-                fallback_basis
-            };
-            basis * percent / 100.0
-        }
+        CssLength::Auto => None,
+        CssLength::Px(px) => Some(px),
+        CssLength::Percent(percent) if percent_basis > 0.0 => Some(percent_basis * percent / 100.0),
+        CssLength::Percent(_) => None,
     }
 }
 
@@ -2796,15 +3949,66 @@ fn push_canvas_graph_layout_box(
         }
         CssLayoutKind::Inline => {
             if let Some(node) = box_.node {
-                push_canvas_graph_node(
-                    node,
-                    source,
-                    image_height_auto,
-                    text_metrics,
-                    inherited_href,
-                    cursor,
-                    graph,
-                );
+                let href = if let RenderNodeKind::Element(element) = &node.kind {
+                    if element.tag_name == "a" {
+                        element.attr("href").or(inherited_href)
+                    } else {
+                        inherited_href
+                    }
+                } else {
+                    inherited_href
+                };
+
+                let previous_x = cursor.x;
+                let previous_y = cursor.y;
+                let previous_width = cursor.width;
+                cursor.x = box_.dimensions.content.left();
+                cursor.y = box_.dimensions.content.top();
+                cursor.width = box_.dimensions.content.width().max(1.0);
+
+                if css_layout_node_is_replaced_or_special(node) {
+                    push_canvas_graph_layout_replaced_or_special(
+                        box_,
+                        node,
+                        source,
+                        image_height_auto,
+                        text_metrics,
+                        href,
+                        cursor,
+                        graph,
+                    );
+                } else {
+                    push_canvas_graph_layout_box_background(box_, graph);
+                    let clips_children = push_canvas_graph_layout_clip_start(box_, graph);
+                    if !node.children.is_empty() && children_are_inline_flow(&node.children) {
+                        push_canvas_graph_inline_children(
+                            &node.children,
+                            text_metrics,
+                            href,
+                            cursor,
+                            graph,
+                        );
+                    } else {
+                        for child in &node.children {
+                            push_canvas_graph_node(
+                                child,
+                                source,
+                                image_height_auto,
+                                text_metrics,
+                                href,
+                                cursor,
+                                graph,
+                            );
+                        }
+                    }
+                    if clips_children {
+                        graph.objects.push(CanvasObject::ClipEnd);
+                    }
+                }
+
+                cursor.x = previous_x;
+                cursor.width = previous_width;
+                cursor.y = previous_y.max(css_margin_box(box_).bottom());
             }
         }
         CssLayoutKind::Block => {
@@ -3099,7 +4303,14 @@ fn push_canvas_graph_layout_children_at_used_positions(
     let previous_x = cursor.x;
     let previous_y = cursor.y;
     let previous_width = cursor.width;
-    for child in children {
+    let mut ordered_children: Vec<_> = children.iter().enumerate().collect();
+    ordered_children.sort_by_key(|(index, child)| {
+        let z_index = child.style.z_index.unwrap_or(0);
+        let positioned_positive_z =
+            child.style.position != CssPosition::Static && child.style.z_index.unwrap_or(0) > 0;
+        (positioned_positive_z, z_index, *index)
+    });
+    for (_, child) in ordered_children {
         let margin_box = css_margin_box(child);
         if css_layout_box_is_block_level(child) {
             cursor.x = margin_box.left();
@@ -4224,7 +5435,7 @@ fn push_render_node_debug(node: &RenderNode, depth: usize, out: &mut String) {
 
 fn resolved_style_debug(style: &ResolvedBoxStyle) -> String {
     format!(
-        "style(display={:?}, color={}, bg={}, margin={}, padding={}, border_width={:.1}, border_color={}, radius={:.1}, width={}, min_width={}, max_width={}, font_size={:.1}, bold={}, align={:?}, overflow_hidden={})",
+        "style(display={:?}, color={}, bg={}, margin={}, padding={}, border_width={:.1}, border_color={}, radius={:.1}, width={}, min_width={}, max_width={}, font_size={:.1}, bold={}, align={:?}, overflow_hidden={}, position={:?}, z_index={})",
         style.display,
         color_debug(style.color),
         color_debug(style.background),
@@ -4239,7 +5450,12 @@ fn resolved_style_debug(style: &ResolvedBoxStyle) -> String {
         style.font_size,
         style.font_weight_bold,
         style.text_align,
-        style.overflow_hidden
+        style.overflow_hidden,
+        style.position,
+        style
+            .z_index
+            .map(|z_index| z_index.to_string())
+            .unwrap_or_else(|| "auto".to_owned())
     )
 }
 
@@ -6968,6 +8184,44 @@ mod tests {
     }
 
     #[test]
+    fn render_graph_width_auto_overrides_earlier_percentage_width() {
+        let html = r#"
+            <html>
+              <head>
+                <style>
+                  .button { width: 100%; }
+                  .button.compact { width: auto; }
+                </style>
+              </head>
+              <body>
+                <a id="target" class="button compact">Sign in</a>
+              </body>
+            </html>
+        "#;
+        let html = remove_html_comments(html);
+        let dom = parse_dom_document(&html);
+        let style = rich_canvas::parse_basic_css(extract_tag_inner(&html, "style").unwrap_or(""));
+        let graph = build_render_graph(&dom, &style);
+        let target = find_render_element_by_id(&graph.root, "target").unwrap();
+
+        assert_eq!(target.style.width, None);
+    }
+
+    #[test]
+    fn canvas_debug_line_index_parses_only_object_rows() {
+        assert_eq!(
+            parse_canvas_debug_line_index("0004 Image rect=(0,0)"),
+            Some(4)
+        );
+        assert_eq!(
+            parse_canvas_debug_line_index("CanvasGraph viewport=1x1"),
+            None
+        );
+        assert_eq!(parse_canvas_debug_line_index("0004Image rect=(0,0)"), None);
+        assert_eq!(parse_canvas_debug_line_index("abcd Image rect=(0,0)"), None);
+    }
+
+    #[test]
     fn render_graph_applies_browser_default_paragraph_margins() {
         let html = remove_html_comments(
             r##"<html><body><p id="top-link"><a href="#top">[Top]</a></p></body></html>"##,
@@ -7296,6 +8550,102 @@ mod tests {
     }
 
     #[test]
+    fn flex_svg_item_uses_explicit_width_for_rasterized_svg() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  .row { display: flex; width: 200px; }
+                  .logo { display: flex; margin-right: 24px; }
+                  svg { width: 70px; height: 20px; }
+                </style>
+              </head>
+              <body>
+                <div class="row">
+                  <div class="logo">
+                    <svg viewBox="0 0 70 20" aria-label="logo">
+                      <path fill="#ffffff" d="M0 0h70v20H0z"></path>
+                    </svg>
+                  </div>
+                  <span>Next</span>
+                </div>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let image_rect = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Image(image) if image.src == "inline-svg-raster" => Some(image.rect),
+                _ => None,
+            })
+            .expect("expected path-only SVG to rasterize into a visible image");
+
+        assert!(
+            image_rect.width() >= 69.0,
+            "expected 70px rasterized svg width, got {}",
+            image_rect.width()
+        );
+    }
+
+    #[test]
+    fn positioned_positive_z_index_paints_after_normal_siblings() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .header {
+                    position: sticky;
+                    z-index: 3;
+                    width: 200px;
+                    height: 48px;
+                    background: #ff0000;
+                  }
+                  .hero {
+                    margin-top: -24px;
+                    width: 200px;
+                    height: 96px;
+                    background: #00ff00;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="header"></div>
+                <div class="hero"></div>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let mut header_index = None;
+        let mut hero_index = None;
+        for (index, object) in document.canvas_graph.objects.iter().enumerate() {
+            if let CanvasObject::Rect(rect) = object {
+                if rect.fill == egui::Color32::from_rgb(0xff, 0x00, 0x00) {
+                    header_index = Some(index);
+                } else if rect.fill == egui::Color32::from_rgb(0x00, 0xff, 0x00) {
+                    hero_index = Some(index);
+                }
+            }
+        }
+
+        let header_index = header_index.expect("expected header background rect");
+        let hero_index = hero_index.expect("expected hero background rect");
+        assert!(
+            header_index > hero_index,
+            "expected z-index header to paint after hero, got header={header_index}, hero={hero_index}"
+        );
+    }
+
+    #[test]
     fn flex_textarea_wrapper_grows_between_button_sections() {
         let document = parse_html_document(
             r#"
@@ -7397,6 +8747,84 @@ mod tests {
     }
 
     #[test]
+    fn flex_row_auto_margin_absorbs_free_space() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  .row {
+                    display: flex;
+                    flex-direction: row;
+                    width: 500px;
+                  }
+                  .left { width: 40px; }
+                  .spacer { margin-left: auto; width: 1px; }
+                  .right { width: 80px; }
+                </style>
+              </head>
+              <body>
+                <div class="row">
+                  <div class="left">Left</div>
+                  <div class="spacer"></div>
+                  <div class="right">Right</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let left = find_canvas_text(&document.canvas_graph, "Left").expect("expected left text");
+        let right = find_canvas_text(&document.canvas_graph, "Right").expect("expected right text");
+
+        assert_eq!(left.rect.top(), right.rect.top());
+        assert!(right.rect.left() > 410.0, "right rect was {:?}", right.rect);
+    }
+
+    #[test]
+    fn flex_row_width_percent_uses_actual_containing_block() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  header { padding: 0 24px; }
+                  .nav {
+                    display: flex;
+                    flex-direction: row;
+                    width: 100%;
+                  }
+                  .logo { width: 70px; }
+                  .spacer { margin-left: auto; width: 1px; }
+                  .action { width: 80px; }
+                </style>
+              </head>
+              <body>
+                <header>
+                  <div class="nav">
+                    <div class="logo">Logo</div>
+                    <div class="spacer"></div>
+                    <div class="action">Action</div>
+                  </div>
+                </header>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let action =
+            find_canvas_text(&document.canvas_graph, "Action").expect("expected action text");
+
+        assert!(
+            action.rect.left() > 1100.0,
+            "action should be near the full header right edge, got {:?}",
+            action.rect
+        );
+    }
+
+    #[test]
     fn flex_placeholder_span_and_button_render_horizontally() {
         let document = parse_html_document(
             r#"
@@ -7446,6 +8874,60 @@ mod tests {
         assert!(ai_chat.rect.left() > placeholder.rect.right());
         assert_eq!(ai_chat.color, egui::Color32::WHITE);
         assert!(ai_chat.font_weight_bold);
+    }
+
+    #[test]
+    fn percent_height_in_auto_height_flex_context_does_not_use_width() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .search {
+                    display: flex;
+                    align-items: center;
+                    width: 800px;
+                    height: 100%;
+                    background: #333333;
+                    border: 1px solid #6c6c6c;
+                    border-radius: 40px;
+                  }
+                  .left { width: 40px; }
+                  .input { flex: 1; }
+                  textarea { margin: 16px 16px 16px 8px; }
+                </style>
+              </head>
+              <body>
+                <div class="search">
+                  <div class="left"></div>
+                  <div class="input"><textarea placeholder="Search the web..."></textarea></div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let search_rect = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0x33, 0x33, 0x33) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("expected search field background");
+
+        assert!(
+            search_rect.height() < 100.0,
+            "percentage height in an indefinite container should stay intrinsic, got {:?}",
+            search_rect
+        );
     }
 
     #[test]

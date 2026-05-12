@@ -148,6 +148,7 @@ pub struct CssBoxStyle {
     pub margin_right: Option<f32>,
     pub margin_bottom: Option<f32>,
     pub margin_left: Option<f32>,
+    pub margin_auto: CssEdgeAutoSpec,
     pub padding: Option<CssEdges>,
     pub padding_top: Option<f32>,
     pub padding_right: Option<f32>,
@@ -176,6 +177,7 @@ pub struct CssBoxStyle {
     pub gap: Option<f32>,
     pub overflow_hidden: Option<bool>,
     pub position: Option<CssPosition>,
+    pub z_index: Option<i32>,
     pub inset: Option<CssEdges>,
     pub inset_sides: CssInset,
     pub object_fit: Option<CssObjectFit>,
@@ -187,6 +189,7 @@ pub struct ResolvedBoxStyle {
     pub color: Color32,
     pub background: Color32,
     pub margin: CssEdges,
+    pub margin_auto: CssEdgeAuto,
     pub padding: CssEdges,
     pub border_width: f32,
     pub border_color: Color32,
@@ -211,6 +214,7 @@ pub struct ResolvedBoxStyle {
     pub gap: f32,
     pub overflow_hidden: bool,
     pub position: CssPosition,
+    pub z_index: Option<i32>,
     pub inset: Option<CssEdges>,
     pub inset_sides: CssInset,
     pub object_fit: CssObjectFit,
@@ -223,6 +227,7 @@ impl Default for ResolvedBoxStyle {
             color: BrowserStyle::default().text_color,
             background: Color32::TRANSPARENT,
             margin: CssEdges::default(),
+            margin_auto: CssEdgeAuto::default(),
             padding: CssEdges::default(),
             border_width: 0.0,
             border_color: Color32::TRANSPARENT,
@@ -247,6 +252,7 @@ impl Default for ResolvedBoxStyle {
             gap: 0.0,
             overflow_hidden: false,
             position: CssPosition::Static,
+            z_index: None,
             inset: None,
             inset_sides: CssInset::default(),
             object_fit: CssObjectFit::Fill,
@@ -274,6 +280,22 @@ pub struct CssEdges {
     pub left: f32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CssEdgeAuto {
+    pub top: bool,
+    pub right: bool,
+    pub bottom: bool,
+    pub left: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CssEdgeAutoSpec {
+    pub top: Option<bool>,
+    pub right: Option<bool>,
+    pub bottom: Option<bool>,
+    pub left: Option<bool>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CssInset {
     pub top: Option<f32>,
@@ -284,6 +306,7 @@ pub struct CssInset {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CssLength {
+    Auto,
     Px(f32),
     Percent(f32),
 }
@@ -992,6 +1015,53 @@ impl BrowserCanvas {
                                 &mut canvas_response,
                             );
                         }
+                    });
+                });
+            });
+        self.scroll_offset = output.state.offset;
+
+        canvas_response
+    }
+
+    pub fn canvas_graph_ui(
+        &mut self,
+        ui: &mut Ui,
+        style: &BrowserStyle,
+        graph: &mut CanvasGraph,
+    ) -> BrowserCanvasResponse {
+        let mut canvas_response = BrowserCanvasResponse::default();
+        let font_scale = self.zoom.clamp(0.75, 2.0);
+
+        let output = ScrollArea::vertical()
+            .id_salt("almostthere_browser_debug_canvas")
+            .auto_shrink(false)
+            .scroll_offset(self.scroll_offset)
+            .show(ui, |ui| {
+                let available_width = ui.available_width();
+                ui.set_min_width(available_width);
+                let main_max_width = if graph.viewport.x > style.main_max_width {
+                    available_width / font_scale
+                } else {
+                    style.main_max_width
+                };
+                let content_width = (available_width - style.main_padding_x * 2.0 * font_scale)
+                    .min(main_max_width * font_scale)
+                    .max(280.0);
+                let left_margin = ((available_width - content_width) * 0.5)
+                    .max(style.main_padding_x * font_scale);
+
+                ui.add_space(style.main_padding_y * font_scale);
+                ui.horizontal(|ui| {
+                    ui.add_space(left_margin);
+                    ui.vertical(|ui| {
+                        ui.set_width(content_width);
+                        paint_canvas_graph(
+                            ui,
+                            graph,
+                            content_width,
+                            font_scale,
+                            &mut canvas_response,
+                        );
                     });
                 });
             });
@@ -1823,6 +1893,7 @@ fn paint_css_box(
 
 fn css_length_px(length: CssLength, containing_width: f32) -> f32 {
     match length {
+        CssLength::Auto => containing_width,
         CssLength::Px(px) => px,
         CssLength::Percent(percent) => containing_width * percent / 100.0,
     }
@@ -3295,6 +3366,18 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
     if source.margin.is_some() {
         target.margin = source.margin;
     }
+    if source.margin_auto.top.is_some() {
+        target.margin_auto.top = source.margin_auto.top;
+    }
+    if source.margin_auto.right.is_some() {
+        target.margin_auto.right = source.margin_auto.right;
+    }
+    if source.margin_auto.bottom.is_some() {
+        target.margin_auto.bottom = source.margin_auto.bottom;
+    }
+    if source.margin_auto.left.is_some() {
+        target.margin_auto.left = source.margin_auto.left;
+    }
     if source.margin_top.is_some() {
         target.margin_top = source.margin_top;
     }
@@ -3390,6 +3473,9 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
     }
     if source.position.is_some() {
         target.position = source.position;
+    }
+    if source.z_index.is_some() {
+        target.z_index = source.z_index;
     }
     if source.inset.is_some() {
         target.inset = source.inset;
@@ -3579,7 +3665,12 @@ fn normalize_css_selector(selector: &str) -> Option<String> {
     if selector.is_empty() {
         return None;
     }
-    if selector.contains('~') || selector.contains("::") || selector.contains(":not(") {
+    if selector.contains('~')
+        || selector.contains("::")
+        || selector.contains(":before")
+        || selector.contains(":after")
+        || selector.contains(":not(")
+    {
         return None;
     }
 
@@ -3666,16 +3757,52 @@ fn parse_css_box_style_with_vars(
                 seen |= style.background.is_some();
             }
             "margin" => {
-                style.margin = parse_edges(value);
-                seen |= style.margin.is_some();
+                if let Some((edges, auto)) = parse_margin_edges(value) {
+                    style.margin = Some(edges);
+                    style.margin_auto = auto;
+                    seen = true;
+                }
             }
             "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
-                if let Some(px) = parse_px(value) {
+                if value.eq_ignore_ascii_case("auto") {
                     match property {
-                        "margin-top" => style.margin_top = Some(px),
-                        "margin-right" => style.margin_right = Some(px),
-                        "margin-bottom" => style.margin_bottom = Some(px),
-                        "margin-left" => style.margin_left = Some(px),
+                        "margin-top" => {
+                            style.margin_top = Some(0.0);
+                            style.margin_auto.top = Some(true);
+                        }
+                        "margin-right" => {
+                            style.margin_right = Some(0.0);
+                            style.margin_auto.right = Some(true);
+                        }
+                        "margin-bottom" => {
+                            style.margin_bottom = Some(0.0);
+                            style.margin_auto.bottom = Some(true);
+                        }
+                        "margin-left" => {
+                            style.margin_left = Some(0.0);
+                            style.margin_auto.left = Some(true);
+                        }
+                        _ => {}
+                    }
+                    seen = true;
+                } else if let Some(px) = parse_px(value) {
+                    match property {
+                        "margin-top" => {
+                            style.margin_top = Some(px);
+                            style.margin_auto.top = Some(false);
+                        }
+                        "margin-right" => {
+                            style.margin_right = Some(px);
+                            style.margin_auto.right = Some(false);
+                        }
+                        "margin-bottom" => {
+                            style.margin_bottom = Some(px);
+                            style.margin_auto.bottom = Some(false);
+                        }
+                        "margin-left" => {
+                            style.margin_left = Some(px);
+                            style.margin_auto.left = Some(false);
+                        }
                         _ => {}
                     }
                     seen = true;
@@ -3832,6 +3959,12 @@ fn parse_css_box_style_with_vars(
                 };
                 seen |= style.position.is_some();
             }
+            "z-index" => {
+                if value != "auto" {
+                    style.z_index = value.parse::<i32>().ok();
+                    seen |= style.z_index.is_some();
+                }
+            }
             "inset" => {
                 style.inset = parse_edges(value);
                 if let Some(edges) = style.inset {
@@ -3963,6 +4096,56 @@ fn parse_edges(value: &str) -> Option<CssEdges> {
     }
 }
 
+fn parse_margin_edges(value: &str) -> Option<(CssEdges, CssEdgeAutoSpec)> {
+    let values = split_css_value_list(value);
+    let expanded = match values.as_slice() {
+        [all] => [all.as_str(), all.as_str(), all.as_str(), all.as_str()],
+        [vertical, horizontal] => [
+            vertical.as_str(),
+            horizontal.as_str(),
+            vertical.as_str(),
+            horizontal.as_str(),
+        ],
+        [top, horizontal, bottom] => [
+            top.as_str(),
+            horizontal.as_str(),
+            bottom.as_str(),
+            horizontal.as_str(),
+        ],
+        [top, right, bottom, left, ..] => {
+            [top.as_str(), right.as_str(), bottom.as_str(), left.as_str()]
+        }
+        _ => return None,
+    };
+
+    let mut edges = CssEdges::default();
+    let mut auto = CssEdgeAutoSpec::default();
+    for (index, token) in expanded.iter().enumerate() {
+        let is_auto = token.eq_ignore_ascii_case("auto");
+        let px = if is_auto { Some(0.0) } else { parse_px(token) }?;
+        match index {
+            0 => {
+                edges.top = px;
+                auto.top = Some(is_auto);
+            }
+            1 => {
+                edges.right = px;
+                auto.right = Some(is_auto);
+            }
+            2 => {
+                edges.bottom = px;
+                auto.bottom = Some(is_auto);
+            }
+            3 => {
+                edges.left = px;
+                auto.left = Some(is_auto);
+            }
+            _ => {}
+        }
+    }
+    Some((edges, auto))
+}
+
 fn set_edge(edges: &mut CssEdges, property: &str, px: f32) {
     match property
         .rsplit_once('-')
@@ -3988,9 +4171,13 @@ fn set_inset_side(inset: &mut CssInset, property: &str, px: f32) {
 }
 
 fn parse_css_length(value: &str) -> Option<CssLength> {
-    parse_percent(value)
-        .map(CssLength::Percent)
-        .or_else(|| parse_px(value).map(CssLength::Px))
+    if value.trim().eq_ignore_ascii_case("auto") {
+        Some(CssLength::Auto)
+    } else {
+        parse_percent(value)
+            .map(CssLength::Percent)
+            .or_else(|| parse_px(value).map(CssLength::Px))
+    }
 }
 
 fn button_width_for_text(text: &str, style: &BrowserStyle, font_scale: f32) -> f32 {
@@ -4618,6 +4805,56 @@ mod tests {
     }
 
     #[test]
+    fn parse_basic_css_carries_position_z_index() {
+        let style = parse_basic_css(
+            r#"
+            .header {
+                position: sticky;
+                z-index: 3;
+            }
+            "#,
+        );
+        let key = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["header".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &key);
+
+        assert_eq!(computed.position, Some(CssPosition::Sticky));
+        assert_eq!(computed.z_index, Some(3));
+    }
+
+    #[test]
+    fn parse_basic_css_preserves_auto_margins() {
+        let style = parse_basic_css(
+            r#"
+            .spacer { margin-left: auto; }
+            .centered { margin: 0 auto; }
+            "#,
+        );
+        let spacer = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["spacer".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let centered = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["centered".to_owned()],
+            ..ElementStyleKey::default()
+        };
+
+        let spacer_style = computed_box_style(&style, &spacer);
+        assert_eq!(spacer_style.margin_left, Some(0.0));
+        assert_eq!(spacer_style.margin_auto.left, Some(true));
+
+        let centered_style = computed_box_style(&style, &centered);
+        assert_eq!(centered_style.margin, Some(CssEdges::default()));
+        assert_eq!(centered_style.margin_auto.left, Some(true));
+        assert_eq!(centered_style.margin_auto.right, Some(true));
+    }
+
+    #[test]
     fn parse_basic_css_ignores_not_selectors_instead_of_broadening_them() {
         let style = parse_basic_css(
             r#"
@@ -4644,6 +4881,25 @@ mod tests {
             computed_box_style(&style, &icon_with_text).display,
             Some(CssDisplay::InlineBlock)
         );
+    }
+
+    #[test]
+    fn parse_basic_css_ignores_pseudo_elements_instead_of_broadening_them() {
+        let style = parse_basic_css(
+            r#"
+            .button:before { width: 100%; }
+            .button::after { min-width: 48px; }
+            "#,
+        );
+        let button = ElementStyleKey {
+            tag: "a".to_owned(),
+            classes: vec!["button".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &button);
+
+        assert_eq!(computed.width, None);
+        assert_eq!(computed.min_width, None);
     }
 
     #[test]
