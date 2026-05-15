@@ -166,6 +166,7 @@ struct AlmostThereApp {
     text_metrics_ready: bool,
     pending_navigation: Option<PendingNavigation>,
     render_debug: PageRenderDebugState,
+    page_loaded_at: std::time::Instant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -190,6 +191,8 @@ struct PageRenderDebugState {
     open: bool,
     object_limit: usize,
     active_tab: DebugPanelTab,
+    /// Staged input values for the Events tab, keyed by element id.
+    event_staged_values: std::collections::HashMap<String, String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -199,6 +202,7 @@ enum DebugPanelTab {
     CanvasGraph,
     Html,
     Console,
+    Events,
 }
 
 impl AlmostThereApp {
@@ -282,6 +286,7 @@ impl AlmostThereApp {
             open: false,
             object_limit: document.canvas_graph.objects.len(),
             active_tab: DebugPanelTab::RenderGraph,
+            event_staged_values: std::collections::HashMap::new(),
         };
 
         Self {
@@ -301,6 +306,7 @@ impl AlmostThereApp {
             text_metrics_ready: false,
             pending_navigation: None,
             render_debug,
+            page_loaded_at: std::time::Instant::now(),
         }
     }
 
@@ -342,6 +348,7 @@ impl AlmostThereApp {
                         self.live_html =
                             apply_safe_script_browser_effects(&remove_html_comments(&source.html));
                         self.script_state = build_script_state(&source.html);
+                        self.page_loaded_at = std::time::Instant::now();
                         self.last_hovered_element_id = None;
                         self.render_graph_debug_text =
                             parse_render_graph_debug_dump(&source.html, &source.source);
@@ -501,6 +508,25 @@ impl AlmostThereApp {
         if effects.is_empty() {
             return;
         }
+
+        // Snapshot live input values so the re-parse doesn't reset what the user typed.
+        let live_input_values: std::collections::HashMap<String, String> = self
+            .document
+            .canvas_graph
+            .objects
+            .iter()
+            .filter_map(|obj| {
+                if let CanvasObject::Input(input) = obj {
+                    input
+                        .element_id
+                        .as_ref()
+                        .map(|id| (id.clone(), input.value.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         for effect in effects {
             match effect {
                 justbarelyscript::BrowserEffect::SetTextContent { element_id, value } => {
@@ -522,13 +548,38 @@ impl AlmostThereApp {
                 justbarelyscript::BrowserEffect::AppendChild { parent_id, child } => {
                     self.live_html = append_child_html_by_id(&self.live_html, &parent_id, &child);
                 }
+                justbarelyscript::BrowserEffect::ConsoleLog { level, text } => {
+                    self.console_messages
+                        .push(justbarelyscript::ConsoleMessage {
+                            level: match level.as_str() {
+                                "warn" => justbarelyscript::ConsoleLevel::Warn,
+                                "error" => justbarelyscript::ConsoleLevel::Error,
+                                "info" => justbarelyscript::ConsoleLevel::Info,
+                                _ => justbarelyscript::ConsoleLevel::Log,
+                            },
+                            text,
+                        });
+                }
             }
         }
+
         self.document = parse_html_document_from_live_html(
             &self.live_html,
             &self.document.source.clone(),
             Some(ctx),
         );
+
+        // Restore live input values that the re-parse reset to their HTML attribute defaults.
+        for obj in &mut self.document.canvas_graph.objects {
+            if let CanvasObject::Input(input) = obj {
+                if let Some(id) = &input.element_id {
+                    if let Some(live_value) = live_input_values.get(id) {
+                        input.value = live_value.clone();
+                    }
+                }
+            }
+        }
+
         ctx.request_repaint();
     }
 
@@ -1526,6 +1577,7 @@ fn build_script_state(html: &str) -> justbarelyscript::BrowserExecutionState {
     let report = justbarelyscript::parse_inline_scripts_from_html(&html);
     let mut state = justbarelyscript::BrowserExecutionState::default();
     seed_script_dom_state_from_html(&html, &mut state);
+    seed_script_computed_styles_from_html(&html, &mut state);
     for script in report.scripts {
         let Ok(program) = script.program else {
             continue;
@@ -1534,6 +1586,74 @@ fn build_script_state(html: &str) -> justbarelyscript::BrowserExecutionState {
         state.drain_effects(); // discard initial DOM effects; we only keep event handlers
     }
     state
+}
+
+fn seed_script_computed_styles_from_html(
+    html: &str,
+    state: &mut justbarelyscript::BrowserExecutionState,
+) {
+    let css = extract_tag_inner(html, "style").unwrap_or("");
+    let browser_style = parse_basic_css_for_viewport_with_root_classes(css, 1280.0, &[]);
+
+    let mut offset = 0;
+    let mut remaining = html;
+    while let Some(rel_open_start) = remaining.find('<') {
+        let open_start = offset + rel_open_start;
+        let after_open = &html[open_start..];
+        if after_open.starts_with("</") || after_open.starts_with("<!") {
+            offset = open_start + 1;
+            remaining = &html[offset..];
+            continue;
+        }
+        let Some(open_end_rel) = after_open.find('>') else {
+            break;
+        };
+        let open_end = open_start + open_end_rel + 1;
+        let open_tag = &html[open_start..open_end];
+        let Some(id) = extract_attr(open_tag, "id") else {
+            offset = open_end;
+            remaining = &html[offset..];
+            continue;
+        };
+        let Some(tag) = tag_name(open_tag) else {
+            offset = open_end;
+            remaining = &html[offset..];
+            continue;
+        };
+        let classes: Vec<String> = extract_attr(open_tag, "class")
+            .unwrap_or_default()
+            .split_ascii_whitespace()
+            .map(str::to_owned)
+            .collect();
+        let key = ElementStyleKey {
+            tag: tag.to_owned(),
+            id: Some(id.clone()),
+            classes,
+            attributes: vec![],
+            parent: None,
+            previous_sibling: None,
+        };
+        let computed = computed_box_style(&browser_style, &key);
+        let mut props = std::collections::HashMap::new();
+        if let Some(display) = computed.display {
+            let display_str = match display {
+                CssDisplay::None => "none",
+                CssDisplay::Block => "block",
+                CssDisplay::Inline => "inline",
+                CssDisplay::InlineBlock => "inline-block",
+                CssDisplay::Flex => "flex",
+                CssDisplay::Grid => "grid",
+                CssDisplay::Table => "table",
+                CssDisplay::ListItem => "list-item",
+            };
+            props.insert("display".to_owned(), display_str.to_owned());
+        }
+        if !props.is_empty() {
+            state.seed_computed_style(&id, props);
+        }
+        offset = open_end;
+        remaining = &html[offset..];
+    }
 }
 
 fn parse_html_document_from_live_html(
@@ -1573,6 +1693,7 @@ fn apply_safe_script_browser_effects(html: &str) -> String {
     let mut output = html.to_owned();
     let mut state = justbarelyscript::BrowserExecutionState::default();
     seed_script_dom_state_from_html(html, &mut state);
+    seed_script_computed_styles_from_html(html, &mut state);
 
     for script in report.scripts {
         let Ok(program) = script.program else {
@@ -1597,6 +1718,7 @@ fn apply_safe_script_browser_effects(html: &str) -> String {
                 justbarelyscript::BrowserEffect::AppendChild { parent_id, child } => {
                     output = append_child_html_by_id(&output, &parent_id, &child);
                 }
+                justbarelyscript::BrowserEffect::ConsoleLog { .. } => {}
             }
         }
     }
@@ -1929,6 +2051,17 @@ impl App for AlmostThereApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         self.poll_pending_navigation(ctx);
 
+        if self.script_state.has_pending_timers() {
+            let elapsed_ms = self.page_loaded_at.elapsed().as_millis() as u64;
+            let timer_effects = self.script_state.poll_timers(elapsed_ms);
+            if !timer_effects.is_empty() {
+                self.apply_script_effects(timer_effects, ctx);
+            }
+            if self.script_state.has_pending_timers() {
+                ctx.request_repaint();
+            }
+        }
+
         if !self.text_metrics_ready {
             if let Ok(document) = load_url_document_with_text_metrics(&self.url_input, ctx) {
                 self.document = document;
@@ -2030,6 +2163,39 @@ impl App for AlmostThereApp {
         });
 
         if self.render_debug.open {
+            // Snapshot interactive elements before the closure to avoid split-borrow conflicts.
+            #[derive(Clone)]
+            struct DebugElement {
+                id: String,
+                label: String,
+                event_type: &'static str,
+            }
+            let interactive_elements: Vec<DebugElement> = self
+                .document
+                .canvas_graph
+                .objects
+                .iter()
+                .filter_map(|obj| match obj {
+                    CanvasObject::Input(input) => {
+                        input.element_id.as_ref().map(|id| DebugElement {
+                            id: id.clone(),
+                            label: input.label.clone(),
+                            event_type: "input",
+                        })
+                    }
+                    CanvasObject::Button(button) => {
+                        button.element_id.as_ref().map(|id| DebugElement {
+                            id: id.clone(),
+                            label: button.text.clone(),
+                            event_type: "click",
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            let mut pending_debug_events: Vec<(String, &'static str)> = Vec::new();
+
             egui::SidePanel::right("render_debug_inspector")
                 .resizable(true)
                 .default_width(380.0)
@@ -2056,11 +2222,57 @@ impl App for AlmostThereApp {
                             DebugPanelTab::Console,
                             "Console",
                         );
+                        ui.selectable_value(
+                            &mut self.render_debug.active_tab,
+                            DebugPanelTab::Events,
+                            "Events",
+                        );
                     });
                     ui.separator();
 
                     if self.render_debug.active_tab == DebugPanelTab::Console {
                         paint_console_messages(ui, &self.console_messages);
+                        return;
+                    }
+
+                    if self.render_debug.active_tab == DebugPanelTab::Events {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink(false)
+                            .show(ui, |ui| {
+                                if interactive_elements.is_empty() {
+                                    ui.label("No interactive elements with an id on this page.");
+                                    return;
+                                }
+                                for elem in &interactive_elements {
+                                    ui.separator();
+                                    if elem.event_type == "input" {
+                                        ui.label(format!("input  #{}", elem.id));
+                                        let staged = self
+                                            .render_debug
+                                            .event_staged_values
+                                            .entry(elem.id.clone())
+                                            .or_default();
+                                        ui.add(
+                                            egui::TextEdit::singleline(staged)
+                                                .desired_width(ui.available_width() - 100.0)
+                                                .hint_text(&elem.label),
+                                        );
+                                        if ui.button("Fire input event").clicked() {
+                                            pending_debug_events
+                                                .push((elem.id.clone(), elem.event_type));
+                                        }
+                                    } else {
+                                        ui.label(format!(
+                                            "button #{}  \"{}\"",
+                                            elem.id, elem.label
+                                        ));
+                                        if ui.button("Fire click event").clicked() {
+                                            pending_debug_events
+                                                .push((elem.id.clone(), elem.event_type));
+                                        }
+                                    }
+                                }
+                            });
                         return;
                     }
 
@@ -2070,7 +2282,7 @@ impl App for AlmostThereApp {
                             canvas_graph_debug_string(&self.document.canvas_graph)
                         }
                         DebugPanelTab::Html => self.current_html.clone(),
-                        DebugPanelTab::Console => String::new(),
+                        DebugPanelTab::Console | DebugPanelTab::Events => String::new(),
                     };
 
                     egui::ScrollArea::both()
@@ -2088,6 +2300,28 @@ impl App for AlmostThereApp {
                             }
                         });
                 });
+
+            // Apply events fired from the Events tab.
+            for (id, event_type) in pending_debug_events {
+                if event_type == "input" {
+                    let value = self
+                        .render_debug
+                        .event_staged_values
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_default();
+                    self.script_state
+                        .dom
+                        .attributes_by_id
+                        .entry(id.clone())
+                        .or_default()
+                        .insert("value".to_owned(), value);
+                }
+                if self.script_state.has_listener(&id, event_type) {
+                    let effects = self.script_state.fire_event(&id, event_type, None);
+                    self.apply_script_effects(effects, ctx);
+                }
+            }
         }
 
         let central_frame = if self.render_debug.open {
@@ -2176,6 +2410,18 @@ impl App for AlmostThereApp {
                         "Input changed: {} ({} chars)",
                         input_change.label, input_change.value_len
                     );
+                    if let Some(ref id) = input_change.element_id {
+                        self.script_state
+                            .dom
+                            .attributes_by_id
+                            .entry(id.clone())
+                            .or_default()
+                            .insert("value".to_owned(), input_change.value.clone());
+                        if self.script_state.has_listener(id, "input") {
+                            let effects = self.script_state.fire_event(id, "input", None);
+                            self.apply_script_effects(effects, ctx);
+                        }
+                    }
                 }
                 for input_submit in &response.submitted_inputs {
                     self.telemetry.emit(

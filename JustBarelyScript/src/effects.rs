@@ -27,6 +27,10 @@ pub enum BrowserEffect {
         parent_id: String,
         child: DomElementSnapshot,
     },
+    ConsoleLog {
+        level: String,
+        text: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -43,11 +47,25 @@ pub struct DomExecutionState {
     pub text_content_by_id: HashMap<String, String>,
     pub inner_html_by_id: HashMap<String, String>,
     pub attributes_by_id: HashMap<String, HashMap<String, String>>,
+    pub computed_styles_by_id: HashMap<String, HashMap<String, String>>,
     query_selector_all_by_class: HashMap<String, Vec<String>>,
     query_selector_by_id: HashMap<String, String>,
     query_selector_by_class: HashMap<String, String>,
     created_elements: HashMap<String, DomElementSnapshot>,
     next_created_id: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PendingTimer {
+    fires_at_ms: u64,
+    params: Vec<String>,
+    body: crate::ast::BlockStatement,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PendingMicrotask {
+    params: Vec<String>,
+    body: crate::ast::BlockStatement,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -57,6 +75,9 @@ pub struct BrowserExecutionState {
     stack: Vec<StackFrame>,
     effects: Vec<BrowserEffect>,
     event_handlers: Vec<EventHandler>,
+    pending_timers: Vec<PendingTimer>,
+    pending_microtasks: Vec<PendingMicrotask>,
+    pub current_time_ms: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -81,8 +102,11 @@ enum JsValue {
     Number(f64),
     String(String),
     Object(HashMap<String, JsValue>),
+    Array(Vec<JsValue>),
     ElementRef(String),
     NodeList(Vec<String>),
+    StyleRef(String),
+    ResolvedPromise,
 }
 
 pub fn collect_browser_effects(program: &Program) -> Vec<BrowserEffect> {
@@ -121,10 +145,27 @@ impl BrowserExecutionState {
         self.dom.attributes_by_id.insert(id.to_owned(), attributes);
     }
 
+    pub fn seed_computed_style(&mut self, id: &str, properties: HashMap<String, String>) {
+        self.dom
+            .computed_styles_by_id
+            .insert(id.to_owned(), properties);
+    }
+
     pub fn execute_program(&mut self, program: &Program) {
         self.ensure_global_frame();
         for statement in &program.body {
             self.execute_statement(statement);
+        }
+        self.drain_and_run_microtasks();
+    }
+
+    fn drain_and_run_microtasks(&mut self) {
+        while !self.pending_microtasks.is_empty() {
+            let task = self.pending_microtasks.remove(0);
+            self.stack.push(StackFrame::default());
+            self.execute_block(&task.body);
+            self.stack.pop();
+            self.ensure_global_frame();
         }
     }
 
@@ -219,10 +260,11 @@ impl BrowserExecutionState {
                 }
             }
             Expression::Array(items) => {
-                for item in items {
-                    self.execute_expression(item);
-                }
-                JsValue::Undefined
+                let values: Vec<JsValue> = items
+                    .iter()
+                    .map(|item| self.execute_expression(item))
+                    .collect();
+                JsValue::Array(values)
             }
             Expression::Object(properties) => {
                 JsValue::Object(self.object_from_properties(properties))
@@ -247,7 +289,120 @@ impl BrowserExecutionState {
         }
 
         if let Some(method) = method_call(callee) {
+            if matches!(&method.object, Expression::Identifier(n) if n == "JSON") {
+                match method.name.as_str() {
+                    "parse" => {
+                        let arg = arguments
+                            .first()
+                            .map(|a| self.execute_expression(a))
+                            .unwrap_or(JsValue::Null);
+                        let s = Self::value_to_string(&arg);
+                        return json_parse_str(&s);
+                    }
+                    "stringify" => {
+                        let arg = arguments
+                            .first()
+                            .map(|a| self.execute_expression(a))
+                            .unwrap_or(JsValue::Undefined);
+                        return JsValue::String(json_stringify(&arg));
+                    }
+                    _ => {}
+                }
+            }
+            if method.name == "push" {
+                if let Expression::Identifier(var_name) = &method.object {
+                    let val = arguments
+                        .first()
+                        .map(|a| self.execute_expression(a))
+                        .unwrap_or(JsValue::Undefined);
+                    let var_name = var_name.clone();
+                    if let Some(JsValue::Array(mut arr)) = self.get_binding(&var_name) {
+                        arr.push(val);
+                        self.set_binding(&var_name, JsValue::Array(arr));
+                    }
+                    return JsValue::Undefined;
+                }
+            }
+        }
+
+        if matches!(callee, Expression::Identifier(name) if name == "setTimeout") {
+            let delay_ms = arguments
+                .get(1)
+                .map(|a| self.execute_expression(a))
+                .map(|v| Self::value_to_number(&v).max(0.0) as u64)
+                .unwrap_or(0);
+            if let Some(Expression::Function(func)) = arguments.first() {
+                self.pending_timers.push(PendingTimer {
+                    fires_at_ms: self.current_time_ms + delay_ms,
+                    params: func.params.clone(),
+                    body: func.body.clone(),
+                });
+            }
+            return JsValue::Undefined;
+        }
+
+        if matches!(callee, Expression::Identifier(name) if name == "getComputedStyle") {
+            let element = arguments
+                .first()
+                .map(|a| self.execute_expression(a))
+                .unwrap_or(JsValue::Undefined);
+            if let JsValue::ElementRef(element_ref) = element {
+                if let Some(element_id) = existing_id_from_ref(&element_ref) {
+                    let mut props: HashMap<String, JsValue> = self
+                        .dom
+                        .computed_styles_by_id
+                        .get(&element_id)
+                        .map(|m| {
+                            m.iter()
+                                .map(|(k, v)| (k.clone(), JsValue::String(v.clone())))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if let Some(inline) = self.get_element_attribute(&element_ref, "style") {
+                        for (prop, val) in parse_inline_style_map(&inline) {
+                            props.insert(prop, JsValue::String(val));
+                        }
+                    }
+                    return JsValue::Object(props);
+                }
+            }
+            return JsValue::Undefined;
+        }
+
+        if let Some(method) = method_call(callee) {
             match method.name.as_str() {
+                "resolve" if matches!(&method.object, Expression::Identifier(n) if n == "Promise") =>
+                {
+                    return JsValue::ResolvedPromise;
+                }
+                "then" => {
+                    let receiver = self.execute_expression(&method.object);
+                    if matches!(receiver, JsValue::ResolvedPromise) {
+                        if let Some(Expression::Function(func)) = arguments.first() {
+                            self.pending_microtasks.push(PendingMicrotask {
+                                params: func.params.clone(),
+                                body: func.body.clone(),
+                            });
+                        }
+                    }
+                    return JsValue::Undefined;
+                }
+                "log" | "info" | "warn" | "error" if matches!(&method.object, Expression::Identifier(n) if n == "console") =>
+                {
+                    let text = arguments
+                        .iter()
+                        .map(|a| {
+                            let v = self.execute_expression(a);
+                            Self::value_to_string(&v)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    self.effects.push(BrowserEffect::ConsoleLog {
+                        level: method.name.clone(),
+                        text,
+                    });
+                    return JsValue::Undefined;
+                }
                 "createElement" if method.receiver == MethodReceiver::Document => {
                     let tag_name = arguments
                         .first()
@@ -334,6 +489,19 @@ impl BrowserExecutionState {
                         .map(|a| self.execute_expression(a))
                         .map(|v| Self::value_to_string(&v))
                         .unwrap_or_default();
+                    // document.addEventListener("DOMContentLoaded", fn) — DOM is already
+                    // parsed by the time scripts run, so fire as a microtask immediately.
+                    if matches!(&method.object, Expression::Identifier(n) if n == "document")
+                        && event_type == "DOMContentLoaded"
+                    {
+                        if let Some(Expression::Function(func)) = arguments.get(1) {
+                            self.pending_microtasks.push(PendingMicrotask {
+                                params: func.params.clone(),
+                                body: func.body.clone(),
+                            });
+                        }
+                        return JsValue::Undefined;
+                    }
                     if let JsValue::ElementRef(element_ref) = receiver {
                         if let Some(element_id) = existing_id_from_ref(&element_ref) {
                             if let Some(Expression::Function(func)) = arguments.get(1) {
@@ -412,9 +580,16 @@ impl BrowserExecutionState {
 
         if let Some((object, property)) = member_assignment_target(target) {
             let receiver = self.execute_expression(object);
-            if let JsValue::ElementRef(element_ref) = receiver {
-                self.assign_element_property(&element_ref, &property, value);
-                return;
+            match receiver {
+                JsValue::ElementRef(element_ref) => {
+                    self.assign_element_property(&element_ref, &property, value);
+                    return;
+                }
+                JsValue::StyleRef(element_id) => {
+                    self.assign_style_property(&element_id, &property, value);
+                    return;
+                }
+                _ => {}
             }
         }
 
@@ -443,6 +618,17 @@ impl BrowserExecutionState {
         }
     }
 
+    fn assign_style_property(&mut self, element_id: &str, js_prop: &str, value: JsValue) {
+        let css_prop = js_style_prop_to_css(js_prop);
+        let css_value = Self::value_to_string(&value);
+        let element_ref = existing_element_ref(element_id);
+        let existing = self
+            .get_element_attribute(&element_ref, "style")
+            .unwrap_or_default();
+        let merged = merge_inline_style(&existing, &css_prop, &css_value);
+        self.set_element_attribute(&element_ref, "style", merged);
+    }
+
     fn eval_member(&mut self, expression: &Expression) -> JsValue {
         if let Some(global_name) = window_member_name(expression) {
             return self
@@ -451,40 +637,86 @@ impl BrowserExecutionState {
                 .cloned()
                 .unwrap_or(JsValue::Undefined);
         }
-        if let Some((object, property)) = member_assignment_target(expression) {
-            let receiver = self.execute_expression(object);
-            match receiver {
-                JsValue::ElementRef(element_ref) => {
-                    if dom_property_is_text_content(&property) {
-                        JsValue::String(
-                            self.get_element_text_content(&element_ref)
-                                .unwrap_or_default(),
-                        )
-                    } else if dom_property_is_inner_html(&property) {
-                        JsValue::String(
-                            self.get_element_inner_html(&element_ref)
-                                .unwrap_or_default(),
-                        )
-                    } else {
-                        JsValue::String(
-                            self.get_element_attribute(
-                                &element_ref,
-                                dom_property_to_attribute_name(&property),
+        let Expression::Member { object, property } = expression else {
+            return JsValue::Undefined;
+        };
+        match property {
+            MemberProperty::Computed(index_expr) => {
+                let receiver = self.execute_expression(object);
+                let index = self.execute_expression(index_expr);
+                match receiver {
+                    JsValue::Array(items) => {
+                        let idx = Self::value_to_number(&index);
+                        if idx >= 0.0 && idx.fract() == 0.0 {
+                            items
+                                .get(idx as usize)
+                                .cloned()
+                                .unwrap_or(JsValue::Undefined)
+                        } else {
+                            JsValue::Undefined
+                        }
+                    }
+                    _ => JsValue::Undefined,
+                }
+            }
+            MemberProperty::Named(property) => {
+                let receiver = self.execute_expression(object);
+                match receiver {
+                    JsValue::ElementRef(element_ref) => {
+                        if property == "style" {
+                            return if let Some(id) = existing_id_from_ref(&element_ref) {
+                                JsValue::StyleRef(id)
+                            } else {
+                                JsValue::Undefined
+                            };
+                        }
+                        if dom_property_is_text_content(property) {
+                            JsValue::String(
+                                self.get_element_text_content(&element_ref)
+                                    .unwrap_or_default(),
                             )
-                            .unwrap_or_default(),
+                        } else if dom_property_is_inner_html(property) {
+                            JsValue::String(
+                                self.get_element_inner_html(&element_ref)
+                                    .unwrap_or_default(),
+                            )
+                        } else {
+                            JsValue::String(
+                                self.get_element_attribute(
+                                    &element_ref,
+                                    dom_property_to_attribute_name(property),
+                                )
+                                .unwrap_or_default(),
+                            )
+                        }
+                    }
+                    JsValue::StyleRef(element_id) => {
+                        let element_ref = existing_element_ref(&element_id);
+                        let inline = self
+                            .get_element_attribute(&element_ref, "style")
+                            .unwrap_or_default();
+                        let css_prop = js_style_prop_to_css(property);
+                        JsValue::String(
+                            parse_inline_style_map(&inline)
+                                .into_iter()
+                                .find(|(k, _)| *k == css_prop)
+                                .map(|(_, v)| v)
+                                .unwrap_or_default(),
                         )
                     }
+                    JsValue::Object(map) => map
+                        .get(property.as_str())
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined),
+                    JsValue::NodeList(items) if property == "length" => {
+                        JsValue::Number(items.len() as f64)
+                    }
+                    JsValue::Array(items) if property == "length" => {
+                        JsValue::Number(items.len() as f64)
+                    }
+                    _ => JsValue::Undefined,
                 }
-                JsValue::Object(object) => {
-                    object.get(&property).cloned().unwrap_or(JsValue::Undefined)
-                }
-                JsValue::NodeList(items) if property == "length" => {
-                    JsValue::Number(items.len() as f64)
-                }
-                _ => JsValue::Undefined,
             }
-        } else {
-            JsValue::Undefined
         }
     }
 
@@ -692,7 +924,12 @@ impl BrowserExecutionState {
             JsValue::Boolean(b) => *b,
             JsValue::Number(n) => *n != 0.0 && !n.is_nan(),
             JsValue::String(s) => !s.is_empty(),
-            JsValue::Object(_) | JsValue::ElementRef(_) | JsValue::NodeList(_) => true,
+            JsValue::Object(_)
+            | JsValue::Array(_)
+            | JsValue::ElementRef(_)
+            | JsValue::NodeList(_)
+            | JsValue::StyleRef(_)
+            | JsValue::ResolvedPromise => true,
         }
     }
 
@@ -703,10 +940,14 @@ impl BrowserExecutionState {
             JsValue::Boolean(false) => 0.0,
             JsValue::String(s) => s.trim().parse::<f64>().unwrap_or(f64::NAN),
             JsValue::Null => 0.0,
+            JsValue::Array(items) if items.is_empty() => 0.0,
             JsValue::Undefined
             | JsValue::Object(_)
+            | JsValue::Array(_)
             | JsValue::ElementRef(_)
-            | JsValue::NodeList(_) => f64::NAN,
+            | JsValue::NodeList(_)
+            | JsValue::StyleRef(_)
+            | JsValue::ResolvedPromise => f64::NAN,
         }
     }
 
@@ -736,9 +977,16 @@ impl BrowserExecutionState {
                 }
             }
             JsValue::String(value) => value.clone(),
+            JsValue::Array(items) => items
+                .iter()
+                .map(|v| Self::value_to_string(v))
+                .collect::<Vec<_>>()
+                .join(","),
             JsValue::Object(_) => "[object Object]".to_owned(),
             JsValue::ElementRef(_) => "[object Element]".to_owned(),
             JsValue::NodeList(_) => "[object NodeList]".to_owned(),
+            JsValue::StyleRef(_) => "[object CSSStyleDeclaration]".to_owned(),
+            JsValue::ResolvedPromise => "[object Promise]".to_owned(),
         }
     }
 
@@ -811,6 +1059,35 @@ impl BrowserExecutionState {
             .filter(|h| h.event_type == event_type)
             .map(|h| h.element_id.clone())
             .collect()
+    }
+
+    pub fn has_pending_timers(&self) -> bool {
+        !self.pending_timers.is_empty()
+    }
+
+    /// Fire all timers due at or before `elapsed_ms` milliseconds since page load.
+    pub fn poll_timers(&mut self, elapsed_ms: u64) -> Vec<BrowserEffect> {
+        self.current_time_ms = elapsed_ms;
+
+        let mut due = Vec::new();
+        let mut i = 0;
+        while i < self.pending_timers.len() {
+            if self.pending_timers[i].fires_at_ms <= elapsed_ms {
+                due.push(self.pending_timers.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+
+        for timer in due {
+            // Run against the live stack so callbacks see variables updated by microtasks.
+            self.stack.push(StackFrame::default());
+            self.execute_block(&timer.body);
+            self.stack.pop();
+            self.ensure_global_frame();
+        }
+
+        self.drain_effects()
     }
 }
 
@@ -921,6 +1198,228 @@ fn dom_property_to_attribute_name(property: &str) -> &str {
         "htmlFor" => "for",
         other => other,
     }
+}
+
+fn json_parse_str(s: &str) -> JsValue {
+    let bytes = s.trim().as_bytes();
+    let mut pos = 0;
+    json_parse_value(bytes, &mut pos)
+}
+
+fn json_skip_ws(bytes: &[u8], pos: &mut usize) {
+    while *pos < bytes.len() && bytes[*pos].is_ascii_whitespace() {
+        *pos += 1;
+    }
+}
+
+fn json_parse_value(bytes: &[u8], pos: &mut usize) -> JsValue {
+    json_skip_ws(bytes, pos);
+    match bytes.get(*pos) {
+        Some(b'"') => json_parse_string(bytes, pos),
+        Some(b'{') => json_parse_object(bytes, pos),
+        Some(b'[') => json_parse_array(bytes, pos),
+        Some(b't') => {
+            *pos += 4;
+            JsValue::Boolean(true)
+        }
+        Some(b'f') => {
+            *pos += 5;
+            JsValue::Boolean(false)
+        }
+        Some(b'n') => {
+            *pos += 4;
+            JsValue::Null
+        }
+        _ => json_parse_number(bytes, pos),
+    }
+}
+
+fn json_parse_string(bytes: &[u8], pos: &mut usize) -> JsValue {
+    *pos += 1; // skip opening "
+    let mut s = String::new();
+    while *pos < bytes.len() {
+        match bytes[*pos] {
+            b'"' => {
+                *pos += 1;
+                break;
+            }
+            b'\\' if *pos + 1 < bytes.len() => {
+                *pos += 1;
+                match bytes[*pos] {
+                    b'"' => s.push('"'),
+                    b'\\' => s.push('\\'),
+                    b'/' => s.push('/'),
+                    b'n' => s.push('\n'),
+                    b'r' => s.push('\r'),
+                    b't' => s.push('\t'),
+                    ch => s.push(ch as char),
+                }
+                *pos += 1;
+            }
+            ch => {
+                s.push(ch as char);
+                *pos += 1;
+            }
+        }
+    }
+    JsValue::String(s)
+}
+
+fn json_parse_object(bytes: &[u8], pos: &mut usize) -> JsValue {
+    *pos += 1; // skip {
+    let mut map = HashMap::new();
+    json_skip_ws(bytes, pos);
+    if bytes.get(*pos) == Some(&b'}') {
+        *pos += 1;
+        return JsValue::Object(map);
+    }
+    loop {
+        json_skip_ws(bytes, pos);
+        let key = match json_parse_string(bytes, pos) {
+            JsValue::String(k) => k,
+            _ => break,
+        };
+        json_skip_ws(bytes, pos);
+        if bytes.get(*pos) == Some(&b':') {
+            *pos += 1;
+        }
+        let value = json_parse_value(bytes, pos);
+        map.insert(key, value);
+        json_skip_ws(bytes, pos);
+        match bytes.get(*pos) {
+            Some(b',') => {
+                *pos += 1;
+            }
+            Some(b'}') => {
+                *pos += 1;
+                break;
+            }
+            _ => break,
+        }
+    }
+    JsValue::Object(map)
+}
+
+fn json_parse_array(bytes: &[u8], pos: &mut usize) -> JsValue {
+    *pos += 1; // skip [
+    let mut items = Vec::new();
+    json_skip_ws(bytes, pos);
+    if bytes.get(*pos) == Some(&b']') {
+        *pos += 1;
+        return JsValue::Array(items);
+    }
+    loop {
+        items.push(json_parse_value(bytes, pos));
+        json_skip_ws(bytes, pos);
+        match bytes.get(*pos) {
+            Some(b',') => {
+                *pos += 1;
+            }
+            Some(b']') => {
+                *pos += 1;
+                break;
+            }
+            _ => break,
+        }
+    }
+    JsValue::Array(items)
+}
+
+fn json_parse_number(bytes: &[u8], pos: &mut usize) -> JsValue {
+    let start = *pos;
+    while *pos < bytes.len()
+        && (bytes[*pos].is_ascii_digit() || matches!(bytes[*pos], b'-' | b'+' | b'.' | b'e' | b'E'))
+    {
+        *pos += 1;
+    }
+    let s = std::str::from_utf8(&bytes[start..*pos]).unwrap_or("0");
+    JsValue::Number(s.parse::<f64>().unwrap_or(0.0))
+}
+
+fn json_stringify(value: &JsValue) -> String {
+    match value {
+        JsValue::Null | JsValue::Undefined => "null".to_owned(),
+        JsValue::Boolean(b) => b.to_string(),
+        JsValue::Number(n) => {
+            if n.fract() == 0.0 && n.is_finite() {
+                (*n as i64).to_string()
+            } else {
+                n.to_string()
+            }
+        }
+        JsValue::String(s) => {
+            let escaped = s
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            format!("\"{escaped}\"")
+        }
+        JsValue::Array(items) => {
+            let parts: Vec<String> = items.iter().map(json_stringify).collect();
+            format!("[{}]", parts.join(","))
+        }
+        JsValue::Object(map) => {
+            let mut pairs: Vec<String> = map
+                .iter()
+                .map(|(k, v)| {
+                    let key = json_stringify(&JsValue::String(k.clone()));
+                    format!("{key}:{}", json_stringify(v))
+                })
+                .collect();
+            pairs.sort(); // stable key order for deterministic output
+            format!("{{{}}}", pairs.join(","))
+        }
+        JsValue::ElementRef(_)
+        | JsValue::NodeList(_)
+        | JsValue::StyleRef(_)
+        | JsValue::ResolvedPromise => "null".to_owned(),
+    }
+}
+
+fn js_style_prop_to_css(prop: &str) -> String {
+    let mut result = String::new();
+    for ch in prop.chars() {
+        if ch.is_uppercase() {
+            result.push('-');
+            result.push(ch.to_ascii_lowercase());
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+fn parse_inline_style_map(style: &str) -> Vec<(String, String)> {
+    style
+        .split(';')
+        .filter_map(|decl| {
+            let decl = decl.trim();
+            let colon = decl.find(':')?;
+            let name = decl[..colon].trim().to_lowercase();
+            let val = decl[colon + 1..].trim().to_owned();
+            if name.is_empty() {
+                None
+            } else {
+                Some((name, val))
+            }
+        })
+        .collect()
+}
+
+fn merge_inline_style(existing: &str, prop: &str, value: &str) -> String {
+    let mut props = parse_inline_style_map(existing);
+    if let Some((_, v)) = props.iter_mut().find(|(k, _)| k == prop) {
+        *v = value.to_owned();
+    } else {
+        props.push((prop.to_owned(), value.to_owned()));
+    }
+    props
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[cfg(test)]
@@ -1226,6 +1725,170 @@ mod tests {
             vec![BrowserEffect::SetTextContent {
                 element_id: "out".to_owned(),
                 value: "Enter".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn dom_content_loaded_fires_as_microtask_after_script() {
+        let program = crate::parse_script(
+            r#"
+            document.addEventListener("DOMContentLoaded", function () {
+                document.getElementById("result").textContent = "Ready";
+            });
+            "#,
+        )
+        .expect("script should parse");
+
+        assert_eq!(
+            collect_browser_effects(&program),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "Ready".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn json_parse_and_stringify_round_trips_object() {
+        let program = crate::parse_script(
+            r#"
+            let obj = JSON.parse('{"name":"AlmosThere"}');
+            document.getElementById("result").textContent = JSON.stringify(obj);
+            "#,
+        )
+        .expect("script should parse");
+
+        assert_eq!(
+            collect_browser_effects(&program),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "{\"name\":\"AlmosThere\"}".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn array_push_and_index_and_length() {
+        let program = crate::parse_script(
+            r#"
+            let items = [];
+            items.push("A");
+            items.push("B");
+            document.getElementById("result").textContent =
+                items[0] + items[1] + String(items.length);
+            "#,
+        )
+        .expect("script should parse");
+
+        assert_eq!(
+            collect_browser_effects(&program),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "AB2".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn promise_microtask_runs_after_sync_code_and_before_timer() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            Promise.resolve().then(function () {
+                output = output + "B";
+            });
+            output = output + "A";
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        // After execute_program: output="A", then microtask ran → output="AB"
+        state.drain_effects();
+
+        let effects = state.poll_timers(0);
+        assert_eq!(
+            effects,
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "AB".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn style_property_assignment_emits_set_attribute_with_inline_style() {
+        let program = crate::parse_script(
+            r#"
+            let box = document.getElementById("box");
+            box.style.display = "none";
+            "#,
+        )
+        .expect("script should parse");
+
+        assert_eq!(
+            collect_browser_effects(&program),
+            vec![BrowserEffect::SetAttribute {
+                element_id: "box".to_owned(),
+                name: "style".to_owned(),
+                value: "display: none".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn style_property_assignment_merges_with_existing_inline_style() {
+        let program = crate::parse_script(
+            r#"
+            let box = document.getElementById("box");
+            box.style.color = "red";
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        let mut attrs = HashMap::new();
+        attrs.insert("style".to_owned(), "display: block".to_owned());
+        state.seed_existing_element("box", String::new(), attrs);
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetAttribute {
+                element_id: "box".to_owned(),
+                name: "style".to_owned(),
+                value: "display: block; color: red".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn get_computed_style_returns_seeded_display_value() {
+        let program = crate::parse_script(
+            r#"
+            let style = getComputedStyle(document.getElementById("box"));
+            document.getElementById("result").textContent = style.display;
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.seed_existing_element("box", String::new(), HashMap::new());
+        let mut computed = HashMap::new();
+        computed.insert("display".to_owned(), "block".to_owned());
+        state.seed_computed_style("box", computed);
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "block".to_owned(),
             }]
         );
     }
