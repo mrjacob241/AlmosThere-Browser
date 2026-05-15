@@ -992,6 +992,8 @@ pub struct BrowserCanvasResponse {
 pub struct InputChange {
     pub label: String,
     pub value_len: usize,
+    pub element_id: Option<String>,
+    pub value: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1049,6 +1051,7 @@ impl BrowserCanvas {
                                 content_width,
                                 font_scale,
                                 &mut canvas_response,
+                                false,
                             );
                         }
                     });
@@ -1097,6 +1100,7 @@ impl BrowserCanvas {
                             content_width,
                             font_scale,
                             &mut canvas_response,
+                            true,
                         );
                     });
                 });
@@ -1122,6 +1126,7 @@ fn paint_canvas_graph(
     content_width: f32,
     font_scale: f32,
     canvas_response: &mut BrowserCanvasResponse,
+    read_only: bool,
 ) {
     let graph_width = graph.viewport.x.max(1.0);
     let scale = (content_width / graph_width).max(0.1) * font_scale;
@@ -1242,36 +1247,56 @@ fn paint_canvas_graph(
             }
             CanvasObject::Input(input) => {
                 let rect = canvas_object_rect(canvas_rect.min, input.rect, scale);
-                let mut value = input.value.clone();
-                let response = ui.put(
-                    rect,
-                    egui::TextEdit::singleline(&mut value)
-                        .hint_text(input.label.as_str())
-                        .frame(false)
-                        .font(FontId::new(
-                            input.font_size * scale,
-                            browser_regular_family(),
-                        ))
-                        .text_color(input.color),
-                );
-                if response.hovered() {
-                    canvas_response.hovered = Some(HitTarget::Input {
-                        label: input.label.clone(),
-                        element_id: input.element_id.clone(),
-                    });
-                }
-                if response.changed() {
-                    input.value = value.clone();
-                    canvas_response.changed_inputs.push(InputChange {
-                        label: input.label.clone(),
-                        value_len: value.chars().count(),
-                    });
-                }
-                if response.lost_focus() && ui.input(|state| state.key_pressed(egui::Key::Enter)) {
-                    canvas_response.submitted_inputs.push(InputSubmit {
-                        label: input.label.clone(),
-                        value,
-                    });
+                if read_only {
+                    let display = if input.value.is_empty() {
+                        input.label.as_str()
+                    } else {
+                        input.value.as_str()
+                    };
+                    ui.put(
+                        rect,
+                        egui::Label::new(
+                            egui::RichText::new(display)
+                                .size(input.font_size * scale)
+                                .color(input.color),
+                        ),
+                    );
+                } else {
+                    let mut value = input.value.clone();
+                    let response = ui.put(
+                        rect,
+                        egui::TextEdit::singleline(&mut value)
+                            .hint_text(input.label.as_str())
+                            .frame(false)
+                            .font(FontId::new(
+                                input.font_size * scale,
+                                browser_regular_family(),
+                            ))
+                            .text_color(input.color),
+                    );
+                    if response.hovered() {
+                        canvas_response.hovered = Some(HitTarget::Input {
+                            label: input.label.clone(),
+                            element_id: input.element_id.clone(),
+                        });
+                    }
+                    if response.changed() {
+                        input.value = value.clone();
+                        canvas_response.changed_inputs.push(InputChange {
+                            label: input.label.clone(),
+                            value_len: value.chars().count(),
+                            element_id: input.element_id.clone(),
+                            value: value.clone(),
+                        });
+                    }
+                    if response.lost_focus()
+                        && ui.input(|state| state.key_pressed(egui::Key::Enter))
+                    {
+                        canvas_response.submitted_inputs.push(InputSubmit {
+                            label: input.label.clone(),
+                            value,
+                        });
+                    }
                 }
             }
             CanvasObject::Image(image) => {
@@ -1333,6 +1358,8 @@ fn reset_inputs_for_form(
             canvas_response.changed_inputs.push(InputChange {
                 label: input.label.clone(),
                 value_len: input.value.chars().count(),
+                element_id: input.element_id.clone(),
+                value: input.value.clone(),
             });
         }
     }
@@ -1901,6 +1928,8 @@ fn paint_block(
                 canvas_response.changed_inputs.push(InputChange {
                     label: label.clone(),
                     value_len: value.chars().count(),
+                    element_id: None,
+                    value: value.clone(),
                 });
             }
             ui.add_space(2.0 * font_scale);
@@ -2662,6 +2691,8 @@ fn paint_ecosia_hero(
         canvas_response.changed_inputs.push(InputChange {
             label: "Search".to_owned(),
             value_len: hero.search_value.chars().count(),
+            element_id: None,
+            value: hero.search_value.clone(),
         });
     }
 

@@ -6,9 +6,13 @@
   <script>
     console.log("Script test fixture loaded");
     console.log("[TEST-0018]: setTimeout. Expected: after the timer runs, #result text changes from Before to After.");
+    console.log("3...");
+    setTimeout(function () { console.log("2..."); }, 1000);
+    setTimeout(function () { console.log("1..."); }, 2000);
     setTimeout(function () {
+      console.log("Timer fired!");
       document.getElementById("result").textContent = "After";
-    }, 10);
+    }, 3000);
   </script>
 </body>
 </html>

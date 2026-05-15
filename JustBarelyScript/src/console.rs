@@ -139,7 +139,7 @@ fn collect_expression_console_messages(expression: &Expression, out: &mut Vec<Co
                 collect_expression_console_messages(&property.value, out);
             }
         }
-        Expression::Function(function) => collect_block_console_messages(&function.body, out),
+        Expression::Function(_) => {} // deferred callbacks — don't collect as synchronous output
         Expression::Binary { left, right, .. } => {
             collect_expression_console_messages(left, out);
             collect_expression_console_messages(right, out);
