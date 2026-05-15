@@ -31,6 +31,108 @@ const DEBUG_EXPORT_DIR: &str =
 const DEFAULT_BOOKMARK_TITLE: &str = "AlmostThere Sample Page";
 const DEFAULT_URL_BOOKMARK_TITLE: &str = "HTML5 Test Page";
 const LOCAL_BOOKMARK_TOKEN: &str = "[local]";
+const SCRIPT_TEST_BOOKMARKS: &[(&str, &str)] = &[
+    (
+        "001 Basic Script Execution",
+        "JustBarelyScript/UnitTest/001-basic-script-execution/index.html",
+    ),
+    (
+        "002 Multiple Script Tags Execute In Order",
+        "JustBarelyScript/UnitTest/002-multiple-script-tags-execute-in-order/index.html",
+    ),
+    (
+        "003 Console Logging",
+        "JustBarelyScript/UnitTest/003-console-logging/index.html",
+    ),
+    (
+        "004 Element Creation",
+        "JustBarelyScript/UnitTest/004-element-creation/index.html",
+    ),
+    (
+        "005 CSS Class Assignment",
+        "JustBarelyScript/UnitTest/005-css-class-assignment/index.html",
+    ),
+    (
+        "006 setAttribute And getAttribute",
+        "JustBarelyScript/UnitTest/006-setattribute-and-getattribute/index.html",
+    ),
+    (
+        "007 innerHTML Basic Replacement",
+        "JustBarelyScript/UnitTest/007-innerhtml-basic-replacement/index.html",
+    ),
+    (
+        "008 Query Selector By ID",
+        "JustBarelyScript/UnitTest/008-query-selector-by-id/index.html",
+    ),
+    (
+        "009 Query Selector By Class",
+        "JustBarelyScript/UnitTest/009-query-selector-by-class/index.html",
+    ),
+    (
+        "010 querySelectorAll And Length",
+        "JustBarelyScript/UnitTest/010-queryselectorall-and-length/index.html",
+    ),
+    (
+        "011 For Loop DOM Update",
+        "JustBarelyScript/UnitTest/011-for-loop-dom-update/index.html",
+    ),
+    (
+        "012 Event Listener Click",
+        "JustBarelyScript/UnitTest/012-event-listener-click/index.html",
+    ),
+    (
+        "013 Event Object Target",
+        "JustBarelyScript/UnitTest/013-event-object-target/index.html",
+    ),
+    (
+        "014 Input Value Reading",
+        "JustBarelyScript/UnitTest/014-input-value-reading/index.html",
+    ),
+    (
+        "015 Input Event",
+        "JustBarelyScript/UnitTest/015-input-event/index.html",
+    ),
+    (
+        "016 Style Property Mutation",
+        "JustBarelyScript/UnitTest/016-style-property-mutation/index.html",
+    ),
+    (
+        "017 Computed Style Smoke Test",
+        "JustBarelyScript/UnitTest/017-computed-style-smoke-test/index.html",
+    ),
+    (
+        "018 setTimeout",
+        "JustBarelyScript/UnitTest/018-settimeout/index.html",
+    ),
+    (
+        "019 Promise Microtask",
+        "JustBarelyScript/UnitTest/019-promise-microtask/index.html",
+    ),
+    (
+        "020 JSON Parse And Stringify",
+        "JustBarelyScript/UnitTest/020-json-parse-and-stringify/index.html",
+    ),
+    (
+        "021 Array Operations",
+        "JustBarelyScript/UnitTest/021-array-operations/index.html",
+    ),
+    (
+        "022 Object Literals And Properties",
+        "JustBarelyScript/UnitTest/022-object-literals-and-properties/index.html",
+    ),
+    (
+        "023 Closures In Event Handlers",
+        "JustBarelyScript/UnitTest/023-closures-in-event-handlers/index.html",
+    ),
+    (
+        "024 DOMContentLoaded",
+        "JustBarelyScript/UnitTest/024-domcontentloaded/index.html",
+    ),
+    (
+        "025 Minimal Todo App",
+        "JustBarelyScript/UnitTest/025-minimal-todo-app/index.html",
+    ),
+];
 
 fn main() -> eframe::Result<()> {
     let options = NativeOptions {
@@ -52,9 +154,13 @@ struct AlmostThereApp {
     debug_canvas: BrowserCanvas,
     document: BrowserDocument,
     current_html: String,
+    live_html: String,
+    script_state: justbarelyscript::BrowserExecutionState,
+    last_hovered_element_id: Option<String>,
     render_graph_debug_text: String,
     url_input: String,
     bookmarks: Vec<Bookmark>,
+    console_messages: Vec<justbarelyscript::ConsoleMessage>,
     status: String,
     telemetry: TelemetrySession,
     text_metrics_ready: bool,
@@ -92,6 +198,7 @@ enum DebugPanelTab {
     RenderGraph,
     CanvasGraph,
     Html,
+    Console,
 }
 
 impl AlmostThereApp {
@@ -107,50 +214,69 @@ impl AlmostThereApp {
             let _ = save_bookmarks(&bookmarks);
         }
 
-        let (document, current_html, render_graph_debug_text, status) =
-            match load_url_source(DEFAULT_URL) {
-                Ok(source) => {
-                    let document =
-                        parse_html_document_with_text_metrics(&source.html, &source.source, None);
-                    let render_graph_debug_text =
-                        parse_render_graph_debug_dump(&source.html, &source.source);
-                    telemetry.emit(
-                        "navigation.loaded",
-                        &[
-                            ("url", DEFAULT_URL),
-                            ("title", &document.title),
-                            ("blocks", &document.blocks.len().to_string()),
-                        ],
-                    );
-                    (
-                        document,
-                        source.html,
-                        render_graph_debug_text,
-                        format!("Loaded {DEFAULT_URL}"),
-                    )
-                }
-                Err(error) => {
-                    telemetry.emit(
-                        "navigation.failed",
-                        &[("url", DEFAULT_URL), ("error", &error.to_string())],
-                    );
-                    let document = BrowserDocument {
-                        title: "Load failed".to_owned(),
-                        source: DEFAULT_URL.to_owned(),
-                        style: Default::default(),
-                        canvas_graph: CanvasGraph::default(),
-                        blocks: vec![CanvasBlock::Paragraph {
-                            text: format!("Failed to load default page {DEFAULT_URL}: {error}"),
-                        }],
-                    };
-                    (
-                        document,
-                        String::new(),
-                        String::new(),
-                        format!("Failed to load default page {DEFAULT_URL}: {error}"),
-                    )
-                }
-            };
+        let (
+            document,
+            current_html,
+            live_html,
+            script_state,
+            render_graph_debug_text,
+            console_messages,
+            status,
+        ) = match load_url_source(DEFAULT_URL) {
+            Ok(source) => {
+                let document =
+                    parse_html_document_with_text_metrics(&source.html, &source.source, None);
+                let live_html =
+                    apply_safe_script_browser_effects(&remove_html_comments(&source.html));
+                let script_state = build_script_state(&source.html);
+                let render_graph_debug_text =
+                    parse_render_graph_debug_dump(&source.html, &source.source);
+                let console_messages = script_console_messages_from_html(&source.html);
+                telemetry.emit(
+                    "navigation.loaded",
+                    &[
+                        ("url", DEFAULT_URL),
+                        ("title", &document.title),
+                        ("blocks", &document.blocks.len().to_string()),
+                    ],
+                );
+                (
+                    document,
+                    source.html,
+                    live_html,
+                    script_state,
+                    render_graph_debug_text,
+                    console_messages,
+                    format!("Loaded {DEFAULT_URL}"),
+                )
+            }
+            Err(error) => {
+                telemetry.emit(
+                    "navigation.failed",
+                    &[("url", DEFAULT_URL), ("error", &error.to_string())],
+                );
+                let document = BrowserDocument {
+                    title: "Load failed".to_owned(),
+                    source: DEFAULT_URL.to_owned(),
+                    style: Default::default(),
+                    canvas_graph: CanvasGraph::default(),
+                    blocks: vec![CanvasBlock::Paragraph {
+                        text: format!("Failed to load default page {DEFAULT_URL}: {error}"),
+                    }],
+                };
+                (
+                    document,
+                    String::new(),
+                    String::new(),
+                    justbarelyscript::BrowserExecutionState::default(),
+                    String::new(),
+                    vec![console_error_message(format!(
+                        "Failed to load default page {DEFAULT_URL}: {error}"
+                    ))],
+                    format!("Failed to load default page {DEFAULT_URL}: {error}"),
+                )
+            }
+        };
 
         let render_debug = PageRenderDebugState {
             open: false,
@@ -163,9 +289,13 @@ impl AlmostThereApp {
             debug_canvas: BrowserCanvas::new(),
             document,
             current_html,
+            live_html,
+            script_state,
+            last_hovered_element_id: None,
             render_graph_debug_text,
             url_input: DEFAULT_URL.to_owned(),
             bookmarks,
+            console_messages,
             status,
             telemetry,
             text_metrics_ready: false,
@@ -209,8 +339,13 @@ impl AlmostThereApp {
                 match result {
                     Ok(source) => {
                         self.current_html = source.html.clone();
+                        self.live_html =
+                            apply_safe_script_browser_effects(&remove_html_comments(&source.html));
+                        self.script_state = build_script_state(&source.html);
+                        self.last_hovered_element_id = None;
                         self.render_graph_debug_text =
                             parse_render_graph_debug_dump(&source.html, &source.source);
+                        self.console_messages = script_console_messages_from_html(&source.html);
                         let document = parse_html_document_with_text_metrics(
                             &source.html,
                             &source.source,
@@ -240,6 +375,8 @@ impl AlmostThereApp {
                             &[("url", &pending.url), ("error", &error.to_string())],
                         );
                         self.status = format!("Load failed: {error}");
+                        self.console_messages
+                            .push(console_error_message(format!("Load failed: {error}")));
                     }
                 }
                 ctx.request_repaint();
@@ -250,6 +387,10 @@ impl AlmostThereApp {
             Err(TryRecvError::Disconnected) => {
                 let pending = self.pending_navigation.take().expect("pending navigation");
                 self.status = format!("Load failed: loader stopped for {}", pending.url);
+                self.console_messages.push(console_error_message(format!(
+                    "Load failed: loader stopped for {}",
+                    pending.url
+                )));
                 ctx.request_repaint();
             }
         }
@@ -303,6 +444,10 @@ impl AlmostThereApp {
         let Some(bookmark) = self.bookmarks.get(index).cloned() else {
             return;
         };
+        self.open_bookmark_value(bookmark, ctx);
+    }
+
+    fn open_bookmark_value(&mut self, bookmark: Bookmark, ctx: &egui::Context) {
         self.url_input = bookmark.url;
         self.telemetry.emit(
             "bookmark.opened",
@@ -346,6 +491,45 @@ impl AlmostThereApp {
 
     fn scroll_to_fragment(&mut self, fragment: &str) {
         self.canvas.scroll_offset.y = estimated_fragment_scroll_y(&self.document, fragment);
+    }
+
+    fn apply_script_effects(
+        &mut self,
+        effects: Vec<justbarelyscript::BrowserEffect>,
+        ctx: &egui::Context,
+    ) {
+        if effects.is_empty() {
+            return;
+        }
+        for effect in effects {
+            match effect {
+                justbarelyscript::BrowserEffect::SetTextContent { element_id, value } => {
+                    self.live_html =
+                        set_element_text_content_by_id(&self.live_html, &element_id, &value);
+                }
+                justbarelyscript::BrowserEffect::SetAttribute {
+                    element_id,
+                    name,
+                    value,
+                } => {
+                    self.live_html =
+                        set_element_attribute_by_id(&self.live_html, &element_id, &name, &value);
+                }
+                justbarelyscript::BrowserEffect::SetInnerHtml { element_id, value } => {
+                    self.live_html =
+                        set_element_inner_html_by_id(&self.live_html, &element_id, &value);
+                }
+                justbarelyscript::BrowserEffect::AppendChild { parent_id, child } => {
+                    self.live_html = append_child_html_by_id(&self.live_html, &parent_id, &child);
+                }
+            }
+        }
+        self.document = parse_html_document_from_live_html(
+            &self.live_html,
+            &self.document.source.clone(),
+            Some(ctx),
+        );
+        ctx.request_repaint();
     }
 
     fn debug_canvas_graph(&self) -> CanvasGraph {
@@ -493,6 +677,50 @@ fn rect_debug(rect: egui::Rect) -> String {
 
 fn paint_alternating_debug_text(ui: &mut egui::Ui, text: &str) {
     paint_alternating_debug_text_with_canvas_thumbs(ui, text, None);
+}
+
+fn paint_console_messages(ui: &mut egui::Ui, messages: &[justbarelyscript::ConsoleMessage]) {
+    egui::ScrollArea::vertical()
+        .id_salt("debug_console_messages")
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            if messages.is_empty() {
+                ui.label("Console is empty.");
+                return;
+            }
+
+            for (index, message) in messages.iter().enumerate() {
+                let is_error = message.level == justbarelyscript::ConsoleLevel::Error;
+                let fill = if is_error {
+                    egui::Color32::from_rgb(255, 244, 179)
+                } else if index % 2 == 0 {
+                    egui::Color32::from_rgb(248, 249, 251)
+                } else {
+                    egui::Color32::from_rgb(237, 240, 244)
+                };
+                let text_color = if is_error {
+                    egui::Color32::from_rgb(176, 0, 32)
+                } else {
+                    ui.visuals().text_color()
+                };
+                let level = match message.level {
+                    justbarelyscript::ConsoleLevel::Log => "log",
+                    justbarelyscript::ConsoleLevel::Info => "info",
+                    justbarelyscript::ConsoleLevel::Warn => "warn",
+                    justbarelyscript::ConsoleLevel::Error => "error",
+                };
+
+                egui::Frame::new()
+                    .fill(fill)
+                    .inner_margin(egui::Margin::symmetric(8, 5))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.monospace(format!("[{level}]"));
+                            ui.label(egui::RichText::new(&message.text).color(text_color));
+                        });
+                    });
+            }
+        });
 }
 
 fn paint_alternating_debug_text_with_canvas_thumbs(
@@ -1247,6 +1475,365 @@ fn default_url_bookmark() -> Bookmark {
     }
 }
 
+fn script_test_bookmarks() -> Vec<Bookmark> {
+    SCRIPT_TEST_BOOKMARKS
+        .iter()
+        .map(|(title, relative_path)| Bookmark {
+            title: (*title).to_owned(),
+            url: path_to_file_url(&workspace_root_path().join(relative_path)),
+        })
+        .collect()
+}
+
+fn script_console_messages_from_html(html: &str) -> Vec<justbarelyscript::ConsoleMessage> {
+    let report = justbarelyscript::parse_inline_scripts_from_html(html);
+    let mut messages = Vec::new();
+
+    if report.is_empty() {
+        messages.push(justbarelyscript::ConsoleMessage {
+            level: justbarelyscript::ConsoleLevel::Info,
+            text: "No inline scripts found.".to_owned(),
+        });
+        return messages;
+    }
+
+    messages.push(justbarelyscript::ConsoleMessage {
+        level: justbarelyscript::ConsoleLevel::Info,
+        text: format!(
+            "Parsed {} inline script(s). ConsoleSink is parser-only; filesystem, process, shell, deletion, creation, and network APIs are not exposed.",
+            report.scripts.len()
+        ),
+    });
+
+    for script in report.scripts {
+        match script.program {
+            Ok(program) => {
+                messages.extend(justbarelyscript::collect_static_console_messages(&program));
+            }
+            Err(error) => messages.push(console_error_message(format!(
+                "Script {}: {}",
+                script.index + 1,
+                error.diagnostic_message()
+            ))),
+        }
+    }
+
+    messages
+}
+
+fn build_script_state(html: &str) -> justbarelyscript::BrowserExecutionState {
+    let html = remove_html_comments(html);
+    let report = justbarelyscript::parse_inline_scripts_from_html(&html);
+    let mut state = justbarelyscript::BrowserExecutionState::default();
+    seed_script_dom_state_from_html(&html, &mut state);
+    for script in report.scripts {
+        let Ok(program) = script.program else {
+            continue;
+        };
+        state.execute_program(&program);
+        state.drain_effects(); // discard initial DOM effects; we only keep event handlers
+    }
+    state
+}
+
+fn parse_html_document_from_live_html(
+    live_html: &str,
+    source: &str,
+    text_metrics: Option<&egui::Context>,
+) -> BrowserDocument {
+    let dom = parse_dom_document(live_html);
+    let title = dom
+        .first_descendant_by_tag("title")
+        .map(DomElement::text_content)
+        .or_else(|| extract_tag_text(live_html, "title"))
+        .unwrap_or_else(|| "Untitled".to_owned())
+        .trim()
+        .to_owned();
+    let mut css = extract_tag_inner(live_html, "style")
+        .unwrap_or("")
+        .to_owned();
+    css.push_str(&load_linked_stylesheets(live_html, source).unwrap_or_default());
+    let root_classes = document_theme_root_classes(&dom, text_metrics);
+    let style = parse_basic_css_for_viewport_with_root_classes(&css, 1280.0, &root_classes);
+    let render_graph = build_render_graph(&dom, &style);
+    let canvas_graph =
+        render_graph_to_canvas_graph(&render_graph, source, style.image_height_auto, text_metrics);
+    let blocks = render_graph_to_blocks(&render_graph, source, style.image_height_auto);
+    BrowserDocument {
+        title,
+        source: source.to_owned(),
+        style,
+        canvas_graph,
+        blocks,
+    }
+}
+
+fn apply_safe_script_browser_effects(html: &str) -> String {
+    let report = justbarelyscript::parse_inline_scripts_from_html(html);
+    let mut output = html.to_owned();
+    let mut state = justbarelyscript::BrowserExecutionState::default();
+    seed_script_dom_state_from_html(html, &mut state);
+
+    for script in report.scripts {
+        let Ok(program) = script.program else {
+            continue;
+        };
+        state.execute_program(&program);
+        for effect in state.drain_effects() {
+            match effect {
+                justbarelyscript::BrowserEffect::SetTextContent { element_id, value } => {
+                    output = set_element_text_content_by_id(&output, &element_id, &value);
+                }
+                justbarelyscript::BrowserEffect::SetAttribute {
+                    element_id,
+                    name,
+                    value,
+                } => {
+                    output = set_element_attribute_by_id(&output, &element_id, &name, &value);
+                }
+                justbarelyscript::BrowserEffect::SetInnerHtml { element_id, value } => {
+                    output = set_element_inner_html_by_id(&output, &element_id, &value);
+                }
+                justbarelyscript::BrowserEffect::AppendChild { parent_id, child } => {
+                    output = append_child_html_by_id(&output, &parent_id, &child);
+                }
+            }
+        }
+    }
+
+    output
+}
+
+fn seed_script_dom_state_from_html(
+    html: &str,
+    state: &mut justbarelyscript::BrowserExecutionState,
+) {
+    let mut offset = 0;
+    let mut remaining = html;
+    let mut generated_id = 0usize;
+
+    while let Some(rel_open_start) = remaining.find('<') {
+        let open_start = offset + rel_open_start;
+        let after_open = &html[open_start..];
+        if after_open.starts_with("</") || after_open.starts_with("<!") {
+            offset = open_start + 1;
+            remaining = &html[offset..];
+            continue;
+        }
+
+        let Some(open_end_rel) = after_open.find('>') else {
+            break;
+        };
+        let open_end = open_start + open_end_rel + 1;
+        let open_tag = &html[open_start..open_end];
+        let real_id = extract_attr(open_tag, "id");
+        let id = real_id.clone().unwrap_or_else(|| {
+            generated_id += 1;
+            format!("__dom_seed_{generated_id}")
+        });
+
+        let mut attributes = std::collections::HashMap::new();
+        if let Some(real_id) = real_id {
+            attributes.insert("id".to_owned(), real_id);
+        }
+        if let Some(classes) = extract_attr(open_tag, "class") {
+            attributes.insert("class".to_owned(), classes);
+        }
+
+        let text_content = tag_name(open_tag)
+            .and_then(|tag| {
+                let close = format!("</{tag}>");
+                let close_start = html[open_end..].find(&close)? + open_end;
+                Some(decode_basic_entities(&strip_tags(
+                    &html[open_end..close_start],
+                )))
+            })
+            .unwrap_or_default();
+
+        state.seed_existing_element(&id, text_content, attributes);
+        offset = open_end;
+        remaining = &html[offset..];
+    }
+}
+
+fn append_child_html_by_id(
+    html: &str,
+    parent_id: &str,
+    child: &justbarelyscript::DomElementSnapshot,
+) -> String {
+    let Some((_open_start, open_end, close_start, close_end)) =
+        find_element_range_by_id(html, parent_id)
+    else {
+        return html.to_owned();
+    };
+
+    let child_html = serialize_dom_snapshot(child);
+    let mut output = String::with_capacity(html.len() + child_html.len());
+    output.push_str(&html[..open_end]);
+    output.push_str(&html[open_end..close_start]);
+    output.push_str(&child_html);
+    output.push_str(&html[close_start..close_end]);
+    output.push_str(&html[close_end..]);
+    output
+}
+
+fn serialize_dom_snapshot(element: &justbarelyscript::DomElementSnapshot) -> String {
+    let tag_name = sanitize_tag_name(&element.tag_name);
+    let mut html = String::new();
+    html.push('<');
+    html.push_str(&tag_name);
+    for (name, value) in &element.attributes {
+        html.push(' ');
+        html.push_str(&sanitize_attr_name(name));
+        html.push_str("=\"");
+        html.push_str(&encode_basic_attr(value));
+        html.push('"');
+    }
+    html.push('>');
+    if element.inner_html.is_empty() {
+        html.push_str(&encode_basic_text(&element.text_content));
+        for child in &element.children {
+            html.push_str(&serialize_dom_snapshot(child));
+        }
+    } else {
+        html.push_str(&element.inner_html);
+    }
+    html.push_str("</");
+    html.push_str(&tag_name);
+    html.push('>');
+    html
+}
+
+fn set_element_text_content_by_id(html: &str, element_id: &str, value: &str) -> String {
+    let Some((open_start, open_end, close_start, close_end)) =
+        find_element_range_by_id(html, element_id)
+    else {
+        return html.to_owned();
+    };
+
+    let mut output = String::with_capacity(html.len() + value.len());
+    output.push_str(&html[..open_end]);
+    output.push_str(&encode_basic_text(value));
+    output.push_str(&html[close_start..close_end]);
+    output.push_str(&html[close_end..]);
+    debug_assert!(output.starts_with(&html[..open_start]));
+    output
+}
+
+fn set_element_inner_html_by_id(html: &str, element_id: &str, value: &str) -> String {
+    let Some((open_start, open_end, close_start, close_end)) =
+        find_element_range_by_id(html, element_id)
+    else {
+        return html.to_owned();
+    };
+
+    let mut output = String::with_capacity(html.len() + value.len());
+    output.push_str(&html[..open_end]);
+    output.push_str(value);
+    output.push_str(&html[close_start..close_end]);
+    output.push_str(&html[close_end..]);
+    debug_assert!(output.starts_with(&html[..open_start]));
+    output
+}
+
+fn set_element_attribute_by_id(html: &str, element_id: &str, name: &str, value: &str) -> String {
+    let Some((open_start, open_end, close_start, close_end)) =
+        find_element_range_by_id(html, element_id)
+    else {
+        return html.to_owned();
+    };
+
+    let open_tag = &html[open_start..open_end];
+    let Some(insert_at) = open_tag.rfind('>') else {
+        return html.to_owned();
+    };
+    let attr = format!(
+        " {}=\"{}\"",
+        sanitize_attr_name(name),
+        encode_basic_attr(value)
+    );
+    let mut output = String::with_capacity(html.len() + attr.len());
+    output.push_str(&html[..open_start + insert_at]);
+    output.push_str(&attr);
+    output.push_str(&html[open_start + insert_at..close_start]);
+    output.push_str(&html[close_start..close_end]);
+    output.push_str(&html[close_end..]);
+    output
+}
+
+fn find_element_range_by_id(html: &str, element_id: &str) -> Option<(usize, usize, usize, usize)> {
+    let mut offset = 0;
+    let mut remaining = html;
+
+    while let Some(rel_open_start) = remaining.find('<') {
+        let open_start = offset + rel_open_start;
+        let after_open = &html[open_start..];
+        if after_open.starts_with("</") || after_open.starts_with("<!") {
+            offset = open_start + 1;
+            remaining = &html[offset..];
+            continue;
+        }
+
+        let open_end = open_start + after_open.find('>')? + 1;
+        let open_tag = &html[open_start..open_end];
+        if extract_attr(open_tag, "id").as_deref() != Some(element_id) {
+            offset = open_end;
+            remaining = &html[offset..];
+            continue;
+        }
+
+        let tag = tag_name(open_tag)?;
+        let close = format!("</{tag}>");
+        let close_rel = html[open_end..].find(&close)?;
+        let close_start = open_end + close_rel;
+        let close_end = close_start + close.len();
+        return Some((open_start, open_end, close_start, close_end));
+    }
+
+    None
+}
+
+fn encode_basic_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn encode_basic_attr(text: &str) -> String {
+    encode_basic_text(text).replace('"', "&quot;")
+}
+
+fn sanitize_tag_name(tag_name: &str) -> String {
+    let sanitized: String = tag_name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+        .collect();
+    if sanitized.is_empty() {
+        "div".to_owned()
+    } else {
+        sanitized.to_ascii_lowercase()
+    }
+}
+
+fn sanitize_attr_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+        .collect();
+    if sanitized.is_empty() {
+        "data-empty".to_owned()
+    } else {
+        sanitized.to_ascii_lowercase()
+    }
+}
+
+fn console_error_message(text: impl Into<String>) -> justbarelyscript::ConsoleMessage {
+    justbarelyscript::ConsoleMessage {
+        level: justbarelyscript::ConsoleLevel::Error,
+        text: text.into(),
+    }
+}
+
 fn ensure_bookmark(bookmarks: &mut Vec<Bookmark>, bookmark: Bookmark) -> bool {
     if bookmarks
         .iter()
@@ -1330,9 +1917,12 @@ fn local_bookmark_path_token() -> String {
 }
 
 fn workspace_root_file_url() -> String {
+    path_to_file_url(&workspace_root_path())
+}
+
+fn workspace_root_path() -> PathBuf {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir.parent().unwrap_or(manifest_dir);
-    path_to_file_url(workspace_root)
+    manifest_dir.parent().unwrap_or(manifest_dir).to_path_buf()
 }
 
 impl App for AlmostThereApp {
@@ -1365,9 +1955,9 @@ impl App for AlmostThereApp {
                     self.load_current_input(ctx);
                 }
                 let debug_label = if self.render_debug.open {
-                    "Close Render Debug"
+                    "Close Debug"
                 } else {
-                    "Render Debug"
+                    "Debug"
                 };
                 if ui.button(debug_label).clicked() {
                     self.render_debug.open = !self.render_debug.open;
@@ -1403,6 +1993,19 @@ impl App for AlmostThereApp {
                 });
                 if let Some(index) = bookmark_to_open {
                     self.open_bookmark(index, ctx);
+                }
+
+                let mut script_test_to_open = None;
+                ui.menu_button("Script Tests", |ui| {
+                    for bookmark in script_test_bookmarks() {
+                        if ui.button(&bookmark.title).clicked() {
+                            script_test_to_open = Some(bookmark);
+                            ui.close();
+                        }
+                    }
+                });
+                if let Some(bookmark) = script_test_to_open {
+                    self.open_bookmark_value(bookmark, ctx);
                 }
 
                 let response = ui.add_sized(
@@ -1448,8 +2051,18 @@ impl App for AlmostThereApp {
                             DebugPanelTab::Html,
                             "HTML",
                         );
+                        ui.selectable_value(
+                            &mut self.render_debug.active_tab,
+                            DebugPanelTab::Console,
+                            "Console",
+                        );
                     });
                     ui.separator();
+
+                    if self.render_debug.active_tab == DebugPanelTab::Console {
+                        paint_console_messages(ui, &self.console_messages);
+                        return;
+                    }
 
                     let text = match self.render_debug.active_tab {
                         DebugPanelTab::RenderGraph => self.render_graph_debug_text.clone(),
@@ -1457,6 +2070,7 @@ impl App for AlmostThereApp {
                             canvas_graph_debug_string(&self.document.canvas_graph)
                         }
                         DebugPanelTab::Html => self.current_html.clone(),
+                        DebugPanelTab::Console => String::new(),
                     };
 
                     egui::ScrollArea::both()
@@ -1577,18 +2191,40 @@ impl App for AlmostThereApp {
                         self.open_link(&search_url, ctx);
                     }
                 }
+                let hovered_element_id = response.hovered.as_ref().and_then(|t| match t {
+                    HitTarget::Button { element_id, .. } | HitTarget::Input { element_id, .. } => {
+                        element_id.clone()
+                    }
+                    HitTarget::Link { .. } => None,
+                });
                 if let Some(target) = response.hovered {
                     match target {
                         HitTarget::Link { href } => {
                             self.status = format!("Link: {href}");
                         }
-                        HitTarget::Button { text } => {
+                        HitTarget::Button { text, .. } => {
                             self.status = format!("Button: {text}");
                         }
-                        HitTarget::Input { label } => {
+                        HitTarget::Input { label, .. } => {
                             self.status = format!("Input: {label}");
                         }
                     }
+                }
+                // Fire mouseover when hover enters a new element with a listener.
+                if hovered_element_id != self.last_hovered_element_id {
+                    if let Some(ref old_id) = self.last_hovered_element_id.clone() {
+                        if self.script_state.has_listener(old_id, "mouseout") {
+                            let effects = self.script_state.fire_event(old_id, "mouseout", None);
+                            self.apply_script_effects(effects, ctx);
+                        }
+                    }
+                    if let Some(ref new_id) = hovered_element_id {
+                        if self.script_state.has_listener(new_id, "mouseover") {
+                            let effects = self.script_state.fire_event(new_id, "mouseover", None);
+                            self.apply_script_effects(effects, ctx);
+                        }
+                    }
+                    self.last_hovered_element_id = hovered_element_id;
                 }
                 if let Some(target) = response.clicked {
                     match target {
@@ -1597,16 +2233,54 @@ impl App for AlmostThereApp {
                                 .emit("hit_test.clicked", &[("target", "link"), ("href", &href)]);
                             self.open_link(&href, ctx);
                         }
-                        HitTarget::Button { text } => {
+                        HitTarget::Button { text, element_id } => {
                             self.telemetry
                                 .emit("hit_test.clicked", &[("target", "button"), ("text", &text)]);
                             self.status = format!("Clicked button {text}");
+                            if let Some(id) = element_id {
+                                if self.script_state.has_listener(&id, "click") {
+                                    let effects = self.script_state.fire_event(&id, "click", None);
+                                    self.apply_script_effects(effects, ctx);
+                                }
+                            }
                         }
-                        HitTarget::Input { label } => {
+                        HitTarget::Input { label, element_id } => {
                             self.telemetry.emit(
                                 "hit_test.clicked",
                                 &[("target", "input"), ("label", &label)],
                             );
+                            if let Some(id) = element_id {
+                                if self.script_state.has_listener(&id, "click") {
+                                    let effects = self.script_state.fire_event(&id, "click", None);
+                                    self.apply_script_effects(effects, ctx);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Fire keydown for any registered listeners.
+                let key_presses: Vec<String> = ctx.input(|state| {
+                    state
+                        .events
+                        .iter()
+                        .filter_map(|event| {
+                            if let egui::Event::Key {
+                                key, pressed: true, ..
+                            } = event
+                            {
+                                Some(key.name().to_owned())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                });
+                if !key_presses.is_empty() {
+                    let keydown_ids = self.script_state.all_element_ids_with_listener("keydown");
+                    for key in &key_presses {
+                        for id in &keydown_ids {
+                            let effects = self.script_state.fire_event(id, "keydown", Some(key));
+                            self.apply_script_effects(effects, ctx);
                         }
                     }
                 }
@@ -2260,6 +2934,7 @@ fn parse_html_document_with_text_metrics(
     text_metrics: Option<&egui::Context>,
 ) -> BrowserDocument {
     let html = remove_html_comments(html);
+    let html = apply_safe_script_browser_effects(&html);
     let dom = parse_dom_document(&html);
     let title = dom
         .first_descendant_by_tag("title")
@@ -2288,6 +2963,7 @@ fn parse_html_document_with_text_metrics(
 
 fn parse_render_graph_debug_dump(html: &str, source: &str) -> String {
     let html = remove_html_comments(html);
+    let html = apply_safe_script_browser_effects(&html);
     let dom = parse_dom_document(&html);
     let mut css = extract_tag_inner(&html, "style").unwrap_or("").to_owned();
     css.push_str(&load_linked_stylesheets(&html, source).unwrap_or_default());
@@ -2761,8 +3437,20 @@ fn apply_css_box_style(
     if let Some(grid_template_columns) = source.grid_template_columns {
         target.grid_template_columns = Some(grid_template_columns);
     }
+    if let Some(grid_template_areas) = &source.grid_template_areas {
+        target.grid_template_areas = Some(grid_template_areas.clone());
+    }
+    if let Some(grid_area) = &source.grid_area {
+        target.grid_area = Some(grid_area.clone());
+    }
     if let Some(gap) = source.gap {
         target.gap = gap;
+    }
+    if let Some(visibility_visible) = source.visibility_visible {
+        target.visibility_visible = visibility_visible;
+    }
+    if let Some(opacity) = source.opacity {
+        target.opacity = opacity;
     }
     if let Some(overflow_hidden) = source.overflow_hidden {
         target.overflow_hidden = overflow_hidden;
@@ -3096,14 +3784,21 @@ fn layout_css_box(
     image_height_auto: bool,
     text_metrics: Option<&egui::Context>,
 ) {
-    box_.dimensions.margin = box_.style.margin;
-    box_.dimensions.padding = box_.style.padding;
-    box_.dimensions.border = CssEdges {
-        top: box_.style.border_width,
-        right: box_.style.border_width,
-        bottom: box_.style.border_width,
-        left: box_.style.border_width,
-    };
+    // Anonymous blocks are synthetic wrappers; they must not apply their parent's box model.
+    if box_.kind == CssLayoutKind::AnonymousBlock {
+        box_.dimensions.margin = CssEdges::default();
+        box_.dimensions.padding = CssEdges::default();
+        box_.dimensions.border = CssEdges::default();
+    } else {
+        box_.dimensions.margin = box_.style.margin;
+        box_.dimensions.padding = box_.style.padding;
+        box_.dimensions.border = CssEdges {
+            top: box_.style.border_width,
+            right: box_.style.border_width,
+            bottom: box_.style.border_width,
+            left: box_.style.border_width,
+        };
+    }
 
     let horizontal_non_content = box_.dimensions.margin.left
         + box_.dimensions.margin.right
@@ -3166,7 +3861,19 @@ fn layout_css_box(
             layout_css_block_children(box_, source, image_height_auto, text_metrics)
         }
         CssLayoutKind::AnonymousBlock => {
-            measure_css_inline_children_height(&box_.children, content_width, text_metrics)
+            if css_layout_box_contains_visual_replaced_content(box_) {
+                layout_css_inline_visual_children(
+                    box_,
+                    source,
+                    image_height_auto,
+                    text_metrics,
+                    content_width,
+                )
+            } else if css_layout_box_contains_replaced_or_special(box_) {
+                layout_css_block_children(box_, source, image_height_auto, text_metrics)
+            } else {
+                measure_css_inline_children_height(&box_.children, content_width, text_metrics)
+            }
         }
         CssLayoutKind::Text => box_
             .text
@@ -3245,6 +3952,148 @@ fn layout_css_box(
         center_css_button_children(box_);
     }
     layout_css_out_of_flow_children(box_, source, image_height_auto, text_metrics);
+}
+
+fn layout_css_inline_visual_children(
+    box_: &mut CssLayoutBox<'_>,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+    containing_width: f32,
+) -> f32 {
+    let mut cursor_x = box_.dimensions.content.left();
+    let cursor_y = box_.dimensions.content.top();
+    let max_x = box_.dimensions.content.right();
+    let mut line_height: f32 = 0.0;
+    let mut max_bottom = cursor_y;
+
+    for child in &mut box_.children {
+        if css_layout_box_is_out_of_flow(child) {
+            continue;
+        }
+        let child_size = layout_css_inline_visual_box(
+            child,
+            cursor_x,
+            cursor_y,
+            (max_x - cursor_x).max(1.0).min(containing_width.max(1.0)),
+            source,
+            image_height_auto,
+            text_metrics,
+        );
+        cursor_x += child_size.x;
+        line_height = line_height.max(child_size.y);
+        max_bottom = max_bottom.max(css_margin_box(child).bottom());
+    }
+
+    (max_bottom - cursor_y).max(line_height).max(0.0)
+}
+
+fn layout_css_inline_visual_box(
+    box_: &mut CssLayoutBox<'_>,
+    containing_x: f32,
+    cursor_y: f32,
+    containing_width: f32,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+) -> egui::Vec2 {
+    box_.dimensions.margin = box_.style.margin;
+    box_.dimensions.padding = box_.style.padding;
+    box_.dimensions.border = CssEdges {
+        top: box_.style.border_width,
+        right: box_.style.border_width,
+        bottom: box_.style.border_width,
+        left: box_.style.border_width,
+    };
+
+    let horizontal_non_content = box_.dimensions.margin.left
+        + box_.dimensions.margin.right
+        + box_.dimensions.border.left
+        + box_.dimensions.border.right
+        + box_.dimensions.padding.left
+        + box_.dimensions.padding.right;
+    let content_x = containing_x
+        + box_.dimensions.margin.left
+        + box_.dimensions.border.left
+        + box_.dimensions.padding.left;
+    let content_y = cursor_y
+        + box_.dimensions.margin.top
+        + box_.dimensions.border.top
+        + box_.dimensions.padding.top;
+    let available_content_width = (containing_width - horizontal_non_content).max(1.0);
+
+    if let Some(size) =
+        css_visual_replaced_content_size(box_, available_content_width, source, image_height_auto)
+    {
+        box_.dimensions.content = egui::Rect::from_min_size(egui::pos2(content_x, content_y), size);
+        return css_margin_box(box_).size();
+    }
+
+    if box_.kind == CssLayoutKind::Text {
+        let text_width = box_
+            .text
+            .as_deref()
+            .map(|text| measure_canvas_text_run(text_metrics, &normalize_ws(text), &box_.style).x)
+            .unwrap_or(1.0)
+            .min(available_content_width)
+            .max(1.0);
+        let text_height = (box_.style.font_size * 1.35).max(1.0);
+        box_.dimensions.content = egui::Rect::from_min_size(
+            egui::pos2(content_x, content_y),
+            egui::vec2(text_width, text_height),
+        );
+        return css_margin_box(box_).size();
+    }
+
+    let mut child_x = content_x;
+    let mut content_width: f32 = 0.0;
+    let mut content_height: f32 = 0.0;
+    for child in &mut box_.children {
+        if css_layout_box_is_out_of_flow(child) {
+            continue;
+        }
+        let child_size = layout_css_inline_visual_box(
+            child,
+            child_x,
+            content_y,
+            (available_content_width - content_width).max(1.0),
+            source,
+            image_height_auto,
+            text_metrics,
+        );
+        child_x += child_size.x;
+        content_width += child_size.x;
+        content_height = content_height.max(child_size.y);
+    }
+    box_.dimensions.content = egui::Rect::from_min_size(
+        egui::pos2(content_x, content_y),
+        egui::vec2(
+            content_width.max(1.0),
+            content_height.max((box_.style.font_size * 1.35).max(1.0)),
+        ),
+    );
+    css_margin_box(box_).size()
+}
+
+fn css_visual_replaced_content_size(
+    box_: &CssLayoutBox<'_>,
+    containing_width: f32,
+    source: &str,
+    image_height_auto: bool,
+) -> Option<egui::Vec2> {
+    let node = box_.node?;
+    if !css_layout_node_is_visual_replaced_content(node) {
+        return None;
+    }
+    let RenderNodeKind::Element(element) = &node.kind else {
+        return None;
+    };
+    let content = replaced_content_from_dom_element(element, source, image_height_auto);
+    Some(replaced_content_size(
+        &content,
+        containing_width,
+        box_.style.font_size,
+    ))
 }
 
 fn css_layout_node_is_button(node: &RenderNode) -> bool {
@@ -3513,13 +4362,8 @@ fn css_flex_row_item_widths(
         return widths;
     }
 
-    let fixed_total = children
-        .iter()
-        .zip(base_widths.iter())
-        .filter(|(child, _)| css_flex_item_effective_grow(child) <= 0.0)
-        .map(|(_, width)| *width)
-        .sum::<f32>();
-    let grow_available = (available_for_items - fixed_total).max(1.0);
+    let base_total = base_widths.iter().sum::<f32>();
+    let grow_available = (available_for_items - base_total).max(0.0);
 
     let mut widths = children
         .iter()
@@ -3527,7 +4371,8 @@ fn css_flex_row_item_widths(
         .map(|(child, base_width)| {
             let grow = css_flex_item_effective_grow(child);
             if grow > 0.0 {
-                (grow_available * grow / total_grow).max(css_flex_item_min_width(child))
+                (base_width + grow_available * grow / total_grow)
+                    .max(css_flex_item_min_width(child))
             } else {
                 base_width.max(css_flex_item_min_width(child))
             }
@@ -3707,6 +4552,12 @@ fn layout_css_grid_children(
 
     let gap = container.style.gap.max(0.0);
     let content = container.dimensions.content;
+    if let Some(height) =
+        layout_named_css_grid_children(container, source, image_height_auto, text_metrics, gap)
+    {
+        return height;
+    }
+
     let columns = container
         .style
         .grid_template_columns
@@ -3753,6 +4604,186 @@ fn layout_css_grid_children(
     }
 
     (max_bottom - content.top()).max(0.0)
+}
+
+fn layout_named_css_grid_children(
+    container: &mut CssLayoutBox<'_>,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+    gap: f32,
+) -> Option<f32> {
+    let areas = container.style.grid_template_areas.clone()?;
+    if areas.is_empty() {
+        return None;
+    }
+
+    let content = container.dimensions.content;
+    let explicit_columns = container.style.grid_template_columns.unwrap_or(0);
+    let area_columns = areas.iter().map(Vec::len).max().unwrap_or(0);
+    let columns = explicit_columns.max(area_columns);
+    if columns == 0 {
+        return None;
+    }
+
+    let auto_width =
+        ((content.width() - gap * columns.saturating_sub(1) as f32) / columns as f32).max(1.0);
+    let mut placed_named_child = false;
+    let mut row_heights: Vec<f32> = vec![0.0; areas.len()];
+
+    for child in &mut container.children {
+        if css_layout_box_is_out_of_flow(child) {
+            continue;
+        }
+        let Some(bounds) = child
+            .style
+            .grid_area
+            .as_deref()
+            .and_then(|name| css_grid_area_bounds(&areas, name))
+        else {
+            continue;
+        };
+        placed_named_child = true;
+        let item_width = css_grid_area_width(auto_width, gap, bounds);
+        layout_css_box(
+            child,
+            content.left() + bounds.2 as f32 * (auto_width + gap),
+            content.top(),
+            item_width,
+            content.height().max(0.0),
+            source,
+            image_height_auto,
+            text_metrics,
+        );
+        let row_span = (bounds.1 - bounds.0 + 1).max(1);
+        let height = (css_margin_box(child).height() - gap * row_span.saturating_sub(1) as f32)
+            .max(0.0)
+            / row_span as f32;
+        for row_height in &mut row_heights[bounds.0..=bounds.1] {
+            *row_height = (*row_height).max(height);
+        }
+    }
+
+    if !placed_named_child {
+        return None;
+    }
+
+    let mut row_tops = Vec::with_capacity(row_heights.len());
+    let mut cursor_y = content.top();
+    for row_height in &row_heights {
+        row_tops.push(cursor_y);
+        cursor_y += *row_height + gap;
+    }
+    let named_grid_bottom = row_heights
+        .last()
+        .and_then(|last_height| row_tops.last().map(|top| top + *last_height))
+        .unwrap_or(content.top());
+    let mut max_bottom = named_grid_bottom;
+
+    for child in &mut container.children {
+        if css_layout_box_is_out_of_flow(child) {
+            continue;
+        }
+        let Some(bounds) = child
+            .style
+            .grid_area
+            .as_deref()
+            .and_then(|name| css_grid_area_bounds(&areas, name))
+        else {
+            continue;
+        };
+        let item_width = css_grid_area_width(auto_width, gap, bounds);
+        layout_css_box(
+            child,
+            content.left() + bounds.2 as f32 * (auto_width + gap),
+            row_tops[bounds.0],
+            item_width,
+            content.height().max(0.0),
+            source,
+            image_height_auto,
+            text_metrics,
+        );
+        max_bottom = max_bottom.max(css_margin_box(child).bottom());
+    }
+
+    let mut column = 0usize;
+    let mut fallback_y = if max_bottom > content.top() {
+        max_bottom + gap
+    } else {
+        content.top()
+    };
+    let mut fallback_row_height: f32 = 0.0;
+
+    for child in &mut container.children {
+        if css_layout_box_is_out_of_flow(child)
+            || child
+                .style
+                .grid_area
+                .as_deref()
+                .and_then(|name| css_grid_area_bounds(&areas, name))
+                .is_some()
+        {
+            continue;
+        }
+        if column >= columns {
+            fallback_y += fallback_row_height + gap;
+            column = 0;
+            fallback_row_height = 0.0;
+        }
+        let cursor_x = content.left() + column as f32 * (auto_width + gap);
+        let item_width = child
+            .style
+            .width
+            .or(child.style.max_width)
+            .unwrap_or(auto_width)
+            .min(auto_width)
+            .max(child.style.min_width.unwrap_or(1.0));
+        layout_css_box(
+            child,
+            cursor_x,
+            fallback_y,
+            item_width,
+            content.height().max(0.0),
+            source,
+            image_height_auto,
+            text_metrics,
+        );
+        let margin_box = css_margin_box(child);
+        fallback_row_height = fallback_row_height.max(margin_box.height());
+        max_bottom = max_bottom.max(margin_box.bottom());
+        column += 1;
+    }
+
+    Some((max_bottom - content.top()).max(0.0))
+}
+
+fn css_grid_area_width(column_width: f32, gap: f32, bounds: (usize, usize, usize, usize)) -> f32 {
+    let column_span = (bounds.3 - bounds.2 + 1).max(1);
+    (column_width * column_span as f32 + gap * column_span.saturating_sub(1) as f32).max(1.0)
+}
+
+fn css_grid_area_bounds(areas: &[Vec<String>], name: &str) -> Option<(usize, usize, usize, usize)> {
+    if name.is_empty() || name == "." {
+        return None;
+    }
+    let mut bounds: Option<(usize, usize, usize, usize)> = None;
+    for (row_index, row) in areas.iter().enumerate() {
+        for (column_index, area_name) in row.iter().enumerate() {
+            if area_name != name {
+                continue;
+            }
+            bounds = Some(match bounds {
+                Some((min_row, max_row, min_column, max_column)) => (
+                    min_row.min(row_index),
+                    max_row.max(row_index),
+                    min_column.min(column_index),
+                    max_column.max(column_index),
+                ),
+                None => (row_index, row_index, column_index, column_index),
+            });
+        }
+    }
+    bounds
 }
 
 fn css_layout_box_is_out_of_flow(box_: &CssLayoutBox<'_>) -> bool {
@@ -4057,6 +5088,13 @@ fn push_canvas_graph_layout_box(
     graph: &mut CanvasGraph,
 ) {
     let pushed_form = push_canvas_form_context_for_layout_box(box_, cursor);
+    if !css_style_paints(&box_.style) {
+        cursor.y = cursor.y.max(css_margin_box(box_).bottom());
+        if pushed_form {
+            cursor.form_stack.pop();
+        }
+        return;
+    }
     match box_.kind {
         CssLayoutKind::Document => {
             for child in &box_.children {
@@ -4073,10 +5111,10 @@ fn push_canvas_graph_layout_box(
         }
         CssLayoutKind::AnonymousBlock => {
             if !box_.children.is_empty()
-                && box_
-                    .children
-                    .iter()
-                    .all(css_layout_box_contains_visual_replaced_content)
+                && box_.children.iter().all(|c| {
+                    css_layout_box_contains_visual_replaced_content(c)
+                        || css_layout_box_contains_replaced_or_special(c)
+                })
             {
                 push_canvas_graph_layout_children_at_used_positions(
                     &box_.children,
@@ -4543,7 +5581,7 @@ fn push_canvas_graph_node(
     cursor: &mut CanvasLayoutCursor,
     graph: &mut CanvasGraph,
 ) {
-    if node.style.display == CssDisplay::None {
+    if node.style.display == CssDisplay::None || !css_style_paints(&node.style) {
         return;
     }
 
@@ -4637,6 +5675,7 @@ fn push_canvas_graph_element(
                     font_size: node.style.font_size,
                     color: node.style.color,
                     form_id: current_canvas_form_id(cursor),
+                    element_id: element.attr("id").map(str::to_owned),
                 }));
             }
         }
@@ -4816,6 +5855,7 @@ fn push_canvas_graph_button_hit_target(
         rect,
         button_type: element.attr("type").unwrap_or("submit").to_owned(),
         form_id: current_canvas_form_id(cursor),
+        element_id: element.attr("id").map(str::to_owned),
     }));
 }
 
@@ -4952,6 +5992,10 @@ fn collect_canvas_layout_inline_runs(
     pending_space: &mut bool,
     runs: &mut Vec<CanvasInlineRun>,
 ) {
+    if !css_style_paints(&box_.style) {
+        return;
+    }
+
     match box_.kind {
         CssLayoutKind::Text => {
             let Some(text) = &box_.text else {
@@ -5018,7 +6062,7 @@ fn collect_canvas_inline_runs(
     pending_space: &mut bool,
     runs: &mut Vec<CanvasInlineRun>,
 ) {
-    if node.style.display == CssDisplay::None {
+    if node.style.display == CssDisplay::None || !css_style_paints(&node.style) {
         return;
     }
 
@@ -5063,6 +6107,10 @@ fn collect_canvas_inline_runs(
             }
         }
     }
+}
+
+fn css_style_paints(style: &ResolvedBoxStyle) -> bool {
+    style.visibility_visible && style.opacity > 0.0
 }
 
 fn push_canvas_line_boxes(
@@ -5705,7 +6753,7 @@ fn push_render_node_debug(node: &RenderNode, depth: usize, out: &mut String) {
 
 fn resolved_style_debug(style: &ResolvedBoxStyle) -> String {
     format!(
-        "style(display={:?}, color={}, bg={}, margin={}, padding={}, border_width={:.1}, border_color={}, radius={:.1}, width={}, min_width={}, max_width={}, font_size={:.1}, bold={}, align={:?}, overflow_hidden={}, position={:?}, z_index={})",
+        "style(display={:?}, color={}, bg={}, margin={}, padding={}, border_width={:.1}, border_color={}, radius={:.1}, width={}, min_width={}, max_width={}, font_size={:.1}, bold={}, align={:?}, visible={}, opacity={:.2}, overflow_hidden={}, position={:?}, z_index={})",
         style.display,
         color_debug(style.color),
         color_debug(style.background),
@@ -5720,6 +6768,8 @@ fn resolved_style_debug(style: &ResolvedBoxStyle) -> String {
         style.font_size,
         style.font_weight_bold,
         style.text_align,
+        style.visibility_visible,
+        style.opacity,
         style.overflow_hidden,
         style.position,
         style
@@ -9180,6 +10230,50 @@ mod tests {
     }
 
     #[test]
+    fn grid_template_areas_position_items_by_declared_names() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .grid {
+                    display: grid;
+                    grid-template-areas:
+                      "side main"
+                      "foot foot";
+                    grid-template-columns: 1fr 1fr;
+                    gap: 10px;
+                    width: 410px;
+                  }
+                  .main { grid-area: main; }
+                  .side { grid-area: side; }
+                  .foot { grid-area: foot; }
+                </style>
+              </head>
+              <body>
+                <div class="grid">
+                  <div class="main">Main</div>
+                  <div class="side">Side</div>
+                  <div class="foot">Foot</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let main = find_canvas_text(&document.canvas_graph, "Main").expect("expected main");
+        let side = find_canvas_text(&document.canvas_graph, "Side").expect("expected side");
+        let foot = find_canvas_text(&document.canvas_graph, "Foot").expect("expected foot");
+
+        assert_eq!(main.rect.top(), side.rect.top());
+        assert!(main.rect.left() > side.rect.right());
+        assert!(foot.rect.top() > side.rect.top());
+        assert!(foot.rect.left() <= side.rect.left() + 1.0);
+    }
+
+    #[test]
     fn canvas_graph_uses_flex_row_positions_from_layout_tree() {
         let document = parse_html_document(
             r#"
@@ -9243,6 +10337,37 @@ mod tests {
 
         assert_eq!(left.rect.top(), right.rect.top());
         assert!(right.rect.left() > 410.0, "right rect was {:?}", right.rect);
+    }
+
+    #[test]
+    fn flex_grow_item_uses_auto_base_before_free_space_distribution() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .row { display: flex; width: 200px; }
+                  .title { flex-grow: 1; font-size: 32px; }
+                  .tools { width: 160px; }
+                </style>
+              </head>
+              <body>
+                <div class="row">
+                  <h1 class="title">Hello world</h1>
+                  <div class="tools">Tools</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let title =
+            find_canvas_text(&document.canvas_graph, "Hello world").expect("expected full title");
+        let tools = find_canvas_text(&document.canvas_graph, "Tools").expect("expected tools");
+
+        assert!(tools.rect.left() > title.rect.left());
     }
 
     #[test]
@@ -9561,6 +10686,214 @@ mod tests {
     }
 
     #[test]
+    fn script_test_bookmarks_cover_generated_unit_tests() {
+        let bookmarks = script_test_bookmarks();
+
+        assert_eq!(bookmarks.len(), 25);
+        assert!(bookmarks[0].title.starts_with("001 "));
+        assert!(
+            bookmarks[0]
+                .url
+                .ends_with("/JustBarelyScript/UnitTest/001-basic-script-execution/index.html")
+        );
+        assert!(
+            bookmarks[24]
+                .url
+                .ends_with("/JustBarelyScript/UnitTest/025-minimal-todo-app/index.html")
+        );
+    }
+
+    #[test]
+    fn script_console_messages_include_logs_and_parse_errors() {
+        let messages = script_console_messages_from_html(
+            r#"
+            <script>console.log("ready");</script>
+            <script>let = ;</script>
+            "#,
+        );
+
+        assert!(messages.iter().any(|message| {
+            message.level == justbarelyscript::ConsoleLevel::Log && message.text == "ready"
+        }));
+        assert!(messages.iter().any(|message| message.level
+            == justbarelyscript::ConsoleLevel::Error
+            && message.text.contains("Parse error")));
+    }
+
+    #[test]
+    fn first_script_test_applies_text_content_effect() {
+        let document = parse_html_document(
+            include_str!("../../JustBarelyScript/UnitTest/001-basic-script-execution/index.html"),
+            "file:///tmp/001-basic-script-execution/index.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "After").is_some());
+        assert!(find_canvas_text(&document.canvas_graph, "Before").is_none());
+    }
+
+    #[test]
+    fn second_script_test_preserves_window_state_between_scripts() {
+        let document = parse_html_document(
+            include_str!(
+                "../../JustBarelyScript/UnitTest/002-multiple-script-tags-execute-in-order/index.html"
+            ),
+            "file:///tmp/002-multiple-script-tags-execute-in-order/index.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "AB").is_some());
+    }
+
+    #[test]
+    fn fourth_script_test_creates_and_appends_element() {
+        let document = parse_html_document(
+            include_str!("../../JustBarelyScript/UnitTest/004-element-creation/index.html"),
+            "file:///tmp/004-element-creation/index.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "Created by script").is_some());
+    }
+
+    #[test]
+    fn fifth_script_test_assigns_class_attribute() {
+        let html = apply_safe_script_browser_effects(include_str!(
+            "../../JustBarelyScript/UnitTest/005-css-class-assignment/index.html"
+        ));
+
+        assert!(html.contains(r#"<div id="box" class="active">Box</div>"#));
+    }
+
+    #[test]
+    fn sixth_script_test_reads_back_set_attribute() {
+        let document = parse_html_document(
+            include_str!(
+                "../../JustBarelyScript/UnitTest/006-setattribute-and-getattribute/index.html"
+            ),
+            "file:///tmp/006-setattribute-and-getattribute/index.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "ready").is_some());
+    }
+
+    #[test]
+    fn seventh_script_test_replaces_inner_html() {
+        let document = parse_html_document(
+            include_str!(
+                "../../JustBarelyScript/UnitTest/007-innerhtml-basic-replacement/index.html"
+            ),
+            "file:///tmp/007-innerhtml-basic-replacement/index.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "Hello").is_some());
+    }
+
+    #[test]
+    fn eighth_script_test_query_selector_by_id_reads_existing_text() {
+        let document = parse_html_document(
+            include_str!("../../JustBarelyScript/UnitTest/008-query-selector-by-id/index.html"),
+            "file:///tmp/008-query-selector-by-id/index.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "Hello").is_some());
+    }
+
+    #[test]
+    fn ninth_script_test_query_selector_by_class_reads_first_match_without_id() {
+        let document = parse_html_document(
+            include_str!("../../JustBarelyScript/UnitTest/009-query-selector-by-class/index.html"),
+            "file:///tmp/009-query-selector-by-class/index.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "First").is_some());
+    }
+
+    #[test]
+    fn tenth_script_test_query_selector_all_length_counts_class_matches() {
+        let document = parse_html_document(
+            include_str!(
+                "../../JustBarelyScript/UnitTest/010-queryselectorall-and-length/index.html"
+            ),
+            "file:///tmp/010-queryselectorall-and-length/index.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "3").is_some());
+    }
+
+    #[test]
+    fn eleventh_script_test_for_loop_appends_list_items() {
+        let html = apply_safe_script_browser_effects(&remove_html_comments(include_str!(
+            "../../JustBarelyScript/UnitTest/011-for-loop-dom-update/index.html"
+        )));
+
+        assert!(html.contains("Item 0"), "html after effects: {html}");
+        assert!(html.contains("Item 1"), "html after effects: {html}");
+        assert!(html.contains("Item 2"), "html after effects: {html}");
+
+        let document = parse_html_document(
+            include_str!("../../JustBarelyScript/UnitTest/011-for-loop-dom-update/index.html"),
+            "file:///tmp/011-for-loop-dom-update/index.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "Item 0").is_some());
+        assert!(find_canvas_text(&document.canvas_graph, "Item 1").is_some());
+        assert!(find_canvas_text(&document.canvas_graph, "Item 2").is_some());
+    }
+
+    #[test]
+    fn twelfth_script_test_click_listener_fires_and_updates_result() {
+        let html =
+            include_str!("../../JustBarelyScript/UnitTest/012-event-listener-click/index.html");
+        let source = "file:///tmp/012-event-listener-click/index.html";
+
+        // Initial render shows "Not clicked".
+        let document = parse_html_document(html, source);
+        assert!(find_canvas_text(&document.canvas_graph, "Not clicked").is_some());
+        assert!(find_canvas_text(&document.canvas_graph, "Clicked").is_none());
+
+        // Button has element_id="button" in the canvas graph.
+        let button = document.canvas_graph.objects.iter().find_map(|o| {
+            if let CanvasObject::Button(b) = o {
+                Some(b)
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            button.map(|b| b.element_id.as_deref()),
+            Some(Some("button"))
+        );
+
+        // Script state registers a click listener on "button".
+        let mut state = build_script_state(html);
+        assert!(state.has_listener("button", "click"));
+
+        // Firing the click produces SetTextContent for "result".
+        let effects = state.fire_event("button", "click", None);
+        assert_eq!(
+            effects,
+            vec![justbarelyscript::BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "Clicked".to_owned(),
+            }]
+        );
+
+        // Applying the effect to live_html and re-parsing shows "Clicked".
+        let live_html = apply_safe_script_browser_effects(&remove_html_comments(html));
+        let live_html = set_element_text_content_by_id(&live_html, "result", "Clicked");
+        let updated = parse_html_document_from_live_html(&live_html, source, None);
+        assert!(find_canvas_text(&updated.canvas_graph, "Clicked").is_some());
+        assert!(find_canvas_text(&updated.canvas_graph, "Not clicked").is_none());
+    }
+
+    #[test]
+    fn safe_script_effect_replaces_element_text_by_id() {
+        let html = apply_safe_script_browser_effects(
+            r#"<div id="result">Before</div><script>document.getElementById("result").textContent = "After";</script>"#,
+        );
+
+        assert!(html.contains(r#"<div id="result">After</div>"#));
+    }
+
+    #[test]
     fn ensure_bookmark_adds_default_without_duplicates() {
         let mut bookmarks = vec![Bookmark {
             title: "Docs".to_owned(),
@@ -9731,12 +11064,51 @@ mod tests {
                     && image.color_image.size == [2, 2]
         )));
         assert!(document.canvas_graph.objects.iter().any(|object| matches!(
-            object,
-            CanvasObject::Image(image)
-                if image.alt == "AVIF sample"
-                    && image.src.ends_with("/sample_pages/test_2x2.avif")
-                    && image.image.color_image.size == [2, 2]
+        object,
+        CanvasObject::Image(image)
+            if image.alt == "AVIF sample"
+                && image.src.ends_with("/sample_pages/test_2x2.avif")
+                && image.image.color_image.size == [2, 2]
         )));
+    }
+
+    #[test]
+    fn linked_inline_image_inside_block_gets_used_position() {
+        let html = r#"
+            <html>
+              <body>
+                <p>Before image.</p>
+                <figure>
+                  <a href="https://example.test/image">
+                    <img src="test_2x2.avif" alt="Linked image" width="40" height="40">
+                  </a>
+                  <figcaption>Caption</figcaption>
+                </figure>
+              </body>
+            </html>
+        "#;
+        let source = path_to_file_url(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../sample_pages/avif_test_page.html"
+        )));
+        let document = parse_html_document(html, &source);
+
+        let image = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Image(image) if image.alt == "Linked image" => Some(image),
+                _ => None,
+            })
+            .expect("expected linked image canvas object");
+
+        assert_eq!(image.rect.size(), egui::vec2(40.0, 40.0));
+        assert!(
+            image.rect.left() > 0.0 && image.rect.top() > 0.0,
+            "linked inline image should use its layout position, got {:?}",
+            image.rect
+        );
     }
 
     #[test]

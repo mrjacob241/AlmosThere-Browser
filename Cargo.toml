@@ -1,5 +1,5 @@
 [workspace]
-members = ["almostthere_browser", "rich_canvas"]
+members = ["almostthere_browser", "rich_canvas", "JustBarelyScript"]
 default-members = ["almostthere_browser"]
 resolver = "2"
 

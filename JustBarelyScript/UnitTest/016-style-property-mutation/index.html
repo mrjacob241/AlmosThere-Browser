@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+<body>
+  <div id="box">Box</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0016]: Style property mutation. Expected: #box style.display becomes none and the box is hidden.");
+    let box = document.getElementById("box");
+    box.style.display = "none";
+  </script>
+</body>
+</html>

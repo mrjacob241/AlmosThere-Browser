@@ -152,6 +152,7 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "justbarelyscript",
  "reqwest",
  "rich_canvas",
  "tiny-skia",
@@ -2060,6 +2061,10 @@ dependencies = [
  "once_cell",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "justbarelyscript"
+version = "0.1.0"
 
 [[package]]
 name = "khronos-egl"

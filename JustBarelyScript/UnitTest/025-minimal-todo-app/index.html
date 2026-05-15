@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    .done {
+      text-decoration: line-through;
+    }
+  </style>
+</head>
+<body>
+  <input id="text" value="">
+  <button id="add">Add</button>
+  <ul id="items"></ul>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0025]: Minimal todo app. Action: type Build JS engine, click Add, then click the created item. Expected: the li text is Build JS engine and it gets class done.");
+    let input = document.getElementById("text");
+    let add = document.getElementById("add");
+    let items = document.getElementById("items");
+
+    add.addEventListener("click", function () {
+      let li = document.createElement("li");
+      li.textContent = input.value;
+
+      li.addEventListener("click", function () {
+        li.className = "done";
+      });
+
+      items.appendChild(li);
+      input.value = "";
+    });
+  </script>
+</body>
+</html>

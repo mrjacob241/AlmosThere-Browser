@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<body>
+  <button id="button">Click</button>
+  <div id="result">Not clicked</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0012]: Click event listener. Action: click the Click button. Expected: #result text becomes Clicked.");
+    let button = document.getElementById("button");
+
+    button.addEventListener("click", function () {
+      document.getElementById("result").textContent = "Clicked";
+    });
+  </script>
+</body>
+</html>

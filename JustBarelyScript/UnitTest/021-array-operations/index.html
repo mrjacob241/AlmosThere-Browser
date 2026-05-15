@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<body>
+  <div id="result"></div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0021]: Array operations. Expected: #result text becomes AB2.");
+    let items = [];
+    items.push("A");
+    items.push("B");
+
+    document.getElementById("result").textContent =
+      items[0] + items[1] + String(items.length);
+  </script>
+</body>
+</html>

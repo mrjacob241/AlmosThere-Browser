@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+<body>
+  <p class="item">First</p>
+  <p class="item">Second</p>
+  <div id="result"></div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0009]: querySelector by class. Expected: first .item is selected and #result text becomes First.");
+    let el = document.querySelector(".item");
+    document.getElementById("result").textContent = el.textContent;
+  </script>
+</body>
+</html>

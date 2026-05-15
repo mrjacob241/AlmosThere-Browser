@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+<body>
+  <input id="name" value="AlmosThere">
+  <div id="result"></div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0014]: Input value reading. Expected: #result text becomes AlmosThere.");
+    let input = document.getElementById("name");
+    document.getElementById("result").textContent = input.value;
+  </script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+<!doctype html>
+<html>
+<body>
+  <div id="result"></div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0002]: Multiple script tags execute in order. Expected final #result text: AB.");
+    window.value = "A";
+  </script>
+
+  <script>
+    window.value = window.value + "B";
+  </script>
+
+  <script>
+    document.getElementById("result").textContent = window.value;
+  </script>
+</body>
+</html>

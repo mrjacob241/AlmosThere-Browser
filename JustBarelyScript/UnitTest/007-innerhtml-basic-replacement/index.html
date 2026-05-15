@@ -1,0 +1,12 @@
+<!doctype html>
+<html>
+<body>
+  <div id="root"></div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0007]: innerHTML replacement. Expected: #root contains a span element with text Hello.");
+    document.getElementById("root").innerHTML = "<span>Hello</span>";
+  </script>
+</body>
+</html>

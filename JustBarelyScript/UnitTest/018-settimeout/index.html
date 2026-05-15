@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+<body>
+  <div id="result">Before</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0018]: setTimeout. Expected: after the timer runs, #result text changes from Before to After.");
+    setTimeout(function () {
+      document.getElementById("result").textContent = "After";
+    }, 10);
+  </script>
+</body>
+</html>

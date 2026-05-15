@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+<body>
+  <ul id="list"></ul>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0011]: for loop DOM update. Expected: #list receives Item 0, Item 1, and Item 2.");
+    let list = document.getElementById("list");
+
+    for (let i = 0; i < 3; i = i + 1) {
+      let li = document.createElement("li");
+      li.textContent = "Item " + i;
+      list.appendChild(li);
+    }
+  </script>
+</body>
+</html>

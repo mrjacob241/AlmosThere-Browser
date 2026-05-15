@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+<body>
+  <div id="message">Hello</div>
+  <div id="result"></div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0008]: querySelector by ID. Expected: #result text copies #message text and becomes Hello.");
+    let el = document.querySelector("#message");
+    document.getElementById("result").textContent = el.textContent;
+  </script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+<body>
+  <div id="result"></div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0020]: JSON parse and stringify. Expected: #result text becomes {\"name\":\"AlmosThere\"}.");
+    let obj = JSON.parse('{"name":"AlmosThere"}');
+    document.getElementById("result").textContent = JSON.stringify(obj);
+  </script>
+</body>
+</html>

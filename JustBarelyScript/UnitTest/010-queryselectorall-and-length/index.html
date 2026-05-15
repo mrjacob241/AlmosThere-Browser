@@ -1,0 +1,16 @@
+<!doctype html>
+<html>
+<body>
+  <p class="item">A</p>
+  <p class="item">B</p>
+  <p class="item">C</p>
+  <div id="result"></div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0010]: querySelectorAll length. Expected: #result text becomes 3.");
+    let items = document.querySelectorAll(".item");
+    document.getElementById("result").textContent = String(items.length);
+  </script>
+</body>
+</html>
