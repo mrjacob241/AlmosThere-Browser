@@ -174,7 +174,11 @@ pub struct CssBoxStyle {
     pub justify_content: Option<CssJustifyContent>,
     pub align_items: Option<CssAlignItems>,
     pub grid_template_columns: Option<usize>,
+    pub grid_template_areas: Option<Vec<Vec<String>>>,
+    pub grid_area: Option<String>,
     pub gap: Option<f32>,
+    pub visibility_visible: Option<bool>,
+    pub opacity: Option<f32>,
     pub overflow_hidden: Option<bool>,
     pub position: Option<CssPosition>,
     pub z_index: Option<i32>,
@@ -212,7 +216,11 @@ pub struct ResolvedBoxStyle {
     pub justify_content: CssJustifyContent,
     pub align_items: CssAlignItems,
     pub grid_template_columns: Option<usize>,
+    pub grid_template_areas: Option<Vec<Vec<String>>>,
+    pub grid_area: Option<String>,
     pub gap: f32,
+    pub visibility_visible: bool,
+    pub opacity: f32,
     pub overflow_hidden: bool,
     pub position: CssPosition,
     pub z_index: Option<i32>,
@@ -251,7 +259,11 @@ impl Default for ResolvedBoxStyle {
             justify_content: CssJustifyContent::FlexStart,
             align_items: CssAlignItems::Stretch,
             grid_template_columns: None,
+            grid_template_areas: None,
+            grid_area: None,
             gap: 0.0,
+            visibility_visible: true,
+            opacity: 1.0,
             overflow_hidden: false,
             position: CssPosition::Static,
             z_index: None,
@@ -411,6 +423,7 @@ pub struct CanvasButtonObject {
     pub rect: Rect,
     pub button_type: String,
     pub form_id: Option<String>,
+    pub element_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -422,6 +435,7 @@ pub struct CanvasInputObject {
     pub font_size: f32,
     pub color: Color32,
     pub form_id: Option<String>,
+    pub element_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -916,9 +930,17 @@ pub struct InlineSpan {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HitTarget {
-    Link { href: String },
-    Button { text: String },
-    Input { label: String },
+    Link {
+        href: String,
+    },
+    Button {
+        text: String,
+        element_id: Option<String>,
+    },
+    Input {
+        label: String,
+        element_id: Option<String>,
+    },
 }
 
 impl BrowserDocument {
@@ -1203,11 +1225,13 @@ fn paint_canvas_graph(
                 if response.hovered() {
                     canvas_response.hovered = Some(HitTarget::Button {
                         text: button.text.clone(),
+                        element_id: button.element_id.clone(),
                     });
                 }
                 if response.clicked() {
                     canvas_response.clicked = Some(HitTarget::Button {
                         text: button.text.clone(),
+                        element_id: button.element_id.clone(),
                     });
                     if button.button_type.eq_ignore_ascii_case("submit") {
                         submitted_forms.push(button.form_id.clone());
@@ -1233,6 +1257,7 @@ fn paint_canvas_graph(
                 if response.hovered() {
                     canvas_response.hovered = Some(HitTarget::Input {
                         label: input.label.clone(),
+                        element_id: input.element_id.clone(),
                     });
                 }
                 if response.changed() {
@@ -1827,10 +1852,16 @@ fn paint_block(
                 .corner_radius(CornerRadius::same(style.button_radius)),
             );
             if response.hovered() {
-                canvas_response.hovered = Some(HitTarget::Button { text: text.clone() });
+                canvas_response.hovered = Some(HitTarget::Button {
+                    text: text.clone(),
+                    element_id: None,
+                });
             }
             if response.clicked() {
-                canvas_response.clicked = Some(HitTarget::Button { text: text.clone() });
+                canvas_response.clicked = Some(HitTarget::Button {
+                    text: text.clone(),
+                    element_id: None,
+                });
             }
             ui.add_space(1.0 * font_scale);
         }
@@ -1863,6 +1894,7 @@ fn paint_block(
             if response.hovered() {
                 canvas_response.hovered = Some(HitTarget::Input {
                     label: label.clone(),
+                    element_id: None,
                 });
             }
             if response.changed() {
@@ -2563,12 +2595,14 @@ fn paint_ecosia_hero(
         );
         canvas_response.hovered = Some(HitTarget::Button {
             text: "Search".to_owned(),
+            element_id: None,
         });
     }
     paint_search_icon(&painter, search_button_center, font_scale);
     if search_response.clicked() {
         canvas_response.clicked = Some(HitTarget::Button {
             text: "Search".to_owned(),
+            element_id: None,
         });
     }
     let ai_width = 104.0 * font_scale;
@@ -2621,6 +2655,7 @@ fn paint_ecosia_hero(
     if input_response.hovered() {
         canvas_response.hovered = Some(HitTarget::Input {
             label: "Search".to_owned(),
+            element_id: None,
         });
     }
     if input_response.changed() {
@@ -2650,11 +2685,13 @@ fn paint_ecosia_hero(
     if ai_response.hovered() {
         canvas_response.hovered = Some(HitTarget::Button {
             text: hero.ai_button_text.clone(),
+            element_id: None,
         });
     }
     if ai_response.clicked() {
         canvas_response.clicked = Some(HitTarget::Button {
             text: hero.ai_button_text.clone(),
+            element_id: None,
         });
     }
 
@@ -3155,10 +3192,18 @@ fn media_query_matches_viewport(query: &str, viewport_width: f32) -> bool {
         return false;
     }
     let mut matched_any_constraint = false;
+    let mut matched_supported_media_type = false;
     for part in query.split("and") {
         let part = part.trim().trim_matches(|ch| ch == '(' || ch == ')').trim();
-        if part.is_empty() || part == "screen" || part == "only screen" {
+        if part.is_empty() {
             continue;
+        }
+        if matches!(part, "screen" | "only screen" | "all" | "only all") {
+            matched_supported_media_type = true;
+            continue;
+        }
+        if matches!(part, "print" | "only print") {
+            return false;
         }
         if let Some(value) = part
             .strip_prefix("min-width:")
@@ -3202,7 +3247,7 @@ fn media_query_matches_viewport(query: &str, viewport_width: f32) -> bool {
         }
         return false;
     }
-    matched_any_constraint
+    matched_any_constraint || matched_supported_media_type
 }
 
 fn parse_css_media_length_px(value: &str) -> Option<f32> {
@@ -3585,8 +3630,20 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
     if source.grid_template_columns.is_some() {
         target.grid_template_columns = source.grid_template_columns;
     }
+    if source.grid_template_areas.is_some() {
+        target.grid_template_areas = source.grid_template_areas.clone();
+    }
+    if source.grid_area.is_some() {
+        target.grid_area = source.grid_area.clone();
+    }
     if source.gap.is_some() {
         target.gap = source.gap;
+    }
+    if source.visibility_visible.is_some() {
+        target.visibility_visible = source.visibility_visible;
+    }
+    if source.opacity.is_some() {
+        target.opacity = source.opacity;
     }
     if source.overflow_hidden.is_some() {
         target.overflow_hidden = source.overflow_hidden;
@@ -4081,9 +4138,36 @@ fn parse_css_box_style_with_vars(
                 style.grid_template_columns = parse_grid_template_columns(value);
                 seen |= style.grid_template_columns.is_some();
             }
+            "grid-template-areas" => {
+                style.grid_template_areas = parse_grid_template_areas(value);
+                seen |= style.grid_template_areas.is_some();
+            }
+            "grid-area" => {
+                style.grid_area = parse_grid_area(value);
+                seen |= style.grid_area.is_some();
+            }
+            "grid-template" => {
+                style.grid_template_columns = parse_grid_template_shorthand_columns(value);
+                seen |= style.grid_template_columns.is_some();
+            }
             "gap" | "row-gap" | "column-gap" => {
                 style.gap = parse_px(value);
                 seen |= style.gap.is_some();
+            }
+            "visibility" => {
+                style.visibility_visible = match value {
+                    "visible" => Some(true),
+                    "hidden" | "collapse" => Some(false),
+                    _ => None,
+                };
+                seen |= style.visibility_visible.is_some();
+            }
+            "opacity" => {
+                style.opacity = value
+                    .parse::<f32>()
+                    .ok()
+                    .map(|opacity| opacity.clamp(0.0, 1.0));
+                seen |= style.opacity.is_some();
             }
             "overflow" | "overflow-x" | "overflow-y" => {
                 if value == "hidden" {
@@ -4188,6 +4272,41 @@ fn parse_grid_template_columns(value: &str) -> Option<usize> {
         })
         .count();
     (columns > 0).then_some(columns)
+}
+
+fn parse_grid_template_shorthand_columns(value: &str) -> Option<usize> {
+    let (_, columns) = value.rsplit_once('/')?;
+    parse_grid_template_columns(columns)
+}
+
+fn parse_grid_template_areas(value: &str) -> Option<Vec<Vec<String>>> {
+    let mut rows = Vec::new();
+    let mut rest = value.trim();
+    while let Some(start) = rest.find(['\'', '"']) {
+        let quote = rest.as_bytes()[start] as char;
+        let after_start = &rest[start + quote.len_utf8()..];
+        let Some(end) = after_start.find(quote) else {
+            break;
+        };
+        let row = after_start[..end]
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if !row.is_empty() {
+            rows.push(row);
+        }
+        rest = &after_start[end + quote.len_utf8()..];
+    }
+    (!rows.is_empty()).then_some(rows)
+}
+
+fn parse_grid_area(value: &str) -> Option<String> {
+    let name = value.split('/').next()?.trim();
+    if name.is_empty() || name == "auto" || name == "." {
+        None
+    } else {
+        Some(name.to_owned())
+    }
 }
 
 fn parse_color(value: &str) -> Option<Color32> {
@@ -4857,6 +4976,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_basic_css_applies_plain_screen_media_blocks() {
+        let style = parse_basic_css_for_viewport(
+            r#"
+            @media screen {
+                .menu {
+                    visibility: hidden;
+                    opacity: 0;
+                    position: absolute;
+                }
+            }
+            @media print {
+                .menu {
+                    display: none;
+                }
+            }
+            "#,
+            1280.0,
+        );
+        let menu = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["menu".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &menu);
+
+        assert_eq!(computed.visibility_visible, Some(false));
+        assert_eq!(computed.opacity, Some(0.0));
+        assert_eq!(computed.position, Some(CssPosition::Absolute));
+        assert_eq!(computed.display, None);
+    }
+
+    #[test]
     fn complex_selectors_do_not_collapse_to_their_last_simple_selector() {
         let style = parse_basic_css(
             r#"
@@ -5082,7 +5233,7 @@ mod tests {
     #[test]
     fn parse_basic_css_carries_grid_template_column_count() {
         let style = parse_basic_css(
-            ".counter { display: grid; grid-template-columns: 1fr auto 1fr; } .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }",
+            ".counter { display: grid; grid-template-columns: 1fr auto 1fr; } .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); } .page { grid-template: min-content 1fr / 12.25rem minmax(0, 1fr); }",
         );
         let counter = ElementStyleKey {
             tag: "div".to_owned(),
@@ -5094,6 +5245,11 @@ mod tests {
             classes: vec!["cards".to_owned()],
             ..ElementStyleKey::default()
         };
+        let page = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["page".to_owned()],
+            ..ElementStyleKey::default()
+        };
 
         assert_eq!(
             computed_box_style(&style, &counter).grid_template_columns,
@@ -5102,6 +5258,46 @@ mod tests {
         assert_eq!(
             computed_box_style(&style, &cards).grid_template_columns,
             Some(4)
+        );
+        assert_eq!(
+            computed_box_style(&style, &page).grid_template_columns,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn parse_basic_css_carries_named_grid_areas() {
+        let style = parse_basic_css(
+            r#"
+            .grid {
+                display: grid;
+                grid-template-areas:
+                    "side main"
+                    "foot foot";
+            }
+            main { grid-area: main; }
+            "#,
+        );
+        let grid = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["grid".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let main = ElementStyleKey {
+            tag: "main".to_owned(),
+            ..ElementStyleKey::default()
+        };
+
+        assert_eq!(
+            computed_box_style(&style, &grid).grid_template_areas,
+            Some(vec![
+                vec!["side".to_owned(), "main".to_owned()],
+                vec!["foot".to_owned(), "foot".to_owned()],
+            ])
+        );
+        assert_eq!(
+            computed_box_style(&style, &main).grid_area,
+            Some("main".to_owned())
         );
     }
 

@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    .active {
+      color: red;
+    }
+  </style>
+</head>
+<body>
+  <div id="box">Box</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0005]: CSS class assignment. Expected: #box gets class active and renders red when style invalidation is supported.");
+    document.getElementById("box").className = "active";
+  </script>
+</body>
+</html>

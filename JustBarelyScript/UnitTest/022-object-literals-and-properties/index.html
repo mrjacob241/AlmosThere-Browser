@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+<body>
+  <div id="result"></div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0022]: Object literals and properties. Expected: #result text becomes AlmosThere / JustBarelyScript.");
+    let browser = {
+      name: "AlmosThere",
+      engine: "JustBarelyScript"
+    };
+
+    document.getElementById("result").textContent =
+      browser.name + " / " + browser.engine;
+  </script>
+</body>
+</html>

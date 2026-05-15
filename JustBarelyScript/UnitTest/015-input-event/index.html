@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<body>
+  <input id="name" value="">
+  <div id="result"></div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0015]: Input event. Action: type Rust into the input. Expected: #result text becomes Rust.");
+    let input = document.getElementById("name");
+
+    input.addEventListener("input", function () {
+      document.getElementById("result").textContent = input.value;
+    });
+  </script>
+</body>
+</html>
