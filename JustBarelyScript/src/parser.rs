@@ -120,6 +120,12 @@ impl Parser {
             }
             _ => {
                 let mut expr = self.parse_expression(0)?;
+                // Labeled statement: `label: statement` — discard label, parse body
+                if let Expression::Identifier(_) = &expr {
+                    if self.eat(TokenKind::Colon) {
+                        return self.parse_statement();
+                    }
+                }
                 // Comma (sequence) operator at statement level: a=1, b=2;
                 while self.eat(TokenKind::Comma) {
                     expr = self.parse_expression(0)?;
@@ -306,7 +312,11 @@ impl Parser {
                         span,
                     }));
                 } else if self.eat(TokenKind::In) {
-                    let object = self.parse_expression(0)?;
+                    let mut object = self.parse_expression(0)?;
+                    // Comma operator: for(x in a, b) — JS iterates over last expr
+                    while self.eat(TokenKind::Comma) {
+                        object = self.parse_expression(0)?;
+                    }
                     self.expect(TokenKind::RightParen)?;
                     let body = Box::new(self.parse_statement()?);
                     return Ok(Statement::ForIn(ForInStatement {
@@ -330,7 +340,11 @@ impl Parser {
             let name = name.clone();
             self.advance();
             if self.eat(TokenKind::In) {
-                let object = self.parse_expression(0)?;
+                let mut object = self.parse_expression(0)?;
+                // Comma operator: for(x in a, b) — JS iterates over last expr
+                while self.eat(TokenKind::Comma) {
+                    object = self.parse_expression(0)?;
+                }
                 self.expect(TokenKind::RightParen)?;
                 let body = Box::new(self.parse_statement()?);
                 return Ok(Statement::ForIn(ForInStatement {
@@ -943,13 +957,25 @@ impl Parser {
         }
     }
 
-    /// Parse the callee for `new` (identifiers and member access, no calls yet).
+    /// Parse the callee for `new` (identifiers, member access, or parenthesised expression).
     fn parse_new_target(&mut self) -> Result<Expression, JsError> {
         let mut expr = match self.current_kind() {
             TokenKind::Identifier(name) => {
                 let name = name.clone();
                 self.advance();
                 Expression::Identifier(name)
+            }
+            // new this.Ctor() — `this` as callee base
+            TokenKind::This => {
+                self.advance();
+                Expression::This
+            }
+            // new(expr) — dynamic constructor: new(A || B)()
+            TokenKind::LeftParen => {
+                self.advance();
+                let inner = self.parse_expression(0)?;
+                self.expect(TokenKind::RightParen)?;
+                inner
             }
             _ => return self.error("expected class name after new"),
         };
@@ -1102,7 +1128,7 @@ impl Parser {
                 let key_expr = self.parse_expression(0)?;
                 self.expect(TokenKind::RightBracket)?;
                 self.expect(TokenKind::Colon)?;
-                let value = self.parse_expression(2)?;
+                let value = self.parse_expression(0)?;
                 // Represent computed key as __computed__; executor ignores for now.
                 let key = match &key_expr {
                     Expression::String(s) => s.clone(),
@@ -1174,7 +1200,7 @@ impl Parser {
                     shorthand: false,
                 });
             } else if self.eat(TokenKind::Colon) {
-                let value = self.parse_expression(2)?;
+                let value = self.parse_expression(0)?;
                 properties.push(ObjectProperty {
                     key,
                     value,
@@ -1203,7 +1229,7 @@ impl Parser {
             let rest = self.eat(TokenKind::DotDotDot);
             let binding = self.parse_binding()?;
             let default = if !rest && self.eat(TokenKind::Equals) {
-                Some(self.parse_expression(2)?)
+                Some(self.parse_expression(0)?)
             } else {
                 None
             };
@@ -1234,6 +1260,9 @@ impl Parser {
             TokenKind::AmpEquals => Some(BinaryOperator::BitAnd),
             TokenKind::PipeEquals => Some(BinaryOperator::BitOr),
             TokenKind::CaretEquals => Some(BinaryOperator::BitXor),
+            TokenKind::ShiftLeftEquals => Some(BinaryOperator::ShiftLeft),
+            TokenKind::ShiftRightEquals => Some(BinaryOperator::ShiftRight),
+            TokenKind::UnsignedShiftRightEquals => Some(BinaryOperator::UnsignedShiftRight),
             _ => None,
         }
     }
@@ -1258,6 +1287,7 @@ impl Parser {
             TokenKind::In => (BinaryOperator::In, 8, 9),
             TokenKind::ShiftLeft => (BinaryOperator::ShiftLeft, 9, 10),
             TokenKind::ShiftRight => (BinaryOperator::ShiftRight, 9, 10),
+            TokenKind::UnsignedShiftRight => (BinaryOperator::UnsignedShiftRight, 9, 10),
             TokenKind::Plus => (BinaryOperator::Add, 10, 11),
             TokenKind::Minus => (BinaryOperator::Subtract, 10, 11),
             TokenKind::Star => (BinaryOperator::Multiply, 12, 13),
@@ -1446,6 +1476,9 @@ fn keyword_as_identifier(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::Catch => Some("catch"),
         TokenKind::Finally => Some("finally"),
         TokenKind::Function => Some("function"),
+        TokenKind::Default => Some("default"),
+        TokenKind::Switch => Some("switch"),
+        TokenKind::Case => Some("case"),
         _ => None,
     }
 }
@@ -1567,5 +1600,63 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn parses_default_as_property_name() {
+        // `default`, `case`, `switch` are reserved words but valid property names.
+        // They appear frequently in bundled/minified code (e.g. `module.default`,
+        // `{default: fn}`, `content.default`).
+        assert!(parse_script("var x = module.default;").is_ok());
+        assert!(parse_script("var x = module.default.extend();").is_ok());
+        assert!(parse_script("e.default = component.exports;").is_ok());
+        assert!(parse_script("var x = { default: 1, case: 2, switch: 3 };").is_ok());
+    }
+
+    #[test]
+    fn parses_ternary_inside_object_literal() {
+        // Object property values must accept full expressions including ternary.
+        // Previously parse_expression(2) blocked the ternary operator (bp 1).
+        assert!(parse_script(
+            "var z = { Find: isStr(u) ? new RegExp(u, 'i') : u, Num: u.num ? 1 : 0 };"
+        )
+        .is_ok());
+        assert!(parse_script("var x = { [key]: a ? b : c };").is_ok());
+        assert!(parse_script("function f(a = b ? c : d) {}").is_ok());
+    }
+
+    #[test]
+    fn parses_new_with_parenthesised_callee() {
+        // new(A || B)() — dynamic constructor common in audio/canvas fingerprinting scripts.
+        assert!(parse_script(
+            "var ctx = new(window.AudioContext || window.webkitAudioContext)();"
+        )
+        .is_ok());
+        assert!(parse_script("var x = new(foo)();").is_ok());
+        assert!(parse_script("var y = new(a.b || c.d)();").is_ok());
+    }
+
+    #[test]
+    fn parses_unsigned_right_shift() {
+        // >>> is the unsigned right-shift operator used in AES/crypto/canvas fingerprinting.
+        assert!(parse_script("var x = n >>> 8;").is_ok());
+        assert!(parse_script("var x = n >>> 8 ^ 255 & n ^ 99;").is_ok());
+        assert!(parse_script("for(var i=0;i<256;i++){var p=i>>>2;}").is_ok());
+    }
+
+    #[test]
+    fn parses_for_in_with_comma_expression_object() {
+        // for(x in a, b) — iterates over b; comma operator in the object position.
+        assert!(parse_script("for(var g in a, b) {}").is_ok());
+        assert!(parse_script("for(var g in fn(x), obj) { g; }").is_ok());
+    }
+
+    #[test]
+    fn parses_shift_compound_assignments() {
+        // <<=, >>=, >>>= were parsed as two separate tokens before this fix.
+        assert!(parse_script("var x = 1; x <<= 2;").is_ok());
+        assert!(parse_script("var x = 8; x >>= 1;").is_ok());
+        assert!(parse_script("var x = 8; x >>>= 1;").is_ok());
+        assert!(parse_script("for(var i=0;i<8;i++){x<<=1;}").is_ok());
     }
 }

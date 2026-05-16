@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::{
     Program,
@@ -101,9 +103,23 @@ pub struct BrowserExecutionState {
     execution_budget_exhausted: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug)]
 struct StackFrame {
-    locals: HashMap<String, JsValue>,
+    locals: Rc<RefCell<HashMap<String, JsValue>>>,
+}
+
+impl Default for StackFrame {
+    fn default() -> Self {
+        StackFrame {
+            locals: Rc::new(RefCell::new(HashMap::new())),
+        }
+    }
+}
+
+impl PartialEq for StackFrame {
+    fn eq(&self, other: &Self) -> bool {
+        *self.locals.borrow() == *other.locals.borrow()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1940,6 +1956,9 @@ impl BrowserExecutionState {
                 let cb = arguments.first().map(|a| self.execute_expression(a));
                 if let Some(JsValue::Function(func)) = cb {
                     for (i, item) in arr.into_iter().enumerate() {
+                        if self.execution_budget_exhausted {
+                            break;
+                        }
                         self.call_function(func.clone(), vec![item, JsValue::Number(i as f64)]);
                         if matches!(
                             self.early_exit,
@@ -1959,6 +1978,9 @@ impl BrowserExecutionState {
                 if let Some(JsValue::Function(func)) = cb {
                     let mut result = Vec::new();
                     for (i, item) in arr.into_iter().enumerate() {
+                        if self.execution_budget_exhausted {
+                            break;
+                        }
                         let v =
                             self.call_function(func.clone(), vec![item, JsValue::Number(i as f64)]);
                         if self.early_exit.is_some() {
@@ -1976,6 +1998,9 @@ impl BrowserExecutionState {
                 if let Some(JsValue::Function(func)) = cb {
                     let mut result = Vec::new();
                     for (i, item) in arr.into_iter().enumerate() {
+                        if self.execution_budget_exhausted {
+                            break;
+                        }
                         let keep = self.call_function(
                             func.clone(),
                             vec![item.clone(), JsValue::Number(i as f64)],
@@ -2004,6 +2029,9 @@ impl BrowserExecutionState {
                         (arr[0].clone(), 1)
                     };
                     for (i, item) in arr.into_iter().enumerate().skip(start) {
+                        if self.execution_budget_exhausted {
+                            break;
+                        }
                         acc = self.call_function(
                             func.clone(),
                             vec![acc, item, JsValue::Number(i as f64)],
@@ -2030,6 +2058,9 @@ impl BrowserExecutionState {
                         (arr[len - 1].clone(), len - 1)
                     };
                     for i in (0..end).rev() {
+                        if self.execution_budget_exhausted {
+                            break;
+                        }
                         acc = self.call_function(
                             func.clone(),
                             vec![acc, arr[i].clone(), JsValue::Number(i as f64)],
@@ -2047,6 +2078,9 @@ impl BrowserExecutionState {
                 let cb = arguments.first().map(|a| self.execute_expression(a));
                 if let Some(JsValue::Function(func)) = cb {
                     for (i, item) in arr.into_iter().enumerate() {
+                        if self.execution_budget_exhausted {
+                            break;
+                        }
                         let found = self.call_function(
                             func.clone(),
                             vec![item.clone(), JsValue::Number(i as f64)],
@@ -2065,6 +2099,9 @@ impl BrowserExecutionState {
                 let cb = arguments.first().map(|a| self.execute_expression(a));
                 if let Some(JsValue::Function(func)) = cb {
                     for (i, item) in arr.into_iter().enumerate() {
+                        if self.execution_budget_exhausted {
+                            break;
+                        }
                         let found =
                             self.call_function(func.clone(), vec![item, JsValue::Number(i as f64)]);
                         if self.early_exit.is_some() {
@@ -2081,6 +2118,9 @@ impl BrowserExecutionState {
                 let cb = arguments.first().map(|a| self.execute_expression(a));
                 if let Some(JsValue::Function(func)) = cb {
                     for (i, item) in arr.into_iter().enumerate() {
+                        if self.execution_budget_exhausted {
+                            break;
+                        }
                         let v =
                             self.call_function(func.clone(), vec![item, JsValue::Number(i as f64)]);
                         if self.early_exit.is_some() {
@@ -2097,6 +2137,9 @@ impl BrowserExecutionState {
                 let cb = arguments.first().map(|a| self.execute_expression(a));
                 if let Some(JsValue::Function(func)) = cb {
                     for (i, item) in arr.into_iter().enumerate() {
+                        if self.execution_budget_exhausted {
+                            break;
+                        }
                         let v =
                             self.call_function(func.clone(), vec![item, JsValue::Number(i as f64)]);
                         if self.early_exit.is_some() {
@@ -2114,6 +2157,9 @@ impl BrowserExecutionState {
                 if let Some(JsValue::Function(func)) = cb {
                     let mut result = Vec::new();
                     for (i, item) in arr.into_iter().enumerate() {
+                        if self.execution_budget_exhausted {
+                            break;
+                        }
                         let v =
                             self.call_function(func.clone(), vec![item, JsValue::Number(i as f64)]);
                         if self.early_exit.is_some() {
@@ -2136,8 +2182,14 @@ impl BrowserExecutionState {
                     // Insertion sort to avoid borrow issues with &mut self in closure
                     let len = r.len();
                     for i in 1..len {
+                        if self.execution_budget_exhausted {
+                            break;
+                        }
                         let mut j = i;
                         while j > 0 {
+                            if self.execution_budget_exhausted {
+                                break;
+                            }
                             let cmp = self
                                 .call_function(func.clone(), vec![r[j - 1].clone(), r[j].clone()]);
                             if Self::value_to_number(&cmp) > 0.0 {
@@ -2775,17 +2827,17 @@ impl BrowserExecutionState {
 
     fn get_binding(&self, name: &str) -> Option<JsValue> {
         for frame in self.stack.iter().rev() {
-            if let Some(value) = frame.locals.get(name) {
-                return Some(value.clone());
+            if let Some(value) = frame.locals.borrow().get(name).cloned() {
+                return Some(value);
             }
         }
         self.globals.get(name).cloned()
     }
 
     fn set_binding(&mut self, name: &str, value: JsValue) {
-        for frame in self.stack.iter_mut().rev() {
-            if frame.locals.contains_key(name) {
-                frame.locals.insert(name.to_owned(), value);
+        for frame in self.stack.iter().rev() {
+            if frame.locals.borrow().contains_key(name) {
+                frame.locals.borrow_mut().insert(name.to_owned(), value);
                 return;
             }
         }
@@ -2794,8 +2846,8 @@ impl BrowserExecutionState {
 
     fn set_local(&mut self, name: &str, value: JsValue) {
         self.ensure_global_frame();
-        if let Some(frame) = self.stack.last_mut() {
-            frame.locals.insert(name.to_owned(), value);
+        if let Some(frame) = self.stack.last() {
+            frame.locals.borrow_mut().insert(name.to_owned(), value);
         }
     }
 
@@ -2849,11 +2901,11 @@ impl BrowserExecutionState {
     }
 
     fn call_function(&mut self, func: JsFunction, args: Vec<JsValue>) -> JsValue {
-        let saved_stack = std::mem::replace(&mut self.stack, func.captured.clone());
+        // Move captured frames directly — no clone needed since func is owned.
+        let saved_stack = std::mem::replace(&mut self.stack, func.captured);
         self.ensure_global_frame();
         self.stack.push(StackFrame::default());
-        let params = func.params.clone();
-        self.bind_params(&params, args);
+        self.bind_params(&func.params, args);
         let result = match func.body {
             FunctionBody::Block(block) => {
                 for stmt in &block.body {
@@ -2972,6 +3024,10 @@ impl BrowserExecutionState {
             BinaryOperator::ShiftRight => JsValue::Number(
                 (((Self::value_to_number(&lv) as i32) >> (Self::value_to_number(&rv) as u32 & 31))
                     as i32) as f64,
+            ),
+            BinaryOperator::UnsignedShiftRight => JsValue::Number(
+                (((Self::value_to_number(&lv) as u32) >> (Self::value_to_number(&rv) as u32 & 31))
+                    ) as f64,
             ),
             BinaryOperator::Exponent => {
                 JsValue::Number(Self::value_to_number(&lv).powf(Self::value_to_number(&rv)))
@@ -3133,9 +3189,10 @@ impl BrowserExecutionState {
                 if let Some(k) = key {
                     event_obj.insert("key".to_owned(), JsValue::String(k.to_owned()));
                 }
-                if let Some(frame) = self.stack.last_mut() {
+                if let Some(frame) = self.stack.last() {
                     frame
                         .locals
+                        .borrow_mut()
                         .insert(param_name.clone(), JsValue::Object(event_obj));
                 }
             }
@@ -4508,5 +4565,55 @@ mod tests {
             document.getElementById("result").textContent = String(x + y);
         "#);
         assert_eq!(effects, vec![text("result", "0.75")]);
+    }
+
+    // Rc<RefCell> shared-frame closure tests
+    // These verify that closures sharing a captured environment see each other's mutations.
+
+    #[test]
+    fn t050_closure_shared_mutable_state() {
+        // inc and get share the same 'n' frame — mutations from inc must be visible via get
+        let effects = run(r#"
+            function makeCounter() {
+                var n = 0;
+                function inc() { n = n + 1; }
+                function get() { return n; }
+                return { inc: inc, get: get };
+            }
+            var c = makeCounter();
+            c.inc();
+            c.inc();
+            c.inc();
+            document.getElementById("result").textContent = String(c.get());
+        "#);
+        assert_eq!(effects, vec![text("result", "3")]);
+    }
+
+    #[test]
+    fn t051_closure_adder_independent_captures() {
+        // Two adder instances must not share state with each other
+        let effects = run(r#"
+            function makeAdder(x) {
+                return function(y) { return x + y; };
+            }
+            var add5 = makeAdder(5);
+            var add10 = makeAdder(10);
+            document.getElementById("a").textContent = String(add5(3));
+            document.getElementById("b").textContent = String(add10(3));
+        "#);
+        assert_eq!(effects, vec![text("a", "8"), text("b", "13")]);
+    }
+
+    #[test]
+    fn t052_closure_mutates_outer_scope_variable() {
+        // A closure that assigns to an outer-scope variable; the caller must see the new value
+        let effects = run(r#"
+            var x = 10;
+            function double() { x = x * 2; }
+            double();
+            double();
+            document.getElementById("result").textContent = String(x);
+        "#);
+        assert_eq!(effects, vec![text("result", "40")]);
     }
 }

@@ -1821,7 +1821,7 @@ enum PageScriptKind {
     External,
 }
 
-const MAX_EXTERNAL_SCRIPT_PARSE_BYTES: usize = 256 * 1024;
+const MAX_EXTERNAL_SCRIPT_PARSE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_SCRIPT_DIAGNOSTIC_BYTES: usize = MAX_EXTERNAL_SCRIPT_PARSE_BYTES;
 const LIVE_JS_DEBUG_STATEMENT_BUDGET: usize = 50_000;
 
@@ -3332,18 +3332,21 @@ impl App for AlmostThereApp {
                         }
                     }
                 }
-                for input_submit in &response.submitted_inputs {
-                    self.telemetry.emit(
-                        "input.submitted",
-                        &[
-                            ("label", &input_submit.label),
-                            ("value", &input_submit.value),
-                        ],
-                    );
-                    if let Some(search_url) =
-                        ecosia_search_url_for_input(&input_submit.label, &input_submit.value)
-                    {
-                        self.open_link(&search_url, ctx);
+                if !response.submitted_inputs.is_empty() {
+                    for input_submit in &response.submitted_inputs {
+                        self.telemetry.emit(
+                            "input.submitted",
+                            &[
+                                ("label", &input_submit.label),
+                                ("value", &input_submit.value),
+                            ],
+                        );
+                    }
+                    if let Some(url) = form_get_url_for_inputs(
+                        &response.submitted_inputs,
+                        &self.document.source,
+                    ) {
+                        self.open_link(&url, ctx);
                     }
                 }
                 let hovered_element_id = response.hovered.as_ref().and_then(|t| match t {
@@ -3441,6 +3444,10 @@ impl App for AlmostThereApp {
                 }
             });
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.telemetry.emit("app.window_closed", &[]);
+    }
 }
 
 fn resolve_navigation_url(source: &str, href: &str) -> String {
@@ -3450,19 +3457,27 @@ fn resolve_navigation_url(source: &str, href: &str) -> String {
     resolve_resource_url(source, href)
 }
 
-fn ecosia_search_url_for_input(label: &str, value: &str) -> Option<String> {
-    let query = value.trim();
+fn form_get_url_for_inputs(inputs: &[rich_canvas::InputSubmit], page_source: &str) -> Option<String> {
+    let action = inputs.iter().find_map(|i| i.form_action.as_deref())?;
+    let base_url = resolve_resource_url(page_source, action);
+    let query: String = inputs
+        .iter()
+        .filter(|i| !i.value.trim().is_empty())
+        .map(|i| {
+            let key = i.name.as_deref().unwrap_or("q");
+            format!("{}={}", percent_encode_query(key), percent_encode_query(i.value.trim()))
+        })
+        .collect::<Vec<_>>()
+        .join("&");
     if query.is_empty() {
         return None;
     }
-    let label = label.to_ascii_lowercase();
-    if !(label.contains("search") || label.contains("web")) {
-        return None;
-    }
-    Some(format!(
-        "https://www.ecosia.org/search?q={}",
-        percent_encode_query(query)
-    ))
+    let base = if base_url.contains('?') {
+        format!("{base_url}&{query}")
+    } else {
+        format!("{base_url}?{query}")
+    };
+    Some(base)
 }
 
 fn percent_encode_query(value: &str) -> String {
@@ -4688,6 +4703,7 @@ struct CanvasListContext {
 #[derive(Clone, Debug)]
 struct CanvasFormContext {
     id: String,
+    action: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -6547,7 +6563,8 @@ fn push_canvas_form_context_for_layout_box(
             cursor.next_form_index += 1;
             id
         });
-    cursor.form_stack.push(CanvasFormContext { id });
+    let action = element.attr("action").map(str::to_owned);
+    cursor.form_stack.push(CanvasFormContext { id, action });
     true
 }
 
@@ -6820,6 +6837,7 @@ fn push_canvas_graph_element(
             if let CanvasBlock::Input { label, value } = block {
                 graph.objects.push(CanvasObject::Input(CanvasInputObject {
                     label,
+                    name: element.attr("name").map(str::to_owned),
                     default_value: value.clone(),
                     value,
                     rect: egui::Rect::from_min_size(
@@ -6832,6 +6850,7 @@ fn push_canvas_graph_element(
                     font_size: node.style.font_size,
                     color: node.style.color,
                     form_id: current_canvas_form_id(cursor),
+                    form_action: current_canvas_form_action(cursor),
                     element_id: element.attr("id").map(str::to_owned),
                 }));
             }
@@ -6992,12 +7011,17 @@ fn push_canvas_form_context_for_element(
             cursor.next_form_index += 1;
             id
         });
-    cursor.form_stack.push(CanvasFormContext { id });
+    let action = element.attr("action").map(str::to_owned);
+    cursor.form_stack.push(CanvasFormContext { id, action });
     true
 }
 
 fn current_canvas_form_id(cursor: &CanvasLayoutCursor) -> Option<String> {
     cursor.form_stack.last().map(|form| form.id.clone())
+}
+
+fn current_canvas_form_action(cursor: &CanvasLayoutCursor) -> Option<String> {
+    cursor.form_stack.last().and_then(|form| form.action.clone())
 }
 
 fn push_canvas_graph_button_hit_target(
@@ -7012,6 +7036,7 @@ fn push_canvas_graph_button_hit_target(
         rect,
         button_type: element.attr("type").unwrap_or("submit").to_owned(),
         form_id: current_canvas_form_id(cursor),
+        form_action: current_canvas_form_action(cursor),
         element_id: element.attr("id").map(str::to_owned),
     }));
 }
@@ -12225,7 +12250,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&dir).expect("create temp script dir");
-        fs::write(dir.join("large.js"), "var x = 1;\n".repeat(40_000)).expect("write large script");
+        fs::write(dir.join("large.js"), "var x = 1;\n".repeat(500_000)).expect("write large script");
 
         let html = r#"
             <div id="result">Still renders</div>
@@ -12249,7 +12274,7 @@ mod tests {
             <div id="result">SSR content remains visible</div>
             <script>{}</script>
             "#,
-            "var nuxtState = 1;\n".repeat(30_000)
+            "var nuxtState = 1;\n".repeat(280_000)
         );
         let document = parse_html_document(&html, "https://example.test/fingerprint");
         let messages = script_console_messages_from_html_with_source(
