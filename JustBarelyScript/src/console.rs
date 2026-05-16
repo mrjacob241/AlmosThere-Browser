@@ -71,6 +71,14 @@ fn collect_statement_console_messages(statement: &Statement, out: &mut Vec<Conso
         Statement::FunctionDeclaration(declaration) => {
             collect_block_console_messages(&declaration.body, out);
         }
+        Statement::ClassDeclaration(_)
+        | Statement::Throw(_)
+        | Statement::ForOf(_)
+        | Statement::ForIn(_)
+        | Statement::TryCatch(_)
+        | Statement::Switch(_)
+        | Statement::Break(_)
+        | Statement::Continue(_) => {}
         Statement::Return(statement) => {
             if let Some(argument) = &statement.argument {
                 collect_expression_console_messages(argument, out);
@@ -149,18 +157,35 @@ fn collect_expression_console_messages(expression: &Expression, out: &mut Vec<Co
             collect_expression_console_messages(target, out);
             collect_expression_console_messages(value, out);
         }
-        Expression::Ternary { test, consequent, alternate } => {
+        Expression::Ternary {
+            test,
+            consequent,
+            alternate,
+        } => {
             collect_expression_console_messages(test, out);
             collect_expression_console_messages(consequent, out);
             collect_expression_console_messages(alternate, out);
         }
-        Expression::Member { object, property } => {
+        Expression::Member {
+            object,
+            property,
+            optional: _,
+        } => {
             collect_expression_console_messages(object, out);
             if let MemberProperty::Computed(expression) = property {
                 collect_expression_console_messages(expression, out);
             }
         }
-        Expression::Identifier(_)
+        Expression::ArrowFunction { .. }
+        | Expression::New { .. }
+        | Expression::Await(_)
+        | Expression::Typeof(_)
+        | Expression::Void(_)
+        | Expression::Delete(_)
+        | Expression::Spread(_)
+        | Expression::TemplateLiteral(_)
+        | Expression::Super
+        | Expression::Identifier(_)
         | Expression::Number(_)
         | Expression::String(_)
         | Expression::Boolean(_)
@@ -171,7 +196,12 @@ fn collect_expression_console_messages(expression: &Expression, out: &mut Vec<Co
 }
 
 fn console_call_level(callee: &Expression) -> Option<ConsoleLevel> {
-    let Expression::Member { object, property } = callee else {
+    let Expression::Member {
+        object,
+        property,
+        optional: _,
+    } = callee
+    else {
         return None;
     };
     if !matches!(object.as_ref(), Expression::Identifier(name) if name == "console") {
