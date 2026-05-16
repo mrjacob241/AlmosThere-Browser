@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    #result { font-weight: bold; }
+    #result.pass { color: green; }
+    #result.fail { color: red; }
+    pre { background: #f4f4f4; padding: 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <p>Test 039: ES modules <code>import</code> / <code>export</code></p>
+  <p style="color:#888;font-size:0.85em;font-style:italic;">Firefox note: ES modules are blocked on <code>file://</code> due to CORS.
+     Serve with <code>python3 -m http.server</code> and open <code>http://localhost:8000</code> to test in Firefox.</p>
+  <pre id="detail"></pre>
+  <div id="result">fail</div>
+
+  <!--
+    This test requires:
+    - loading external <script type="module"> files
+    - named exports: import { GREETING, add, Point } from './module.js'
+    - default export: import defaultFn from './module.js'
+    - top-level await is optional; static imports suffice here
+  -->
+  <script type="module">
+    import defaultFn from "./module.js";
+    import { GREETING, add, Point } from "./module.js";
+
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0039]: ES modules. Named and default imports from a sibling module.js file. Expected: #result text becomes Hello from module/3/(1,2).");
+
+    var r1 = GREETING;
+    var r2 = add(1, 2);
+    var r3 = new Point(1, 2).toString();
+    var r4 = defaultFn();
+
+    var passed = r1 === "Hello from module" && r2 === 3 && r3 === "(1,2)" && r4 === "default export";
+
+    document.getElementById("detail").textContent =
+      "GREETING: " + r1 + "\n" +
+      "add(1,2): " + String(r2) + "\n" +
+      "Point:    " + r3 + "\n" +
+      "default:  " + r4;
+
+    document.getElementById("result").textContent = passed
+      ? "Hello from module/3/(1,2)"
+      : "fail (r1=" + r1 + " r2=" + String(r2) + " r3=" + r3 + " r4=" + r4 + ")";
+    document.getElementById("result").className = passed ? "pass" : "fail";
+  </script>
+</body>
+</html>

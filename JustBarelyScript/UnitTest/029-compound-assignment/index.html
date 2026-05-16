@@ -1,0 +1,39 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    #result { font-weight: bold; }
+    #result.pass { color: green; }
+    #result.fail { color: red; }
+    pre { background: #f4f4f4; padding: 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <p>Test 029: compound assignment <code>+=</code> <code>-=</code></p>
+  <pre id="detail"></pre>
+  <div id="result">fail</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0029]: Compound assignment. n starts at 10, n += 5, n -= 3. Expected: #result text becomes 12.");
+
+    var n = 10;
+    var start = n;
+    n += 5;
+    var after_plus = n;
+    n -= 3;
+    var after_minus = n;
+
+    var passed = after_minus === 12;
+
+    document.getElementById("detail").textContent =
+      "start:    " + String(start) + "\n" +
+      "n += 5 -> " + String(after_plus) + "\n" +
+      "n -= 3 -> " + String(after_minus);
+
+    document.getElementById("result").textContent = passed ? String(after_minus) : "fail (got " + String(after_minus) + ")";
+    document.getElementById("result").className = passed ? "pass" : "fail";
+  </script>
+</body>
+</html>

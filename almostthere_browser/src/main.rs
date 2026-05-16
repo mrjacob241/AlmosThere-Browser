@@ -132,6 +132,70 @@ const SCRIPT_TEST_BOOKMARKS: &[(&str, &str)] = &[
         "025 Minimal Todo App",
         "JustBarelyScript/UnitTest/025-minimal-todo-app/index.html",
     ),
+    (
+        "026 Decorator Skip",
+        "JustBarelyScript/UnitTest/026-decorator-skip/index.html",
+    ),
+    (
+        "027 XOR Operator",
+        "JustBarelyScript/UnitTest/027-xor-operator/index.html",
+    ),
+    (
+        "028 Increment Decrement",
+        "JustBarelyScript/UnitTest/028-increment-decrement/index.html",
+    ),
+    (
+        "029 Compound Assignment",
+        "JustBarelyScript/UnitTest/029-compound-assignment/index.html",
+    ),
+    (
+        "030 Nullish Coalescing",
+        "JustBarelyScript/UnitTest/030-nullish-coalescing/index.html",
+    ),
+    (
+        "031 Default Parameters",
+        "JustBarelyScript/UnitTest/031-default-parameters/index.html",
+    ),
+    (
+        "032 Arrow Functions",
+        "JustBarelyScript/UnitTest/032-arrow-functions/index.html",
+    ),
+    (
+        "033 Spread Operator",
+        "JustBarelyScript/UnitTest/033-spread-operator/index.html",
+    ),
+    (
+        "034 Optional Chaining",
+        "JustBarelyScript/UnitTest/034-optional-chaining/index.html",
+    ),
+    (
+        "035 Template Literals",
+        "JustBarelyScript/UnitTest/035-template-literals/index.html",
+    ),
+    (
+        "036 Try Catch Finally",
+        "JustBarelyScript/UnitTest/036-try-catch-finally/index.html",
+    ),
+    (
+        "037 For Of",
+        "JustBarelyScript/UnitTest/037-for-of/index.html",
+    ),
+    (
+        "038 Class Syntax",
+        "JustBarelyScript/UnitTest/038-class-syntax/index.html",
+    ),
+    (
+        "039 ES Modules",
+        "JustBarelyScript/UnitTest/039-es-modules/index.html",
+    ),
+    (
+        "040 Async Await",
+        "JustBarelyScript/UnitTest/040-async-await/index.html",
+    ),
+    (
+        "041 Proxy",
+        "JustBarelyScript/UnitTest/041-proxy/index.html",
+    ),
 ];
 
 fn main() -> eframe::Result<()> {
@@ -2130,12 +2194,16 @@ impl App for AlmostThereApp {
 
                 let mut script_test_to_open = None;
                 ui.menu_button("Script Tests", |ui| {
-                    for bookmark in script_test_bookmarks() {
-                        if ui.button(&bookmark.title).clicked() {
-                            script_test_to_open = Some(bookmark);
-                            ui.close();
-                        }
-                    }
+                    egui::ScrollArea::vertical()
+                        .max_height(400.0)
+                        .show(ui, |ui| {
+                            for bookmark in script_test_bookmarks() {
+                                if ui.button(&bookmark.title).clicked() {
+                                    script_test_to_open = Some(bookmark);
+                                    ui.close();
+                                }
+                            }
+                        });
                 });
                 if let Some(bookmark) = script_test_to_open {
                     self.open_bookmark_value(bookmark, ctx);

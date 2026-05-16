@@ -1,0 +1,46 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    #result { font-weight: bold; }
+    #result.pass { color: green; }
+    #result.fail { color: red; }
+    pre { background: #f4f4f4; padding: 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <p>Test 031: default parameters</p>
+  <pre id="detail"></pre>
+  <div id="result">fail</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0031]: Default parameters. greet() with no args should use defaults. Expected: #result text becomes Hello World.");
+
+    function greet(name = "World", greeting = "Hello") {
+      return greeting + " " + name;
+    }
+
+    function add(a, b = 10) {
+      return a + b;
+    }
+
+    var r1 = greet();
+    var r2 = greet("Alice");
+    var r3 = greet("Bob", "Hi");
+    var r4 = add(5);
+
+    var passed = r1 === "Hello World" && r2 === "Hello Alice" && r3 === "Hi Bob" && r4 === 15;
+
+    document.getElementById("detail").textContent =
+      "greet():           " + r1 + "\n" +
+      "greet('Alice'):    " + r2 + "\n" +
+      "greet('Bob','Hi'): " + r3 + "\n" +
+      "add(5):            " + String(r4);
+
+    document.getElementById("result").textContent = passed ? "Hello World" : "fail (r1=" + r1 + " r2=" + r2 + " r3=" + r3 + " r4=" + String(r4) + ")";
+    document.getElementById("result").className = passed ? "pass" : "fail";
+  </script>
+</body>
+</html>

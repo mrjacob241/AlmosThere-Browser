@@ -149,6 +149,11 @@ fn collect_expression_console_messages(expression: &Expression, out: &mut Vec<Co
             collect_expression_console_messages(target, out);
             collect_expression_console_messages(value, out);
         }
+        Expression::Ternary { test, consequent, alternate } => {
+            collect_expression_console_messages(test, out);
+            collect_expression_console_messages(consequent, out);
+            collect_expression_console_messages(alternate, out);
+        }
         Expression::Member { object, property } => {
             collect_expression_console_messages(object, out);
             if let MemberProperty::Computed(expression) = property {

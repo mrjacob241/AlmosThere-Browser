@@ -1,0 +1,57 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    #result { font-weight: bold; }
+    #result.pass { color: green; }
+    #result.fail { color: red; }
+    pre { background: #f4f4f4; padding: 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <p>Test 035: template literals <code>`...`</code></p>
+  <pre id="detail"></pre>
+  <div id="result">fail</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0035]: Template literals. Backtick strings with ${} interpolation should work. Expected: #result text becomes Hello Alice, you are 30.");
+
+    var name = "Alice";
+    var age = 30;
+
+    // basic variable interpolation
+    var greeting = `Hello ${name}, you are ${age}.`;
+
+    // expression inside ${}
+    var math = `2 + 2 = ${2 + 2}`;
+
+    // function call result inside ${}
+    function addBang(s) { return s + "!"; }
+    var loud = `${addBang(name)} says hi`;
+
+    // multi-line: compare directly against expected string with embedded newline
+    var multi = `line one
+line two`;
+
+    var r1 = greeting === "Hello Alice, you are 30.";
+    var r2 = math === "2 + 2 = 4";
+    var r3 = loud === "Alice! says hi";
+    var r4 = multi === "line one\nline two";
+
+    var passed = r1 && r2 && r3 && r4;
+
+    document.getElementById("detail").textContent =
+      "greeting: " + greeting + "\n" +
+      "math:     " + math + "\n" +
+      "loud:     " + loud + "\n" +
+      "multi ok: " + String(r4);
+
+    document.getElementById("result").textContent = passed
+      ? "Hello Alice, you are 30."
+      : "fail (r1=" + String(r1) + " r2=" + String(r2) + " r3=" + String(r3) + " r4=" + String(r4) + ")";
+    document.getElementById("result").className = passed ? "pass" : "fail";
+  </script>
+</body>
+</html>

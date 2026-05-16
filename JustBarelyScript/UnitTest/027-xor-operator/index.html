@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    #result { font-weight: bold; }
+    #result.pass { color: green; }
+    #result.fail { color: red; }
+    pre { background: #f4f4f4; padding: 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <p>Test 027: XOR operator <code>^</code></p>
+  <pre id="detail"></pre>
+  <div id="result">fail</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0027]: XOR operator. 5 ^ 3 should equal 6. Expected: #result text becomes 6.");
+
+    var a = 5;
+    var b = 3;
+    var xorResult = a ^ b;
+    var roundtrip = xorResult ^ b;
+
+    var passed = xorResult === 6 && roundtrip === 5;
+
+    document.getElementById("detail").textContent =
+      "5 ^ 3 = " + String(xorResult) + "\n" +
+      "6 ^ 3 = " + String(roundtrip) + " (round-trip back to 5)";
+
+    document.getElementById("result").textContent = passed ? String(xorResult) : "fail (got " + String(xorResult) + ")";
+    document.getElementById("result").className = passed ? "pass" : "fail";
+  </script>
+</body>
+</html>

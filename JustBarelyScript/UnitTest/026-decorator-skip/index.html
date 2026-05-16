@@ -1,0 +1,39 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    #result { font-weight: bold; }
+    #result.pass { color: green; }
+    #result.fail { color: red; }
+    pre { background: #f4f4f4; padding: 8px; border-radius: 4px; }
+    .note { color: #888; font-size: 0.85em; font-style: italic; }
+  </style>
+</head>
+<body>
+  <p>Test 026: decorator skip <code>@annotation</code></p>
+  <p class="note">JBS-only test: <code>@annotation</code> before a function is not valid in standard JS.
+     Firefox will SyntaxError; this test is the acceptance criterion for JBS decorator-skip behaviour.</p>
+  <pre id="detail"></pre>
+  <div id="result">fail</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0026]: Decorator skip. @annotation before a function should be ignored by the lexer. Expected: #result text becomes pass.");
+
+    var value = "pass";
+
+    @deprecated
+    function legacyFunction() {
+      return "old";
+    }
+
+    document.getElementById("detail").textContent =
+      "value:           " + value + "\n" +
+      "legacyFunction:  " + legacyFunction();
+
+    document.getElementById("result").textContent = value === "pass" ? "pass" : "fail (got " + value + ")";
+    document.getElementById("result").className = value === "pass" ? "pass" : "fail";
+  </script>
+</body>
+</html>

@@ -1,0 +1,81 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    #result { font-weight: bold; }
+    #result.pass { color: green; }
+    #result.fail { color: red; }
+    pre { background: #f4f4f4; padding: 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <p>Test 038: <code>class</code> syntax and private fields <code>#</code></p>
+  <pre id="detail"></pre>
+  <div id="result">fail</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0038]: Class syntax. constructor, methods, extends, super, static, and private fields #. Expected: #result text becomes Rex barks/2.");
+
+    // basic class with constructor and method
+    class Animal {
+      constructor(name) {
+        this.name = name;
+      }
+      speak() {
+        return this.name + " makes a sound";
+      }
+    }
+
+    // inheritance with extends and super
+    class Dog extends Animal {
+      constructor(name) {
+        super(name);
+      }
+      speak() {
+        return this.name + " barks";
+      }
+    }
+
+    // static method
+    class MathHelper {
+      static double(n) {
+        return n * 2;
+      }
+    }
+
+    // private field
+    class Counter {
+      #count = 0;
+      increment() { this.#count = this.#count + 1; }
+      value() { return this.#count; }
+    }
+
+    var dog = new Dog("Rex");
+    var base = new Animal("Cat");
+
+    // verify inheritance via method override — no instanceof needed
+    var r1 = dog.speak();
+    var r2 = base.speak();
+    var r3 = MathHelper.double(3);
+    var counter = new Counter();
+    counter.increment();
+    counter.increment();
+    var r4 = counter.value();
+
+    var passed = r1 === "Rex barks" && r2 === "Cat makes a sound" && r3 === 6 && r4 === 2;
+
+    document.getElementById("detail").textContent =
+      "dog.speak():   " + r1 + "\n" +
+      "base.speak():  " + r2 + "\n" +
+      "static double: " + String(r3) + "\n" +
+      "private #:     " + String(r4);
+
+    document.getElementById("result").textContent = passed
+      ? "Rex barks/2"
+      : "fail (r1=" + r1 + " r2=" + r2 + " r3=" + String(r3) + " r4=" + String(r4) + ")";
+    document.getElementById("result").className = passed ? "pass" : "fail";
+  </script>
+</body>
+</html>
