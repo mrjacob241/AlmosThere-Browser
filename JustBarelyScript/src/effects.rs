@@ -248,6 +248,13 @@ impl BrowserExecutionState {
                 self.assign_target(target, value.clone());
                 value
             }
+            Expression::Ternary { test, consequent, alternate } => {
+                if Self::is_truthy(&self.execute_expression(test)) {
+                    self.execute_expression(consequent)
+                } else {
+                    self.execute_expression(alternate)
+                }
+            }
             Expression::Call { callee, arguments } => self.execute_call(callee, arguments),
             Expression::Member { .. } => self.eval_member(expression),
             Expression::Binary { op, left, right } => self.execute_binary(op, left, right),
@@ -851,7 +858,7 @@ impl BrowserExecutionState {
         left: &Expression,
         right: &Expression,
     ) -> JsValue {
-        // Short-circuit logical operators before evaluating both sides.
+        // Short-circuit operators — evaluate right side only when needed.
         match op {
             BinaryOperator::LogicalAnd => {
                 let left = self.execute_expression(left);
@@ -866,6 +873,14 @@ impl BrowserExecutionState {
                     return left;
                 }
                 return self.execute_expression(right);
+            }
+            BinaryOperator::NullishCoalescing => {
+                let left = self.execute_expression(left);
+                return if matches!(left, JsValue::Null | JsValue::Undefined) {
+                    self.execute_expression(right)
+                } else {
+                    left
+                };
             }
             _ => {}
         }
@@ -912,7 +927,14 @@ impl BrowserExecutionState {
             BinaryOperator::NotEqual | BinaryOperator::StrictNotEqual => {
                 JsValue::Boolean(!Self::values_equal(&lv, &rv))
             }
-            BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr => {
+            BinaryOperator::BitXor => {
+                let l = Self::value_to_number(&lv) as i64;
+                let r = Self::value_to_number(&rv) as i64;
+                JsValue::Number((l ^ r) as f64)
+            }
+            BinaryOperator::LogicalAnd
+            | BinaryOperator::LogicalOr
+            | BinaryOperator::NullishCoalescing => {
                 unreachable!("handled above")
             }
         }

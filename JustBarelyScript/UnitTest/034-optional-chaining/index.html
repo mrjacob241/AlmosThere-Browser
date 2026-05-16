@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    #result { font-weight: bold; }
+    #result.pass { color: green; }
+    #result.fail { color: red; }
+    pre { background: #f4f4f4; padding: 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <p>Test 034: optional chaining <code>?.</code></p>
+  <pre id="detail"></pre>
+  <div id="result">fail</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0034]: Optional chaining. obj?.prop on null/undefined should return undefined, not crash. Expected: #result text becomes none/found.");
+
+    var obj = null;
+    var user = { name: "Alice", address: { city: "Rome" } };
+
+    var r1 = obj?.name;
+    var r2 = user?.name;
+    var r3 = user?.address?.city;
+    var r4 = obj?.foo?.bar;
+
+    var r1ok = r1 === undefined || r1 === null;
+    var r4ok = r4 === undefined || r4 === null;
+    var passed = r1ok && r2 === "Alice" && r3 === "Rome" && r4ok;
+
+    document.getElementById("detail").textContent =
+      "null?.name:              " + String(r1) + "\n" +
+      "user?.name:              " + r2 + "\n" +
+      "user?.address?.city:     " + r3 + "\n" +
+      "null?.foo?.bar:          " + String(r4);
+
+    document.getElementById("result").textContent = passed ? "none/found" : "fail (r1=" + r1 + " r2=" + r2 + " r3=" + r3 + " r4=" + r4 + ")";
+    document.getElementById("result").className = passed ? "pass" : "fail";
+  </script>
+</body>
+</html>

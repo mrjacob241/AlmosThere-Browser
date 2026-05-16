@@ -1,0 +1,44 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    #result { font-weight: bold; }
+    #result.pass { color: green; }
+    #result.fail { color: red; }
+    pre { background: #f4f4f4; padding: 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <p>Test 032: arrow functions <code>=&gt;</code></p>
+  <pre id="detail"></pre>
+  <div id="result">fail</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0032]: Arrow functions. Concise and block-body arrow functions should work like regular functions. Expected: #result text becomes 5/hello/3.");
+
+    var add = (a, b) => a + b;
+
+    var shout = (s) => {
+      return s + "!";
+    };
+
+    var double = x => x * 2;
+
+    var r1 = add(2, 3);
+    var r2 = shout("hello");
+    var r3 = double(1) + 1;
+
+    var passed = r1 === 5 && r2 === "hello!" && r3 === 3;
+
+    document.getElementById("detail").textContent =
+      "add(2,3):        " + String(r1) + "\n" +
+      "shout('hello'):  " + r2 + "\n" +
+      "double(1)+1:     " + String(r3);
+
+    document.getElementById("result").textContent = passed ? "5/hello/3" : "fail (r1=" + String(r1) + " r2=" + r2 + " r3=" + String(r3) + ")";
+    document.getElementById("result").className = passed ? "pass" : "fail";
+  </script>
+</body>
+</html>

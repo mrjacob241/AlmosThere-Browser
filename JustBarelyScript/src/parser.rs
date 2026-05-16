@@ -244,6 +244,26 @@ impl Parser {
                 continue;
             }
 
+            // Postfix ++ / -- — desugar to n = n + 1 / n = n - 1.
+            if self.at(TokenKind::PlusPlus) || self.at(TokenKind::MinusMinus) {
+                let op = if self.at(TokenKind::PlusPlus) {
+                    BinaryOperator::Add
+                } else {
+                    BinaryOperator::Subtract
+                };
+                self.advance();
+                let target = left.clone();
+                left = Expression::Assignment {
+                    target: Box::new(target.clone()),
+                    value: Box::new(Expression::Binary {
+                        op,
+                        left: Box::new(target),
+                        right: Box::new(Expression::Number(1.0)),
+                    }),
+                };
+                continue;
+            }
+
             if self.at(TokenKind::Equals) {
                 let (left_bp, right_bp) = (1, 0);
                 if left_bp < min_bp {
@@ -254,6 +274,48 @@ impl Parser {
                 left = Expression::Assignment {
                     target: Box::new(left),
                     value: Box::new(value),
+                };
+                continue;
+            }
+
+            // Compound assignment: += and -=. Desugar to n = n + rhs.
+            if self.at(TokenKind::PlusEquals) || self.at(TokenKind::MinusEquals) {
+                let (lbp, rbp) = (1u8, 0u8);
+                if lbp < min_bp {
+                    break;
+                }
+                let op = if self.at(TokenKind::PlusEquals) {
+                    BinaryOperator::Add
+                } else {
+                    BinaryOperator::Subtract
+                };
+                self.advance();
+                let rhs = self.parse_expression(rbp)?;
+                let target = left.clone();
+                left = Expression::Assignment {
+                    target: Box::new(target.clone()),
+                    value: Box::new(Expression::Binary {
+                        op,
+                        left: Box::new(target),
+                        right: Box::new(rhs),
+                    }),
+                };
+                continue;
+            }
+
+            // Ternary: test ? consequent : alternate.
+            if self.at(TokenKind::Question) {
+                if 1u8 < min_bp {
+                    break;
+                }
+                self.advance(); // consume ?
+                let consequent = self.parse_expression(0)?;
+                self.expect(TokenKind::Colon)?;
+                let alternate = self.parse_expression(0)?;
+                left = Expression::Ternary {
+                    test: Box::new(left),
+                    consequent: Box::new(consequent),
+                    alternate: Box::new(alternate),
                 };
                 continue;
             }
@@ -312,6 +374,25 @@ impl Parser {
             TokenKind::This => {
                 self.advance();
                 Ok(Expression::This)
+            }
+            // Prefix ++ / -- — desugar to n = n + 1 / n = n - 1.
+            TokenKind::PlusPlus | TokenKind::MinusMinus => {
+                let op = if matches!(self.current_kind(), TokenKind::PlusPlus) {
+                    BinaryOperator::Add
+                } else {
+                    BinaryOperator::Subtract
+                };
+                self.advance();
+                let inner = self.parse_expression(13)?;
+                let target = inner.clone();
+                Ok(Expression::Assignment {
+                    target: Box::new(target.clone()),
+                    value: Box::new(Expression::Binary {
+                        op,
+                        left: Box::new(target),
+                        right: Box::new(Expression::Number(1.0)),
+                    }),
+                })
             }
             TokenKind::Bang | TokenKind::Minus | TokenKind::Plus => {
                 let op = match self.current_kind() {
@@ -412,8 +493,10 @@ impl Parser {
 
     fn binary_operator(&self) -> Option<(BinaryOperator, u8, u8)> {
         let operator = match self.current_kind() {
+            TokenKind::QuestionQuestion => (BinaryOperator::NullishCoalescing, 2, 3),
             TokenKind::PipePipe => (BinaryOperator::LogicalOr, 2, 3),
             TokenKind::AmpAmp => (BinaryOperator::LogicalAnd, 4, 5),
+            TokenKind::Caret => (BinaryOperator::BitXor, 5, 6),
             TokenKind::EqualEqual => (BinaryOperator::Equal, 6, 7),
             TokenKind::EqualEqualEqual => (BinaryOperator::StrictEqual, 6, 7),
             TokenKind::BangEqual => (BinaryOperator::NotEqual, 6, 7),
@@ -557,6 +640,11 @@ mod tests {
             include_str!("../UnitTest/023-closures-in-event-handlers/index.html"),
             include_str!("../UnitTest/024-domcontentloaded/index.html"),
             include_str!("../UnitTest/025-minimal-todo-app/index.html"),
+            include_str!("../UnitTest/026-decorator-skip/index.html"),
+            include_str!("../UnitTest/027-xor-operator/index.html"),
+            include_str!("../UnitTest/028-increment-decrement/index.html"),
+            include_str!("../UnitTest/029-compound-assignment/index.html"),
+            include_str!("../UnitTest/030-nullish-coalescing/index.html"),
         ];
 
         for (index, page) in pages.iter().enumerate() {

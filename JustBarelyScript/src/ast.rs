@@ -108,6 +108,11 @@ pub enum Expression {
         target: Box<Expression>,
         value: Box<Expression>,
     },
+    Ternary {
+        test: Box<Expression>,
+        consequent: Box<Expression>,
+        alternate: Box<Expression>,
+    },
     Call {
         callee: Box<Expression>,
         arguments: Vec<Expression>,
@@ -153,6 +158,8 @@ pub enum BinaryOperator {
     GreaterEqual,
     LogicalAnd,
     LogicalOr,
+    BitXor,
+    NullishCoalescing,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

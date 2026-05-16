@@ -1,0 +1,73 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    #result { font-weight: bold; }
+    #result.pass { color: green; }
+    #result.fail { color: red; }
+    pre { background: #f4f4f4; padding: 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <p>Test 040: <code>async</code> / <code>await</code></p>
+  <pre id="detail"></pre>
+  <div id="result">pending...</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0040]: async/await. async function returns a Promise. await suspends until resolved. Expected: #result text becomes loaded/chained/3.");
+
+    // async function returns a Promise implicitly
+    async function fetchValue() {
+      return "loaded";
+    }
+
+    // await suspends and resumes after a timer
+    async function delayed() {
+      var v = await new Promise(function(resolve) {
+        setTimeout(function() { resolve("chained"); }, 10);
+      });
+      return v;
+    }
+
+    // await in sequence: each awaited value resolves before the next line
+    async function sequential() {
+      var a = await Promise.resolve(1);
+      var b = await Promise.resolve(2);
+      return a + b;
+    }
+
+    // throw inside async is caught by try/catch inside async
+    async function failThenRecover() {
+      try {
+        throw "async error";
+      } catch (e) {
+        return "recovered:" + e;
+      }
+    }
+
+    async function main() {
+      var r1 = await fetchValue();
+      var r2 = await delayed();
+      var r3 = await sequential();
+      var r4 = await failThenRecover();
+
+      var passed = r1 === "loaded" && r2 === "chained" && r3 === 3 && r4 === "recovered:async error";
+
+      document.getElementById("detail").textContent =
+        "fetchValue:       " + r1 + "\n" +
+        "delayed:          " + r2 + "\n" +
+        "sequential (1+2): " + String(r3) + "\n" +
+        "error recovery:   " + r4;
+
+      document.getElementById("result").textContent = passed
+        ? "loaded/chained/3"
+        : "fail (r1=" + r1 + " r2=" + r2 + " r3=" + String(r3) + " r4=" + r4 + ")";
+      document.getElementById("result").className = passed ? "pass" : "fail";
+    }
+
+    main();
+  </script>
+</body>
+</html>

@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    #result { font-weight: bold; }
+    #result.pass { color: green; }
+    #result.fail { color: red; }
+    pre { background: #f4f4f4; padding: 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <p>Test 033: spread operator <code>...</code></p>
+  <pre id="detail"></pre>
+  <div id="result">fail</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0033]: Spread operator. [...a, ...b] should concatenate arrays. fn(...args) should forward args. Expected: #result text becomes 4/6.");
+
+    var a = [1, 2];
+    var b = [3, 4];
+    var c = [...a, ...b];
+
+    function sum(x, y, z) {
+      return x + y + z;
+    }
+    var nums = [1, 2, 3];
+    var total = sum(...nums);
+
+    var passed = c.length === 4 && c[0] === 1 && c[3] === 4 && total === 6;
+
+    document.getElementById("detail").textContent =
+      "[...a, ...b] length: " + String(c.length) + "\n" +
+      "[0]:                 " + String(c[0]) + "\n" +
+      "[3]:                 " + String(c[3]) + "\n" +
+      "sum(...[1,2,3]):     " + String(total);
+
+    document.getElementById("result").textContent = passed ? "4/6" : "fail (len=" + String(c.length) + " total=" + String(total) + ")";
+    document.getElementById("result").className = passed ? "pass" : "fail";
+  </script>
+</body>
+</html>

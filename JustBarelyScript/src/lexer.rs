@@ -49,6 +49,12 @@ pub enum TokenKind {
     GreaterEqual,
     AmpAmp,
     PipePipe,
+    Caret,
+    PlusPlus,
+    MinusMinus,
+    PlusEquals,
+    MinusEquals,
+    QuestionQuestion,
     LeftParen,
     RightParen,
     LeftBrace,
@@ -147,6 +153,14 @@ impl<'a> Lexer<'a> {
                         self.bump();
                         break;
                     }
+                    self.bump();
+                }
+                continue;
+            }
+
+            // Skip decorator lines: @annotation before function declarations.
+            if self.current() == Some('@') {
+                while !matches!(self.current(), None | Some('\n')) {
                     self.bump();
                 }
                 continue;
@@ -262,8 +276,30 @@ impl Iterator for Lexer<'_> {
             Some(ch) if is_identifier_start(ch) => self.identifier_or_keyword(span),
             Some(ch) if ch.is_ascii_digit() => self.number(span),
             Some('"') | Some('\'') => self.string(span, ch.unwrap()),
-            Some('+') => self.simple(span, TokenKind::Plus),
-            Some('-') => self.simple(span, TokenKind::Minus),
+            Some('+') => {
+                self.bump();
+                if self.current() == Some('+') {
+                    self.bump();
+                    Token { kind: TokenKind::PlusPlus, span: self.finish_span(span) }
+                } else if self.current() == Some('=') {
+                    self.bump();
+                    Token { kind: TokenKind::PlusEquals, span: self.finish_span(span) }
+                } else {
+                    Token { kind: TokenKind::Plus, span: self.finish_span(span) }
+                }
+            }
+            Some('-') => {
+                self.bump();
+                if self.current() == Some('-') {
+                    self.bump();
+                    Token { kind: TokenKind::MinusMinus, span: self.finish_span(span) }
+                } else if self.current() == Some('=') {
+                    self.bump();
+                    Token { kind: TokenKind::MinusEquals, span: self.finish_span(span) }
+                } else {
+                    Token { kind: TokenKind::Minus, span: self.finish_span(span) }
+                }
+            }
             Some('*') => self.simple(span, TokenKind::Star),
             Some('/') => self.simple(span, TokenKind::Slash),
             Some('%') => self.simple(span, TokenKind::Percent),
@@ -277,7 +313,16 @@ impl Iterator for Lexer<'_> {
             Some(',') => self.simple(span, TokenKind::Comma),
             Some('.') => self.simple(span, TokenKind::Dot),
             Some(':') => self.simple(span, TokenKind::Colon),
-            Some('?') => self.simple(span, TokenKind::Question),
+            Some('^') => self.simple(span, TokenKind::Caret),
+            Some('?') => {
+                self.bump();
+                if self.current() == Some('?') {
+                    self.bump();
+                    Token { kind: TokenKind::QuestionQuestion, span: self.finish_span(span) }
+                } else {
+                    Token { kind: TokenKind::Question, span: self.finish_span(span) }
+                }
+            }
             Some('=') => {
                 self.bump();
                 if self.current() == Some('=') {
