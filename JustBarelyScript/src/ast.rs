@@ -308,6 +308,7 @@ pub enum BinaryOperator {
     BitOr,
     ShiftLeft,
     ShiftRight,
+    UnsignedShiftRight,
     NullishCoalescing,
     Instanceof,
     In,

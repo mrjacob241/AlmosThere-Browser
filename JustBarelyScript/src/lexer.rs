@@ -104,6 +104,10 @@ pub enum TokenKind {
     Caret,
     ShiftLeft,
     ShiftRight,
+    UnsignedShiftRight,
+    ShiftLeftEquals,
+    ShiftRightEquals,
+    UnsignedShiftRightEquals,
     // increment / decrement
     PlusPlus,
     MinusMinus,
@@ -388,7 +392,9 @@ impl<'a> Lexer<'a> {
         while matches!(self.current(), Some(ch) if ch.is_ascii_digit() || ch == '_') {
             self.bump();
         }
-        if self.current() == Some('.') && matches!(self.peek(), Some(ch) if ch.is_ascii_digit()) {
+        // Consume `.` as part of the number if followed by a digit OR another `.`
+        // The second case handles `1..toString()` — `1.` is the float, `.toString` is member access.
+        if self.current() == Some('.') && matches!(self.peek(), Some(ch) if ch.is_ascii_digit() || ch == '.') {
             self.bump();
             while matches!(self.current(), Some(ch) if ch.is_ascii_digit()) {
                 self.bump();
@@ -635,14 +641,15 @@ impl Iterator for Lexer<'_> {
             }
             Some('/') => {
                 self.bump();
-                if self.current() == Some('=') {
+                // Check regex context FIRST: `/=` after `=` is a regex `=/g`, not `/=` operator.
+                if self.slash_is_regex() {
+                    self.lex_regex(span)
+                } else if self.current() == Some('=') {
                     self.bump();
                     Token {
                         kind: TokenKind::SlashEquals,
                         span: self.finish_span(span),
                     }
-                } else if self.slash_is_regex() {
-                    self.lex_regex(span)
                 } else {
                     Token {
                         kind: TokenKind::Slash,
@@ -737,10 +744,18 @@ impl Iterator for Lexer<'_> {
                         }
                     }
                     Some('.') => {
-                        self.bump();
-                        Token {
-                            kind: TokenKind::QuestionDot,
-                            span: self.finish_span(span),
+                        // `?.digit` is ternary `?` + float `.5`, not optional chaining.
+                        if matches!(self.peek(), Some(d) if d.is_ascii_digit()) {
+                            Token {
+                                kind: TokenKind::Question,
+                                span: self.finish_span(span),
+                            }
+                        } else {
+                            self.bump();
+                            Token {
+                                kind: TokenKind::QuestionDot,
+                                span: self.finish_span(span),
+                            }
                         }
                     }
                     _ => Token {
@@ -808,9 +823,17 @@ impl Iterator for Lexer<'_> {
                 match self.current() {
                     Some('<') => {
                         self.bump();
-                        Token {
-                            kind: TokenKind::ShiftLeft,
-                            span: self.finish_span(span),
+                        if self.current() == Some('=') {
+                            self.bump();
+                            Token {
+                                kind: TokenKind::ShiftLeftEquals,
+                                span: self.finish_span(span),
+                            }
+                        } else {
+                            Token {
+                                kind: TokenKind::ShiftLeft,
+                                span: self.finish_span(span),
+                            }
                         }
                     }
                     Some('=') => {
@@ -831,9 +854,31 @@ impl Iterator for Lexer<'_> {
                 match self.current() {
                     Some('>') => {
                         self.bump();
-                        Token {
-                            kind: TokenKind::ShiftRight,
-                            span: self.finish_span(span),
+                        if self.current() == Some('>') {
+                            self.bump();
+                            if self.current() == Some('=') {
+                                self.bump();
+                                Token {
+                                    kind: TokenKind::UnsignedShiftRightEquals,
+                                    span: self.finish_span(span),
+                                }
+                            } else {
+                                Token {
+                                    kind: TokenKind::UnsignedShiftRight,
+                                    span: self.finish_span(span),
+                                }
+                            }
+                        } else if self.current() == Some('=') {
+                            self.bump();
+                            Token {
+                                kind: TokenKind::ShiftRightEquals,
+                                span: self.finish_span(span),
+                            }
+                        } else {
+                            Token {
+                                kind: TokenKind::ShiftRight,
+                                span: self.finish_span(span),
+                            }
                         }
                     }
                     Some('=') => {

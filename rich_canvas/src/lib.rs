@@ -423,18 +423,21 @@ pub struct CanvasButtonObject {
     pub rect: Rect,
     pub button_type: String,
     pub form_id: Option<String>,
+    pub form_action: Option<String>,
     pub element_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub struct CanvasInputObject {
     pub label: String,
+    pub name: Option<String>,
     pub value: String,
     pub default_value: String,
     pub rect: Rect,
     pub font_size: f32,
     pub color: Color32,
     pub form_id: Option<String>,
+    pub form_action: Option<String>,
     pub element_id: Option<String>,
 }
 
@@ -999,7 +1002,9 @@ pub struct InputChange {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputSubmit {
     pub label: String,
+    pub name: Option<String>,
     pub value: String,
+    pub form_action: Option<String>,
 }
 
 impl BrowserCanvas {
@@ -1134,7 +1139,7 @@ fn paint_canvas_graph(
     let (canvas_rect, _) = ui.allocate_exact_size(graph_size, Sense::hover());
     let mut painter = ui.painter().with_clip_rect(canvas_rect);
     let mut clip_stack = Vec::new();
-    let mut submitted_forms: Vec<Option<String>> = Vec::new();
+    let mut submitted_forms: Vec<(Option<String>, Option<String>)> = Vec::new();
     let mut reset_forms: Vec<Option<String>> = Vec::new();
 
     for (index, object) in graph.objects.iter_mut().enumerate() {
@@ -1239,7 +1244,7 @@ fn paint_canvas_graph(
                         element_id: button.element_id.clone(),
                     });
                     if button.button_type.eq_ignore_ascii_case("submit") {
-                        submitted_forms.push(button.form_id.clone());
+                        submitted_forms.push((button.form_id.clone(), button.form_action.clone()));
                     } else if button.button_type.eq_ignore_ascii_case("reset") {
                         reset_forms.push(button.form_id.clone());
                     }
@@ -1294,7 +1299,9 @@ fn paint_canvas_graph(
                     {
                         canvas_response.submitted_inputs.push(InputSubmit {
                             label: input.label.clone(),
+                            name: input.name.clone(),
                             value,
+                            form_action: input.form_action.clone(),
                         });
                     }
                 }
@@ -1336,8 +1343,13 @@ fn paint_canvas_graph(
     for form_id in reset_forms {
         reset_inputs_for_form(&mut graph.objects, form_id.as_deref(), canvas_response);
     }
-    for form_id in submitted_forms {
-        push_submitted_inputs_for_form(&graph.objects, form_id.as_deref(), canvas_response);
+    for (form_id, form_action) in submitted_forms {
+        push_submitted_inputs_for_form(
+            &graph.objects,
+            form_id.as_deref(),
+            form_action.as_deref(),
+            canvas_response,
+        );
     }
 }
 
@@ -1368,6 +1380,7 @@ fn reset_inputs_for_form(
 fn push_submitted_inputs_for_form(
     objects: &[CanvasObject],
     form_id: Option<&str>,
+    form_action: Option<&str>,
     canvas_response: &mut BrowserCanvasResponse,
 ) {
     for object in objects {
@@ -1377,7 +1390,9 @@ fn push_submitted_inputs_for_form(
         if canvas_input_belongs_to_form(input, form_id) {
             canvas_response.submitted_inputs.push(InputSubmit {
                 label: input.label.clone(),
+                name: input.name.clone(),
                 value: input.value.clone(),
+                form_action: form_action.map(str::to_owned),
             });
         }
     }
