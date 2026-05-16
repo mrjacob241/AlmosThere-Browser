@@ -1,8 +1,12 @@
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, TryRecvError},
+    sync::{
+        Mutex, OnceLock,
+        mpsc::{self, Receiver, TryRecvError},
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -199,6 +203,7 @@ const SCRIPT_TEST_BOOKMARKS: &[(&str, &str)] = &[
 ];
 
 fn main() -> eframe::Result<()> {
+    let config = AppConfig::from_args();
     let options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1040.0, 720.0])
@@ -209,8 +214,21 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         APP_TITLE,
         options,
-        Box::new(|cc| Ok(Box::new(AlmostThereApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(AlmostThereApp::new(cc, config)))),
     )
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AppConfig {
+    record_events: bool,
+}
+
+impl AppConfig {
+    fn from_args() -> Self {
+        Self {
+            record_events: std::env::args().any(|arg| arg == "--record-events"),
+        }
+    }
 }
 
 struct AlmostThereApp {
@@ -225,12 +243,15 @@ struct AlmostThereApp {
     url_input: String,
     bookmarks: Vec<Bookmark>,
     console_messages: Vec<justbarelyscript::ConsoleMessage>,
+    live_js_debug_text: String,
     status: String,
     telemetry: TelemetrySession,
     text_metrics_ready: bool,
     pending_navigation: Option<PendingNavigation>,
     render_debug: PageRenderDebugState,
     page_loaded_at: std::time::Instant,
+    record_events: bool,
+    recorded_event_count: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -266,14 +287,36 @@ enum DebugPanelTab {
     CanvasGraph,
     Html,
     Console,
+    LiveJs,
     Events,
 }
 
 impl AlmostThereApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, config: AppConfig) -> Self {
         configure_browser_fonts(&cc.egui_ctx);
         let telemetry = TelemetrySession::start().unwrap_or_else(|_| TelemetrySession::disabled());
-        telemetry.emit("session.started", &[("app", APP_TITLE)]);
+        install_global_telemetry(&telemetry);
+        install_telemetry_panic_hook();
+        telemetry.emit(
+            "session.started",
+            &[
+                ("app", APP_TITLE),
+                (
+                    "record_events",
+                    if config.record_events {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                ),
+            ],
+        );
+        if config.record_events {
+            telemetry.emit(
+                "event_recording.started",
+                &[("source", "cli"), ("flag", "--record-events")],
+            );
+        }
 
         let mut bookmarks = load_bookmarks().unwrap_or_default();
         let inserted_default_bookmark = ensure_bookmark(&mut bookmarks, default_sample_bookmark())
@@ -289,17 +332,25 @@ impl AlmostThereApp {
             script_state,
             render_graph_debug_text,
             console_messages,
+            live_js_debug_text,
             status,
         ) = match load_url_source(DEFAULT_URL) {
             Ok(source) => {
                 let document =
                     parse_html_document_with_text_metrics(&source.html, &source.source, None);
-                let live_html =
-                    apply_safe_script_browser_effects(&remove_html_comments(&source.html));
-                let script_state = build_script_state(&source.html);
+                let live_html = apply_safe_script_browser_effects_with_source(
+                    &remove_html_comments(&source.html),
+                    Some(&source.source),
+                );
+                let script_state =
+                    build_script_state_with_source(&source.html, Some(&source.source));
                 let render_graph_debug_text =
                     parse_render_graph_debug_dump(&source.html, &source.source);
-                let console_messages = script_console_messages_from_html(&source.html);
+                let console_messages = script_console_messages_from_html_with_source(
+                    &source.html,
+                    Some(&source.source),
+                );
+                let live_js_debug_text = live_js_debug_report(&source.html, Some(&source.source));
                 telemetry.emit(
                     "navigation.loaded",
                     &[
@@ -315,6 +366,7 @@ impl AlmostThereApp {
                     script_state,
                     render_graph_debug_text,
                     console_messages,
+                    live_js_debug_text,
                     format!("Loaded {DEFAULT_URL}"),
                 )
             }
@@ -341,6 +393,7 @@ impl AlmostThereApp {
                     vec![console_error_message(format!(
                         "Failed to load default page {DEFAULT_URL}: {error}"
                     ))],
+                    String::new(),
                     format!("Failed to load default page {DEFAULT_URL}: {error}"),
                 )
             }
@@ -365,12 +418,15 @@ impl AlmostThereApp {
             url_input: DEFAULT_URL.to_owned(),
             bookmarks,
             console_messages,
+            live_js_debug_text,
             status,
             telemetry,
             text_metrics_ready: false,
             pending_navigation: None,
             render_debug,
             page_loaded_at: std::time::Instant::now(),
+            record_events: config.record_events,
+            recorded_event_count: 0,
         }
     }
 
@@ -389,7 +445,23 @@ impl AlmostThereApp {
         let (sender, receiver) = mpsc::channel();
         let thread_url = url.clone();
         thread::spawn(move || {
-            let _ = sender.send(load_url_source(&thread_url));
+            emit_global_telemetry("navigation.fetch.started", &[("url", &thread_url)]);
+            let result = load_url_source(&thread_url);
+            match &result {
+                Ok(source) => emit_global_telemetry(
+                    "navigation.fetch.completed",
+                    &[
+                        ("url", &thread_url),
+                        ("final_url", &source.source),
+                        ("html_bytes", &source.html.len().to_string()),
+                    ],
+                ),
+                Err(error) => emit_global_telemetry(
+                    "navigation.fetch.failed",
+                    &[("url", &thread_url), ("error", &error.to_string())],
+                ),
+            }
+            let _ = sender.send(result);
         });
         self.pending_navigation = Some(PendingNavigation {
             url,
@@ -408,19 +480,95 @@ impl AlmostThereApp {
                 let pending = self.pending_navigation.take().expect("pending navigation");
                 match result {
                     Ok(source) => {
+                        self.telemetry.emit(
+                            "navigation.scripts.started",
+                            &[
+                                ("url", &source.source),
+                                ("html_bytes", &source.html.len().to_string()),
+                            ],
+                        );
                         self.current_html = source.html.clone();
-                        self.live_html =
-                            apply_safe_script_browser_effects(&remove_html_comments(&source.html));
-                        self.script_state = build_script_state(&source.html);
+                        self.live_html = apply_safe_script_browser_effects_with_source(
+                            &remove_html_comments(&source.html),
+                            Some(&source.source),
+                        );
+                        self.telemetry.emit(
+                            "navigation.scripts.completed",
+                            &[
+                                ("url", &source.source),
+                                ("live_html_bytes", &self.live_html.len().to_string()),
+                            ],
+                        );
+                        self.telemetry.emit(
+                            "navigation.script_state.started",
+                            &[("url", &source.source)],
+                        );
+                        self.script_state =
+                            build_script_state_with_source(&source.html, Some(&source.source));
+                        self.telemetry.emit(
+                            "navigation.script_state.completed",
+                            &[("url", &source.source)],
+                        );
                         self.page_loaded_at = std::time::Instant::now();
                         self.last_hovered_element_id = None;
+                        self.telemetry.emit(
+                            "navigation.render_graph.started",
+                            &[("url", &source.source)],
+                        );
                         self.render_graph_debug_text =
                             parse_render_graph_debug_dump(&source.html, &source.source);
-                        self.console_messages = script_console_messages_from_html(&source.html);
+                        self.telemetry.emit(
+                            "navigation.render_graph.completed",
+                            &[
+                                ("url", &source.source),
+                                ("bytes", &self.render_graph_debug_text.len().to_string()),
+                            ],
+                        );
+                        self.telemetry
+                            .emit("navigation.console.started", &[("url", &source.source)]);
+                        self.console_messages = script_console_messages_from_html_with_source(
+                            &source.html,
+                            Some(&source.source),
+                        );
+                        self.telemetry.emit(
+                            "navigation.console.completed",
+                            &[
+                                ("url", &source.source),
+                                ("messages", &self.console_messages.len().to_string()),
+                            ],
+                        );
+                        self.telemetry.emit(
+                            "navigation.live_js_debug.started",
+                            &[("url", &source.source)],
+                        );
+                        self.live_js_debug_text =
+                            live_js_debug_report(&source.html, Some(&source.source));
+                        self.telemetry.emit(
+                            "navigation.live_js_debug.completed",
+                            &[
+                                ("url", &source.source),
+                                ("bytes", &self.live_js_debug_text.len().to_string()),
+                            ],
+                        );
+                        self.telemetry.emit(
+                            "navigation.canvas_graph.started",
+                            &[("url", &source.source)],
+                        );
                         let document = parse_html_document_with_text_metrics(
                             &source.html,
                             &source.source,
                             Some(ctx),
+                        );
+                        self.telemetry.emit(
+                            "navigation.canvas_graph.completed",
+                            &[
+                                ("url", &source.source),
+                                ("blocks", &document.blocks.len().to_string()),
+                                (
+                                    "canvas_objects",
+                                    &document.canvas_graph.objects.len().to_string(),
+                                ),
+                            ],
                         );
                         self.telemetry.emit(
                             "navigation.loaded",
@@ -448,6 +596,7 @@ impl AlmostThereApp {
                         self.status = format!("Load failed: {error}");
                         self.console_messages
                             .push(console_error_message(format!("Load failed: {error}")));
+                        self.live_js_debug_text.clear();
                     }
                 }
                 ctx.request_repaint();
@@ -562,6 +711,61 @@ impl AlmostThereApp {
 
     fn scroll_to_fragment(&mut self, fragment: &str) {
         self.canvas.scroll_offset.y = estimated_fragment_scroll_y(&self.document, fragment);
+    }
+
+    fn report_user_error(&mut self) {
+        let console_errors = self
+            .console_messages
+            .iter()
+            .filter(|message| message.level == justbarelyscript::ConsoleLevel::Error)
+            .count();
+        let budget_stops = self
+            .live_js_debug_text
+            .matches("statement budget exhausted")
+            .count();
+        let skipped_scripts = self
+            .live_js_debug_text
+            .matches("status: not executed")
+            .count();
+        self.telemetry.emit(
+            "user.error",
+            &[
+                ("url", &self.document.source),
+                ("title", &self.document.title),
+                ("status", &self.status),
+                ("blocks", &self.document.blocks.len().to_string()),
+                (
+                    "canvas_objects",
+                    &self.document.canvas_graph.objects.len().to_string(),
+                ),
+                ("console_errors", &console_errors.to_string()),
+                ("script_budget_stops", &budget_stops.to_string()),
+                ("skipped_scripts", &skipped_scripts.to_string()),
+            ],
+        );
+        self.status = format!("Recorded user.error telemetry for {}", self.document.source);
+    }
+
+    fn record_frame_events(&mut self, ctx: &egui::Context) {
+        if !self.record_events {
+            return;
+        }
+
+        let events = ctx.input(|input| input.events.clone());
+        for event in events {
+            self.recorded_event_count += 1;
+            let sequence = self.recorded_event_count.to_string();
+            let (kind, detail) = telemetry_event_kind_and_detail(&event);
+            self.telemetry.emit(
+                "input.event",
+                &[
+                    ("seq", &sequence),
+                    ("kind", kind),
+                    ("detail", &detail),
+                    ("url", &self.document.source),
+                ],
+            );
+        }
     }
 
     fn apply_script_effects(
@@ -1600,14 +1804,42 @@ fn script_test_bookmarks() -> Vec<Bookmark> {
         .collect()
 }
 
+#[derive(Clone, Debug)]
+struct PageScript {
+    label: String,
+    kind: PageScriptKind,
+    source_url: Option<String>,
+    byte_len: usize,
+    deferred: bool,
+    diagnostics: Vec<String>,
+    program: Result<justbarelyscript::Program, justbarelyscript::JsError>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageScriptKind {
+    Inline,
+    External,
+}
+
+const MAX_EXTERNAL_SCRIPT_PARSE_BYTES: usize = 256 * 1024;
+const MAX_SCRIPT_DIAGNOSTIC_BYTES: usize = MAX_EXTERNAL_SCRIPT_PARSE_BYTES;
+const LIVE_JS_DEBUG_STATEMENT_BUDGET: usize = 50_000;
+
 fn script_console_messages_from_html(html: &str) -> Vec<justbarelyscript::ConsoleMessage> {
-    let report = justbarelyscript::parse_inline_scripts_from_html(html);
+    script_console_messages_from_html_with_source(html, None)
+}
+
+fn script_console_messages_from_html_with_source(
+    html: &str,
+    source: Option<&str>,
+) -> Vec<justbarelyscript::ConsoleMessage> {
+    let scripts = collect_page_scripts(html, source);
     let mut messages = Vec::new();
 
-    if report.is_empty() {
+    if scripts.is_empty() {
         messages.push(justbarelyscript::ConsoleMessage {
             level: justbarelyscript::ConsoleLevel::Info,
-            text: "No inline scripts found.".to_owned(),
+            text: "No scripts found.".to_owned(),
         });
         return messages;
     }
@@ -1615,39 +1847,256 @@ fn script_console_messages_from_html(html: &str) -> Vec<justbarelyscript::Consol
     messages.push(justbarelyscript::ConsoleMessage {
         level: justbarelyscript::ConsoleLevel::Info,
         text: format!(
-            "Parsed {} inline script(s). ConsoleSink is parser-only; filesystem, process, shell, deletion, creation, and network APIs are not exposed.",
-            report.scripts.len()
+            "Parsed {} script(s). ConsoleSink is parser-only; filesystem, process, shell, deletion, creation, and network APIs are not exposed.",
+            scripts.len()
         ),
     });
 
-    for script in report.scripts {
+    for script in scripts {
         match script.program {
             Ok(program) => {
                 messages.extend(justbarelyscript::collect_static_console_messages(&program));
+                let mut state = justbarelyscript::BrowserExecutionState::default();
+                seed_script_browser_globals(&mut state, source);
+                state.set_execution_budget(LIVE_JS_DEBUG_STATEMENT_BUDGET);
+                emit_global_telemetry(
+                    "js.script.execute.started",
+                    &[("phase", "console"), ("label", &script.label)],
+                );
+                let start = std::time::Instant::now();
+                state.execute_program(&program);
+                let elapsed = start.elapsed().as_millis().to_string();
+                let budget_exhausted = if state.execution_budget_exhausted() {
+                    "true"
+                } else {
+                    "false"
+                };
+                emit_global_telemetry(
+                    "js.script.execute.completed",
+                    &[
+                        ("phase", "console"),
+                        ("label", &script.label),
+                        ("elapsed_ms", &elapsed),
+                        ("budget_exhausted", budget_exhausted),
+                    ],
+                );
+                if state.execution_budget_exhausted() {
+                    messages.push(console_error_message(format!(
+                        "{}: execution stopped after {} statements; continuing page load with partial JavaScript",
+                        script.label, LIVE_JS_DEBUG_STATEMENT_BUDGET
+                    )));
+                }
             }
-            Err(error) => messages.push(console_error_message(format!(
-                "Script {}: {}",
-                script.index + 1,
-                error.diagnostic_message()
-            ))),
+            Err(error) => {
+                let diagnostic_suffix = if script.diagnostics.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " Unsupported constructs: {}.",
+                        script.diagnostics.join(", ")
+                    )
+                };
+                messages.push(console_error_message(format!(
+                    "{}: {}{}",
+                    script.label,
+                    error.diagnostic_message(),
+                    diagnostic_suffix
+                )));
+            }
         }
     }
 
     messages
 }
 
-fn build_script_state(html: &str) -> justbarelyscript::BrowserExecutionState {
+fn live_js_debug_report(html: &str, source: Option<&str>) -> String {
     let html = remove_html_comments(html);
-    let report = justbarelyscript::parse_inline_scripts_from_html(&html);
+    let scripts = collect_page_scripts(&html, source);
+    let mut out = String::new();
+    out.push_str("Live JS Debug\n");
+    out.push_str("================\n");
+    out.push_str(&format!("source: {}\n", source.unwrap_or("<unknown>")));
+    out.push_str(&format!("html_bytes: {}\n", html.len()));
+    out.push_str(&format!("script_count: {}\n", scripts.len()));
+    out.push_str(&format!(
+        "statement_budget_per_script: {}\n\n",
+        LIVE_JS_DEBUG_STATEMENT_BUDGET
+    ));
+
+    if scripts.is_empty() {
+        out.push_str("No scripts found.\n");
+        return out;
+    }
+
     let mut state = justbarelyscript::BrowserExecutionState::default();
+    seed_script_browser_globals(&mut state, source);
     seed_script_dom_state_from_html(&html, &mut state);
     seed_script_computed_styles_from_html(&html, &mut state);
-    for script in report.scripts {
+
+    let mut parsed = 0usize;
+    let mut skipped_or_failed = 0usize;
+    let mut executed = 0usize;
+    let mut budget_exhausted = 0usize;
+    let mut total_effects = 0usize;
+
+    for (index, script) in scripts.iter().enumerate() {
+        out.push_str(&format!("{}. {}\n", index + 1, script.label));
+        out.push_str(&format!(
+            "   kind: {}{}\n",
+            match script.kind {
+                PageScriptKind::Inline => "inline",
+                PageScriptKind::External => "external",
+            },
+            if script.deferred { " defer" } else { "" }
+        ));
+        if let Some(url) = &script.source_url {
+            out.push_str(&format!("   url: {url}\n"));
+        }
+        out.push_str(&format!("   bytes: {}\n", script.byte_len));
+        if !script.diagnostics.is_empty() {
+            out.push_str(&format!(
+                "   constructs: {}\n",
+                script.diagnostics.join(", ")
+            ));
+        }
+
+        match &script.program {
+            Ok(program) => {
+                parsed += 1;
+                state.set_execution_budget(LIVE_JS_DEBUG_STATEMENT_BUDGET);
+                emit_global_telemetry(
+                    "js.script.execute.started",
+                    &[("phase", "live_js_debug"), ("label", &script.label)],
+                );
+                let start = std::time::Instant::now();
+                state.execute_program(program);
+                let elapsed = start.elapsed();
+                let effects = state.drain_effects();
+                let effect_count = effects.len();
+                total_effects += effect_count;
+                executed += 1;
+                out.push_str(&format!(
+                    "   status: executed in {:.2?}; effects={}; {}\n",
+                    elapsed,
+                    effect_count,
+                    browser_effect_summary(&effects)
+                ));
+                if state.execution_budget_exhausted() {
+                    budget_exhausted += 1;
+                    out.push_str(
+                        "   stop: statement budget exhausted; possible long-running script\n",
+                    );
+                }
+                let elapsed_ms = elapsed.as_millis().to_string();
+                let effect_count_string = effect_count.to_string();
+                let budget_exhausted_string = if state.execution_budget_exhausted() {
+                    "true"
+                } else {
+                    "false"
+                };
+                emit_global_telemetry(
+                    "js.script.execute.completed",
+                    &[
+                        ("phase", "live_js_debug"),
+                        ("label", &script.label),
+                        ("elapsed_ms", &elapsed_ms),
+                        ("effects", &effect_count_string),
+                        ("budget_exhausted", budget_exhausted_string),
+                    ],
+                );
+                out.push_str(&format!(
+                    "   state: listeners={} pending_timers={}\n",
+                    state.listener_count(),
+                    state.pending_timer_count()
+                ));
+            }
+            Err(error) => {
+                skipped_or_failed += 1;
+                out.push_str(&format!(
+                    "   status: not executed; {}\n",
+                    error.diagnostic_message()
+                ));
+            }
+        }
+        out.push('\n');
+    }
+
+    out.push_str("Summary\n");
+    out.push_str("-------\n");
+    out.push_str(&format!("parsed: {parsed}\n"));
+    out.push_str(&format!("executed: {executed}\n"));
+    out.push_str(&format!("not_executed: {skipped_or_failed}\n"));
+    out.push_str(&format!("budget_exhausted: {budget_exhausted}\n"));
+    out.push_str(&format!("dom_effects: {total_effects}\n"));
+    out.push_str(&format!("listeners: {}\n", state.listener_count()));
+    out.push_str(&format!(
+        "pending_timers: {}\n",
+        state.pending_timer_count()
+    ));
+    out
+}
+
+fn browser_effect_summary(effects: &[justbarelyscript::BrowserEffect]) -> String {
+    let mut text = 0usize;
+    let mut attr = 0usize;
+    let mut html = 0usize;
+    let mut append = 0usize;
+    let mut console = 0usize;
+    for effect in effects {
+        match effect {
+            justbarelyscript::BrowserEffect::SetTextContent { .. } => text += 1,
+            justbarelyscript::BrowserEffect::SetAttribute { .. } => attr += 1,
+            justbarelyscript::BrowserEffect::SetInnerHtml { .. } => html += 1,
+            justbarelyscript::BrowserEffect::AppendChild { .. } => append += 1,
+            justbarelyscript::BrowserEffect::ConsoleLog { .. } => console += 1,
+        }
+    }
+    format!("text={text} attr={attr} inner_html={html} append={append} console={console}")
+}
+
+fn build_script_state(html: &str) -> justbarelyscript::BrowserExecutionState {
+    build_script_state_with_source(html, None)
+}
+
+fn build_script_state_with_source(
+    html: &str,
+    source: Option<&str>,
+) -> justbarelyscript::BrowserExecutionState {
+    let html = remove_html_comments(html);
+    let scripts = collect_page_scripts(&html, source);
+    let mut state = justbarelyscript::BrowserExecutionState::default();
+    seed_script_browser_globals(&mut state, source);
+    seed_script_dom_state_from_html(&html, &mut state);
+    seed_script_computed_styles_from_html(&html, &mut state);
+    for script in scripts {
         let Ok(program) = script.program else {
             continue;
         };
+        state.set_execution_budget(LIVE_JS_DEBUG_STATEMENT_BUDGET);
+        emit_global_telemetry(
+            "js.script.execute.started",
+            &[("phase", "script_state"), ("label", &script.label)],
+        );
+        let start = std::time::Instant::now();
         state.execute_program(&program);
+        let elapsed = start.elapsed().as_millis().to_string();
+        let budget_exhausted = if state.execution_budget_exhausted() {
+            "true"
+        } else {
+            "false"
+        };
         state.drain_effects(); // discard initial DOM effects; we only keep event handlers
+        emit_global_telemetry(
+            "js.script.execute.completed",
+            &[
+                ("phase", "script_state"),
+                ("label", &script.label),
+                ("elapsed_ms", &elapsed),
+                ("budget_exhausted", budget_exhausted),
+                ("listeners", &state.listener_count().to_string()),
+                ("pending_timers", &state.pending_timer_count().to_string()),
+            ],
+        );
     }
     state
 }
@@ -1725,18 +2174,19 @@ fn parse_html_document_from_live_html(
     source: &str,
     text_metrics: Option<&egui::Context>,
 ) -> BrowserDocument {
-    let dom = parse_dom_document(live_html);
-    let title = dom
-        .first_descendant_by_tag("title")
-        .map(DomElement::text_content)
-        .or_else(|| extract_tag_text(live_html, "title"))
-        .unwrap_or_else(|| "Untitled".to_owned())
-        .trim()
-        .to_owned();
     let mut css = extract_tag_inner(live_html, "style")
         .unwrap_or("")
         .to_owned();
     css.push_str(&load_linked_stylesheets(live_html, source).unwrap_or_default());
+    let live_html = remove_non_visual_metadata_elements(live_html);
+    let dom = parse_dom_document(&live_html);
+    let title = dom
+        .first_descendant_by_tag("title")
+        .map(DomElement::text_content)
+        .or_else(|| extract_tag_text(&live_html, "title"))
+        .unwrap_or_else(|| "Untitled".to_owned())
+        .trim()
+        .to_owned();
     let root_classes = document_theme_root_classes(&dom, text_metrics);
     let style = parse_basic_css_for_viewport_with_root_classes(&css, 1280.0, &root_classes);
     let render_graph = build_render_graph(&dom, &style);
@@ -1753,18 +2203,47 @@ fn parse_html_document_from_live_html(
 }
 
 fn apply_safe_script_browser_effects(html: &str) -> String {
-    let report = justbarelyscript::parse_inline_scripts_from_html(html);
+    apply_safe_script_browser_effects_with_source(html, None)
+}
+
+fn apply_safe_script_browser_effects_with_source(html: &str, source: Option<&str>) -> String {
+    let scripts = collect_page_scripts(html, source);
     let mut output = html.to_owned();
     let mut state = justbarelyscript::BrowserExecutionState::default();
+    seed_script_browser_globals(&mut state, source);
     seed_script_dom_state_from_html(html, &mut state);
     seed_script_computed_styles_from_html(html, &mut state);
 
-    for script in report.scripts {
+    for script in scripts {
         let Ok(program) = script.program else {
             continue;
         };
+        state.set_execution_budget(LIVE_JS_DEBUG_STATEMENT_BUDGET);
+        emit_global_telemetry(
+            "js.script.execute.started",
+            &[("phase", "dom_effects"), ("label", &script.label)],
+        );
+        let start = std::time::Instant::now();
         state.execute_program(&program);
-        for effect in state.drain_effects() {
+        let elapsed = start.elapsed().as_millis().to_string();
+        let budget_exhausted = if state.execution_budget_exhausted() {
+            "true"
+        } else {
+            "false"
+        };
+        let effects = state.drain_effects();
+        let effect_count = effects.len().to_string();
+        emit_global_telemetry(
+            "js.script.execute.completed",
+            &[
+                ("phase", "dom_effects"),
+                ("label", &script.label),
+                ("elapsed_ms", &elapsed),
+                ("effects", &effect_count),
+                ("budget_exhausted", budget_exhausted),
+            ],
+        );
+        for effect in effects {
             match effect {
                 justbarelyscript::BrowserEffect::SetTextContent { element_id, value } => {
                     output = set_element_text_content_by_id(&output, &element_id, &value);
@@ -1788,6 +2267,358 @@ fn apply_safe_script_browser_effects(html: &str) -> String {
     }
 
     output
+}
+
+fn seed_script_browser_globals(
+    state: &mut justbarelyscript::BrowserExecutionState,
+    source: Option<&str>,
+) {
+    let navigator = justbarelyscript::NavigatorInfo::detect();
+    let screen = justbarelyscript::ScreenInfo::detect();
+    let fingerprint = justbarelyscript::FingerprintSuite::detect();
+    state.seed_navigator(&navigator);
+    state.seed_screen(&screen);
+    state.seed_fingerprint_suite(fingerprint);
+    if let Some(source) = source {
+        state.seed_location(source);
+    }
+}
+
+fn collect_page_scripts(html: &str, source: Option<&str>) -> Vec<PageScript> {
+    let mut normal = Vec::new();
+    let mut deferred = Vec::new();
+    let mut remaining = html;
+    let mut offset = 0usize;
+    let mut index = 0usize;
+
+    while let Some(rel_open_start) = find_ascii_case_insensitive_local(remaining, "<script") {
+        let open_start = offset + rel_open_start;
+        let after_open = &html[open_start..];
+        let Some(open_end_rel) = after_open.find('>') else {
+            break;
+        };
+        let open_end = open_start + open_end_rel + 1;
+        let open_tag = &html[open_start..open_end];
+        let after_content_start = &html[open_end..];
+        let Some(close_rel) = find_ascii_case_insensitive_local(after_content_start, "</script>")
+        else {
+            break;
+        };
+        let close_start = open_end + close_rel;
+        let inline_source = &html[open_end..close_start];
+
+        index += 1;
+        let defer = tag_has_bool_attr(open_tag, "defer");
+        let script = if let Some(src) = extract_attr(open_tag, "src") {
+            load_external_page_script(source, &src, index, defer)
+        } else {
+            let label = format!("Inline script {index}");
+            if inline_source.len() > MAX_EXTERNAL_SCRIPT_PARSE_BYTES {
+                let diagnostics = oversized_script_diagnostics(inline_source.len());
+                PageScript {
+                    label,
+                    kind: PageScriptKind::Inline,
+                    source_url: None,
+                    byte_len: inline_source.len(),
+                    deferred: defer,
+                    diagnostics,
+                    program: Err(synthetic_script_error(&format!(
+                        "inline script skipped: {} bytes exceeds parser budget of {} bytes",
+                        inline_source.len(),
+                        MAX_EXTERNAL_SCRIPT_PARSE_BYTES
+                    ))),
+                }
+            } else {
+                let diagnostics = script_construct_diagnostics(inline_source);
+                PageScript {
+                    label,
+                    kind: PageScriptKind::Inline,
+                    source_url: None,
+                    byte_len: inline_source.len(),
+                    deferred: defer,
+                    diagnostics,
+                    program: justbarelyscript::parse_script(inline_source),
+                }
+            }
+        };
+
+        emit_script_parse_telemetry(index, &script);
+
+        if defer {
+            deferred.push(script);
+        } else {
+            normal.push(script);
+        }
+
+        offset = close_start + "</script>".len();
+        remaining = &html[offset..];
+    }
+
+    normal.extend(deferred);
+    normal
+}
+
+fn emit_script_parse_telemetry(index: usize, script: &PageScript) {
+    let index = index.to_string();
+    let bytes = script.byte_len.to_string();
+    let deferred = if script.deferred { "true" } else { "false" };
+    let kind = page_script_kind_str(script.kind);
+    let url = script.source_url.as_deref().unwrap_or("");
+    match &script.program {
+        Ok(program) => {
+            let statements = program.body.len().to_string();
+            emit_global_telemetry(
+                "js.script.parsed",
+                &[
+                    ("index", &index),
+                    ("label", &script.label),
+                    ("kind", kind),
+                    ("url", url),
+                    ("bytes", &bytes),
+                    ("defer", deferred),
+                    ("statements", &statements),
+                ],
+            );
+        }
+        Err(error) => {
+            let constructs = script.diagnostics.join(", ");
+            let reason = error.diagnostic_message();
+            emit_global_telemetry(
+                "js.script.skipped",
+                &[
+                    ("index", &index),
+                    ("label", &script.label),
+                    ("kind", kind),
+                    ("url", url),
+                    ("bytes", &bytes),
+                    ("defer", deferred),
+                    ("reason", &reason),
+                    ("constructs", &constructs),
+                ],
+            );
+        }
+    }
+}
+
+fn page_script_kind_str(kind: PageScriptKind) -> &'static str {
+    match kind {
+        PageScriptKind::Inline => "inline",
+        PageScriptKind::External => "external",
+    }
+}
+
+fn load_external_page_script(
+    document_source: Option<&str>,
+    src: &str,
+    index: usize,
+    deferred: bool,
+) -> PageScript {
+    let Some(document_source) = document_source else {
+        let label = format!("External script {index} ({src})");
+        return PageScript {
+            label,
+            kind: PageScriptKind::External,
+            source_url: Some(src.to_owned()),
+            byte_len: 0,
+            deferred,
+            diagnostics: Vec::new(),
+            program: Err(synthetic_script_error(
+                "external script skipped: document source unavailable",
+            )),
+        };
+    };
+
+    let resolved = resolve_resource_url(document_source, src);
+    let label = format!("External script {index} ({resolved})");
+    if !script_allowed_for_document(document_source, &resolved) {
+        return PageScript {
+            label,
+            kind: PageScriptKind::External,
+            source_url: Some(resolved),
+            byte_len: 0,
+            deferred,
+            diagnostics: Vec::new(),
+            program: Err(synthetic_script_error(
+                "external script blocked by document policy",
+            )),
+        };
+    }
+
+    match read_script_resource(&resolved) {
+        Ok(source) => {
+            if source.len() > MAX_EXTERNAL_SCRIPT_PARSE_BYTES {
+                let diagnostics = oversized_script_diagnostics(source.len());
+                return PageScript {
+                    label,
+                    kind: PageScriptKind::External,
+                    source_url: Some(resolved),
+                    byte_len: source.len(),
+                    deferred,
+                    diagnostics,
+                    program: Err(synthetic_script_error(&format!(
+                        "external script skipped: {} bytes exceeds parser budget of {} bytes",
+                        source.len(),
+                        MAX_EXTERNAL_SCRIPT_PARSE_BYTES
+                    ))),
+                };
+            }
+            let diagnostics = script_construct_diagnostics(&source);
+            let program = justbarelyscript::parse_script(&source);
+            PageScript {
+                label,
+                kind: PageScriptKind::External,
+                source_url: Some(resolved),
+                byte_len: source.len(),
+                deferred,
+                diagnostics,
+                program,
+            }
+        }
+        Err(error) => PageScript {
+            label,
+            kind: PageScriptKind::External,
+            source_url: Some(resolved),
+            byte_len: 0,
+            deferred,
+            diagnostics: Vec::new(),
+            program: Err(synthetic_script_error(&format!(
+                "external script load failed: {error}"
+            ))),
+        },
+    }
+}
+
+fn oversized_script_diagnostics(byte_len: usize) -> Vec<String> {
+    vec![format!(
+        "diagnostics skipped: {byte_len} bytes exceeds diagnostic budget of {MAX_SCRIPT_DIAGNOSTIC_BYTES} bytes"
+    )]
+}
+
+fn script_construct_diagnostics(source: &str) -> Vec<String> {
+    let checks = [
+        ("import ", "ES modules"),
+        ("export ", "ES modules"),
+        ("=>", "arrow functions"),
+        ("?.", "optional chaining"),
+        ("??", "nullish coalescing"),
+        ("...", "spread/rest"),
+        ("`", "template literals"),
+        ("async ", "async/await"),
+        ("await ", "async/await"),
+        ("class ", "class syntax"),
+        ("new Promise", "Promise constructor"),
+        ("regeneratorRuntime", "regenerator runtime"),
+        ("webpackJsonp", "Webpack runtime"),
+        ("XMLHttpRequest", "XMLHttpRequest"),
+        ("fetch(", "fetch"),
+        ("axios", "axios"),
+        ("Object.defineProperty", "property descriptors"),
+        ("Object.getOwnPropertyDescriptor", "property descriptors"),
+        ("Object.getPrototypeOf", "prototype reflection"),
+        ("Object.create", "prototype creation"),
+        ("Proxy", "Proxy"),
+        ("WeakMap", "WeakMap"),
+        ("Symbol", "Symbol"),
+    ];
+
+    let mut diagnostics = Vec::new();
+    for (needle, label) in checks {
+        let count = source.matches(needle).count();
+        if count > 0 {
+            let entry = format!("{label} x{count}");
+            if !diagnostics.contains(&entry) {
+                diagnostics.push(entry);
+            }
+        }
+    }
+    diagnostics
+}
+
+fn read_script_resource(resolved: &str) -> io::Result<String> {
+    let cache = SCRIPT_RESOURCE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.get(resolved).cloned()
+    {
+        let status = if cached.is_ok() { "ok" } else { "error" };
+        let bytes = cached
+            .as_ref()
+            .map(|source| source.len().to_string())
+            .unwrap_or_else(|_| "0".to_owned());
+        emit_global_telemetry(
+            "js.resource.cache_hit",
+            &[("url", resolved), ("status", status), ("bytes", &bytes)],
+        );
+        return cached.map_err(io::Error::other);
+    }
+
+    emit_global_telemetry("js.resource.cache_miss", &[("url", resolved)]);
+    let loaded = if is_remote_url(resolved) {
+        http_client()?
+            .get(resolved)
+            .send()
+            .map_err(io::Error::other)?
+            .error_for_status()
+            .map_err(io::Error::other)?
+            .text()
+            .map_err(io::Error::other)
+    } else {
+        fs::read_to_string(input_to_path(resolved))
+    };
+
+    let cached = loaded
+        .as_ref()
+        .map(|source| source.to_owned())
+        .map_err(|error| error.to_string());
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(resolved.to_owned(), cached);
+    }
+
+    loaded
+}
+
+fn script_allowed_for_document(source: &str, resource: &str) -> bool {
+    if !resource_allowed_for_document(source, resource) {
+        return false;
+    }
+    if is_remote_url(source) && is_remote_url(resource) {
+        return same_origin_url(source, resource);
+    }
+    true
+}
+
+fn same_origin_url(a: &str, b: &str) -> bool {
+    let Ok(a) = reqwest::Url::parse(a) else {
+        return false;
+    };
+    let Ok(b) = reqwest::Url::parse(b) else {
+        return false;
+    };
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+fn tag_has_bool_attr(tag: &str, attr: &str) -> bool {
+    let lower_tag = tag.to_ascii_lowercase();
+    let attr = attr.to_ascii_lowercase();
+    lower_tag
+        .split(|ch: char| ch.is_whitespace() || ch == '<' || ch == '>' || ch == '/')
+        .any(|part| part == attr || part.starts_with(&format!("{attr}=")))
+}
+
+fn synthetic_script_error(message: &str) -> justbarelyscript::JsError {
+    justbarelyscript::JsError {
+        kind: justbarelyscript::JsErrorKind::Parse,
+        message: message.to_owned(),
+        span: None,
+    }
+}
+
+fn find_ascii_case_insensitive_local(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn seed_script_dom_state_from_html(
@@ -2113,6 +2944,7 @@ fn workspace_root_path() -> PathBuf {
 
 impl App for AlmostThereApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+        self.record_frame_events(ctx);
         self.poll_pending_navigation(ctx);
 
         if self.script_state.has_pending_timers() {
@@ -2161,6 +2993,9 @@ impl App for AlmostThereApp {
                     if self.render_debug.open {
                         self.render_debug.object_limit = self.document.canvas_graph.objects.len();
                     }
+                }
+                if ui.button("Report Error").clicked() {
+                    self.report_user_error();
                 }
                 if self.pending_navigation.is_some() {
                     ui.add(egui::Spinner::new().size(16.0));
@@ -2292,6 +3127,11 @@ impl App for AlmostThereApp {
                         );
                         ui.selectable_value(
                             &mut self.render_debug.active_tab,
+                            DebugPanelTab::LiveJs,
+                            "Live JS",
+                        );
+                        ui.selectable_value(
+                            &mut self.render_debug.active_tab,
                             DebugPanelTab::Events,
                             "Events",
                         );
@@ -2350,6 +3190,7 @@ impl App for AlmostThereApp {
                             canvas_graph_debug_string(&self.document.canvas_graph)
                         }
                         DebugPanelTab::Html => self.current_html.clone(),
+                        DebugPanelTab::LiveJs => self.live_js_debug_text.clone(),
                         DebugPanelTab::Console | DebugPanelTab::Events => String::new(),
                     };
 
@@ -3248,7 +4089,10 @@ fn parse_html_document_with_text_metrics(
     text_metrics: Option<&egui::Context>,
 ) -> BrowserDocument {
     let html = remove_html_comments(html);
-    let html = apply_safe_script_browser_effects(&html);
+    let html = apply_safe_script_browser_effects_with_source(&html, Some(source));
+    let mut css = extract_tag_inner(&html, "style").unwrap_or("").to_owned();
+    css.push_str(&load_linked_stylesheets(&html, source).unwrap_or_default());
+    let html = remove_non_visual_metadata_elements(&html);
     let dom = parse_dom_document(&html);
     let title = dom
         .first_descendant_by_tag("title")
@@ -3257,8 +4101,6 @@ fn parse_html_document_with_text_metrics(
         .unwrap_or_else(|| "Untitled".to_owned())
         .trim()
         .to_owned();
-    let mut css = extract_tag_inner(&html, "style").unwrap_or("").to_owned();
-    css.push_str(&load_linked_stylesheets(&html, source).unwrap_or_default());
     let root_classes = document_theme_root_classes(&dom, text_metrics);
     let style = parse_basic_css_for_viewport_with_root_classes(&css, 1280.0, &root_classes);
     let render_graph = build_render_graph(&dom, &style);
@@ -3277,10 +4119,11 @@ fn parse_html_document_with_text_metrics(
 
 fn parse_render_graph_debug_dump(html: &str, source: &str) -> String {
     let html = remove_html_comments(html);
-    let html = apply_safe_script_browser_effects(&html);
-    let dom = parse_dom_document(&html);
+    let html = apply_safe_script_browser_effects_with_source(&html, Some(source));
     let mut css = extract_tag_inner(&html, "style").unwrap_or("").to_owned();
     css.push_str(&load_linked_stylesheets(&html, source).unwrap_or_default());
+    let html = remove_non_visual_metadata_elements(&html);
+    let dom = parse_dom_document(&html);
     let root_classes = document_theme_root_classes(&dom, None);
     let style = parse_basic_css_for_viewport_with_root_classes(&css, 1280.0, &root_classes);
     let render_graph = build_render_graph(&dom, &style);
@@ -9464,6 +10307,14 @@ fn remove_non_rendered_elements(html: &str) -> String {
     remove_hidden_elements(&cleaned)
 }
 
+fn remove_non_visual_metadata_elements(html: &str) -> String {
+    let mut cleaned = html.to_owned();
+    for tag in ["script", "style", "template", "noscript"] {
+        cleaned = remove_elements_by_tag(&cleaned, tag);
+    }
+    cleaned
+}
+
 fn remove_elements_by_tag(html: &str, tag: &str) -> String {
     let mut out = String::new();
     let mut remaining = html;
@@ -9613,6 +10464,149 @@ fn percent_decode_file_path(path: &str) -> String {
     out
 }
 
+fn telemetry_event_kind_and_detail(event: &egui::Event) -> (&'static str, String) {
+    match event {
+        egui::Event::Copy => ("copy", String::new()),
+        egui::Event::Cut => ("cut", String::new()),
+        egui::Event::Paste(text) => ("paste", format!("chars={}", text.chars().count())),
+        egui::Event::Text(text) => ("text", format!("chars={}", text.chars().count())),
+        egui::Event::Key {
+            key,
+            physical_key: _,
+            pressed,
+            repeat,
+            modifiers,
+        } => (
+            "key",
+            format!("key={key:?} pressed={pressed} repeat={repeat} modifiers={modifiers:?}"),
+        ),
+        egui::Event::PointerMoved(pos) => {
+            ("pointer_moved", format!("x={:.1} y={:.1}", pos.x, pos.y))
+        }
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers,
+        } => (
+            "pointer_button",
+            format!(
+                "x={:.1} y={:.1} button={button:?} pressed={pressed} modifiers={modifiers:?}",
+                pos.x, pos.y
+            ),
+        ),
+        egui::Event::PointerGone => ("pointer_gone", String::new()),
+        egui::Event::MouseWheel {
+            unit,
+            delta,
+            modifiers,
+        } => (
+            "mouse_wheel",
+            format!(
+                "unit={unit:?} dx={:.1} dy={:.1} modifiers={modifiers:?}",
+                delta.x, delta.y
+            ),
+        ),
+        egui::Event::Zoom(value) => ("zoom", format!("value={value:.3}")),
+        egui::Event::Touch { phase, pos, .. } => (
+            "touch",
+            format!("phase={phase:?} x={:.1} y={:.1}", pos.x, pos.y),
+        ),
+        egui::Event::WindowFocused(focused) => ("window_focused", format!("focused={focused}")),
+        _ => ("other", String::new()),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TelemetrySink {
+    session_id: String,
+    session_path: PathBuf,
+}
+
+static GLOBAL_TELEMETRY: OnceLock<Mutex<Option<TelemetrySink>>> = OnceLock::new();
+static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+static SCRIPT_RESOURCE_CACHE: OnceLock<Mutex<HashMap<String, Result<String, String>>>> =
+    OnceLock::new();
+
+fn install_global_telemetry(session: &TelemetrySession) {
+    let Some(sink) = session.sink() else {
+        return;
+    };
+    let slot = GLOBAL_TELEMETRY.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(sink);
+    }
+}
+
+fn emit_global_telemetry(event: &str, fields: &[(&str, &str)]) {
+    let Some(slot) = GLOBAL_TELEMETRY.get() else {
+        return;
+    };
+    let Ok(guard) = slot.lock() else {
+        return;
+    };
+    let Some(sink) = guard.as_ref() else {
+        return;
+    };
+    write_telemetry_line(sink, event, fields);
+}
+
+fn install_telemetry_panic_hook() {
+    PANIC_HOOK_INSTALLED.get_or_init(|| {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let message = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|value| (*value).to_owned())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic payload unavailable".to_owned());
+            let location = info
+                .location()
+                .map(|location| {
+                    format!(
+                        "{}:{}:{}",
+                        location.file(),
+                        location.line(),
+                        location.column()
+                    )
+                })
+                .unwrap_or_else(|| "unknown".to_owned());
+            emit_global_telemetry(
+                "app.panic",
+                &[("message", &message), ("location", &location)],
+            );
+            previous_hook(info);
+        }));
+    });
+}
+
+fn write_telemetry_line(sink: &TelemetrySink, event: &str, fields: &[(&str, &str)]) {
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(sink.session_path.join("session.jsonl"))
+    else {
+        return;
+    };
+
+    let mut line = format!(
+        "{{\"schema_version\":1,\"session_id\":\"{}\",\"timestamp_ms\":{},\"event\":\"{}\"",
+        json_escape(&sink.session_id),
+        unix_ms(),
+        json_escape(event)
+    );
+    for (key, value) in fields {
+        line.push_str(&format!(
+            ",\"{}\":\"{}\"",
+            json_escape(key),
+            json_escape(value)
+        ));
+    }
+    line.push_str("}\n");
+    let _ = file.write_all(line.as_bytes());
+}
+
 struct TelemetrySession {
     session_id: String,
     session_path: Option<PathBuf>,
@@ -9648,32 +10642,9 @@ impl TelemetrySession {
     }
 
     fn emit(&self, event: &str, fields: &[(&str, &str)]) {
-        let Some(path) = &self.session_path else {
-            return;
-        };
-        let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path.join("session.jsonl"))
-        else {
-            return;
-        };
-
-        let mut line = format!(
-            "{{\"schema_version\":1,\"session_id\":\"{}\",\"timestamp_ms\":{},\"event\":\"{}\"",
-            json_escape(&self.session_id),
-            unix_ms(),
-            json_escape(event)
-        );
-        for (key, value) in fields {
-            line.push_str(&format!(
-                ",\"{}\":\"{}\"",
-                json_escape(key),
-                json_escape(value)
-            ));
+        if let Some(sink) = self.sink() {
+            write_telemetry_line(&sink, event, fields);
         }
-        line.push_str("}\n");
-        let _ = file.write_all(line.as_bytes());
     }
 
     fn display_path(&self) -> String {
@@ -9681,6 +10652,13 @@ impl TelemetrySession {
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "disabled".to_owned())
+    }
+
+    fn sink(&self) -> Option<TelemetrySink> {
+        self.session_path.as_ref().map(|path| TelemetrySink {
+            session_id: self.session_id.clone(),
+            session_path: path.clone(),
+        })
     }
 }
 
@@ -11003,7 +11981,7 @@ mod tests {
     fn script_test_bookmarks_cover_generated_unit_tests() {
         let bookmarks = script_test_bookmarks();
 
-        assert_eq!(bookmarks.len(), 25);
+        assert_eq!(bookmarks.len(), 41);
         assert!(bookmarks[0].title.starts_with("001 "));
         assert!(
             bookmarks[0]
@@ -11011,9 +11989,9 @@ mod tests {
                 .ends_with("/JustBarelyScript/UnitTest/001-basic-script-execution/index.html")
         );
         assert!(
-            bookmarks[24]
+            bookmarks[40]
                 .url
-                .ends_with("/JustBarelyScript/UnitTest/025-minimal-todo-app/index.html")
+                .ends_with("/JustBarelyScript/UnitTest/041-proxy/index.html")
         );
     }
 
@@ -11032,6 +12010,259 @@ mod tests {
         assert!(messages.iter().any(|message| message.level
             == justbarelyscript::ConsoleLevel::Error
             && message.text.contains("Parse error")));
+    }
+
+    #[test]
+    fn script_execution_seeds_navigator_and_screen_globals() {
+        let document = parse_html_document(
+            r#"
+            <div id="ua"></div>
+            <div id="screen"></div>
+            <script>
+            document.getElementById("ua").textContent = navigator.userAgent;
+            document.getElementById("screen").textContent = screen.width;
+            </script>
+            "#,
+            "file:///tmp/seeded-browser-globals.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "AlmostThere Browser/0.1.0").is_some());
+        assert!(
+            document.canvas_graph.objects.iter().any(|object| {
+                matches!(object, CanvasObject::Text(text) if text.text.parse::<u32>().is_ok())
+            }),
+            "expected numeric screen width text in canvas graph"
+        );
+    }
+
+    #[test]
+    fn same_origin_external_scripts_execute_in_document_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "almostthere-script-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp script dir");
+        fs::write(dir.join("a.js"), r#"window.value = "A";"#).expect("write first script");
+        fs::write(
+            dir.join("b.js"),
+            r#"document.getElementById("result").textContent = window.value + "B";"#,
+        )
+        .expect("write second script");
+
+        let html = r#"
+            <div id="result">Before</div>
+            <script src="a.js"></script>
+            <script src="b.js"></script>
+        "#;
+        let source = path_to_file_url(&dir.join("index.html"));
+        let document = parse_html_document(html, &source);
+
+        assert!(find_canvas_text(&document.canvas_graph, "AB").is_some());
+        assert!(find_canvas_text(&document.canvas_graph, "Before").is_none());
+    }
+
+    #[test]
+    fn external_script_parse_errors_are_reported_with_source_label() {
+        let dir = std::env::temp_dir().join(format!(
+            "almostthere-script-error-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp script dir");
+        fs::write(dir.join("bad.js"), "let = ;").expect("write bad script");
+
+        let html = r#"<script src="bad.js"></script>"#;
+        let source = path_to_file_url(&dir.join("index.html"));
+        let messages = script_console_messages_from_html_with_source(html, Some(&source));
+
+        assert!(messages.iter().any(|message| {
+            message.level == justbarelyscript::ConsoleLevel::Error
+                && message.text.contains("bad.js")
+                && message.text.contains("Parse error")
+        }));
+    }
+
+    #[test]
+    fn external_script_parse_errors_include_construct_diagnostics() {
+        let dir = std::env::temp_dir().join(format!(
+            "almostthere-script-diagnostic-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp script dir");
+        fs::write(
+            dir.join("bundle.js"),
+            r#"import runtime from "./runtime.js";
+            (window.webpackJsonp = window.webpackJsonp || []).push([["x"], {
+                1: function(module) {
+                    class Collector {}
+                    const run = async () => await fetch("/fingerprint");
+                    const pick = window?.navigator?.userAgent ?? "";
+                    const broken = ;
+                    module.exports = { Collector, run, pick };
+                }
+            }]);"#,
+        )
+        .expect("write diagnostic bundle");
+
+        let html = r#"<script src="bundle.js"></script>"#;
+        let source = path_to_file_url(&dir.join("index.html"));
+        let messages = script_console_messages_from_html_with_source(html, Some(&source));
+        let error = messages
+            .iter()
+            .find(|message| message.level == justbarelyscript::ConsoleLevel::Error)
+            .expect("expected parse diagnostic");
+
+        assert!(error.text.contains("bundle.js"));
+        assert!(error.text.contains("Unsupported constructs"));
+        assert!(error.text.contains("ES modules"));
+        assert!(error.text.contains("Webpack runtime"));
+        assert!(error.text.contains("class syntax"));
+        assert!(error.text.contains("async/await"));
+        assert!(error.text.contains("optional chaining"));
+        assert!(error.text.contains("nullish coalescing"));
+        assert!(error.text.contains("fetch"));
+    }
+
+    #[test]
+    fn fingerprint_suite_values_are_exposed_to_scripts() {
+        let expected = justbarelyscript::FingerprintSuite::detect();
+        let document = parse_html_document(
+            r#"
+            <div id="timezone"></div>
+            <div id="storage"></div>
+            <div id="canvas"></div>
+            <div id="location"></div>
+            <script>
+            localStorage.setItem("fp", "ok");
+            sessionStorage.session = "yes";
+            document.getElementById("timezone").textContent = new Date().getTimezoneOffset();
+            document.getElementById("storage").textContent = localStorage.getItem("fp") + "/" + sessionStorage.session;
+            var canvas = document.createElement("canvas");
+            document.getElementById("canvas").textContent = canvas.toDataURL();
+            document.getElementById("location").textContent = location.href;
+            </script>
+            "#,
+            "https://www.amiunique.org/fingerprint",
+        );
+
+        assert!(
+            find_canvas_text(
+                &document.canvas_graph,
+                &expected.timezone.offset_minutes.to_string()
+            )
+            .is_some()
+        );
+        assert!(find_canvas_text(&document.canvas_graph, "ok/yes").is_some());
+        assert!(
+            find_canvas_text(&document.canvas_graph, &expected.canvas.data_url).is_some(),
+            "expected precomputed canvas data URL to be exposed"
+        );
+        assert!(
+            find_canvas_text(
+                &document.canvas_graph,
+                "https://www.amiunique.org/fingerprint"
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn synthetic_amiunique_collector_renders_precomputed_js_attributes() {
+        let expected = justbarelyscript::FingerprintSuite::detect();
+        let document = parse_html_document(
+            r#"
+            <table>
+              <tbody id="js-attributes"><tr><td>No data available</td></tr></tbody>
+            </table>
+            <script>
+            var fp = window.__almostthereFingerprint;
+            document.getElementById("js-attributes").innerHTML =
+              "<tr><td>Canvas</td><td>" + fp.canvas + "</td></tr>" +
+              "<tr><td>Fonts</td><td>" + fp.fontsEnum + "</td></tr>" +
+              "<tr><td>Audio</td><td>" + fp.audio + "</td></tr>" +
+              "<tr><td>Modernizr</td><td>" + fp.modernizr + "</td></tr>" +
+              "<tr><td>Touch</td><td>" + fp.touchSupport + "</td></tr>";
+            </script>
+            "#,
+            "https://www.amiunique.org/fingerprint",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "No data available").is_none());
+        assert!(find_canvas_text(&document.canvas_graph, "Canvas").is_some());
+        assert!(find_canvas_text(&document.canvas_graph, &expected.canvas.data_url).is_some());
+        assert!(find_canvas_text(&document.canvas_graph, "Fonts").is_some());
+        assert!(
+            document.canvas_graph.objects.iter().any(|object| {
+                matches!(object, CanvasObject::Text(text) if text.text.contains("Arial--"))
+            }),
+            "expected rendered AMIUnique font availability tokens"
+        );
+        assert!(find_canvas_text(&document.canvas_graph, "Modernizr").is_some());
+        assert!(
+            find_canvas_text(
+                &document.canvas_graph,
+                &expected.modernizr.as_amiunique_string()
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn oversized_external_scripts_are_not_parsed_on_render_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "almostthere-large-script-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp script dir");
+        fs::write(dir.join("large.js"), "var x = 1;\n".repeat(40_000)).expect("write large script");
+
+        let html = r#"
+            <div id="result">Still renders</div>
+            <script src="large.js"></script>
+        "#;
+        let source = path_to_file_url(&dir.join("index.html"));
+        let document = parse_html_document(html, &source);
+        let messages = script_console_messages_from_html_with_source(html, Some(&source));
+
+        assert!(find_canvas_text(&document.canvas_graph, "Still renders").is_some());
+        assert!(messages.iter().any(|message| {
+            message.level == justbarelyscript::ConsoleLevel::Error
+                && message.text.contains("exceeds parser budget")
+        }));
+    }
+
+    #[test]
+    fn oversized_inline_scripts_are_not_parsed_on_render_path() {
+        let html = format!(
+            r#"
+            <div id="result">SSR content remains visible</div>
+            <script>{}</script>
+            "#,
+            "var nuxtState = 1;\n".repeat(30_000)
+        );
+        let document = parse_html_document(&html, "https://example.test/fingerprint");
+        let messages = script_console_messages_from_html_with_source(
+            &html,
+            Some("https://example.test/fingerprint"),
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "SSR content remains visible").is_some());
+        assert!(messages.iter().any(|message| {
+            message.level == justbarelyscript::ConsoleLevel::Error
+                && message.text.contains("inline script skipped")
+                && message.text.contains("exceeds parser budget")
+        }));
     }
 
     #[test]
@@ -11487,6 +12718,67 @@ mod tests {
         assert!(!rendered_text.contains("hidden attr text"));
         assert!(!rendered_text.contains("display none text"));
         assert!(!rendered_text.contains("aria hidden text"));
+    }
+
+    #[test]
+    fn render_graph_dump_excludes_non_visual_metadata_text() {
+        let html = r#"
+            <html>
+              <head>
+                <style>p { color: rgb(10, 20, 30); }</style>
+              </head>
+              <body>
+                <script>window.__NUXT__ = "large state payload";</script>
+                <template>template payload</template>
+                <noscript>noscript payload</noscript>
+                <p>Visible text</p>
+              </body>
+            </html>
+        "#;
+        let dump = parse_render_graph_debug_dump(html, "https://example.test/");
+
+        assert!(dump.contains("Visible text"));
+        assert!(!dump.contains("window.__NUXT__"));
+        assert!(!dump.contains("template payload"));
+        assert!(!dump.contains("noscript payload"));
+    }
+
+    #[test]
+    fn live_js_debug_report_marks_budget_exhaustion() {
+        let html = r#"
+            <html>
+              <body>
+                <script>while (true) { var x = 1; }</script>
+              </body>
+            </html>
+        "#;
+        let report = live_js_debug_report(html, Some("https://example.test/"));
+
+        assert!(report.contains("Live JS Debug"));
+        assert!(report.contains("status: executed"));
+        assert!(report.contains("statement budget exhausted"));
+        assert!(report.contains("budget_exhausted: 1"));
+    }
+
+    #[test]
+    fn page_load_continues_when_script_budget_is_exhausted() {
+        let html = r#"
+            <html>
+              <body>
+                <p>Still visible</p>
+                <script>while (true) { var x = 1; }</script>
+              </body>
+            </html>
+        "#;
+        let document = parse_html_document(html, "https://example.test/");
+        let messages =
+            script_console_messages_from_html_with_source(html, Some("https://example.test/"));
+
+        assert!(find_canvas_text(&document.canvas_graph, "Still visible").is_some());
+        assert!(messages.iter().any(|message| {
+            message.level == justbarelyscript::ConsoleLevel::Error
+                && message.text.contains("execution stopped")
+        }));
     }
 
     #[test]
