@@ -101,6 +101,7 @@ pub struct BrowserExecutionState {
     early_exit: Option<EarlyExit>,
     execution_budget_remaining: Option<usize>,
     execution_budget_exhausted: bool,
+    array_method_overrides: HashMap<String, JsValue>,
 }
 
 #[derive(Clone, Debug)]
@@ -605,6 +606,30 @@ impl BrowserExecutionState {
                     }
                 }
             }
+            Statement::DoWhile(statement) => {
+                let statement = statement.clone();
+                loop {
+                    if self.execution_budget_exhausted {
+                        break;
+                    }
+                    self.execute_statement(&statement.body);
+                    match self.early_exit {
+                        Some(EarlyExit::Break) => {
+                            self.early_exit = None;
+                            break;
+                        }
+                        Some(EarlyExit::Continue) => {
+                            self.early_exit = None;
+                        }
+                        Some(_) => break,
+                        None => {}
+                    }
+                    let condition = self.execute_expression(&statement.test);
+                    if !Self::is_truthy(&condition) {
+                        break;
+                    }
+                }
+            }
             Statement::For(statement) => {
                 let statement = statement.clone();
                 self.stack.push(StackFrame::default());
@@ -733,7 +758,7 @@ impl BrowserExecutionState {
                         break;
                     }
                     self.stack.push(StackFrame::default());
-                    self.set_local(&stmt.binding, item);
+                    self.execute_binding(&stmt.binding, item);
                     self.execute_statement(&stmt.body);
                     self.stack.pop();
                     self.ensure_global_frame();
@@ -762,7 +787,7 @@ impl BrowserExecutionState {
                         break;
                     }
                     self.stack.push(StackFrame::default());
-                    self.set_local(&stmt.binding, JsValue::String(key));
+                    self.execute_binding(&stmt.binding, JsValue::String(key));
                     self.execute_statement(&stmt.body);
                     self.stack.pop();
                     self.ensure_global_frame();
@@ -1451,6 +1476,25 @@ impl BrowserExecutionState {
 
             // Built-in array instance methods
             if let JsValue::Array(arr) = receiver.clone() {
+                // Check for an overridden method before falling back to native dispatch.
+                // Covers: window.X.method(args), (window.X = ...).method(args),
+                //         and localVar.method(args) where the override was stored via
+                //         localVar.method = fn assignment.
+                let override_key = if let Some(global_name) = extract_window_global_name(object) {
+                    Some(format!("{global_name}:{method_name}"))
+                } else if let Expression::Identifier(varname) = object.as_ref() {
+                    Some(format!("{varname}:{method_name}"))
+                } else {
+                    None
+                };
+                if let Some(key) = override_key {
+                    if let Some(JsValue::Function(func)) =
+                        self.array_method_overrides.get(&key).cloned()
+                    {
+                        let args = self.eval_args(arguments);
+                        return self.call_function(func, args);
+                    }
+                }
                 if let Some(v) = self.call_array_method(&method_name, arr, arguments) {
                     return v;
                 }
@@ -1535,10 +1579,56 @@ impl BrowserExecutionState {
                 }
             }
 
+            // Function.prototype.call / apply / bind
+            if let JsValue::Function(func) = receiver.clone() {
+                match method_name.as_str() {
+                    "call" => {
+                        // func.call(thisArg, arg1, arg2, ...) — skip thisArg
+                        let args = self.eval_args(arguments);
+                        let real_args = if args.is_empty() {
+                            vec![]
+                        } else {
+                            args[1..].to_vec()
+                        };
+                        return self.call_function(func, real_args);
+                    }
+                    "apply" => {
+                        // func.apply(thisArg, [arg1, arg2, ...]) — spread second arg
+                        let mut iter = arguments.iter();
+                        let _this_arg = iter.next().map(|a| self.execute_expression(a));
+                        let args_val = iter
+                            .next()
+                            .map(|a| self.execute_expression(a))
+                            .unwrap_or(JsValue::Undefined);
+                        let real_args = match args_val {
+                            JsValue::Array(arr) => arr,
+                            _ => vec![],
+                        };
+                        return self.call_function(func, real_args);
+                    }
+                    "bind" => {
+                        // func.bind(thisArg) — return the same function (ignore this)
+                        for arg in arguments {
+                            self.execute_expression(arg);
+                        }
+                        return JsValue::Function(func);
+                    }
+                    _ => {}
+                }
+            }
+
             if let JsValue::Object(ref map) = receiver {
                 if let Some(JsValue::Function(func)) = map.get(&method_name).cloned() {
                     let args = self.eval_args(arguments);
                     return self.call_function(func, args);
+                }
+                // hasOwnProperty on any object
+                if method_name == "hasOwnProperty" {
+                    let key = arguments
+                        .first()
+                        .map(|a| Self::value_to_string(&self.execute_expression(a)))
+                        .unwrap_or_default();
+                    return JsValue::Boolean(map.contains_key(&key));
                 }
             }
             // Evaluated receiver but method not found — still evaluate args for side effects
@@ -1768,6 +1858,28 @@ impl BrowserExecutionState {
                     }
                 }
                 JsValue::Object(map)
+            }
+            "defineProperty" => {
+                // Object.defineProperty(obj, key, descriptor) — apply value if present
+                let mut iter = args.into_iter();
+                let obj = iter.next().unwrap_or(JsValue::Undefined);
+                let key = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
+                let descriptor = iter.next().unwrap_or(JsValue::Undefined);
+                if let (JsValue::Object(mut map), JsValue::Object(desc)) = (obj, descriptor) {
+                    if let Some(val) = desc.get("value") {
+                        map.insert(key, val.clone());
+                    } else if let Some(JsValue::Function(getter)) = desc.get("get").cloned() {
+                        let v = self.call_function(getter, vec![]);
+                        map.insert(key, v);
+                    }
+                    JsValue::Object(map)
+                } else {
+                    JsValue::Undefined
+                }
+            }
+            "defineProperties" | "getOwnPropertyDescriptor" | "getOwnPropertyNames"
+            | "getOwnPropertySymbols" | "getPrototypeOf" | "setPrototypeOf" => {
+                args.into_iter().next().unwrap_or(JsValue::Undefined)
             }
             "create" => JsValue::Object(HashMap::new()), // ignore prototype arg
             "freeze" | "seal" | "preventExtensions" => {
@@ -2218,6 +2330,25 @@ impl BrowserExecutionState {
                 Some(JsValue::Array(entries))
             }
             "values" => Some(JsValue::Array(arr)),
+            "push" => {
+                let new_len = arr.len()
+                    + arguments
+                        .iter()
+                        .filter(|a| !matches!(a, Expression::Spread(_)))
+                        .count();
+                for arg in arguments {
+                    self.execute_expression(arg);
+                }
+                Some(JsValue::Number(new_len as f64))
+            }
+            "unshift" => {
+                let added = arguments.len();
+                for arg in arguments {
+                    self.execute_expression(arg);
+                }
+                Some(JsValue::Number((arr.len() + added) as f64))
+            }
+            "splice" => Some(JsValue::Array(Vec::new())),
             "pop" => {
                 // read-only approximation: return last element
                 Some(arr.into_iter().last().unwrap_or(JsValue::Undefined))
@@ -2509,6 +2640,34 @@ impl BrowserExecutionState {
             return;
         }
 
+        // Computed member assignment: obj[key] = val, arr[idx] = val
+        if let Expression::Member {
+            object,
+            property: MemberProperty::Computed(key_expr),
+            ..
+        } = target
+        {
+            let key = Self::value_to_string(&self.execute_expression(key_expr));
+            let receiver = self.execute_expression(object);
+            match receiver {
+                JsValue::Object(mut map) => {
+                    map.insert(key, value);
+                    self.assign_target(object, JsValue::Object(map));
+                }
+                JsValue::Array(mut arr) => {
+                    if let Ok(idx) = key.parse::<usize>() {
+                        if idx >= arr.len() {
+                            arr.resize(idx + 1, JsValue::Undefined);
+                        }
+                        arr[idx] = value;
+                        self.assign_target(object, JsValue::Array(arr));
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if let Some((object, property)) = member_assignment_target(target) {
             let receiver = self.execute_expression(object);
             match receiver {
@@ -2525,6 +2684,11 @@ impl BrowserExecutionState {
                     self.storage_map_mut(kind).insert(property, value);
                     return;
                 }
+                JsValue::Object(mut map) => {
+                    map.insert(property, value);
+                    self.assign_target(object, JsValue::Object(map));
+                    return;
+                }
                 _ => {}
             }
         }
@@ -2532,6 +2696,44 @@ impl BrowserExecutionState {
         if let Some(global_name) = window_member_name(target) {
             self.globals.insert(global_name, value);
             return;
+        }
+
+        // anyExpr.method = fn  →  store as array method override
+        // Handles two cases:
+        //   window.X.method = fn  → keyed "X:method"
+        //   localVar.method = fn  → keyed "localVar:method", and also propagated to any
+        //                           global that currently holds the same array value
+        //                           (bridges the var d = window.X = []; d.push = r pattern)
+        if let Expression::Member {
+            object,
+            property: MemberProperty::Named(method_name),
+            ..
+        } = target
+        {
+            if let Some(global_name) = window_member_name(object) {
+                self.array_method_overrides
+                    .insert(format!("{global_name}:{method_name}"), value);
+                return;
+            }
+            if let Expression::Identifier(varname) = object.as_ref() {
+                if let Some(arr_val @ JsValue::Array(_)) = self.get_binding(varname) {
+                    // Store by local var name (for direct calls on the same variable)
+                    self.array_method_overrides
+                        .insert(format!("{varname}:{method_name}"), value.clone());
+                    // Propagate to every global currently holding the same array value
+                    let matching_globals: Vec<String> = self
+                        .globals
+                        .iter()
+                        .filter(|(_, v)| *v == &arr_val)
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    for global_name in matching_globals {
+                        self.array_method_overrides
+                            .insert(format!("{global_name}:{method_name}"), value.clone());
+                    }
+                    return;
+                }
+            }
         }
 
         if let Expression::Identifier(name) = target {
@@ -2599,6 +2801,21 @@ impl BrowserExecutionState {
                             items
                                 .get(idx as usize)
                                 .cloned()
+                                .unwrap_or(JsValue::Undefined)
+                        } else {
+                            JsValue::Undefined
+                        }
+                    }
+                    JsValue::Object(map) => {
+                        let key = Self::value_to_string(&index);
+                        map.get(&key).cloned().unwrap_or(JsValue::Undefined)
+                    }
+                    JsValue::String(s) => {
+                        let idx = Self::value_to_number(&index);
+                        if idx >= 0.0 && idx.fract() == 0.0 {
+                            s.chars()
+                                .nth(idx as usize)
+                                .map(|c| JsValue::String(c.to_string()))
                                 .unwrap_or(JsValue::Undefined)
                         } else {
                             JsValue::Undefined
@@ -3360,6 +3577,18 @@ fn window_member_name(expression: &Expression) -> Option<String> {
         return None;
     };
     Some(name.clone())
+}
+
+/// For `window.X` and `(window.X = ...)` expressions, return the global name `X`.
+/// Used to detect calls like `(window.webpackJsonp = ...).push(data)`.
+fn extract_window_global_name(expr: &Expression) -> Option<String> {
+    if let Some(name) = window_member_name(expr) {
+        return Some(name);
+    }
+    if let Expression::Assignment { target, .. } = expr {
+        return extract_window_global_name(target);
+    }
+    None
 }
 
 fn existing_element_ref(id: &str) -> String {
@@ -4615,5 +4844,89 @@ mod tests {
             document.getElementById("result").textContent = String(x);
         "#);
         assert_eq!(effects, vec![text("result", "40")]);
+    }
+
+    #[test]
+    fn t053_webpack_jsonp_push_override() {
+        // window.webpackJsonp.push = callback — direct assignment on global member
+        let effects = run(r#"
+            window.webpackJsonp = [];
+            window.webpackJsonp.push = function(data) {
+                document.getElementById("app").textContent = "loaded:" + data[0];
+            };
+            (window.webpackJsonp = window.webpackJsonp || []).push([42]);
+        "#);
+        assert_eq!(effects, vec![text("app", "loaded:42")]);
+    }
+
+    #[test]
+    fn t054_webpack_jsonp_local_alias_push_override() {
+        // var d = window.X = []; d.push = r  — local-alias pattern from Webpack runtime
+        // var d = window.X = []; d.push = r  — local-alias pattern from Webpack runtime
+        let effects = run(r#"
+            var d = window.webpackJsonp = window.webpackJsonp || [];
+            d.push = function(data) {
+                document.getElementById("app").textContent = "via-alias:" + data[0];
+            };
+            (window.webpackJsonp = window.webpackJsonp || []).push([99]);
+        "#);
+        assert_eq!(effects, vec![text("app", "via-alias:99")]);
+    }
+
+    #[test]
+    fn t055_function_call_apply_bind() {
+        let effects = run(r#"
+            function greet(a, b) {
+                document.getElementById("a").textContent = a;
+                document.getElementById("b").textContent = b;
+            }
+            greet.call(null, "hello", "world");
+            greet.apply(null, ["foo", "bar"]);
+            var bound = greet.bind(null);
+            bound("x", "y");
+        "#);
+        assert_eq!(effects, vec![
+            text("a", "hello"), text("b", "world"),
+            text("a", "foo"), text("b", "bar"),
+            text("a", "x"), text("b", "y"),
+        ]);
+    }
+
+    #[test]
+    fn t056_computed_member_assignment() {
+        let effects = run(r#"
+            var obj = {};
+            var key = "result";
+            obj[key] = "computed";
+            document.getElementById("out").textContent = obj.result;
+            var arr = [0, 0, 0];
+            arr[1] = "mid";
+            document.getElementById("arr").textContent = arr[1];
+        "#);
+        assert_eq!(effects, vec![text("out", "computed"), text("arr", "mid")]);
+    }
+
+    #[test]
+    fn t057_named_object_property_assignment() {
+        let effects = run(r#"
+            var obj = {};
+            obj.name = "alice";
+            obj.age = 30;
+            document.getElementById("name").textContent = obj.name;
+            document.getElementById("age").textContent = String(obj.age);
+        "#);
+        assert_eq!(effects, vec![text("name", "alice"), text("age", "30")]);
+    }
+
+    #[test]
+    fn t058_computed_object_read() {
+        let effects = run(r#"
+            var map = {};
+            map["hello"] = "world";
+            var key = "hello";
+            document.getElementById("a").textContent = map["hello"];
+            document.getElementById("b").textContent = map[key];
+        "#);
+        assert_eq!(effects, vec![text("a", "world"), text("b", "world")]);
     }
 }
