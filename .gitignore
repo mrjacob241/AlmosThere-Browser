@@ -5,6 +5,8 @@ appdata/
 sample_pages/cache/
 sample_pages/temp_outputs/
 sample_pages/*_files/
+sample_pages/*_assets/
+sample_pages/diagnostics/
 sample_pages/Ecosia - Offline.html
 sample_pages/Ecosia - Online.html
 sample_pages/hello world - Ecosia.html
