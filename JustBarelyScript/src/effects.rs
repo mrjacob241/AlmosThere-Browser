@@ -1585,12 +1585,14 @@ impl BrowserExecutionState {
                     "call" => {
                         // func.call(thisArg, arg1, arg2, ...) — skip thisArg
                         let args = self.eval_args(arguments);
-                        let real_args = if args.is_empty() {
-                            vec![]
-                        } else {
-                            args[1..].to_vec()
-                        };
-                        return self.call_function(func, real_args);
+                        let real_args =
+                            if args.is_empty() { vec![] } else { args[1..].to_vec() };
+                        let real_exprs: Vec<Expression> = arguments
+                            .iter()
+                            .skip(1)
+                            .cloned()
+                            .collect();
+                        return self.call_function_with_writeback(func, real_args, &real_exprs);
                     }
                     "apply" => {
                         // func.apply(thisArg, [arg1, arg2, ...]) — spread second arg
@@ -3145,6 +3147,77 @@ impl BrowserExecutionState {
         self.stack.pop();
         self.ensure_global_frame();
         let _ = std::mem::replace(&mut self.stack, saved_stack);
+        result
+    }
+
+    /// Like `call_function` but writes back mutated Object/Array params to the
+    /// original argument expressions after the call. This gives reference-like
+    /// semantics for object arguments passed via `.call()` / `.apply()`, which
+    /// is required for Webpack's module factory pattern:
+    ///   `factory.call(exports, module, exports, require)`
+    ///   Inside: `exports.foo = 1` — must propagate back to the caller's `exports`.
+    fn call_function_with_writeback(
+        &mut self,
+        func: JsFunction,
+        args: Vec<JsValue>,
+        arg_exprs: &[Expression],
+    ) -> JsValue {
+        // Collect simple param names in order (destructuring params are skipped).
+        let param_names: Vec<Option<String>> = func
+            .params
+            .iter()
+            .map(|p| {
+                if let Binding::Name(n) = &p.binding {
+                    Some(n.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let saved_stack = std::mem::replace(&mut self.stack, func.captured);
+        self.ensure_global_frame();
+        self.stack.push(StackFrame::default());
+        self.bind_params(&func.params, args);
+        let result = match func.body {
+            FunctionBody::Block(block) => {
+                for stmt in &block.body {
+                    self.execute_statement(stmt);
+                    if self.early_exit.is_some() {
+                        break;
+                    }
+                }
+                match self.early_exit.take() {
+                    Some(EarlyExit::Return(v)) => v,
+                    Some(throw @ EarlyExit::Throw(_)) => {
+                        self.early_exit = Some(throw);
+                        JsValue::Undefined
+                    }
+                    _ => JsValue::Undefined,
+                }
+            }
+            FunctionBody::Expr(expr) => self.execute_expression(&expr),
+        };
+
+        // Snapshot final param values before frame is destroyed.
+        let final_values: Vec<Option<JsValue>> = param_names
+            .iter()
+            .map(|name_opt| name_opt.as_deref().and_then(|n| self.get_binding(n)))
+            .collect();
+
+        self.stack.pop();
+        self.ensure_global_frame();
+        let _ = std::mem::replace(&mut self.stack, saved_stack);
+
+        // Write mutated Objects/Arrays back to the caller's argument expressions.
+        for (final_val_opt, arg_expr) in final_values.iter().zip(arg_exprs.iter()) {
+            if let Some(final_val) = final_val_opt {
+                if matches!(final_val, JsValue::Object(_) | JsValue::Array(_)) {
+                    self.assign_target(arg_expr, final_val.clone());
+                }
+            }
+        }
+
         result
     }
 
@@ -4928,5 +5001,36 @@ mod tests {
             document.getElementById("b").textContent = map[key];
         "#);
         assert_eq!(effects, vec![text("a", "world"), text("b", "world")]);
+    }
+
+    #[test]
+    fn t059_call_writeback_exports() {
+        // Simulates Webpack module factory: factory.call(exports, module, exports, require)
+        // exports.result inside factory must propagate back to module.exports outside.
+        let effects = run(r#"
+            function makeModule(module, exports, require) {
+                exports.result = "from factory";
+            }
+            var mod = { exports: {} };
+            makeModule.call(mod.exports, mod, mod.exports, function(){});
+            document.getElementById("out").textContent = mod.exports.result;
+        "#);
+        assert_eq!(effects, vec![text("out", "from factory")]);
+    }
+
+    #[test]
+    fn t060_call_writeback_nested_object() {
+        // Object passed to .call() as arg — mutations visible after return.
+        let effects = run(r#"
+            function populate(obj) {
+                obj.x = "hello";
+                obj.y = "world";
+            }
+            var data = {};
+            populate.call(null, data);
+            document.getElementById("a").textContent = data.x;
+            document.getElementById("b").textContent = data.y;
+        "#);
+        assert_eq!(effects, vec![text("a", "hello"), text("b", "world")]);
     }
 }
