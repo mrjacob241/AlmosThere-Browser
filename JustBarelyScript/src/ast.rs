@@ -14,6 +14,7 @@ pub enum Statement {
     Throw(ThrowStatement),
     If(IfStatement),
     While(WhileStatement),
+    DoWhile(DoWhileStatement),
     For(ForStatement),
     ForOf(ForOfStatement),
     ForIn(ForInStatement),
@@ -153,6 +154,13 @@ pub struct WhileStatement {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct DoWhileStatement {
+    pub body: Box<Statement>,
+    pub test: Expression,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct ForStatement {
     pub init: Option<Box<Statement>>,
     pub test: Option<Expression>,
@@ -163,7 +171,7 @@ pub struct ForStatement {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ForOfStatement {
-    pub binding: String,
+    pub binding: Binding,
     pub binding_kind: VarKind,
     pub iterable: Expression,
     pub body: Box<Statement>,
@@ -172,7 +180,7 @@ pub struct ForOfStatement {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ForInStatement {
-    pub binding: String,
+    pub binding: Binding,
     pub binding_kind: VarKind,
     pub object: Expression,
     pub body: Box<Statement>,

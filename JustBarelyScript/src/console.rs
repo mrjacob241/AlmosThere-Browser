@@ -95,6 +95,10 @@ fn collect_statement_console_messages(statement: &Statement, out: &mut Vec<Conso
             collect_expression_console_messages(&statement.test, out);
             collect_statement_console_messages(&statement.body, out);
         }
+        Statement::DoWhile(statement) => {
+            collect_statement_console_messages(&statement.body, out);
+            collect_expression_console_messages(&statement.test, out);
+        }
         Statement::For(statement) => {
             if let Some(init) = &statement.init {
                 collect_statement_console_messages(init, out);

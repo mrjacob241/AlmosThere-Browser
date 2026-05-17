@@ -2,11 +2,11 @@ use crate::{
     Program,
     ast::{
         BinaryOperator, Binding, BlockStatement, ClassDeclaration, ClassMethod, Expression,
-        ForInStatement, ForOfStatement, ForStatement, FunctionBody, FunctionDeclaration,
-        FunctionExpression, IfStatement, MemberProperty, ObjectBindingProp, ObjectProperty, Param,
-        ReturnStatement, Statement, SwitchCase, SwitchStatement, TemplateElement, ThrowStatement,
-        TryCatchStatement, UnaryOperator, VarKind, VariableDeclaration, VariableDeclarator,
-        WhileStatement,
+        DoWhileStatement, ForInStatement, ForOfStatement, ForStatement, FunctionBody,
+        FunctionDeclaration, FunctionExpression, IfStatement, MemberProperty, ObjectBindingProp,
+        ObjectProperty, Param, ReturnStatement, Statement, SwitchCase, SwitchStatement,
+        TemplateElement, ThrowStatement, TryCatchStatement, UnaryOperator, VarKind,
+        VariableDeclaration, VariableDeclarator, WhileStatement,
     },
     error::JsError,
     lexer::{TemplatePart, Token, TokenKind, lex},
@@ -68,6 +68,7 @@ impl Parser {
                 Ok(Statement::Throw(ThrowStatement { argument, span }))
             }
             TokenKind::If => self.parse_if_statement().map(Statement::If),
+            TokenKind::Do => self.parse_do_while_statement().map(Statement::DoWhile),
             TokenKind::While => self.parse_while_statement().map(Statement::While),
             TokenKind::For => self.parse_for_statement(),
             TokenKind::Try => self.parse_try_statement().map(Statement::TryCatch),
@@ -281,11 +282,23 @@ impl Parser {
         Ok(WhileStatement { test, body, span })
     }
 
+    fn parse_do_while_statement(&mut self) -> Result<DoWhileStatement, JsError> {
+        let span = self.expect(TokenKind::Do)?.span;
+        let body = Box::new(self.parse_statement()?);
+        self.expect(TokenKind::While)?;
+        self.expect(TokenKind::LeftParen)?;
+        let test = self.parse_sequence_expr()?;
+        self.expect(TokenKind::RightParen)?;
+        self.eat(TokenKind::Semicolon); // optional trailing semicolon
+        Ok(DoWhileStatement { body, test, span })
+    }
+
     fn parse_for_statement(&mut self) -> Result<Statement, JsError> {
         let span = self.expect(TokenKind::For)?.span;
         self.expect(TokenKind::LeftParen)?;
 
-        // Detect for-of and for-in: "for (var/let/const x of/in ...)".
+        // Detect for-of and for-in: "for (var/let/const binding of/in ...)".
+        // Binding may be a simple identifier or a destructuring pattern ([a,b] / {x,y}).
         if matches!(
             self.current_kind(),
             TokenKind::Let | TokenKind::Const | TokenKind::Var
@@ -297,15 +310,29 @@ impl Parser {
             };
             let saved = self.position;
             self.advance();
-            if let TokenKind::Identifier(name) = self.current_kind() {
+            // Try to parse any binding pattern (identifier or destructuring).
+            let maybe_binding = if let TokenKind::Identifier(name) = self.current_kind() {
                 let name = name.clone();
                 self.advance();
+                Some(Binding::Name(name))
+            } else if matches!(
+                self.current_kind(),
+                TokenKind::LeftBracket | TokenKind::LeftBrace
+            ) {
+                match self.parse_binding() {
+                    Ok(b) => Some(b),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            if let Some(binding) = maybe_binding {
                 if self.eat(TokenKind::Of) {
                     let iterable = self.parse_expression(0)?;
                     self.expect(TokenKind::RightParen)?;
                     let body = Box::new(self.parse_statement()?);
                     return Ok(Statement::ForOf(ForOfStatement {
-                        binding: name,
+                        binding,
                         binding_kind,
                         iterable,
                         body,
@@ -320,21 +347,19 @@ impl Parser {
                     self.expect(TokenKind::RightParen)?;
                     let body = Box::new(self.parse_statement()?);
                     return Ok(Statement::ForIn(ForInStatement {
-                        binding: name,
+                        binding,
                         binding_kind,
                         object,
                         body,
                         span,
                     }));
                 }
-                // Not for-of or for-in — reset and parse as C-style for.
-                self.position = saved;
-            } else {
-                self.position = saved;
             }
+            // Not for-of or for-in — reset and parse as C-style for.
+            self.position = saved;
         }
 
-        // Detect bare for-in: "for (x in obj)" — no var/let/const.
+        // Detect bare for-in / for-of: "for (x in/of obj)" — no var/let/const.
         if let TokenKind::Identifier(name) = self.current_kind() {
             let saved = self.position;
             let name = name.clone();
@@ -348,9 +373,20 @@ impl Parser {
                 self.expect(TokenKind::RightParen)?;
                 let body = Box::new(self.parse_statement()?);
                 return Ok(Statement::ForIn(ForInStatement {
-                    binding: name,
+                    binding: Binding::Name(name),
                     binding_kind: VarKind::Var,
                     object,
+                    body,
+                    span,
+                }));
+            } else if self.eat(TokenKind::Of) {
+                let iterable = self.parse_expression(0)?;
+                self.expect(TokenKind::RightParen)?;
+                let body = Box::new(self.parse_statement()?);
+                return Ok(Statement::ForOf(ForOfStatement {
+                    binding: Binding::Name(name),
+                    binding_kind: VarKind::Var,
+                    iterable,
                     body,
                     span,
                 }));
@@ -410,7 +446,7 @@ impl Parser {
     fn parse_switch_statement(&mut self) -> Result<SwitchStatement, JsError> {
         let span = self.expect(TokenKind::Switch)?.span;
         self.expect(TokenKind::LeftParen)?;
-        let discriminant = self.parse_expression(0)?;
+        let discriminant = self.parse_sequence_expr()?;
         self.expect(TokenKind::RightParen)?;
         self.expect(TokenKind::LeftBrace)?;
 
@@ -916,6 +952,7 @@ impl Parser {
 
             TokenKind::LeftBracket => self.parse_array_literal(),
             TokenKind::LeftBrace => self.parse_object_literal(),
+            TokenKind::Class => self.parse_class_expression(),
             TokenKind::Function => {
                 let func = self.parse_function_expression_inner()?;
                 Ok(Expression::Function(func))
@@ -957,6 +994,41 @@ impl Parser {
         }
     }
 
+    /// Parse a class expression (anonymous or named). Returns `Expression::Null` because JBS
+    /// does not execute class bodies; the body tokens are consumed so the parser stays in sync.
+    fn parse_class_expression(&mut self) -> Result<Expression, JsError> {
+        self.expect(TokenKind::Class)?;
+        // optional class name
+        if let TokenKind::Identifier(_) = self.current_kind() {
+            self.advance();
+        }
+        // optional `extends <superclass-expr>`
+        if self.eat(TokenKind::Extends) {
+            // Parse the superclass expression. It stops naturally before `{` because `{` is
+            // not an infix operator.
+            self.parse_expression(0)?;
+        }
+        // consume the class body with a brace counter (tokens correctly tokenise strings/regexes)
+        self.expect(TokenKind::LeftBrace)?;
+        let mut depth = 1usize;
+        while depth > 0 && !self.at_eof() {
+            match self.current_kind() {
+                TokenKind::LeftBrace => {
+                    depth += 1;
+                    self.advance();
+                }
+                TokenKind::RightBrace => {
+                    depth -= 1;
+                    self.advance();
+                }
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+        Ok(Expression::Null)
+    }
+
     /// Parse the callee for `new` (identifiers, member access, or parenthesised expression).
     fn parse_new_target(&mut self) -> Result<Expression, JsError> {
         let mut expr = match self.current_kind() {
@@ -977,6 +1049,8 @@ impl Parser {
                 self.expect(TokenKind::RightParen)?;
                 inner
             }
+            // new class { ... }() — anonymous/named class expression as constructor
+            TokenKind::Class => self.parse_class_expression()?,
             _ => return self.error("expected class name after new"),
         };
         while self.eat(TokenKind::Dot) {
@@ -1305,22 +1379,48 @@ impl Parser {
                 self.advance();
                 let mut props = Vec::new();
                 while !matches!(self.current_kind(), TokenKind::RightBrace | TokenKind::Eof) {
-                    let key = self.expect_identifier_or_keyword()?;
-                    let (binding, default) = if self.eat(TokenKind::Colon) {
+                    // rest element: ...identifier — must be last
+                    if self.eat(TokenKind::DotDotDot) {
+                        let name = self.expect_identifier()?;
+                        props.push(ObjectBindingProp {
+                            key: name.clone(),
+                            binding: Binding::Name(name),
+                            default: None,
+                        });
+                        self.eat(TokenKind::Comma);
+                        break;
+                    }
+                    // computed key: [expr]: binding
+                    let (key, binding, default) = if self.eat(TokenKind::LeftBracket) {
+                        self.parse_expression(0)?; // key expression (discarded)
+                        self.expect(TokenKind::RightBracket)?;
+                        self.expect(TokenKind::Colon)?;
                         let b = self.parse_binding()?;
                         let d = if self.eat(TokenKind::Equals) {
                             Some(self.parse_expression(0)?)
                         } else {
                             None
                         };
-                        (b, d)
+                        ("[computed]".to_owned(), b, d)
                     } else {
-                        let d = if self.eat(TokenKind::Equals) {
-                            Some(self.parse_expression(0)?)
+                        let key = self.expect_identifier_or_keyword()?;
+                        let (binding, default) = if self.eat(TokenKind::Colon) {
+                            let b = self.parse_binding()?;
+                            let d = if self.eat(TokenKind::Equals) {
+                                Some(self.parse_expression(0)?)
+                            } else {
+                                None
+                            };
+                            (b, d)
                         } else {
-                            None
+                            let d = if self.eat(TokenKind::Equals) {
+                                Some(self.parse_expression(0)?)
+                            } else {
+                                None
+                            };
+                            (Binding::Name(key.clone()), d)
                         };
-                        (Binding::Name(key.clone()), d)
+                        (key, binding, default)
                     };
                     props.push(ObjectBindingProp {
                         key,
@@ -1658,5 +1758,50 @@ mod tests {
         assert!(parse_script("var x = 8; x >>= 1;").is_ok());
         assert!(parse_script("var x = 8; x >>>= 1;").is_ok());
         assert!(parse_script("for(var i=0;i<8;i++){x<<=1;}").is_ok());
+    }
+
+    #[test]
+    fn parses_switch_comma_discriminant() {
+        // switch(a, b) — comma sequence in discriminant was stopped at the comma.
+        assert!(parse_script("switch(a, b) { case 1: break; }").is_ok());
+        assert!(parse_script("switch(f(), g()) { default: break; }").is_ok());
+    }
+
+    #[test]
+    fn parses_do_while() {
+        assert!(parse_script("do { x++; } while (x < 10);").is_ok());
+        assert!(parse_script("do { x++; } while (x < 10)").is_ok());
+        assert!(parse_script("var n=0; do { n++; } while(n<3);").is_ok());
+    }
+
+    #[test]
+    fn parses_new_class_expression() {
+        // new class{...}() — anonymous class expression as constructor.
+        assert!(parse_script("var x = new class { constructor() {} }();").is_ok());
+        assert!(parse_script("var x = new class Foo { constructor() {} }();").is_ok());
+        assert!(parse_script("var x = new class extends Base { f(){} }();").is_ok());
+    }
+
+    #[test]
+    fn parses_class_expression_in_assignment() {
+        // let x = class { ... } — class as expression on the right-hand side.
+        assert!(parse_script("var x = class { f() {} };").is_ok());
+        assert!(parse_script("var x = class Foo { f() {} };").is_ok());
+    }
+
+    #[test]
+    fn parses_for_of_destructuring() {
+        // for(const [a, b] of arr) — array destructuring binding in for-of.
+        assert!(parse_script("for(const [a, b] of arr) {}").is_ok());
+        assert!(parse_script("for(const {x, y} of arr) {}").is_ok());
+        // for(const [a, b, c] of this._syncList) — from the real failing script.
+        assert!(parse_script("for(const [t,e,n] of this._syncList) this[t](e,n);").is_ok());
+    }
+
+    #[test]
+    fn parses_object_binding_computed_key() {
+        // const {[d]:n,[h]:o} = t — computed key in object destructuring.
+        assert!(parse_script("const {[d]:n,[h]:o} = t;").is_ok());
+        assert!(parse_script("var {[key]:val} = obj;").is_ok());
     }
 }
