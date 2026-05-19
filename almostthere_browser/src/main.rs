@@ -2174,6 +2174,8 @@ fn parse_html_document_from_live_html(
     source: &str,
     text_metrics: Option<&egui::Context>,
 ) -> BrowserDocument {
+    let reveal_hydration_hidden_content =
+        page_has_unexecuted_hydration_script(live_html, Some(source));
     let mut css = extract_tag_inner(live_html, "style")
         .unwrap_or("")
         .to_owned();
@@ -2190,8 +2192,13 @@ fn parse_html_document_from_live_html(
     let root_classes = document_theme_root_classes(&dom, text_metrics);
     let style = parse_basic_css_for_viewport_with_root_classes(&css, 1280.0, &root_classes);
     let render_graph = build_render_graph(&dom, &style);
-    let canvas_graph =
-        render_graph_to_canvas_graph(&render_graph, source, style.image_height_auto, text_metrics);
+    let canvas_graph = render_graph_to_canvas_graph(
+        &render_graph,
+        source,
+        style.image_height_auto,
+        text_metrics,
+        reveal_hydration_hidden_content,
+    );
     let blocks = render_graph_to_blocks(&render_graph, source, style.image_height_auto);
     BrowserDocument {
         title,
@@ -2207,15 +2214,33 @@ fn apply_safe_script_browser_effects(html: &str) -> String {
 }
 
 fn apply_safe_script_browser_effects_with_source(html: &str, source: Option<&str>) -> String {
+    apply_safe_script_browser_effects_detailed(html, source).html
+}
+
+#[derive(Debug)]
+struct ScriptApplicationResult {
+    html: String,
+    hydration_failed: bool,
+}
+
+fn apply_safe_script_browser_effects_detailed(
+    html: &str,
+    source: Option<&str>,
+) -> ScriptApplicationResult {
     let scripts = collect_page_scripts(html, source);
     let mut output = html.to_owned();
     let mut state = justbarelyscript::BrowserExecutionState::default();
     seed_script_browser_globals(&mut state, source);
     seed_script_dom_state_from_html(html, &mut state);
     seed_script_computed_styles_from_html(html, &mut state);
+    let mut hydration_failed = false;
 
     for script in scripts {
+        let script_hydration_candidate = page_script_is_hydration_candidate(&script);
         let Ok(program) = script.program else {
+            if script_hydration_candidate {
+                hydration_failed = true;
+            }
             continue;
         };
         state.set_execution_budget(LIVE_JS_DEBUG_STATEMENT_BUDGET);
@@ -2266,7 +2291,33 @@ fn apply_safe_script_browser_effects_with_source(html: &str, source: Option<&str
         }
     }
 
-    output
+    ScriptApplicationResult {
+        html: output,
+        hydration_failed,
+    }
+}
+
+fn page_has_unexecuted_hydration_script(html: &str, source: Option<&str>) -> bool {
+    collect_page_scripts(html, source)
+        .iter()
+        .any(|script| script.program.is_err() && page_script_is_hydration_candidate(script))
+}
+
+fn page_script_is_hydration_candidate(script: &PageScript) -> bool {
+    script.kind == PageScriptKind::External
+        || script.diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.as_str(),
+                "ES modules"
+                    | "arrow functions"
+                    | "optional chaining"
+                    | "nullish coalescing"
+                    | "spread/rest"
+                    | "template literals"
+                    | "async/await"
+                    | "Promise constructor"
+            )
+        })
 }
 
 fn seed_script_browser_globals(
@@ -3342,10 +3393,9 @@ impl App for AlmostThereApp {
                             ],
                         );
                     }
-                    if let Some(url) = form_get_url_for_inputs(
-                        &response.submitted_inputs,
-                        &self.document.source,
-                    ) {
+                    if let Some(url) =
+                        form_get_url_for_inputs(&response.submitted_inputs, &self.document.source)
+                    {
                         self.open_link(&url, ctx);
                     }
                 }
@@ -3457,7 +3507,10 @@ fn resolve_navigation_url(source: &str, href: &str) -> String {
     resolve_resource_url(source, href)
 }
 
-fn form_get_url_for_inputs(inputs: &[rich_canvas::InputSubmit], page_source: &str) -> Option<String> {
+fn form_get_url_for_inputs(
+    inputs: &[rich_canvas::InputSubmit],
+    page_source: &str,
+) -> Option<String> {
     let action = inputs.iter().find_map(|i| i.form_action.as_deref())?;
     let base_url = resolve_resource_url(page_source, action);
     let query: String = inputs
@@ -3465,7 +3518,11 @@ fn form_get_url_for_inputs(inputs: &[rich_canvas::InputSubmit], page_source: &st
         .filter(|i| !i.value.trim().is_empty())
         .map(|i| {
             let key = i.name.as_deref().unwrap_or("q");
-            format!("{}={}", percent_encode_query(key), percent_encode_query(i.value.trim()))
+            format!(
+                "{}={}",
+                percent_encode_query(key),
+                percent_encode_query(i.value.trim())
+            )
         })
         .collect::<Vec<_>>()
         .join("&");
@@ -4104,7 +4161,9 @@ fn parse_html_document_with_text_metrics(
     text_metrics: Option<&egui::Context>,
 ) -> BrowserDocument {
     let html = remove_html_comments(html);
-    let html = apply_safe_script_browser_effects_with_source(&html, Some(source));
+    let script_result = apply_safe_script_browser_effects_detailed(&html, Some(source));
+    let reveal_hydration_hidden_content = script_result.hydration_failed;
+    let html = script_result.html;
     let mut css = extract_tag_inner(&html, "style").unwrap_or("").to_owned();
     css.push_str(&load_linked_stylesheets(&html, source).unwrap_or_default());
     let html = remove_non_visual_metadata_elements(&html);
@@ -4119,8 +4178,13 @@ fn parse_html_document_with_text_metrics(
     let root_classes = document_theme_root_classes(&dom, text_metrics);
     let style = parse_basic_css_for_viewport_with_root_classes(&css, 1280.0, &root_classes);
     let render_graph = build_render_graph(&dom, &style);
-    let canvas_graph =
-        render_graph_to_canvas_graph(&render_graph, source, style.image_height_auto, text_metrics);
+    let canvas_graph = render_graph_to_canvas_graph(
+        &render_graph,
+        source,
+        style.image_height_auto,
+        text_metrics,
+        reveal_hydration_hidden_content,
+    );
     let blocks = render_graph_to_blocks(&render_graph, source, style.image_height_auto);
 
     BrowserDocument {
@@ -6212,6 +6276,7 @@ fn render_graph_to_canvas_graph(
     source: &str,
     image_height_auto: bool,
     text_metrics: Option<&egui::Context>,
+    reveal_hydration_hidden_content: bool,
 ) -> CanvasGraph {
     let viewport = egui::vec2(graph.root.style.max_width.unwrap_or(1280.0), 0.0);
     let mut layout_root = build_css_layout_tree(&graph.root);
@@ -6235,6 +6300,9 @@ fn render_graph_to_canvas_graph(
         image_height_auto,
         text_metrics,
     );
+    if reveal_hydration_hidden_content {
+        apply_hydration_visibility_fallback(&mut layout_root);
+    }
 
     for child in &layout_root.children {
         push_canvas_graph_layout_box(
@@ -6249,6 +6317,87 @@ fn render_graph_to_canvas_graph(
     }
     canvas_graph.viewport.y = cursor.y.max(layout_root.dimensions.content.height());
     canvas_graph
+}
+
+fn apply_hydration_visibility_fallback(box_: &mut CssLayoutBox<'_>) {
+    if css_layout_box_should_reveal_for_hydration_fallback(box_) {
+        set_css_layout_subtree_visibility_visible(box_);
+        return;
+    }
+
+    for child in &mut box_.children {
+        apply_hydration_visibility_fallback(child);
+    }
+}
+
+fn set_css_layout_subtree_visibility_visible(box_: &mut CssLayoutBox<'_>) {
+    box_.style.visibility_visible = true;
+    for child in &mut box_.children {
+        set_css_layout_subtree_visibility_visible(child);
+    }
+}
+
+fn css_layout_box_should_reveal_for_hydration_fallback(box_: &CssLayoutBox<'_>) -> bool {
+    !box_.style.visibility_visible
+        && box_.style.opacity > 0.0
+        && matches!(
+            box_.style.display,
+            CssDisplay::Block | CssDisplay::Flex | CssDisplay::Grid | CssDisplay::ListItem
+        )
+        && box_.style.position == CssPosition::Static
+        && css_layout_box_has_meaningful_ssr_content(box_)
+}
+
+fn css_layout_box_has_meaningful_ssr_content(box_: &CssLayoutBox<'_>) -> bool {
+    let text_len = css_layout_box_visible_text_len(box_);
+    let link_count = css_layout_box_link_count(box_);
+    css_layout_box_contains_tag(box_, &["article", "main"]) || (text_len >= 24 && link_count > 0)
+}
+
+fn css_layout_box_visible_text_len(box_: &CssLayoutBox<'_>) -> usize {
+    let mut total = box_
+        .text
+        .as_deref()
+        .map(str::trim)
+        .map(str::len)
+        .unwrap_or(0);
+    for child in &box_.children {
+        total += css_layout_box_visible_text_len(child);
+    }
+    total
+}
+
+fn css_layout_box_link_count(box_: &CssLayoutBox<'_>) -> usize {
+    let own = match &box_.node {
+        Some(RenderNode {
+            kind: RenderNodeKind::Element(element),
+            ..
+        }) if element.tag_name.eq_ignore_ascii_case("a") && element.attr("href").is_some() => 1,
+        _ => 0,
+    };
+    own + box_
+        .children
+        .iter()
+        .map(css_layout_box_link_count)
+        .sum::<usize>()
+}
+
+fn css_layout_box_contains_tag(box_: &CssLayoutBox<'_>, tags: &[&str]) -> bool {
+    if let Some(RenderNode {
+        kind: RenderNodeKind::Element(element),
+        ..
+    }) = box_.node
+    {
+        if tags
+            .iter()
+            .any(|tag| element.tag_name.eq_ignore_ascii_case(tag))
+        {
+            return true;
+        }
+    }
+    box_.children
+        .iter()
+        .any(|child| css_layout_box_contains_tag(child, tags))
 }
 
 fn push_canvas_graph_layout_box(
@@ -7021,7 +7170,10 @@ fn current_canvas_form_id(cursor: &CanvasLayoutCursor) -> Option<String> {
 }
 
 fn current_canvas_form_action(cursor: &CanvasLayoutCursor) -> Option<String> {
-    cursor.form_stack.last().and_then(|form| form.action.clone())
+    cursor
+        .form_stack
+        .last()
+        .and_then(|form| form.action.clone())
 }
 
 fn push_canvas_graph_button_hit_target(
@@ -12250,7 +12402,8 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&dir).expect("create temp script dir");
-        fs::write(dir.join("large.js"), "var x = 1;\n".repeat(500_000)).expect("write large script");
+        fs::write(dir.join("large.js"), "var x = 1;\n".repeat(500_000))
+            .expect("write large script");
 
         let html = r#"
             <div id="result">Still renders</div>
@@ -12804,6 +12957,74 @@ mod tests {
             message.level == justbarelyscript::ConsoleLevel::Error
                 && message.text.contains("execution stopped")
         }));
+    }
+
+    #[test]
+    fn hydration_fallback_reveals_hidden_ssr_article_content() {
+        let dir = std::env::temp_dir().join(format!(
+            "almostthere-hydration-fallback-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp script dir");
+        fs::write(dir.join("hydrate.js"), "function () {").expect("write hydration script");
+
+        let html = r#"
+            <style>
+              .ssr-card { visibility: hidden; }
+            </style>
+            <main>
+              <div class="ssr-card">
+                <article>
+                  <a href="https://example.test/result">Server rendered result title</a>
+                  <p>Server rendered result body that should remain available without hydration.</p>
+                </article>
+              </div>
+            </main>
+            <script src="hydrate.js" type="module"></script>
+        "#;
+        let source = path_to_file_url(&dir.join("index.html"));
+        let document = parse_html_document(html, &source);
+
+        assert!(document.canvas_graph.objects.iter().any(|object| matches!(
+            object,
+            CanvasObject::Text(text) if text.text.contains("Server rendered result title")
+        )));
+    }
+
+    #[test]
+    fn hydration_fallback_does_not_reveal_absolute_hidden_menus() {
+        let dir = std::env::temp_dir().join(format!(
+            "almostthere-hydration-menu-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp script dir");
+        fs::write(dir.join("hydrate.js"), "function () {").expect("write hydration script");
+
+        let html = r#"
+            <style>
+              .menu { visibility: hidden; position: absolute; }
+            </style>
+            <nav class="menu">
+              <a href="/settings">Hidden menu link with enough text to look meaningful</a>
+            </nav>
+            <p>Visible page text</p>
+            <script src="hydrate.js" type="module"></script>
+        "#;
+        let source = path_to_file_url(&dir.join("index.html"));
+        let document = parse_html_document(html, &source);
+
+        assert!(find_canvas_text(&document.canvas_graph, "Visible page text").is_some());
+        assert!(!document.canvas_graph.objects.iter().any(|object| matches!(
+            object,
+            CanvasObject::Text(text)
+                if text.text.contains("Hidden menu link with enough text to look meaningful")
+        )));
     }
 
     #[test]
