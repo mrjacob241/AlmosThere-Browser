@@ -21,6 +21,7 @@ const IMAGE_MIN_SIZE: f32 = 24.0;
 pub struct BrowserCanvas {
     pub zoom: f32,
     pub scroll_offset: Vec2,
+    pub hovered_link_href: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -427,6 +428,17 @@ pub struct CanvasButtonObject {
     pub element_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub enum CanvasInputKind {
+    #[default]
+    Text,
+    Password,
+    TextArea,
+    Checkbox,
+    Radio,
+    Select { options: Vec<String> },
+}
+
 #[derive(Clone, Debug)]
 pub struct CanvasInputObject {
     pub label: String,
@@ -439,6 +451,7 @@ pub struct CanvasInputObject {
     pub form_id: Option<String>,
     pub form_action: Option<String>,
     pub element_id: Option<String>,
+    pub kind: CanvasInputKind,
 }
 
 #[derive(Clone, Debug)]
@@ -1012,6 +1025,7 @@ impl BrowserCanvas {
         Self {
             zoom: 1.0,
             scroll_offset: Vec2::ZERO,
+            hovered_link_href: None,
         }
     }
 
@@ -1057,12 +1071,17 @@ impl BrowserCanvas {
                                 font_scale,
                                 &mut canvas_response,
                                 false,
+                                self.hovered_link_href.as_deref(),
                             );
                         }
                     });
                 });
             });
         self.scroll_offset = output.state.offset;
+        self.hovered_link_href = canvas_response.hovered.as_ref().and_then(|t| match t {
+            HitTarget::Link { href } => Some(href.clone()),
+            _ => None,
+        });
 
         canvas_response
     }
@@ -1106,11 +1125,16 @@ impl BrowserCanvas {
                             font_scale,
                             &mut canvas_response,
                             true,
+                            self.hovered_link_href.as_deref(),
                         );
                     });
                 });
             });
         self.scroll_offset = output.state.offset;
+        self.hovered_link_href = canvas_response.hovered.as_ref().and_then(|t| match t {
+            HitTarget::Link { href } => Some(href.clone()),
+            _ => None,
+        });
 
         canvas_response
     }
@@ -1132,6 +1156,7 @@ fn paint_canvas_graph(
     font_scale: f32,
     canvas_response: &mut BrowserCanvasResponse,
     read_only: bool,
+    hovered_link_href: Option<&str>,
 ) {
     let graph_width = graph.viewport.x.max(1.0);
     let scale = (content_width / graph_width).max(0.1) * font_scale;
@@ -1141,6 +1166,8 @@ fn paint_canvas_graph(
     let mut clip_stack = Vec::new();
     let mut submitted_forms: Vec<(Option<String>, Option<String>)> = Vec::new();
     let mut reset_forms: Vec<Option<String>> = Vec::new();
+    // (name, element_id) of radio buttons clicked this frame — used to deselect group peers.
+    let mut selected_radios: Vec<(Option<String>, Option<String>)> = Vec::new();
 
     for (index, object) in graph.objects.iter_mut().enumerate() {
         match object {
@@ -1164,12 +1191,14 @@ fn paint_canvas_graph(
                 };
                 let font_size = text.font_size * scale;
                 let stroke = Stroke::new((1.0 * scale).max(1.0), text.color);
+                let link_hovered = text.href.is_some()
+                    && text.href.as_deref() == hovered_link_href;
                 let text_format = TextFormat {
                     font_id: FontId::new(font_size, family),
                     color: text.color,
                     background: text.text_background,
                     italics: text.font_style_italic,
-                    underline: if text.text_decoration_underline {
+                    underline: if text.text_decoration_underline || link_hovered {
                         stroke
                     } else {
                         Stroke::NONE
@@ -1267,42 +1296,147 @@ fn paint_canvas_graph(
                         ),
                     );
                 } else {
-                    let mut value = input.value.clone();
-                    let response = ui.put(
-                        rect,
-                        egui::TextEdit::singleline(&mut value)
-                            .hint_text(input.label.as_str())
-                            .frame(false)
-                            .font(FontId::new(
-                                input.font_size * scale,
-                                browser_regular_family(),
-                            ))
-                            .text_color(input.color),
-                    );
-                    if response.hovered() {
-                        canvas_response.hovered = Some(HitTarget::Input {
-                            label: input.label.clone(),
-                            element_id: input.element_id.clone(),
-                        });
-                    }
-                    if response.changed() {
-                        input.value = value.clone();
-                        canvas_response.changed_inputs.push(InputChange {
-                            label: input.label.clone(),
-                            value_len: value.chars().count(),
-                            element_id: input.element_id.clone(),
-                            value: value.clone(),
-                        });
-                    }
-                    if response.lost_focus()
-                        && ui.input(|state| state.key_pressed(egui::Key::Enter))
-                    {
-                        canvas_response.submitted_inputs.push(InputSubmit {
-                            label: input.label.clone(),
-                            name: input.name.clone(),
-                            value,
-                            form_action: input.form_action.clone(),
-                        });
+                    match &input.kind {
+                        CanvasInputKind::Checkbox => {
+                            let mut checked = input.value == "true";
+                            let response = ui.put(
+                                rect,
+                                egui::Checkbox::new(&mut checked, input.label.as_str()),
+                            );
+                            if response.changed() {
+                                input.value = if checked { "true" } else { "false" }.to_owned();
+                                canvas_response.changed_inputs.push(InputChange {
+                                    label: input.label.clone(),
+                                    value_len: input.value.len(),
+                                    element_id: input.element_id.clone(),
+                                    value: input.value.clone(),
+                                });
+                            }
+                        }
+                        CanvasInputKind::Radio => {
+                            let checked = input.value == "true";
+                            let response = ui.put(
+                                rect,
+                                egui::RadioButton::new(checked, input.label.as_str()),
+                            );
+                            if response.clicked() && !checked {
+                                input.value = "true".to_owned();
+                                selected_radios
+                                    .push((input.name.clone(), input.element_id.clone()));
+                                canvas_response.changed_inputs.push(InputChange {
+                                    label: input.label.clone(),
+                                    value_len: input.value.len(),
+                                    element_id: input.element_id.clone(),
+                                    value: input.value.clone(),
+                                });
+                            }
+                        }
+                        CanvasInputKind::Select { options } => {
+                            let options = options.clone();
+                            let mut selected = input.value.clone();
+                            let combo_id =
+                                ui.make_persistent_id(("canvas_graph_select", index));
+                            let mut selection_changed = false;
+                            ui.allocate_ui_at_rect(rect, |ui| {
+                                egui::ComboBox::from_id_salt(combo_id)
+                                    .selected_text(selected.as_str())
+                                    .width(rect.width())
+                                    .show_ui(ui, |ui| {
+                                        for option in &options {
+                                            // selectable_label + explicit click tracking
+                                            // mirrors what show_index does internally.
+                                            if ui
+                                                .selectable_label(
+                                                    selected == *option,
+                                                    option.as_str(),
+                                                )
+                                                .clicked()
+                                            {
+                                                selected = option.clone();
+                                                selection_changed = true;
+                                            }
+                                        }
+                                    });
+                            });
+                            if selection_changed {
+                                input.value = selected.clone();
+                                canvas_response.changed_inputs.push(InputChange {
+                                    label: input.label.clone(),
+                                    value_len: selected.chars().count(),
+                                    element_id: input.element_id.clone(),
+                                    value: selected,
+                                });
+                            }
+                        }
+                        CanvasInputKind::TextArea => {
+                            let mut value = input.value.clone();
+                            let response = ui.put(
+                                rect,
+                                egui::TextEdit::multiline(&mut value)
+                                    .hint_text(input.label.as_str())
+                                    .font(FontId::new(
+                                        input.font_size * scale,
+                                        browser_regular_family(),
+                                    ))
+                                    .text_color(input.color),
+                            );
+                            if response.hovered() {
+                                canvas_response.hovered = Some(HitTarget::Input {
+                                    label: input.label.clone(),
+                                    element_id: input.element_id.clone(),
+                                });
+                            }
+                            if response.changed() {
+                                input.value = value.clone();
+                                canvas_response.changed_inputs.push(InputChange {
+                                    label: input.label.clone(),
+                                    value_len: value.chars().count(),
+                                    element_id: input.element_id.clone(),
+                                    value,
+                                });
+                            }
+                        }
+                        CanvasInputKind::Text | CanvasInputKind::Password => {
+                            let password = matches!(input.kind, CanvasInputKind::Password);
+                            let mut value = input.value.clone();
+                            let response = ui.put(
+                                rect,
+                                egui::TextEdit::singleline(&mut value)
+                                    .hint_text(input.label.as_str())
+                                    .frame(false)
+                                    .password(password)
+                                    .font(FontId::new(
+                                        input.font_size * scale,
+                                        browser_regular_family(),
+                                    ))
+                                    .text_color(input.color),
+                            );
+                            if response.hovered() {
+                                canvas_response.hovered = Some(HitTarget::Input {
+                                    label: input.label.clone(),
+                                    element_id: input.element_id.clone(),
+                                });
+                            }
+                            if response.changed() {
+                                input.value = value.clone();
+                                canvas_response.changed_inputs.push(InputChange {
+                                    label: input.label.clone(),
+                                    value_len: value.chars().count(),
+                                    element_id: input.element_id.clone(),
+                                    value: value.clone(),
+                                });
+                            }
+                            if response.lost_focus()
+                                && ui.input(|state| state.key_pressed(egui::Key::Enter))
+                            {
+                                canvas_response.submitted_inputs.push(InputSubmit {
+                                    label: input.label.clone(),
+                                    name: input.name.clone(),
+                                    value,
+                                    form_action: input.form_action.clone(),
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -1337,6 +1471,18 @@ fn paint_canvas_graph(
                     FontId::new(14.0 * scale, browser_regular_family()),
                     Color32::from_rgb(90, 100, 110),
                 );
+            }
+        }
+    }
+    for (name, element_id) in selected_radios {
+        for object in &mut graph.objects {
+            if let CanvasObject::Input(radio) = object {
+                if matches!(&radio.kind, CanvasInputKind::Radio)
+                    && radio.name == name
+                    && radio.element_id != element_id
+                {
+                    radio.value = "false".to_owned();
+                }
             }
         }
     }
