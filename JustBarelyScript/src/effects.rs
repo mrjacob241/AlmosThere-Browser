@@ -33,6 +33,15 @@ pub enum BrowserEffect {
         level: String,
         text: String,
     },
+    NetworkRequest {
+        method: String,
+        url: String,
+        body: String,
+    },
+    RuntimeTrace {
+        kind: String,
+        detail: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -146,9 +155,22 @@ enum JsValue {
     NodeList(Vec<String>),
     StyleRef(String),
     StorageRef(StorageKind),
+    DocumentRef,
+    WindowRef,
+    NavigatorRef,
     CanvasContextRef(String),
     DateInstance,
     ResolvedPromise,
+    XhrInstance {
+        method: String,
+        url: String,
+        headers: HashMap<String, String>,
+    },
+    Proxy {
+        target: Box<JsValue>,
+        get: Option<JsFunction>,
+    },
+    WeakMap(HashMap<String, JsValue>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -291,7 +313,9 @@ impl BrowserExecutionState {
         obj.insert("mimeTypes".into(), JsValue::Array(vec![]));
 
         self.globals
-            .insert("navigator".into(), JsValue::Object(obj));
+            .insert("navigator".into(), JsValue::NavigatorRef);
+        self.globals
+            .insert("__navigatorData".into(), JsValue::Object(obj));
     }
 
     /// Seed the global `screen` object so scripts can read
@@ -329,6 +353,8 @@ impl BrowserExecutionState {
             "sessionStorage".into(),
             JsValue::StorageRef(StorageKind::Session),
         );
+        self.globals.insert("document".into(), JsValue::DocumentRef);
+        self.globals.insert("window".into(), JsValue::WindowRef);
     }
 
     /// Seed the precomputed browser fingerprint suite into JS-facing APIs.
@@ -560,6 +586,25 @@ impl BrowserExecutionState {
 
     pub fn drain_effects(&mut self) -> Vec<BrowserEffect> {
         self.effects.drain(..).collect()
+    }
+
+    fn trace_runtime(&mut self, kind: &str, detail: impl Into<String>) {
+        self.effects.push(BrowserEffect::RuntimeTrace {
+            kind: kind.to_owned(),
+            detail: detail.into(),
+        });
+    }
+
+    fn emit_network_request(&mut self, method: &str, url: String, body: String) {
+        self.effects.push(BrowserEffect::RuntimeTrace {
+            kind: "network.request".to_owned(),
+            detail: format!("{} {} body_bytes={}", method, url, body.len()),
+        });
+        self.effects.push(BrowserEffect::NetworkRequest {
+            method: method.to_owned(),
+            url,
+            body,
+        });
     }
 
     fn execute_statement(&mut self, statement: &Statement) {
@@ -1026,10 +1071,50 @@ impl BrowserExecutionState {
             }
             Expression::Delete(_) => JsValue::Boolean(true),
             Expression::Await(expr) => self.execute_expression(expr),
-            Expression::New { callee, .. } => {
+            Expression::New { callee, arguments } => {
                 if matches!(callee.as_ref(), Expression::Identifier(name) if name == "Date") {
                     JsValue::DateInstance
+                } else if matches!(callee.as_ref(), Expression::Identifier(name) if name == "XMLHttpRequest")
+                {
+                    self.trace_runtime("xhr.new", "XMLHttpRequest");
+                    JsValue::XhrInstance {
+                        method: "GET".to_owned(),
+                        url: String::new(),
+                        headers: HashMap::new(),
+                    }
+                } else if matches!(callee.as_ref(), Expression::Identifier(name) if name == "Promise")
+                {
+                    self.trace_runtime(
+                        "promise.new",
+                        "Promise constructor approximated as resolved",
+                    );
+                    for argument in arguments {
+                        self.execute_expression(argument);
+                    }
+                    JsValue::ResolvedPromise
+                } else if matches!(callee.as_ref(), Expression::Identifier(name) if name == "Proxy")
+                {
+                    let mut args = self.eval_args(arguments);
+                    let target = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+                    let get = args.get_mut(1).and_then(|handler| {
+                        if let JsValue::Object(map) = handler {
+                            match map.get("get") {
+                                Some(JsValue::Function(func)) => Some(func.clone()),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    });
+                    JsValue::Proxy {
+                        target: Box::new(target),
+                        get,
+                    }
+                } else if matches!(callee.as_ref(), Expression::Identifier(name) if name == "WeakMap" || name == "Map")
+                {
+                    JsValue::WeakMap(HashMap::new())
                 } else {
+                    self.trace_runtime("unsupported.constructor", format!("{:?}", callee.as_ref()));
                     JsValue::Undefined
                 }
             }
@@ -1087,6 +1172,31 @@ impl BrowserExecutionState {
                     return JsValue::Undefined;
                 }
             }
+        }
+
+        if matches!(callee, Expression::Identifier(name) if name == "fetch") {
+            let url = arguments
+                .first()
+                .map(|argument| self.execute_expression(argument))
+                .map(|value| Self::value_to_string(&value))
+                .unwrap_or_default();
+            let mut method = "GET".to_owned();
+            let mut body = String::new();
+            if let Some(options) = arguments
+                .get(1)
+                .map(|argument| self.execute_expression(argument))
+            {
+                if let JsValue::Object(map) = options {
+                    if let Some(value) = map.get("method") {
+                        method = Self::value_to_string(value).to_ascii_uppercase();
+                    }
+                    if let Some(value) = map.get("body") {
+                        body = Self::value_to_string(value);
+                    }
+                }
+            }
+            self.emit_network_request(&method, url, body);
+            return JsValue::ResolvedPromise;
         }
 
         if matches!(callee, Expression::Identifier(name) if name == "setTimeout") {
@@ -1175,6 +1285,22 @@ impl BrowserExecutionState {
                         .unwrap_or_else(|| "div".to_owned());
                     return self.create_element(tag_name);
                 }
+                "createTextNode" if method.receiver == MethodReceiver::Document => {
+                    let text = arguments
+                        .first()
+                        .map(|argument| self.execute_expression(argument))
+                        .map(|value| Self::value_to_string(&value))
+                        .unwrap_or_default();
+                    return self.create_text_node(text);
+                }
+                "createComment" if method.receiver == MethodReceiver::Document => {
+                    let text = arguments
+                        .first()
+                        .map(|argument| self.execute_expression(argument))
+                        .map(|value| Self::value_to_string(&value))
+                        .unwrap_or_default();
+                    return self.create_comment_node(text);
+                }
                 "getElementById" if method.receiver == MethodReceiver::Document => {
                     let id = arguments
                         .first()
@@ -1211,6 +1337,30 @@ impl BrowserExecutionState {
                         (parent, child)
                     {
                         self.append_child(&parent_ref, &child_ref);
+                    }
+                    return JsValue::Undefined;
+                }
+                "insertBefore" => {
+                    let parent = self.execute_expression(&method.object);
+                    let child = arguments
+                        .first()
+                        .map(|argument| self.execute_expression(argument));
+                    if let (JsValue::ElementRef(parent_ref), Some(JsValue::ElementRef(child_ref))) =
+                        (parent, child)
+                    {
+                        self.insert_before(&parent_ref, &child_ref);
+                    }
+                    return JsValue::Undefined;
+                }
+                "removeChild" => {
+                    let parent = self.execute_expression(&method.object);
+                    let child = arguments
+                        .first()
+                        .map(|argument| self.execute_expression(argument));
+                    if let (JsValue::ElementRef(parent_ref), Some(JsValue::ElementRef(child_ref))) =
+                        (parent, child)
+                    {
+                        self.remove_child(&parent_ref, &child_ref);
                     }
                     return JsValue::Undefined;
                 }
@@ -1286,6 +1436,19 @@ impl BrowserExecutionState {
                     return JsValue::Undefined;
                 }
                 _ => {}
+            }
+        }
+
+        if let Expression::Member {
+            object,
+            property: MemberProperty::Named(method_name),
+            ..
+        } = callee
+        {
+            if matches!(object.as_ref(), Expression::Identifier(name) if name == "Object")
+                && method_name == "defineProperty"
+            {
+                return self.call_object_define_property(arguments);
             }
         }
 
@@ -1512,6 +1675,197 @@ impl BrowserExecutionState {
                 return self.call_storage_method(kind, &method_name, arguments);
             }
 
+            if matches!(receiver, JsValue::DocumentRef) {
+                match method_name.as_str() {
+                    "createElement" => {
+                        let tag_name = arguments
+                            .first()
+                            .map(|argument| self.execute_expression(argument))
+                            .map(|value| Self::value_to_string(&value))
+                            .unwrap_or_else(|| "div".to_owned());
+                        return self.create_element(tag_name);
+                    }
+                    "createTextNode" => {
+                        let text = arguments
+                            .first()
+                            .map(|argument| self.execute_expression(argument))
+                            .map(|value| Self::value_to_string(&value))
+                            .unwrap_or_default();
+                        return self.create_text_node(text);
+                    }
+                    "createComment" => {
+                        let text = arguments
+                            .first()
+                            .map(|argument| self.execute_expression(argument))
+                            .map(|value| Self::value_to_string(&value))
+                            .unwrap_or_default();
+                        return self.create_comment_node(text);
+                    }
+                    "getElementById" => {
+                        let id = arguments
+                            .first()
+                            .map(|argument| self.execute_expression(argument))
+                            .map(|value| Self::value_to_string(&value))
+                            .unwrap_or_default();
+                        return JsValue::ElementRef(existing_element_ref(&id));
+                    }
+                    "getElementsByTagName" => {
+                        let tag = arguments
+                            .first()
+                            .map(|argument| self.execute_expression(argument))
+                            .map(|value| Self::value_to_string(&value).to_ascii_lowercase())
+                            .unwrap_or_default();
+                        let ids = match tag.as_str() {
+                            "body" => vec![existing_element_ref("body")],
+                            "head" => vec![existing_element_ref("head")],
+                            "html" => vec![existing_element_ref("html")],
+                            _ => Vec::new(),
+                        };
+                        return JsValue::Array(ids.into_iter().map(JsValue::ElementRef).collect());
+                    }
+                    "addEventListener" => {
+                        let event_type = arguments
+                            .first()
+                            .map(|a| self.execute_expression(a))
+                            .map(|v| Self::value_to_string(&v))
+                            .unwrap_or_default();
+                        if event_type == "DOMContentLoaded" {
+                            if let Some(Expression::Function(func)) = arguments.get(1) {
+                                self.pending_microtasks.push(PendingMicrotask {
+                                    params: func
+                                        .params
+                                        .iter()
+                                        .map(|p| p.name().to_owned())
+                                        .collect(),
+                                    body: func.body.clone(),
+                                });
+                            }
+                        }
+                        return JsValue::Undefined;
+                    }
+                    _ => {}
+                }
+            }
+
+            if matches!(receiver, JsValue::NavigatorRef) {
+                if method_name == "javaEnabled" {
+                    for arg in arguments {
+                        self.execute_expression(arg);
+                    }
+                    return JsValue::Boolean(false);
+                }
+            }
+
+            if let JsValue::XhrInstance {
+                mut method,
+                mut url,
+                mut headers,
+            } = receiver.clone()
+            {
+                match method_name.as_str() {
+                    "open" => {
+                        method = arguments
+                            .first()
+                            .map(|argument| self.execute_expression(argument))
+                            .map(|value| Self::value_to_string(&value).to_ascii_uppercase())
+                            .unwrap_or_else(|| "GET".to_owned());
+                        url = arguments
+                            .get(1)
+                            .map(|argument| self.execute_expression(argument))
+                            .map(|value| Self::value_to_string(&value))
+                            .unwrap_or_default();
+                        self.trace_runtime("xhr.open", format!("{method} {url}"));
+                        self.assign_target(
+                            object,
+                            JsValue::XhrInstance {
+                                method,
+                                url,
+                                headers,
+                            },
+                        );
+                        return JsValue::Undefined;
+                    }
+                    "setRequestHeader" => {
+                        let name = arguments
+                            .first()
+                            .map(|argument| self.execute_expression(argument))
+                            .map(|value| Self::value_to_string(&value))
+                            .unwrap_or_default();
+                        let value = arguments
+                            .get(1)
+                            .map(|argument| self.execute_expression(argument))
+                            .map(|value| Self::value_to_string(&value))
+                            .unwrap_or_default();
+                        headers.insert(name.clone(), value);
+                        self.trace_runtime("xhr.header", name);
+                        self.assign_target(
+                            object,
+                            JsValue::XhrInstance {
+                                method,
+                                url,
+                                headers,
+                            },
+                        );
+                        return JsValue::Undefined;
+                    }
+                    "send" => {
+                        let body = arguments
+                            .first()
+                            .map(|argument| self.execute_expression(argument))
+                            .map(|value| Self::value_to_string(&value))
+                            .unwrap_or_default();
+                        self.emit_network_request(&method, url, body);
+                        return JsValue::Undefined;
+                    }
+                    _ => {}
+                }
+            }
+
+            if let JsValue::WeakMap(mut map) = receiver.clone() {
+                match method_name.as_str() {
+                    "set" => {
+                        let key = arguments
+                            .first()
+                            .map(|argument| self.execute_expression(argument))
+                            .unwrap_or(JsValue::Undefined);
+                        let value = arguments
+                            .get(1)
+                            .map(|argument| self.execute_expression(argument))
+                            .unwrap_or(JsValue::Undefined);
+                        map.insert(Self::weak_map_key(&key), value);
+                        self.assign_target(object, JsValue::WeakMap(map));
+                        return receiver;
+                    }
+                    "get" => {
+                        let key = arguments
+                            .first()
+                            .map(|argument| self.execute_expression(argument))
+                            .unwrap_or(JsValue::Undefined);
+                        return map
+                            .get(&Self::weak_map_key(&key))
+                            .cloned()
+                            .unwrap_or(JsValue::Undefined);
+                    }
+                    "has" => {
+                        let key = arguments
+                            .first()
+                            .map(|argument| self.execute_expression(argument))
+                            .unwrap_or(JsValue::Undefined);
+                        return JsValue::Boolean(map.contains_key(&Self::weak_map_key(&key)));
+                    }
+                    "delete" => {
+                        let key = arguments
+                            .first()
+                            .map(|argument| self.execute_expression(argument))
+                            .unwrap_or(JsValue::Undefined);
+                        let removed = map.remove(&Self::weak_map_key(&key)).is_some();
+                        self.assign_target(object, JsValue::WeakMap(map));
+                        return JsValue::Boolean(removed);
+                    }
+                    _ => {}
+                }
+            }
+
             if matches!(receiver, JsValue::DateInstance) {
                 if method_name == "getTimezoneOffset" {
                     let offset = self
@@ -1585,13 +1939,13 @@ impl BrowserExecutionState {
                     "call" => {
                         // func.call(thisArg, arg1, arg2, ...) — skip thisArg
                         let args = self.eval_args(arguments);
-                        let real_args =
-                            if args.is_empty() { vec![] } else { args[1..].to_vec() };
-                        let real_exprs: Vec<Expression> = arguments
-                            .iter()
-                            .skip(1)
-                            .cloned()
-                            .collect();
+                        let real_args = if args.is_empty() {
+                            vec![]
+                        } else {
+                            args[1..].to_vec()
+                        };
+                        let real_exprs: Vec<Expression> =
+                            arguments.iter().skip(1).cloned().collect();
                         return self.call_function_with_writeback(func, real_args, &real_exprs);
                     }
                     "apply" => {
@@ -1633,7 +1987,11 @@ impl BrowserExecutionState {
                     return JsValue::Boolean(map.contains_key(&key));
                 }
             }
-            // Evaluated receiver but method not found — still evaluate args for side effects
+            // Evaluated receiver but method not found; trace it and still evaluate args for side effects.
+            self.trace_runtime(
+                "unsupported.method",
+                format!("{} on {}", method_name, Self::value_to_string(&receiver)),
+            );
             for arg in arguments {
                 self.execute_expression(arg);
             }
@@ -1644,6 +2002,12 @@ impl BrowserExecutionState {
         let args = self.eval_args(arguments);
         if let JsValue::Function(func) = func_val {
             return self.call_function(func, args);
+        }
+        if !matches!(func_val, JsValue::Undefined | JsValue::Null) {
+            self.trace_runtime(
+                "unsupported.call",
+                format!("callee={}", Self::value_to_string(&func_val)),
+            );
         }
         JsValue::Undefined
     }
@@ -1797,6 +2161,35 @@ impl BrowserExecutionState {
         }
     }
 
+    fn call_object_define_property(&mut self, arguments: &[Expression]) -> JsValue {
+        let Some(target_expr) = arguments.first() else {
+            return JsValue::Undefined;
+        };
+        let mut target = self.execute_expression(target_expr);
+        let key = arguments
+            .get(1)
+            .map(|argument| self.execute_expression(argument))
+            .map(|value| Self::value_to_string(&value))
+            .unwrap_or_default();
+        let descriptor = arguments
+            .get(2)
+            .map(|argument| self.execute_expression(argument))
+            .unwrap_or(JsValue::Undefined);
+
+        if let (JsValue::Object(map), JsValue::Object(desc)) = (&mut target, descriptor) {
+            if let Some(val) = desc.get("value") {
+                map.insert(key, val.clone());
+            } else if let Some(JsValue::Function(getter)) = desc.get("get").cloned() {
+                let value = self.call_function(getter, vec![]);
+                map.insert(key, value);
+            }
+            self.assign_target(target_expr, target.clone());
+            target
+        } else {
+            JsValue::Undefined
+        }
+    }
+
     fn call_object_static(&mut self, name: &str, args: Vec<JsValue>) -> JsValue {
         match name {
             "keys" => {
@@ -1879,10 +2272,12 @@ impl BrowserExecutionState {
                     JsValue::Undefined
                 }
             }
-            "defineProperties" | "getOwnPropertyDescriptor" | "getOwnPropertyNames"
-            | "getOwnPropertySymbols" | "getPrototypeOf" | "setPrototypeOf" => {
-                args.into_iter().next().unwrap_or(JsValue::Undefined)
-            }
+            "defineProperties"
+            | "getOwnPropertyDescriptor"
+            | "getOwnPropertyNames"
+            | "getOwnPropertySymbols"
+            | "getPrototypeOf"
+            | "setPrototypeOf" => args.into_iter().next().unwrap_or(JsValue::Undefined),
             "create" => JsValue::Object(HashMap::new()), // ignore prototype arg
             "freeze" | "seal" | "preventExtensions" => {
                 args.into_iter().next().unwrap_or(JsValue::Undefined)
@@ -2797,6 +3192,10 @@ impl BrowserExecutionState {
                 let receiver = self.execute_expression(object);
                 let index = self.execute_expression(index_expr);
                 match receiver {
+                    JsValue::Proxy { target, get } => {
+                        let key = Self::value_to_string(&index);
+                        self.proxy_get_property(*target, get, &key)
+                    }
                     JsValue::Array(items) => {
                         let idx = Self::value_to_number(&index);
                         if idx >= 0.0 && idx.fract() == 0.0 {
@@ -2833,6 +3232,15 @@ impl BrowserExecutionState {
                         "document" if property == "body" => {
                             return JsValue::ElementRef(existing_element_ref("body"));
                         }
+                        "document" if property == "head" => {
+                            return JsValue::ElementRef(existing_element_ref("head"));
+                        }
+                        "document" if property == "documentElement" => {
+                            return JsValue::ElementRef(existing_element_ref("html"));
+                        }
+                        "window" if property == "ActiveXObject" => {
+                            return JsValue::Undefined;
+                        }
                         "Math" => {
                             return match property.as_str() {
                                 "PI" => JsValue::Number(std::f64::consts::PI),
@@ -2865,6 +3273,9 @@ impl BrowserExecutionState {
 
                 let receiver = self.execute_expression(object);
                 match receiver {
+                    JsValue::Proxy { target, get } => {
+                        self.proxy_get_property(*target, get, property)
+                    }
                     JsValue::String(ref s) if property == "length" => {
                         JsValue::Number(s.chars().count() as f64)
                     }
@@ -2896,6 +3307,33 @@ impl BrowserExecutionState {
                             )
                         }
                     }
+                    JsValue::DocumentRef => {
+                        if property == "body" {
+                            JsValue::ElementRef(existing_element_ref("body"))
+                        } else if property == "head" {
+                            JsValue::ElementRef(existing_element_ref("head"))
+                        } else if property == "documentElement" {
+                            JsValue::ElementRef(existing_element_ref("html"))
+                        } else {
+                            JsValue::Undefined
+                        }
+                    }
+                    JsValue::NavigatorRef => self
+                        .globals
+                        .get("__navigatorData")
+                        .and_then(|value| {
+                            if let JsValue::Object(map) = value {
+                                map.get(property).cloned()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(JsValue::Undefined),
+                    JsValue::WindowRef => self
+                        .globals
+                        .get(property)
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined),
                     JsValue::StyleRef(element_id) => {
                         let element_ref = existing_element_ref(&element_id);
                         let inline = self
@@ -2943,6 +3381,22 @@ impl BrowserExecutionState {
         }
     }
 
+    fn proxy_get_property(
+        &mut self,
+        target: JsValue,
+        get: Option<JsFunction>,
+        property: &str,
+    ) -> JsValue {
+        if let Some(getter) = get {
+            return self.call_function(getter, vec![target, JsValue::String(property.to_owned())]);
+        }
+        match target {
+            JsValue::Object(map) => map.get(property).cloned().unwrap_or(JsValue::Undefined),
+            JsValue::Array(items) if property == "length" => JsValue::Number(items.len() as f64),
+            _ => JsValue::Undefined,
+        }
+    }
+
     fn create_element(&mut self, tag_name: String) -> JsValue {
         self.dom.next_created_id += 1;
         let element_ref = format!("created:{}", self.dom.next_created_id);
@@ -2950,6 +3404,34 @@ impl BrowserExecutionState {
             element_ref.clone(),
             DomElementSnapshot {
                 tag_name,
+                ..Default::default()
+            },
+        );
+        JsValue::ElementRef(element_ref)
+    }
+
+    fn create_text_node(&mut self, text_content: String) -> JsValue {
+        self.dom.next_created_id += 1;
+        let element_ref = format!("created:{}", self.dom.next_created_id);
+        self.dom.created_elements.insert(
+            element_ref.clone(),
+            DomElementSnapshot {
+                tag_name: "#text".to_owned(),
+                text_content,
+                ..Default::default()
+            },
+        );
+        JsValue::ElementRef(element_ref)
+    }
+
+    fn create_comment_node(&mut self, text_content: String) -> JsValue {
+        self.dom.next_created_id += 1;
+        let element_ref = format!("created:{}", self.dom.next_created_id);
+        self.dom.created_elements.insert(
+            element_ref.clone(),
+            DomElementSnapshot {
+                tag_name: "#comment".to_owned(),
+                text_content,
                 ..Default::default()
             },
         );
@@ -2964,6 +3446,15 @@ impl BrowserExecutionState {
             self.effects
                 .push(BrowserEffect::AppendChild { parent_id, child });
         }
+    }
+
+    fn insert_before(&mut self, parent_ref: &str, child_ref: &str) {
+        self.append_child(parent_ref, child_ref);
+    }
+
+    fn remove_child(&mut self, _parent_ref: &str, _child_ref: &str) {
+        // No explicit remove effect exists yet; consuming the call lets renderers
+        // continue through Vue/React mount sequences that manage anchor nodes.
     }
 
     fn set_element_text_content(&mut self, element_ref: &str, value: String) {
@@ -3316,8 +3807,8 @@ impl BrowserExecutionState {
                     as i32) as f64,
             ),
             BinaryOperator::UnsignedShiftRight => JsValue::Number(
-                (((Self::value_to_number(&lv) as u32) >> (Self::value_to_number(&rv) as u32 & 31))
-                    ) as f64,
+                ((Self::value_to_number(&lv) as u32) >> (Self::value_to_number(&rv) as u32 & 31))
+                    as f64,
             ),
             BinaryOperator::Exponent => {
                 JsValue::Number(Self::value_to_number(&lv).powf(Self::value_to_number(&rv)))
@@ -3350,9 +3841,15 @@ impl BrowserExecutionState {
             | JsValue::NodeList(_)
             | JsValue::StyleRef(_)
             | JsValue::StorageRef(_)
+            | JsValue::DocumentRef
+            | JsValue::WindowRef
+            | JsValue::NavigatorRef
             | JsValue::CanvasContextRef(_)
             | JsValue::DateInstance
-            | JsValue::ResolvedPromise => true,
+            | JsValue::ResolvedPromise
+            | JsValue::XhrInstance { .. }
+            | JsValue::Proxy { .. }
+            | JsValue::WeakMap(_) => true,
         }
     }
 
@@ -3372,9 +3869,31 @@ impl BrowserExecutionState {
             | JsValue::NodeList(_)
             | JsValue::StyleRef(_)
             | JsValue::StorageRef(_)
+            | JsValue::DocumentRef
+            | JsValue::WindowRef
+            | JsValue::NavigatorRef
             | JsValue::CanvasContextRef(_)
             | JsValue::DateInstance
-            | JsValue::ResolvedPromise => f64::NAN,
+            | JsValue::ResolvedPromise
+            | JsValue::XhrInstance { .. }
+            | JsValue::Proxy { .. }
+            | JsValue::WeakMap(_) => f64::NAN,
+        }
+    }
+
+    fn weak_map_key(value: &JsValue) -> String {
+        match value {
+            JsValue::Object(map) => {
+                let mut pairs: Vec<_> = map.iter().collect();
+                pairs.sort_by(|a, b| a.0.cmp(b.0));
+                let body = pairs
+                    .into_iter()
+                    .map(|(key, value)| format!("{key}:{}", Self::value_to_string(value)))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("object:{{{body}}}")
+            }
+            _ => Self::value_to_string(value),
         }
     }
 
@@ -3428,9 +3947,15 @@ impl BrowserExecutionState {
             JsValue::NodeList(_) => "[object NodeList]".to_owned(),
             JsValue::StyleRef(_) => "[object CSSStyleDeclaration]".to_owned(),
             JsValue::StorageRef(_) => "[object Storage]".to_owned(),
+            JsValue::DocumentRef => "[object Document]".to_owned(),
+            JsValue::WindowRef => "[object Window]".to_owned(),
+            JsValue::NavigatorRef => "[object Navigator]".to_owned(),
             JsValue::CanvasContextRef(_) => "[object CanvasRenderingContext]".to_owned(),
             JsValue::DateInstance => "[object Date]".to_owned(),
             JsValue::ResolvedPromise => "[object Promise]".to_owned(),
+            JsValue::XhrInstance { .. } => "[object XMLHttpRequest]".to_owned(),
+            JsValue::Proxy { .. } => "[object Object]".to_owned(),
+            JsValue::WeakMap(_) => "[object WeakMap]".to_owned(),
         }
     }
 
@@ -3673,7 +4198,7 @@ fn existing_id_from_ref(element_ref: &str) -> Option<String> {
 }
 
 fn dom_property_is_text_content(property: &str) -> bool {
-    matches!(property, "textContent" | "innerText")
+    matches!(property, "textContent" | "innerText" | "nodeValue")
 }
 
 fn dom_property_is_inner_html(property: &str) -> bool {
@@ -3864,9 +4389,15 @@ fn json_stringify(value: &JsValue) -> String {
         | JsValue::NodeList(_)
         | JsValue::StyleRef(_)
         | JsValue::StorageRef(_)
+        | JsValue::DocumentRef
+        | JsValue::WindowRef
+        | JsValue::NavigatorRef
         | JsValue::CanvasContextRef(_)
         | JsValue::DateInstance
-        | JsValue::ResolvedPromise => "null".to_owned(),
+        | JsValue::ResolvedPromise
+        | JsValue::XhrInstance { .. }
+        | JsValue::Proxy { .. }
+        | JsValue::WeakMap(_) => "null".to_owned(),
     }
 }
 
@@ -4958,11 +5489,17 @@ mod tests {
             var bound = greet.bind(null);
             bound("x", "y");
         "#);
-        assert_eq!(effects, vec![
-            text("a", "hello"), text("b", "world"),
-            text("a", "foo"), text("b", "bar"),
-            text("a", "x"), text("b", "y"),
-        ]);
+        assert_eq!(
+            effects,
+            vec![
+                text("a", "hello"),
+                text("b", "world"),
+                text("a", "foo"),
+                text("b", "bar"),
+                text("a", "x"),
+                text("b", "y"),
+            ]
+        );
     }
 
     #[test]
@@ -5032,5 +5569,134 @@ mod tests {
             document.getElementById("b").textContent = data.y;
         "#);
         assert_eq!(effects, vec![text("a", "hello"), text("b", "world")]);
+    }
+
+    // AMIUnique / Nuxt bootstrap hypotheses.
+
+    #[test]
+    fn t061_webpack_jsonp_factory_pipeline_reaches_module_effect() {
+        // Composes the current Webpack pieces: JSONP push override, module table
+        // lookup, factory.call(...), exports write-back, and a final DOM effect.
+        // If this regresses, AMIUnique can stop before Vue/Nuxt bootstrap begins.
+        let effects = run(r#"
+            window.webpackJsonp = [];
+            window.webpackJsonp.push = function(chunk) {
+                var factories = chunk[1];
+                var module = { exports: {} };
+                factories.entry.call(module.exports, module, module.exports, function(id) {
+                    return factories[id];
+                });
+                document.getElementById("app").textContent = module.exports.value;
+            };
+            (window.webpackJsonp = window.webpackJsonp || []).push([["app"], {
+                entry: function(module, exports, require) {
+                    exports.value = "mounted";
+                }
+            }]);
+        "#);
+        assert_eq!(effects, vec![text("app", "mounted")]);
+    }
+
+    #[test]
+    fn t062_vue_mount_dom_primitives_create_and_insert_nodes() {
+        // Vue renderers commonly build text/comment nodes and insert/remove them
+        // around a mount anchor. This should eventually emit an append/insert-like
+        // DOM effect or equivalent durable DOM mutation.
+        let effects = run(r#"
+            var root = document.getElementById("app");
+            var textNode = document.createTextNode("hello");
+            var marker = document.createComment("anchor");
+            root.appendChild(marker);
+            root.insertBefore(textNode, marker);
+            root.removeChild(marker);
+        "#);
+        assert!(
+            !effects.is_empty(),
+            "Vue-style DOM node creation/insertion produced no effects"
+        );
+    }
+
+    #[test]
+    fn t063_object_define_property_persists_to_original_target() {
+        // Webpack and Vue define exports, getters, and flags via descriptors.
+        // Returning a modified clone is not enough; later reads of the original
+        // object must see the descriptor value.
+        let effects = run(r#"
+            var exports = {};
+            Object.defineProperty(exports, "answer", { value: "ok" });
+            document.getElementById("result").textContent = exports.answer;
+        "#);
+        assert_eq!(effects, vec![text("result", "ok")]);
+    }
+
+    #[test]
+    fn t064_fetch_then_callback_can_update_dom() {
+        // AMIUnique's bundles contain fetch/axios/XHR paths. A minimal host bridge
+        // should return a thenable/resolved promise so collector chains can progress
+        // instead of disappearing as undefined/no-op calls.
+        let effects = run(r#"
+            fetch("/fingerprint").then(function(response) {
+                document.getElementById("result").textContent = "fetched";
+            });
+        "#);
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                BrowserEffect::NetworkRequest { method, url, .. }
+                    if method == "GET" && url == "/fingerprint"
+            )),
+            "fetch should emit a network request effect: {effects:?}"
+        );
+        assert!(
+            effects.contains(&text("result", "fetched")),
+            "fetch callback should still update the DOM: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn t064b_xml_http_request_send_emits_network_trace() {
+        let effects = run(r#"
+            var xhr = new XMLHttpRequest();
+            xhr.open("POST", "/collect");
+            xhr.setRequestHeader("content-type", "application/json");
+            xhr.send("{\"ok\":true}");
+        "#);
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                BrowserEffect::RuntimeTrace { kind, detail }
+                    if kind == "xhr.open" && detail == "POST /collect"
+            )),
+            "XHR open should be traced: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                BrowserEffect::NetworkRequest { method, url, body }
+                    if method == "POST" && url == "/collect" && body == "{\"ok\":true}"
+            )),
+            "XHR send should emit a network request effect: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn t065_proxy_and_weakmap_basic_semantics() {
+        // The AMIUnique Nuxt chunks reference Proxy and WeakMap. This smoke test
+        // captures the minimum behavior needed before those constructs can be
+        // trusted in real-world bundles.
+        let effects = run(r#"
+            var target = { name: "Alice" };
+            var proxy = new Proxy(target, {
+                get: function(obj, prop) {
+                    if (obj[prop] === undefined) { return "missing"; }
+                    return obj[prop];
+                }
+            });
+            var map = new WeakMap();
+            map.set(target, "stored");
+            document.getElementById("result").textContent =
+                proxy.name + "/" + proxy.unknown + "/" + map.get(target);
+        "#);
+        assert_eq!(effects, vec![text("result", "Alice/missing/stored")]);
     }
 }
