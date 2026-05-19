@@ -16,11 +16,11 @@ use rich_canvas::{
     BrowserCanvas, BrowserCanvasResponse, BrowserDocument, BrowserStyle, CanvasBlock,
     CanvasButtonObject, CanvasClipObject, CanvasGraph, CanvasImageObject, CanvasInputKind,
     CanvasInputObject, CanvasMediaObject, CanvasObject, CanvasRectObject, CanvasSvgObject,
-    CanvasTextObject,
-    CssAlignItems, CssBoxStyle, CssDisplay, CssEdges, CssFlexDirection, CssJustifyContent,
-    CssLength, CssObjectFit, CssPosition, CssTextAlign, ElementStyleKey, HitTarget, ImageBlock,
-    InlineSpan, ResolvedBoxStyle, SvgBlock, SvgShape, computed_box_style, configure_browser_fonts,
-    parse_basic_css_for_viewport_with_root_classes, parse_inline_box_style, wrap_browser_textboxes,
+    CanvasTextObject, CssAlignItems, CssBoxStyle, CssDisplay, CssEdges, CssFlexDirection,
+    CssJustifyContent, CssLength, CssObjectFit, CssPosition, CssTextAlign, ElementStyleKey,
+    HitTarget, ImageBlock, InlineSpan, ResolvedBoxStyle, SvgBlock, SvgShape, computed_box_style,
+    configure_browser_fonts, parse_basic_css_for_viewport_with_root_classes,
+    parse_inline_box_style, wrap_browser_textboxes,
 };
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
 
@@ -33,6 +33,7 @@ const DEFAULT_URL: &str = "https://latex.vercel.app/elements";
 const BOOKMARKS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bookmarks.txt");
 const DEBUG_EXPORT_DIR: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/../target/render_debug_export");
+const URL_SCREENSHOTS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/url_screenshots");
 const DEFAULT_BOOKMARK_TITLE: &str = "AlmostThere Sample Page";
 const DEFAULT_URL_BOOKMARK_TITLE: &str = "HTML5 Test Page";
 const LOCAL_BOOKMARK_TOKEN: &str = "[local]";
@@ -352,6 +353,13 @@ impl AlmostThereApp {
                     Some(&source.source),
                 );
                 let live_js_debug_text = live_js_debug_report(&source.html, Some(&source.source));
+                if config.record_events {
+                    write_recorded_live_js_debug_artifact(
+                        &telemetry,
+                        &source.source,
+                        &live_js_debug_text,
+                    );
+                }
                 telemetry.emit(
                     "navigation.loaded",
                     &[
@@ -544,6 +552,13 @@ impl AlmostThereApp {
                         );
                         self.live_js_debug_text =
                             live_js_debug_report(&source.html, Some(&source.source));
+                        if self.record_events {
+                            write_recorded_live_js_debug_artifact(
+                                &self.telemetry,
+                                &source.source,
+                                &self.live_js_debug_text,
+                            );
+                        }
                         self.telemetry.emit(
                             "navigation.live_js_debug.completed",
                             &[
@@ -829,6 +844,19 @@ impl AlmostThereApp {
                             text,
                         });
                 }
+                justbarelyscript::BrowserEffect::NetworkRequest { method, url, body } => {
+                    self.perform_script_network_request(&method, &url, &body);
+                }
+                justbarelyscript::BrowserEffect::RuntimeTrace { kind, detail } => {
+                    self.telemetry.emit(
+                        "js.runtime.trace",
+                        &[
+                            ("kind", &kind),
+                            ("detail", &detail),
+                            ("url", &self.document.source),
+                        ],
+                    );
+                }
             }
         }
 
@@ -850,6 +878,58 @@ impl AlmostThereApp {
         }
 
         ctx.request_repaint();
+    }
+
+    fn perform_script_network_request(&mut self, method: &str, url: &str, body: &str) {
+        let resolved = resolve_resource_url(&self.document.source, url);
+        let body_bytes = body.len().to_string();
+        self.telemetry.emit(
+            "js.network.request",
+            &[
+                ("method", method),
+                ("url", &resolved),
+                ("body_bytes", &body_bytes),
+                ("page_url", &self.document.source),
+            ],
+        );
+
+        let client = match http_client() {
+            Ok(client) => client,
+            Err(error) => {
+                self.telemetry.emit(
+                    "js.network.failed",
+                    &[("url", &resolved), ("error", &error.to_string())],
+                );
+                return;
+            }
+        };
+
+        let response = match method.to_ascii_uppercase().as_str() {
+            "POST" => client.post(&resolved).body(body.to_owned()).send(),
+            "PUT" => client.put(&resolved).body(body.to_owned()).send(),
+            "DELETE" => client.delete(&resolved).send(),
+            _ => client.get(&resolved).send(),
+        };
+
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16().to_string();
+                let bytes = response
+                    .text()
+                    .map(|text| text.len().to_string())
+                    .unwrap_or_else(|_| "0".to_owned());
+                self.telemetry.emit(
+                    "js.network.completed",
+                    &[("url", &resolved), ("status", &status), ("bytes", &bytes)],
+                );
+            }
+            Err(error) => {
+                self.telemetry.emit(
+                    "js.network.failed",
+                    &[("url", &resolved), ("error", &error.to_string())],
+                );
+            }
+        }
     }
 
     fn debug_canvas_graph(&self) -> CanvasGraph {
@@ -1982,6 +2062,45 @@ fn live_js_debug_report(html: &str, source: Option<&str>) -> String {
                     effect_count,
                     browser_effect_summary(&effects)
                 ));
+                for effect in effects.iter().take(8) {
+                    match effect {
+                        justbarelyscript::BrowserEffect::RuntimeTrace { kind, detail } => {
+                            out.push_str(&format!("   trace: {kind}: {detail}\n"));
+                            emit_global_telemetry(
+                                "js.runtime.trace",
+                                &[
+                                    ("phase", "live_js_debug"),
+                                    ("label", &script.label),
+                                    ("kind", kind),
+                                    ("detail", detail),
+                                ],
+                            );
+                        }
+                        justbarelyscript::BrowserEffect::NetworkRequest { method, url, body } => {
+                            out.push_str(&format!(
+                                "   network: {method} {url} body_bytes={}\n",
+                                body.len()
+                            ));
+                            emit_global_telemetry(
+                                "js.network.request",
+                                &[
+                                    ("phase", "live_js_debug"),
+                                    ("label", &script.label),
+                                    ("method", method),
+                                    ("url", url),
+                                    ("body_bytes", &body.len().to_string()),
+                                ],
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                if effects.len() > 8 {
+                    out.push_str(&format!(
+                        "   trace: ... {} additional effect(s) omitted\n",
+                        effects.len() - 8
+                    ));
+                }
                 if state.execution_budget_exhausted() {
                     budget_exhausted += 1;
                     out.push_str(
@@ -2043,6 +2162,8 @@ fn browser_effect_summary(effects: &[justbarelyscript::BrowserEffect]) -> String
     let mut html = 0usize;
     let mut append = 0usize;
     let mut console = 0usize;
+    let mut network = 0usize;
+    let mut trace = 0usize;
     for effect in effects {
         match effect {
             justbarelyscript::BrowserEffect::SetTextContent { .. } => text += 1,
@@ -2050,9 +2171,13 @@ fn browser_effect_summary(effects: &[justbarelyscript::BrowserEffect]) -> String
             justbarelyscript::BrowserEffect::SetInnerHtml { .. } => html += 1,
             justbarelyscript::BrowserEffect::AppendChild { .. } => append += 1,
             justbarelyscript::BrowserEffect::ConsoleLog { .. } => console += 1,
+            justbarelyscript::BrowserEffect::NetworkRequest { .. } => network += 1,
+            justbarelyscript::BrowserEffect::RuntimeTrace { .. } => trace += 1,
         }
     }
-    format!("text={text} attr={attr} inner_html={html} append={append} console={console}")
+    format!(
+        "text={text} attr={attr} inner_html={html} append={append} console={console} network={network} trace={trace}"
+    )
 }
 
 fn build_script_state(html: &str) -> justbarelyscript::BrowserExecutionState {
@@ -2288,6 +2413,27 @@ fn apply_safe_script_browser_effects_detailed(
                     output = append_child_html_by_id(&output, &parent_id, &child);
                 }
                 justbarelyscript::BrowserEffect::ConsoleLog { .. } => {}
+                justbarelyscript::BrowserEffect::NetworkRequest { method, url, body } => {
+                    emit_global_telemetry(
+                        "js.network.request",
+                        &[
+                            ("phase", "dom_effects"),
+                            ("method", &method),
+                            ("url", &url),
+                            ("body_bytes", &body.len().to_string()),
+                        ],
+                    );
+                }
+                justbarelyscript::BrowserEffect::RuntimeTrace { kind, detail } => {
+                    emit_global_telemetry(
+                        "js.runtime.trace",
+                        &[
+                            ("phase", "dom_effects"),
+                            ("kind", &kind),
+                            ("detail", &detail),
+                        ],
+                    );
+                }
             }
         }
     }
@@ -2328,6 +2474,7 @@ fn seed_script_browser_globals(
     let navigator = justbarelyscript::NavigatorInfo::detect();
     let screen = justbarelyscript::ScreenInfo::detect();
     let fingerprint = justbarelyscript::FingerprintSuite::detect();
+    state.seed_browser_basics();
     state.seed_navigator(&navigator);
     state.seed_screen(&screen);
     state.seed_fingerprint_suite(fingerprint);
@@ -6883,7 +7030,14 @@ fn push_canvas_graph_layout_replaced_or_special(
             if matches!(input_type.as_str(), "submit" | "button" | "reset") {
                 push_canvas_graph_layout_box_background(box_, graph);
                 let label = canvas_button_label(element, node);
-                push_canvas_graph_text(&label, &node.style, text_metrics, inherited_href, cursor, graph);
+                push_canvas_graph_text(
+                    &label,
+                    &node.style,
+                    text_metrics,
+                    inherited_href,
+                    cursor,
+                    graph,
+                );
                 push_canvas_graph_button_hit_target(
                     element,
                     node,
@@ -6892,7 +7046,15 @@ fn push_canvas_graph_layout_replaced_or_special(
                     graph,
                 );
             } else {
-                push_canvas_graph_node(node, source, image_height_auto, text_metrics, inherited_href, cursor, graph);
+                push_canvas_graph_node(
+                    node,
+                    source,
+                    image_height_auto,
+                    text_metrics,
+                    inherited_href,
+                    cursor,
+                    graph,
+                );
             }
         }
         _ => push_canvas_graph_node(
@@ -11019,6 +11181,33 @@ impl TelemetrySession {
             session_id: self.session_id.clone(),
             session_path: path.clone(),
         })
+    }
+}
+
+fn write_recorded_live_js_debug_artifact(
+    telemetry: &TelemetrySession,
+    source: &str,
+    live_js_debug_text: &str,
+) {
+    let output_dir = Path::new(URL_SCREENSHOTS_DIR);
+    let output_path = output_dir.join("last_live_js_debug.txt");
+    match fs::create_dir_all(output_dir).and_then(|_| fs::write(&output_path, live_js_debug_text)) {
+        Ok(()) => telemetry.emit(
+            "live_js_debug.artifact.written",
+            &[
+                ("url", source),
+                ("path", &output_path.display().to_string()),
+                ("bytes", &live_js_debug_text.len().to_string()),
+            ],
+        ),
+        Err(error) => telemetry.emit(
+            "live_js_debug.artifact.failed",
+            &[
+                ("url", source),
+                ("path", &output_path.display().to_string()),
+                ("error", &error.to_string()),
+            ],
+        ),
     }
 }
 
