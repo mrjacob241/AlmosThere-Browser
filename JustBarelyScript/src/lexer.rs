@@ -396,7 +396,9 @@ impl<'a> Lexer<'a> {
         }
         // Consume `.` as part of the number if followed by a digit OR another `.`
         // The second case handles `1..toString()` — `1.` is the float, `.toString` is member access.
-        if self.current() == Some('.') && matches!(self.peek(), Some(ch) if ch.is_ascii_digit() || ch == '.') {
+        if self.current() == Some('.')
+            && matches!(self.peek(), Some(ch) if ch.is_ascii_digit() || ch == '.')
+        {
             self.bump();
             while matches!(self.current(), Some(ch) if ch.is_ascii_digit()) {
                 self.bump();
