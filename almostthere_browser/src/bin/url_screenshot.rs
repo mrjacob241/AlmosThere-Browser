@@ -396,6 +396,7 @@ fn capture_browser_window_screenshot(
                 canvas: BrowserCanvas {
                     zoom: 1.0,
                     scroll_offset: egui::vec2(0.0, scroll_y),
+                    hovered_link_href: None,
                 },
                 document,
                 output_path,

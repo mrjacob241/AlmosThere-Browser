@@ -14,8 +14,9 @@ use std::{
 use eframe::{App, Frame, NativeOptions, egui};
 use rich_canvas::{
     BrowserCanvas, BrowserCanvasResponse, BrowserDocument, BrowserStyle, CanvasBlock,
-    CanvasButtonObject, CanvasClipObject, CanvasGraph, CanvasImageObject, CanvasInputObject,
-    CanvasMediaObject, CanvasObject, CanvasRectObject, CanvasSvgObject, CanvasTextObject,
+    CanvasButtonObject, CanvasClipObject, CanvasGraph, CanvasImageObject, CanvasInputKind,
+    CanvasInputObject, CanvasMediaObject, CanvasObject, CanvasRectObject, CanvasSvgObject,
+    CanvasTextObject,
     CssAlignItems, CssBoxStyle, CssDisplay, CssEdges, CssFlexDirection, CssJustifyContent,
     CssLength, CssObjectFit, CssPosition, CssTextAlign, ElementStyleKey, HitTarget, ImageBlock,
     InlineSpan, ResolvedBoxStyle, SvgBlock, SvgShape, computed_box_style, configure_browser_fonts,
@@ -4519,6 +4520,61 @@ fn inherited_style_for_element(
             style.color = document_style.link_color;
             style.text_decoration_underline = true;
         }
+        "fieldset" => {
+            style.border_width = 2.0;
+            style.border_color = egui::Color32::from_rgb(160, 160, 160);
+            style.padding = CssEdges {
+                top: 6.0,
+                right: 12.0,
+                bottom: 10.0,
+                left: 12.0,
+            };
+            style.margin = CssEdges {
+                top: 0.0,
+                right: 2.0,
+                bottom: 4.0,
+                left: 2.0,
+            };
+        }
+        "button" => {
+            style.background = egui::Color32::from_rgb(224, 224, 224);
+            style.border_width = 1.0;
+            style.border_color = egui::Color32::from_rgb(118, 118, 118);
+            style.border_radius = 3;
+            style.padding = CssEdges {
+                top: 2.0,
+                right: 8.0,
+                bottom: 2.0,
+                left: 8.0,
+            };
+            style.margin = CssEdges {
+                top: 0.0,
+                right: 4.0,
+                bottom: 0.0,
+                left: 0.0,
+            };
+        }
+        "input" => {
+            let input_type = element.attr("type").unwrap_or("text").to_ascii_lowercase();
+            if matches!(input_type.as_str(), "submit" | "button" | "reset") {
+                style.background = egui::Color32::from_rgb(224, 224, 224);
+                style.border_width = 1.0;
+                style.border_color = egui::Color32::from_rgb(118, 118, 118);
+                style.border_radius = 3;
+                style.padding = CssEdges {
+                    top: 2.0,
+                    right: 8.0,
+                    bottom: 2.0,
+                    left: 8.0,
+                };
+                style.margin = CssEdges {
+                    top: 0.0,
+                    right: 4.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                };
+            }
+        }
         _ => {}
     }
 
@@ -5716,12 +5772,31 @@ fn css_layout_preferred_content_width(
                 if let Some(width) = box_.style.width.or(box_.style.max_width) {
                     return width.max(box_.style.min_width.unwrap_or(1.0)).max(1.0);
                 }
-                let text_width = box_
-                    .node
-                    .map(render_node_text_content)
-                    .filter(|text| !text.is_empty())
-                    .map(|text| measure_canvas_text_run(text_metrics, &text, &box_.style).x)
-                    .unwrap_or(0.0);
+                let text_width = if let Some(node) = box_.node {
+                    if let RenderNodeKind::Element(element) = &node.kind {
+                        if element.tag_name == "input" {
+                            let input_type =
+                                element.attr("type").unwrap_or("text").to_ascii_lowercase();
+                            if matches!(input_type.as_str(), "submit" | "button" | "reset") {
+                                let label = canvas_button_label(element, node);
+                                measure_canvas_text_run(text_metrics, &label, &box_.style).x
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            let text = render_node_text_content(node);
+                            if text.is_empty() {
+                                0.0
+                            } else {
+                                measure_canvas_text_run(text_metrics, &text, &box_.style).x
+                            }
+                        }
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
                 return text_width.max(box_.style.font_size * 1.35).max(1.0);
             }
             box_.children
@@ -6225,7 +6300,14 @@ fn estimate_special_css_box_height(
             let block = replaced_content_from_dom_element(element, source, image_height_auto);
             replaced_content_size(&block, width, node.style.font_size).y
         }
-        "input" | "textarea" | "select" | "button" => (node.style.font_size * 1.35).max(1.0),
+        "textarea" => {
+            let rows = element
+                .attr("rows")
+                .and_then(|r| r.parse::<f32>().ok())
+                .unwrap_or(2.0);
+            (node.style.font_size * 1.35 * rows).max(1.0)
+        }
+        "input" | "select" | "button" => (node.style.font_size * 1.35).max(1.0),
         _ => (node.style.font_size * 3.0).max(48.0),
     }
 }
@@ -6796,6 +6878,23 @@ fn push_canvas_graph_layout_replaced_or_special(
                 graph,
             );
         }
+        "input" => {
+            let input_type = element.attr("type").unwrap_or("text").to_ascii_lowercase();
+            if matches!(input_type.as_str(), "submit" | "button" | "reset") {
+                push_canvas_graph_layout_box_background(box_, graph);
+                let label = canvas_button_label(element, node);
+                push_canvas_graph_text(&label, &node.style, text_metrics, inherited_href, cursor, graph);
+                push_canvas_graph_button_hit_target(
+                    element,
+                    node,
+                    css_border_box(&box_.dimensions),
+                    cursor,
+                    graph,
+                );
+            } else {
+                push_canvas_graph_node(node, source, image_height_auto, text_metrics, inherited_href, cursor, graph);
+            }
+        }
         _ => push_canvas_graph_node(
             node,
             source,
@@ -6976,14 +7075,69 @@ fn push_canvas_graph_element(
             );
         }
         "input" | "textarea" | "select" => {
-            if element
-                .attr("type")
-                .is_some_and(|value| value.eq_ignore_ascii_case("hidden"))
-            {
+            let input_type = element.attr("type").unwrap_or("text");
+            if input_type.eq_ignore_ascii_case("hidden") {
                 return;
             }
+            // Button-like input types go to CanvasObject::Button.
+            if element.tag_name == "input"
+                && matches!(
+                    input_type.to_ascii_lowercase().as_str(),
+                    "submit" | "button" | "reset"
+                )
+            {
+                let button_rect = egui::Rect::from_min_size(
+                    egui::pos2(cursor.x, cursor.y),
+                    egui::vec2(
+                        cursor.width.max(1.0),
+                        (node.style.font_size * 1.35).max(1.0),
+                    ),
+                );
+                let label = canvas_button_label(element, node);
+                push_canvas_graph_text(&label, &node.style, text_metrics, href, cursor, graph);
+                push_canvas_graph_button_hit_target(element, node, button_rect, cursor, graph);
+                return;
+            }
+            let kind = if element.tag_name == "textarea" {
+                CanvasInputKind::TextArea
+            } else if element.tag_name == "select" {
+                let mut options = Vec::new();
+                collect_select_options(&element.children, &mut options);
+                CanvasInputKind::Select { options }
+            } else {
+                match input_type.to_ascii_lowercase().as_str() {
+                    "checkbox" => CanvasInputKind::Checkbox,
+                    "radio" => CanvasInputKind::Radio,
+                    "password" => CanvasInputKind::Password,
+                    _ => CanvasInputKind::Text,
+                }
+            };
+            let line_height = (node.style.font_size * 1.35).max(1.0);
+            let height = if element.tag_name == "textarea" {
+                let rows = element
+                    .attr("rows")
+                    .and_then(|r| r.parse::<f32>().ok())
+                    .unwrap_or(2.0);
+                line_height * rows
+            } else {
+                line_height
+            };
             let block = input_block_from_dom_element(element);
             if let CanvasBlock::Input { label, value } = block {
+                // For checkboxes/radios, derive initial value from the `checked` attribute.
+                let value = if matches!(kind, CanvasInputKind::Checkbox | CanvasInputKind::Radio) {
+                    if element.attr("checked").is_some() {
+                        "true".to_owned()
+                    } else {
+                        "false".to_owned()
+                    }
+                } else if let CanvasInputKind::Select { ref options } = kind {
+                    // Use the first selected option, or the first option, or empty.
+                    let selected = find_selected_option(&element.children);
+                    selected.unwrap_or_else(|| options.first().cloned().unwrap_or(value))
+                } else {
+                    value
+                };
                 graph.objects.push(CanvasObject::Input(CanvasInputObject {
                     label,
                     name: element.attr("name").map(str::to_owned),
@@ -6991,16 +7145,14 @@ fn push_canvas_graph_element(
                     value,
                     rect: egui::Rect::from_min_size(
                         egui::pos2(cursor.x, cursor.y),
-                        egui::vec2(
-                            cursor.width.max(1.0),
-                            (node.style.font_size * 1.35).max(1.0),
-                        ),
+                        egui::vec2(cursor.width.max(1.0), height),
                     ),
                     font_size: node.style.font_size,
                     color: node.style.color,
                     form_id: current_canvas_form_id(cursor),
                     form_action: current_canvas_form_action(cursor),
                     element_id: element.attr("id").map(str::to_owned),
+                    kind,
                 }));
             }
         }
@@ -9354,6 +9506,37 @@ fn input_block_from_dom_element(element: &DomElement) -> CanvasBlock {
             .unwrap_or_else(|| "Input".to_owned()),
         value,
     }
+}
+
+fn collect_select_options(nodes: &[DomNode], options: &mut Vec<String>) {
+    for child in nodes {
+        if let DomNode::Element(el) = child {
+            if el.tag_name == "option" {
+                let text = el.text_content();
+                let text = text.trim();
+                if !text.is_empty() {
+                    options.push(text.to_owned());
+                }
+            } else if el.tag_name == "optgroup" {
+                collect_select_options(&el.children, options);
+            }
+        }
+    }
+}
+
+fn find_selected_option(nodes: &[DomNode]) -> Option<String> {
+    for child in nodes {
+        if let DomNode::Element(el) = child {
+            if el.tag_name == "option" && el.attr("selected").is_some() {
+                return Some(el.text_content().trim().to_owned());
+            } else if el.tag_name == "optgroup" {
+                if let Some(found) = find_selected_option(&el.children) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn labelize_input_name(value: &str) -> String {
