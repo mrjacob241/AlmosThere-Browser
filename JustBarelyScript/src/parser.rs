@@ -1,8 +1,8 @@
 use crate::{
     Program,
     ast::{
-        BinaryOperator, Binding, BlockStatement, ClassDeclaration, ClassMethod, Expression,
-        DoWhileStatement, ForInStatement, ForOfStatement, ForStatement, FunctionBody,
+        BinaryOperator, Binding, BlockStatement, ClassDeclaration, ClassMethod, DoWhileStatement,
+        Expression, ForInStatement, ForOfStatement, ForStatement, FunctionBody,
         FunctionDeclaration, FunctionExpression, IfStatement, MemberProperty, ObjectBindingProp,
         ObjectProperty, Param, ReturnStatement, Statement, SwitchCase, SwitchStatement,
         TemplateElement, ThrowStatement, TryCatchStatement, UnaryOperator, VarKind,
@@ -1717,10 +1717,12 @@ mod tests {
     fn parses_ternary_inside_object_literal() {
         // Object property values must accept full expressions including ternary.
         // Previously parse_expression(2) blocked the ternary operator (bp 1).
-        assert!(parse_script(
-            "var z = { Find: isStr(u) ? new RegExp(u, 'i') : u, Num: u.num ? 1 : 0 };"
-        )
-        .is_ok());
+        assert!(
+            parse_script(
+                "var z = { Find: isStr(u) ? new RegExp(u, 'i') : u, Num: u.num ? 1 : 0 };"
+            )
+            .is_ok()
+        );
         assert!(parse_script("var x = { [key]: a ? b : c };").is_ok());
         assert!(parse_script("function f(a = b ? c : d) {}").is_ok());
     }
@@ -1728,10 +1730,10 @@ mod tests {
     #[test]
     fn parses_new_with_parenthesised_callee() {
         // new(A || B)() — dynamic constructor common in audio/canvas fingerprinting scripts.
-        assert!(parse_script(
-            "var ctx = new(window.AudioContext || window.webkitAudioContext)();"
-        )
-        .is_ok());
+        assert!(
+            parse_script("var ctx = new(window.AudioContext || window.webkitAudioContext)();")
+                .is_ok()
+        );
         assert!(parse_script("var x = new(foo)();").is_ok());
         assert!(parse_script("var y = new(a.b || c.d)();").is_ok());
     }

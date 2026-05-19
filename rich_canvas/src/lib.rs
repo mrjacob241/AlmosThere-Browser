@@ -436,7 +436,9 @@ pub enum CanvasInputKind {
     TextArea,
     Checkbox,
     Radio,
-    Select { options: Vec<String> },
+    Select {
+        options: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1191,8 +1193,7 @@ fn paint_canvas_graph(
                 };
                 let font_size = text.font_size * scale;
                 let stroke = Stroke::new((1.0 * scale).max(1.0), text.color);
-                let link_hovered = text.href.is_some()
-                    && text.href.as_deref() == hovered_link_href;
+                let link_hovered = text.href.is_some() && text.href.as_deref() == hovered_link_href;
                 let text_format = TextFormat {
                     font_id: FontId::new(font_size, family),
                     color: text.color,
@@ -1315,10 +1316,8 @@ fn paint_canvas_graph(
                         }
                         CanvasInputKind::Radio => {
                             let checked = input.value == "true";
-                            let response = ui.put(
-                                rect,
-                                egui::RadioButton::new(checked, input.label.as_str()),
-                            );
+                            let response =
+                                ui.put(rect, egui::RadioButton::new(checked, input.label.as_str()));
                             if response.clicked() && !checked {
                                 input.value = "true".to_owned();
                                 selected_radios
@@ -1334,8 +1333,7 @@ fn paint_canvas_graph(
                         CanvasInputKind::Select { options } => {
                             let options = options.clone();
                             let mut selected = input.value.clone();
-                            let combo_id =
-                                ui.make_persistent_id(("canvas_graph_select", index));
+                            let combo_id = ui.make_persistent_id(("canvas_graph_select", index));
                             let mut selection_changed = false;
                             ui.allocate_ui_at_rect(rect, |ui| {
                                 egui::ComboBox::from_id_salt(combo_id)
