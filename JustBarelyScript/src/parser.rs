@@ -819,10 +819,10 @@ impl Parser {
                 self.advance();
                 Ok(Expression::String(value))
             }
-            TokenKind::Regex(_) => {
-                // Regex literals are not executed — treat as a null-ish opaque object.
+            TokenKind::Regex(value) => {
+                let value = value.clone();
                 self.advance();
-                Ok(Expression::Null)
+                Ok(Expression::Regex(value))
             }
             TokenKind::TemplateLiteral(parts) => {
                 let parts = parts.clone();

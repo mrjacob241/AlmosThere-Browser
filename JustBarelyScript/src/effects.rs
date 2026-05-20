@@ -71,6 +71,7 @@ pub struct JsFunction {
     pub params: Vec<Param>,
     pub body: FunctionBody,
     pub captured: Vec<StackFrame>,
+    properties: HashMap<String, JsValue>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -158,6 +159,12 @@ enum JsValue {
     DocumentRef,
     WindowRef,
     NavigatorRef,
+    HostFunction(String),
+    HostObject(String),
+    RegExp {
+        pattern: String,
+        flags: String,
+    },
     CanvasContextRef(String),
     DateInstance,
     ResolvedPromise,
@@ -355,6 +362,10 @@ impl BrowserExecutionState {
         );
         self.globals.insert("document".into(), JsValue::DocumentRef);
         self.globals.insert("window".into(), JsValue::WindowRef);
+        self.globals.insert(
+            "ActiveXObject".into(),
+            JsValue::HostFunction("ActiveXObject".into()),
+        );
     }
 
     /// Seed the precomputed browser fingerprint suite into JS-facing APIs.
@@ -715,6 +726,7 @@ impl BrowserExecutionState {
                     params: decl.params.clone(),
                     body: FunctionBody::Block(decl.body.clone()),
                     captured: self.stack.clone(),
+                    properties: HashMap::new(),
                 };
                 let name = decl.name.clone();
                 self.set_local(&name, JsValue::Function(func));
@@ -1037,11 +1049,13 @@ impl BrowserExecutionState {
                 params: fe.params.clone(),
                 body: FunctionBody::Block(fe.body.clone()),
                 captured: self.stack.clone(),
+                properties: HashMap::new(),
             }),
             Expression::ArrowFunction { params, body, .. } => JsValue::Function(JsFunction {
                 params: params.clone(),
                 body: *body.clone(),
                 captured: self.stack.clone(),
+                properties: HashMap::new(),
             }),
             Expression::TemplateLiteral(parts) => {
                 let parts = parts.clone();
@@ -1059,7 +1073,7 @@ impl BrowserExecutionState {
             }
             Expression::Typeof(expr) => {
                 let val = if let Expression::Identifier(name) = expr.as_ref() {
-                    self.get_binding(name).unwrap_or(JsValue::Undefined)
+                    self.get_identifier_value(name)
                 } else {
                     self.execute_expression(expr)
                 };
@@ -1074,6 +1088,22 @@ impl BrowserExecutionState {
             Expression::New { callee, arguments } => {
                 if matches!(callee.as_ref(), Expression::Identifier(name) if name == "Date") {
                     JsValue::DateInstance
+                } else if matches!(callee.as_ref(), Expression::Identifier(name) if name == "Function")
+                {
+                    JsValue::HostFunction("Function".into())
+                } else if matches!(callee.as_ref(), Expression::Identifier(name) if name == "RegExp")
+                {
+                    let pattern = arguments
+                        .first()
+                        .map(|argument| self.execute_expression(argument))
+                        .map(|value| Self::value_to_string(&value))
+                        .unwrap_or_default();
+                    let flags = arguments
+                        .get(1)
+                        .map(|argument| self.execute_expression(argument))
+                        .map(|value| Self::value_to_string(&value))
+                        .unwrap_or_default();
+                    JsValue::RegExp { pattern, flags }
                 } else if matches!(callee.as_ref(), Expression::Identifier(name) if name == "XMLHttpRequest")
                 {
                     self.trace_runtime("xhr.new", "XMLHttpRequest");
@@ -1113,18 +1143,43 @@ impl BrowserExecutionState {
                 } else if matches!(callee.as_ref(), Expression::Identifier(name) if name == "WeakMap" || name == "Map")
                 {
                     JsValue::WeakMap(HashMap::new())
+                } else if let JsValue::Function(func) = self.execute_expression(callee) {
+                    let this_obj = func
+                        .properties
+                        .get("prototype")
+                        .cloned()
+                        .unwrap_or_else(|| JsValue::Object(HashMap::new()));
+                    let args = self.eval_args(arguments);
+                    let (result, this_after) = self.call_function_with_this(func, args, this_obj);
+                    if matches!(result, JsValue::Object(_)) {
+                        result
+                    } else {
+                        this_after
+                    }
+                } else if let JsValue::HostFunction(name) = self.execute_expression(callee) {
+                    JsValue::HostObject(name)
+                } else if let Some(name) = constructor_like_member_name(callee) {
+                    for argument in arguments {
+                        self.execute_expression(argument);
+                    }
+                    JsValue::HostObject(name)
                 } else {
                     self.trace_runtime("unsupported.constructor", format!("{:?}", callee.as_ref()));
                     JsValue::Undefined
                 }
             }
             Expression::Spread(_) | Expression::Super => JsValue::Undefined,
-            Expression::Identifier(name) => self.get_binding(name).unwrap_or(JsValue::Undefined),
+            Expression::Identifier(name) => self.get_identifier_value(name),
             Expression::Number(value) => JsValue::Number(*value),
             Expression::String(value) => JsValue::String(value.clone()),
+            Expression::Regex(value) => {
+                let (pattern, flags) = parse_regex_literal(value);
+                JsValue::RegExp { pattern, flags }
+            }
             Expression::Boolean(value) => JsValue::Boolean(*value),
             Expression::Null => JsValue::Null,
-            Expression::Undefined | Expression::This => JsValue::Undefined,
+            Expression::Undefined => JsValue::Undefined,
+            Expression::This => self.get_identifier_value("this"),
         }
     }
 
@@ -1135,6 +1190,27 @@ impl BrowserExecutionState {
                 .map(|argument| self.execute_expression(argument))
                 .map(|value| JsValue::String(Self::value_to_string(&value)))
                 .unwrap_or_else(|| JsValue::String(String::new()));
+        }
+
+        if matches!(callee, Expression::Identifier(name) if name == "RegExp") {
+            let pattern = arguments
+                .first()
+                .map(|argument| self.execute_expression(argument))
+                .map(|value| Self::value_to_string(&value))
+                .unwrap_or_default();
+            let flags = arguments
+                .get(1)
+                .map(|argument| self.execute_expression(argument))
+                .map(|value| Self::value_to_string(&value))
+                .unwrap_or_default();
+            return JsValue::RegExp { pattern, flags };
+        }
+
+        if matches!(callee, Expression::Identifier(name) if name == "Function") {
+            for argument in arguments {
+                self.execute_expression(argument);
+            }
+            return JsValue::HostFunction("Function".into());
         }
 
         if let Some(method) = method_call(callee) {
@@ -1396,13 +1472,19 @@ impl BrowserExecutionState {
                     }
                     return JsValue::Undefined;
                 }
-                "addEventListener" => {
+                "addEventListener" | "attachEvent" | "detachEvent" => {
                     let receiver = self.execute_expression(&method.object);
-                    let event_type = arguments
+                    let mut event_type = arguments
                         .first()
                         .map(|a| self.execute_expression(a))
                         .map(|v| Self::value_to_string(&v))
                         .unwrap_or_default();
+                    if method.name == "detachEvent" {
+                        return JsValue::Undefined;
+                    }
+                    if let Some(stripped) = event_type.strip_prefix("on") {
+                        event_type = stripped.to_owned();
+                    }
                     // document.addEventListener("DOMContentLoaded", fn) — DOM is already
                     // parsed by the time scripts run, so fire as a microtask immediately.
                     if matches!(&method.object, Expression::Identifier(n) if n == "document")
@@ -1723,12 +1805,18 @@ impl BrowserExecutionState {
                         };
                         return JsValue::Array(ids.into_iter().map(JsValue::ElementRef).collect());
                     }
-                    "addEventListener" => {
-                        let event_type = arguments
+                    "addEventListener" | "attachEvent" | "detachEvent" => {
+                        let mut event_type = arguments
                             .first()
                             .map(|a| self.execute_expression(a))
                             .map(|v| Self::value_to_string(&v))
                             .unwrap_or_default();
+                        if method_name == "detachEvent" {
+                            return JsValue::Undefined;
+                        }
+                        if let Some(stripped) = event_type.strip_prefix("on") {
+                            event_type = stripped.to_owned();
+                        }
                         if event_type == "DOMContentLoaded" {
                             if let Some(Expression::Function(func)) = arguments.get(1) {
                                 self.pending_microtasks.push(PendingMicrotask {
@@ -1882,6 +1970,36 @@ impl BrowserExecutionState {
                 }
             }
 
+            if let JsValue::RegExp { pattern, flags } = receiver.clone() {
+                match method_name.as_str() {
+                    "test" => {
+                        let haystack = arguments
+                            .first()
+                            .map(|argument| self.execute_expression(argument))
+                            .map(|value| Self::value_to_string(&value))
+                            .unwrap_or_default();
+                        return JsValue::Boolean(Self::simple_regex_test(
+                            &pattern, &flags, &haystack,
+                        ));
+                    }
+                    "exec" => {
+                        let haystack = arguments
+                            .first()
+                            .map(|argument| self.execute_expression(argument))
+                            .map(|value| Self::value_to_string(&value))
+                            .unwrap_or_default();
+                        if Self::simple_regex_test(&pattern, &flags, &haystack) {
+                            return JsValue::Array(vec![JsValue::String(pattern)]);
+                        }
+                        return JsValue::Null;
+                    }
+                    "toString" => {
+                        return JsValue::String(format!("/{pattern}/{flags}"));
+                    }
+                    _ => {}
+                }
+            }
+
             if let JsValue::ElementRef(element_ref) = receiver.clone() {
                 if method_name == "toDataURL"
                     && self.element_tag_name(&element_ref) == Some("canvas")
@@ -1933,12 +2051,51 @@ impl BrowserExecutionState {
                 }
             }
 
+            if method_name == "item" {
+                let index = arguments
+                    .first()
+                    .map(|argument| self.execute_expression(argument))
+                    .map(|value| Self::value_to_number(&value))
+                    .unwrap_or(0.0);
+                if index >= 0.0 && index.fract() == 0.0 {
+                    let index = index as usize;
+                    return match receiver.clone() {
+                        JsValue::Array(items) => items.get(index).cloned().unwrap_or(JsValue::Null),
+                        JsValue::NodeList(ids) => ids
+                            .get(index)
+                            .map(|id| JsValue::ElementRef(existing_element_ref(id)))
+                            .unwrap_or(JsValue::Null),
+                        _ => JsValue::Undefined,
+                    };
+                }
+                return JsValue::Null;
+            }
+
+            if let JsValue::HostFunction(name) = receiver.clone() {
+                match method_name.as_str() {
+                    "call" | "apply" => {
+                        for argument in arguments {
+                            self.execute_expression(argument);
+                        }
+                        return Self::host_function_default_return(&name);
+                    }
+                    "bind" => {
+                        for argument in arguments {
+                            self.execute_expression(argument);
+                        }
+                        return JsValue::HostFunction(name);
+                    }
+                    _ => {}
+                }
+            }
+
             // Function.prototype.call / apply / bind
             if let JsValue::Function(func) = receiver.clone() {
                 match method_name.as_str() {
                     "call" => {
-                        // func.call(thisArg, arg1, arg2, ...) — skip thisArg
+                        // func.call(thisArg, arg1, arg2, ...)
                         let args = self.eval_args(arguments);
+                        let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
                         let real_args = if args.is_empty() {
                             vec![]
                         } else {
@@ -1946,12 +2103,20 @@ impl BrowserExecutionState {
                         };
                         let real_exprs: Vec<Expression> =
                             arguments.iter().skip(1).cloned().collect();
-                        return self.call_function_with_writeback(func, real_args, &real_exprs);
+                        return self.call_function_with_writeback(
+                            func,
+                            real_args,
+                            &real_exprs,
+                            this_arg,
+                        );
                     }
                     "apply" => {
                         // func.apply(thisArg, [arg1, arg2, ...]) — spread second arg
                         let mut iter = arguments.iter();
-                        let _this_arg = iter.next().map(|a| self.execute_expression(a));
+                        let this_arg = iter
+                            .next()
+                            .map(|a| self.execute_expression(a))
+                            .unwrap_or(JsValue::Undefined);
                         let args_val = iter
                             .next()
                             .map(|a| self.execute_expression(a))
@@ -1960,7 +2125,7 @@ impl BrowserExecutionState {
                             JsValue::Array(arr) => arr,
                             _ => vec![],
                         };
-                        return self.call_function(func, real_args);
+                        return self.call_function_with_this(func, real_args, this_arg).0;
                     }
                     "bind" => {
                         // func.bind(thisArg) — return the same function (ignore this)
@@ -1976,7 +2141,18 @@ impl BrowserExecutionState {
             if let JsValue::Object(ref map) = receiver {
                 if let Some(JsValue::Function(func)) = map.get(&method_name).cloned() {
                     let args = self.eval_args(arguments);
-                    return self.call_function(func, args);
+                    let (result, this_after) =
+                        self.call_function_with_this(func, args, receiver.clone());
+                    if matches!(this_after, JsValue::Object(_) | JsValue::Array(_)) {
+                        self.assign_target(object, this_after);
+                    }
+                    return result;
+                }
+                if let Some(JsValue::HostFunction(name)) = map.get(&method_name).cloned() {
+                    for argument in arguments {
+                        self.execute_expression(argument);
+                    }
+                    return Self::host_function_default_return(&name);
                 }
                 // hasOwnProperty on any object
                 if method_name == "hasOwnProperty" {
@@ -2002,6 +2178,9 @@ impl BrowserExecutionState {
         let args = self.eval_args(arguments);
         if let JsValue::Function(func) = func_val {
             return self.call_function(func, args);
+        }
+        if let JsValue::HostFunction(name) = func_val {
+            return JsValue::HostObject(name);
         }
         if !matches!(func_val, JsValue::Undefined | JsValue::Null) {
             self.trace_runtime(
@@ -3086,6 +3265,11 @@ impl BrowserExecutionState {
                     self.assign_target(object, JsValue::Object(map));
                     return;
                 }
+                JsValue::Function(mut func) => {
+                    func.properties.insert(property, value);
+                    self.assign_target(object, JsValue::Function(func));
+                    return;
+                }
                 _ => {}
             }
         }
@@ -3135,6 +3319,8 @@ impl BrowserExecutionState {
 
         if let Expression::Identifier(name) = target {
             self.set_binding(name, value);
+        } else if matches!(target, Expression::This) {
+            self.set_binding("this", value);
         }
     }
 
@@ -3166,11 +3352,20 @@ impl BrowserExecutionState {
 
     fn eval_member(&mut self, expression: &Expression) -> JsValue {
         if let Some(global_name) = window_member_name(expression) {
-            return self
-                .globals
-                .get(&global_name)
-                .cloned()
-                .unwrap_or(JsValue::Undefined);
+            return self.globals.get(&global_name).cloned().unwrap_or_else(|| {
+                match global_name.as_str() {
+                    "ActiveXObject" => JsValue::HostFunction("ActiveXObject".into()),
+                    "external" => {
+                        let mut map = HashMap::new();
+                        map.insert(
+                            "msActiveXFilteringEnabled".to_owned(),
+                            JsValue::HostFunction("msActiveXFilteringEnabled".into()),
+                        );
+                        JsValue::Object(map)
+                    }
+                    _ => JsValue::Undefined,
+                }
+            });
         }
         let Expression::Member {
             object,
@@ -3202,6 +3397,16 @@ impl BrowserExecutionState {
                             items
                                 .get(idx as usize)
                                 .cloned()
+                                .unwrap_or(JsValue::Undefined)
+                        } else {
+                            JsValue::Undefined
+                        }
+                    }
+                    JsValue::NodeList(ids) => {
+                        let idx = Self::value_to_number(&index);
+                        if idx >= 0.0 && idx.fract() == 0.0 {
+                            ids.get(idx as usize)
+                                .map(|id| JsValue::ElementRef(existing_element_ref(id)))
                                 .unwrap_or(JsValue::Undefined)
                         } else {
                             JsValue::Undefined
@@ -3239,7 +3444,7 @@ impl BrowserExecutionState {
                             return JsValue::ElementRef(existing_element_ref("html"));
                         }
                         "window" if property == "ActiveXObject" => {
-                            return JsValue::Undefined;
+                            return JsValue::HostFunction("ActiveXObject".into());
                         }
                         "Math" => {
                             return match property.as_str() {
@@ -3329,11 +3534,24 @@ impl BrowserExecutionState {
                             }
                         })
                         .unwrap_or(JsValue::Undefined),
-                    JsValue::WindowRef => self
-                        .globals
-                        .get(property)
-                        .cloned()
-                        .unwrap_or(JsValue::Undefined),
+                    JsValue::WindowRef => {
+                        self.globals.get(property).cloned().unwrap_or_else(|| {
+                            match property.as_str() {
+                                "external" => {
+                                    let mut map = HashMap::new();
+                                    map.insert(
+                                        "msActiveXFilteringEnabled".to_owned(),
+                                        JsValue::HostFunction("msActiveXFilteringEnabled".into()),
+                                    );
+                                    JsValue::Object(map)
+                                }
+                                "msActiveXFilteringEnabled" => {
+                                    JsValue::HostFunction("msActiveXFilteringEnabled".into())
+                                }
+                                _ => JsValue::Undefined,
+                            }
+                        })
+                    }
                     JsValue::StyleRef(element_id) => {
                         let element_ref = existing_element_ref(&element_id);
                         let inline = self
@@ -3369,6 +3587,19 @@ impl BrowserExecutionState {
                         .get(property.as_str())
                         .cloned()
                         .unwrap_or(JsValue::Undefined),
+                    JsValue::Function(func) => {
+                        if property == "prototype" {
+                            func.properties
+                                .get(property.as_str())
+                                .cloned()
+                                .unwrap_or_else(|| JsValue::Object(HashMap::new()))
+                        } else {
+                            func.properties
+                                .get(property.as_str())
+                                .cloned()
+                                .unwrap_or(JsValue::Undefined)
+                        }
+                    }
                     JsValue::NodeList(items) if property == "length" => {
                         JsValue::Number(items.len() as f64)
                     }
@@ -3544,6 +3775,16 @@ impl BrowserExecutionState {
         self.globals.get(name).cloned()
     }
 
+    fn get_identifier_value(&self, name: &str) -> JsValue {
+        self.get_binding(name).unwrap_or_else(|| match name {
+            "document" => JsValue::DocumentRef,
+            "window" => JsValue::WindowRef,
+            "navigator" => JsValue::NavigatorRef,
+            "ActiveXObject" => JsValue::HostFunction("ActiveXObject".into()),
+            _ => JsValue::Undefined,
+        })
+    }
+
     fn set_binding(&mut self, name: &str, value: JsValue) {
         for frame in self.stack.iter().rev() {
             if frame.locals.borrow().contains_key(name) {
@@ -3611,10 +3852,21 @@ impl BrowserExecutionState {
     }
 
     fn call_function(&mut self, func: JsFunction, args: Vec<JsValue>) -> JsValue {
+        self.call_function_with_this(func, args, JsValue::Undefined)
+            .0
+    }
+
+    fn call_function_with_this(
+        &mut self,
+        func: JsFunction,
+        args: Vec<JsValue>,
+        this_value: JsValue,
+    ) -> (JsValue, JsValue) {
         // Move captured frames directly — no clone needed since func is owned.
         let saved_stack = std::mem::replace(&mut self.stack, func.captured);
         self.ensure_global_frame();
         self.stack.push(StackFrame::default());
+        self.set_local("this", this_value);
         self.bind_params(&func.params, args);
         let result = match func.body {
             FunctionBody::Block(block) => {
@@ -3635,10 +3887,11 @@ impl BrowserExecutionState {
             }
             FunctionBody::Expr(expr) => self.execute_expression(&expr),
         };
+        let this_after = self.get_identifier_value("this");
         self.stack.pop();
         self.ensure_global_frame();
         let _ = std::mem::replace(&mut self.stack, saved_stack);
-        result
+        (result, this_after)
     }
 
     /// Like `call_function` but writes back mutated Object/Array params to the
@@ -3652,6 +3905,7 @@ impl BrowserExecutionState {
         func: JsFunction,
         args: Vec<JsValue>,
         arg_exprs: &[Expression],
+        this_value: JsValue,
     ) -> JsValue {
         // Collect simple param names in order (destructuring params are skipped).
         let param_names: Vec<Option<String>> = func
@@ -3669,6 +3923,7 @@ impl BrowserExecutionState {
         let saved_stack = std::mem::replace(&mut self.stack, func.captured);
         self.ensure_global_frame();
         self.stack.push(StackFrame::default());
+        self.set_local("this", this_value);
         self.bind_params(&func.params, args);
         let result = match func.body {
             FunctionBody::Block(block) => {
@@ -3844,6 +4099,9 @@ impl BrowserExecutionState {
             | JsValue::DocumentRef
             | JsValue::WindowRef
             | JsValue::NavigatorRef
+            | JsValue::HostFunction(_)
+            | JsValue::HostObject(_)
+            | JsValue::RegExp { .. }
             | JsValue::CanvasContextRef(_)
             | JsValue::DateInstance
             | JsValue::ResolvedPromise
@@ -3872,6 +4130,9 @@ impl BrowserExecutionState {
             | JsValue::DocumentRef
             | JsValue::WindowRef
             | JsValue::NavigatorRef
+            | JsValue::HostFunction(_)
+            | JsValue::HostObject(_)
+            | JsValue::RegExp { .. }
             | JsValue::CanvasContextRef(_)
             | JsValue::DateInstance
             | JsValue::ResolvedPromise
@@ -3918,6 +4179,7 @@ impl BrowserExecutionState {
             JsValue::Number(_) => "number",
             JsValue::String(_) => "string",
             JsValue::Function(_) => "function",
+            JsValue::HostFunction(_) => "function",
             _ => "object",
         }
         .to_owned()
@@ -3950,8 +4212,11 @@ impl BrowserExecutionState {
             JsValue::DocumentRef => "[object Document]".to_owned(),
             JsValue::WindowRef => "[object Window]".to_owned(),
             JsValue::NavigatorRef => "[object Navigator]".to_owned(),
+            JsValue::HostFunction(_) => "[object Function]".to_owned(),
+            JsValue::HostObject(name) => format!("[object {name}]"),
             JsValue::CanvasContextRef(_) => "[object CanvasRenderingContext]".to_owned(),
             JsValue::DateInstance => "[object Date]".to_owned(),
+            JsValue::RegExp { pattern, flags } => format!("/{pattern}/{flags}"),
             JsValue::ResolvedPromise => "[object Promise]".to_owned(),
             JsValue::XhrInstance { .. } => "[object XMLHttpRequest]".to_owned(),
             JsValue::Proxy { .. } => "[object Object]".to_owned(),
@@ -3967,6 +4232,41 @@ impl BrowserExecutionState {
             (JsValue::String(x), JsValue::String(y)) => x == y,
             _ => false,
         }
+    }
+
+    fn host_function_default_return(name: &str) -> JsValue {
+        if name.ends_with("Enabled") || name.starts_with("ms") {
+            JsValue::Boolean(false)
+        } else {
+            JsValue::Undefined
+        }
+    }
+
+    fn simple_regex_test(pattern: &str, flags: &str, haystack: &str) -> bool {
+        let mut needle = pattern
+            .trim_start_matches('^')
+            .trim_end_matches('$')
+            .replace("\\.", ".")
+            .replace("\\/", "/")
+            .replace("\\-", "-")
+            .replace("\\_", "_")
+            .replace("\\s", " ");
+        needle = needle.replace(".*", "");
+        let haystack = if flags.contains('i') {
+            haystack.to_ascii_lowercase()
+        } else {
+            haystack.to_owned()
+        };
+        let needle = if flags.contains('i') {
+            needle.to_ascii_lowercase()
+        } else {
+            needle
+        };
+        needle
+            .split('|')
+            .map(|part| part.trim_matches(|c| matches!(c, '(' | ')' | '[' | ']')))
+            .filter(|part| !part.is_empty())
+            .any(|part| haystack.contains(part))
     }
 
     /// Fire all registered handlers for `(element_id, event_type)`, returning any DOM effects.
@@ -4189,12 +4489,59 @@ fn extract_window_global_name(expr: &Expression) -> Option<String> {
     None
 }
 
+fn constructor_like_member_name(expr: &Expression) -> Option<String> {
+    let Expression::Member {
+        property: MemberProperty::Named(name),
+        ..
+    } = expr
+    else {
+        return None;
+    };
+    if name
+        .chars()
+        .next()
+        .map(|ch| ch.is_ascii_uppercase())
+        .unwrap_or(false)
+    {
+        Some(name.clone())
+    } else {
+        None
+    }
+}
+
 fn existing_element_ref(id: &str) -> String {
     format!("existing:{id}")
 }
 
 fn existing_id_from_ref(element_ref: &str) -> Option<String> {
     element_ref.strip_prefix("existing:").map(str::to_owned)
+}
+
+fn parse_regex_literal(src: &str) -> (String, String) {
+    if !src.starts_with('/') {
+        return (src.to_owned(), String::new());
+    }
+    let mut escaped = false;
+    let mut in_class = false;
+    for (idx, ch) in src.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '[' => in_class = true,
+            ']' => in_class = false,
+            '/' if !in_class => {
+                return (
+                    src[1..idx].to_owned(),
+                    src[idx + ch.len_utf8()..].to_owned(),
+                );
+            }
+            _ => {}
+        }
+    }
+    (src.trim_matches('/').to_owned(), String::new())
 }
 
 fn dom_property_is_text_content(property: &str) -> bool {
@@ -4392,6 +4739,9 @@ fn json_stringify(value: &JsValue) -> String {
         | JsValue::DocumentRef
         | JsValue::WindowRef
         | JsValue::NavigatorRef
+        | JsValue::HostFunction(_)
+        | JsValue::HostObject(_)
+        | JsValue::RegExp { .. }
         | JsValue::CanvasContextRef(_)
         | JsValue::DateInstance
         | JsValue::ResolvedPromise
@@ -4688,6 +5038,141 @@ mod tests {
                 value: "Clicked".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn legacy_attach_event_registers_event_handler() {
+        let program = crate::parse_script(
+            r#"
+            let button = document.getElementById("button");
+            button.attachEvent("onclick", function () {
+                document.getElementById("result").textContent = "legacy";
+            });
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        assert!(state.has_listener("button", "click"));
+
+        let effects = state.fire_event("button", "click", None);
+        assert_eq!(
+            effects,
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "legacy".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn tag_name_collection_supports_indexing_and_item() {
+        let effects = run(r#"
+            let bodies = document.getElementsByTagName("body");
+            document.getElementById("result").textContent =
+                String(bodies.length) + ":" + String(bodies[0]) + ":" + String(bodies.item(0));
+            "#);
+
+        assert_eq!(
+            effects,
+            vec![text("result", "1:[object Element]:[object Element]")]
+        );
+    }
+
+    #[test]
+    fn legacy_host_constructor_is_callable_stub() {
+        let effects = run(r#"
+            let ax = new window.ActiveXObject("ShockwaveFlash.ShockwaveFlash");
+            document.getElementById("result").textContent =
+                typeof window.ActiveXObject + ":" + String(ax);
+            "#);
+
+        assert_eq!(
+            effects,
+            vec![text("result", "function:[object ActiveXObject]")]
+        );
+    }
+
+    #[test]
+    fn constructor_prototype_methods_are_available_on_instances() {
+        let effects = run(r#"
+            function Detector(name) {
+                this.name = name;
+            }
+            Detector.prototype.test = function () {
+                return this.name + ":ok";
+            };
+            let detector = new Detector("plugin");
+            document.getElementById("result").textContent = detector.test();
+            "#);
+
+        assert_eq!(effects, vec![text("result", "plugin:ok")]);
+    }
+
+    #[test]
+    fn object_method_call_binds_and_writes_back_this() {
+        let effects = run(r#"
+            let counter = {
+                value: 1,
+                inc: function () {
+                    this.value = this.value + 1;
+                    return this.value;
+                }
+            };
+            document.getElementById("a").textContent = String(counter.inc());
+            document.getElementById("b").textContent = String(counter.value);
+            "#);
+
+        assert_eq!(effects, vec![text("a", "2"), text("b", "2")]);
+    }
+
+    #[test]
+    fn regexp_constructor_supports_test_exec_and_to_string() {
+        let effects = run(r#"
+            let re = new RegExp("hello|world", "i");
+            document.getElementById("a").textContent = String(re.test("Well Hello"));
+            document.getElementById("b").textContent = String(re.exec("world")[0]);
+            document.getElementById("c").textContent = String(re);
+            "#);
+
+        assert_eq!(
+            effects,
+            vec![
+                text("a", "true"),
+                text("b", "hello|world"),
+                text("c", "/hello|world/i"),
+            ]
+        );
+    }
+
+    #[test]
+    fn regexp_literal_supports_test() {
+        let effects = run(r#"
+            document.getElementById("result").textContent = String(/hello/i.test("HELLO"));
+            "#);
+
+        assert_eq!(effects, vec![text("result", "true")]);
+    }
+
+    #[test]
+    fn function_constructor_returns_callable_host_function() {
+        let effects = run(r#"
+            let f = new Function("return true");
+            document.getElementById("result").textContent = String(f.call(null));
+            "#);
+
+        assert_eq!(effects, vec![text("result", "undefined")]);
+    }
+
+    #[test]
+    fn window_external_feature_detection_methods_are_safe_false() {
+        let effects = run(r#"
+            document.getElementById("result").textContent =
+                String(window.external.msActiveXFilteringEnabled());
+            "#);
+
+        assert_eq!(effects, vec![text("result", "false")]);
     }
 
     #[test]
