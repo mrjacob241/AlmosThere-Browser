@@ -2,9 +2,10 @@ use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{self, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
         mpsc::{self, Receiver, TryRecvError},
     },
     thread,
@@ -223,12 +224,15 @@ fn main() -> eframe::Result<()> {
 #[derive(Clone, Copy, Debug, Default)]
 struct AppConfig {
     record_events: bool,
+    debug_socket: bool,
 }
 
 impl AppConfig {
     fn from_args() -> Self {
+        let args: Vec<String> = std::env::args().collect();
         Self {
-            record_events: std::env::args().any(|arg| arg == "--record-events"),
+            record_events: args.iter().any(|a| a == "--record-events"),
+            debug_socket: args.iter().any(|a| a == "--debug-socket"),
         }
     }
 }
@@ -299,6 +303,9 @@ impl AlmostThereApp {
         let telemetry = TelemetrySession::start().unwrap_or_else(|_| TelemetrySession::disabled());
         install_global_telemetry(&telemetry);
         install_telemetry_panic_hook();
+        if config.debug_socket {
+            install_debug_server();
+        }
         telemetry.emit(
             "session.started",
             &[
@@ -11077,6 +11084,80 @@ static GLOBAL_TELEMETRY: OnceLock<Mutex<Option<TelemetrySink>>> = OnceLock::new(
 static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 static SCRIPT_RESOURCE_CACHE: OnceLock<Mutex<HashMap<String, Result<String, String>>>> =
     OnceLock::new();
+static DEBUG_SERVER: OnceLock<DebugServer> = OnceLock::new();
+
+pub const DEBUG_PORT: u16 = 9876;
+
+struct DebugServer {
+    clients: Arc<Mutex<Vec<TcpStream>>>,
+}
+
+impl DebugServer {
+    fn start(port: u16) -> io::Result<Self> {
+        let listener = TcpListener::bind(format!("127.0.0.1:{port}"))?;
+        let clients: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let clients_clone = clients.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                if let Ok(s) = stream {
+                    let _ = s.set_nodelay(true);
+                    if let Ok(mut guard) = clients_clone.lock() {
+                        guard.push(s);
+                    }
+                }
+            }
+        });
+        Ok(Self { clients })
+    }
+
+    fn broadcast(&self, line: &str) {
+        let Ok(mut guard) = self.clients.lock() else {
+            return;
+        };
+        guard.retain_mut(|c| c.write_all(line.as_bytes()).is_ok());
+    }
+}
+
+fn install_debug_server() {
+    match DebugServer::start(DEBUG_PORT) {
+        Ok(server) => {
+            let _ = DEBUG_SERVER.set(server);
+            eprintln!("[debug] socket listening on 127.0.0.1:{DEBUG_PORT}");
+        }
+        Err(e) => {
+            eprintln!("[debug] socket unavailable (port {DEBUG_PORT}): {e}");
+        }
+    }
+}
+
+fn spawn_debug_terminal() {
+    let client_script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../debug_client.py")
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from("debug_client.py"));
+    let script = client_script.to_string_lossy().into_owned();
+
+    // Try common terminal emulators in preference order.
+    let candidates: &[(&str, &[&str])] = &[
+        ("gnome-terminal", &["--", "python3"] as &[&str]),
+        ("x-terminal-emulator", &["-e", "python3"]),
+        ("xterm", &["-e", "python3"]),
+        ("konsole", &["--", "python3"]),
+        ("alacritty", &["-e", "python3"]),
+    ];
+    for (term, prefix_args) in candidates {
+        let mut cmd = std::process::Command::new(term);
+        cmd.args(*prefix_args).arg(&script);
+        match cmd.spawn() {
+            Ok(_) => {
+                eprintln!("[debug] opened terminal: {term} python3 {script}");
+                return;
+            }
+            Err(_) => continue,
+        }
+    }
+    eprintln!("[debug] no terminal emulator found — run manually: python3 {script}");
+}
 
 fn install_global_telemetry(session: &TelemetrySession) {
     let Some(sink) = session.sink() else {
@@ -11155,6 +11236,9 @@ fn write_telemetry_line(sink: &TelemetrySink, event: &str, fields: &[(&str, &str
     }
     line.push_str("}\n");
     let _ = file.write_all(line.as_bytes());
+    if let Some(server) = DEBUG_SERVER.get() {
+        server.broadcast(&line);
+    }
 }
 
 struct TelemetrySession {
