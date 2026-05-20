@@ -120,17 +120,23 @@ impl Parser {
                 Ok(Statement::Empty)
             }
             _ => {
-                let mut expr = self.parse_expression(0)?;
+                let first = self.parse_expression(0)?;
                 // Labeled statement: `label: statement` — discard label, parse body
-                if let Expression::Identifier(_) = &expr {
+                if let Expression::Identifier(_) = &first {
                     if self.eat(TokenKind::Colon) {
                         return self.parse_statement();
                     }
                 }
-                // Comma (sequence) operator at statement level: a=1, b=2;
-                while self.eat(TokenKind::Comma) {
-                    expr = self.parse_expression(0)?;
-                }
+                // Comma (sequence) operator at statement level: a=1, b=2, c=3;
+                let expr = if self.at(TokenKind::Comma) {
+                    let mut exprs = vec![first];
+                    while self.eat(TokenKind::Comma) {
+                        exprs.push(self.parse_expression(0)?);
+                    }
+                    Expression::Sequence(exprs)
+                } else {
+                    first
+                };
                 self.consume_semicolon();
                 Ok(Statement::Expression(expr))
             }
@@ -235,11 +241,17 @@ impl Parser {
             if self.at(TokenKind::Semicolon) || self.at(TokenKind::RightBrace) || self.at_eof() {
                 None
             } else {
-                let mut expr = self.parse_expression(0)?;
-                // Comma (sequence) operator in return: return a, b  →  return b
-                while self.eat(TokenKind::Comma) {
-                    expr = self.parse_expression(0)?;
-                }
+                let first = self.parse_expression(0)?;
+                // Comma (sequence) operator in return: return a, b — evaluate all, return last.
+                let expr = if self.at(TokenKind::Comma) {
+                    let mut exprs = vec![first];
+                    while self.eat(TokenKind::Comma) {
+                        exprs.push(self.parse_expression(0)?);
+                    }
+                    Expression::Sequence(exprs)
+                } else {
+                    first
+                };
                 Some(expr)
             };
         self.consume_semicolon();
@@ -247,11 +259,15 @@ impl Parser {
     }
 
     fn parse_sequence_expr(&mut self) -> Result<Expression, JsError> {
-        let mut expr = self.parse_expression(0)?;
-        while self.eat(TokenKind::Comma) {
-            expr = self.parse_expression(0)?;
+        let first = self.parse_expression(0)?;
+        if !self.at(TokenKind::Comma) {
+            return Ok(first);
         }
-        Ok(expr)
+        let mut exprs = vec![first];
+        while self.eat(TokenKind::Comma) {
+            exprs.push(self.parse_expression(0)?);
+        }
+        Ok(Expression::Sequence(exprs))
     }
 
     fn parse_if_statement(&mut self) -> Result<IfStatement, JsError> {

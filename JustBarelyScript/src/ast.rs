@@ -265,6 +265,8 @@ pub enum Expression {
         property: MemberProperty,
         optional: bool,
     },
+    // Comma-sequence operator: evaluate all expressions, return the last value.
+    Sequence(Vec<Expression>),
 }
 
 /// One segment of a template literal: either literal text or an interpolated expression.
