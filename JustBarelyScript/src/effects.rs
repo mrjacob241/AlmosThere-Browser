@@ -68,6 +68,7 @@ pub struct DomExecutionState {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct JsFunction {
+    pub name: Option<String>,
     pub params: Vec<Param>,
     pub body: FunctionBody,
     pub captured: Vec<StackFrame>,
@@ -112,6 +113,7 @@ pub struct BrowserExecutionState {
     execution_budget_remaining: Option<usize>,
     execution_budget_exhausted: bool,
     array_method_overrides: HashMap<String, JsValue>,
+    symbol_counter: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -367,10 +369,21 @@ impl BrowserExecutionState {
         );
         self.globals.insert("document".into(), JsValue::DocumentRef);
         self.globals.insert("window".into(), JsValue::WindowRef);
+        self.globals.insert("globalThis".into(), JsValue::WindowRef);
         self.globals.insert(
             "ActiveXObject".into(),
             JsValue::HostFunction("ActiveXObject".into()),
         );
+        self.globals.insert(
+            "Symbol".into(),
+            JsValue::HostFunction("Symbol".into()),
+        );
+        let mut perf = HashMap::new();
+        perf.insert(
+            "now".to_owned(),
+            JsValue::HostFunction("performance.now".into()),
+        );
+        self.globals.insert("performance".into(), JsValue::Object(perf));
     }
 
     /// Seed the precomputed browser fingerprint suite into JS-facing APIs.
@@ -554,33 +567,66 @@ impl BrowserExecutionState {
             let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
             let host = &rest[..host_end];
             obj.insert("host".into(), JsValue::String(host.to_owned()));
+            let hostname = host.split(':').next().unwrap_or("").to_owned();
+            let port = host
+                .split(':')
+                .nth(1)
+                .unwrap_or("")
+                .to_owned();
+            obj.insert("hostname".into(), JsValue::String(hostname.clone()));
+            obj.insert("port".into(), JsValue::String(port));
+            let after_host = &rest[host_end..];
+            let (path_part, rest_after_path) = after_host
+                .split_once('?')
+                .map(|(p, r)| (p, format!("?{r}")))
+                .unwrap_or_else(|| {
+                    after_host
+                        .split_once('#')
+                        .map(|(p, r)| (p, format!("#{r}")))
+                        .unwrap_or((after_host, String::new()))
+                });
+            let pathname = if path_part.is_empty() {
+                "/".to_owned()
+            } else {
+                path_part.to_owned()
+            };
+            obj.insert("pathname".into(), JsValue::String(pathname));
+            let (search_part, hash_part) = if let Some(q_rest) = rest_after_path.strip_prefix('?') {
+                let (s, h) = q_rest
+                    .split_once('#')
+                    .map(|(s, h)| (format!("?{s}"), format!("#{h}")))
+                    .unwrap_or_else(|| (format!("?{q_rest}"), String::new()));
+                (s, h)
+            } else if let Some(h_rest) = rest_after_path.strip_prefix('#') {
+                (String::new(), format!("#{h_rest}"))
+            } else {
+                (String::new(), String::new())
+            };
+            obj.insert("search".into(), JsValue::String(search_part));
+            obj.insert("hash".into(), JsValue::String(hash_part));
             obj.insert(
-                "hostname".into(),
-                JsValue::String(host.split(':').next().unwrap_or("").to_owned()),
-            );
-            obj.insert(
-                "pathname".into(),
-                JsValue::String(
-                    rest[host_end..]
-                        .split(['?', '#'])
-                        .next()
-                        .filter(|path| !path.is_empty())
-                        .unwrap_or("/")
-                        .to_owned(),
-                ),
+                "origin".into(),
+                JsValue::String(format!("{protocol}://{hostname}")),
             );
         } else {
             obj.insert("protocol".into(), JsValue::String(String::new()));
             obj.insert("host".into(), JsValue::String(String::new()));
             obj.insert("hostname".into(), JsValue::String(String::new()));
             obj.insert("pathname".into(), JsValue::String(href.to_owned()));
+            obj.insert("port".into(), JsValue::String(String::new()));
+            obj.insert("search".into(), JsValue::String(String::new()));
+            obj.insert("hash".into(), JsValue::String(String::new()));
+            obj.insert("origin".into(), JsValue::String("null".to_owned()));
         }
 
-        self.globals.insert("location".into(), JsValue::Object(obj));
+        self.globals.insert("location".into(), JsValue::Object(obj.clone()));
+        // Mirror as window.location for scripts that read window.location.*
+        self.globals.insert("__location__".into(), JsValue::Object(obj));
     }
 
     pub fn execute_program(&mut self, program: &Program) {
         self.ensure_global_frame();
+        self.hoist_function_declarations(&program.body);
         for statement in &program.body {
             self.execute_statement(statement);
             if self.early_exit.is_some() {
@@ -765,13 +811,17 @@ impl BrowserExecutionState {
             }
             Statement::FunctionDeclaration(decl) => {
                 let func = JsFunction {
+                    name: Some(decl.name.clone()),
                     params: decl.params.clone(),
                     body: FunctionBody::Block(decl.body.clone()),
                     captured: self.stack.clone(),
                     properties: HashMap::new(),
                 };
                 let name = decl.name.clone();
-                self.set_local(&name, JsValue::Function(func));
+                self.set_local(&name, JsValue::Function(func.clone()));
+                // If this was previously hoisted (empty-closure version stored in an
+                // override), refresh those overrides with the now-complete closure.
+                self.refresh_overrides_for_named_func(&name, JsValue::Function(func));
             }
             Statement::ClassDeclaration(_) => {}
             Statement::Return(stmt) => {
@@ -966,8 +1016,24 @@ impl BrowserExecutionState {
         }
     }
 
+    fn hoist_function_declarations(&mut self, stmts: &[Statement]) {
+        for stmt in stmts {
+            if let Statement::FunctionDeclaration(decl) = stmt {
+                let func = JsFunction {
+                    name: Some(decl.name.clone()),
+                    params: decl.params.clone(),
+                    body: FunctionBody::Block(decl.body.clone()),
+                    captured: self.stack.clone(),
+                    properties: HashMap::new(),
+                };
+                self.set_local(&decl.name, JsValue::Function(func));
+            }
+        }
+    }
+
     fn execute_block(&mut self, block: &BlockStatement) {
         self.stack.push(StackFrame::default());
+        self.hoist_function_declarations(&block.body);
         for statement in &block.body {
             self.execute_statement(statement);
             if self.early_exit.is_some() {
@@ -1088,12 +1154,14 @@ impl BrowserExecutionState {
                 JsValue::Object(self.object_from_properties(properties))
             }
             Expression::Function(fe) => JsValue::Function(JsFunction {
+                name: None,
                 params: fe.params.clone(),
                 body: FunctionBody::Block(fe.body.clone()),
                 captured: self.stack.clone(),
                 properties: HashMap::new(),
             }),
             Expression::ArrowFunction { params, body, .. } => JsValue::Function(JsFunction {
+                name: None,
                 params: params.clone(),
                 body: *body.clone(),
                 captured: self.stack.clone(),
@@ -1376,6 +1444,24 @@ impl BrowserExecutionState {
             match method.name.as_str() {
                 "resolve" if matches!(&method.object, Expression::Identifier(n) if n == "Promise") =>
                 {
+                    for arg in arguments {
+                        self.execute_expression(arg);
+                    }
+                    return JsValue::ResolvedPromise;
+                }
+                "reject" if matches!(&method.object, Expression::Identifier(n) if n == "Promise") =>
+                {
+                    for arg in arguments {
+                        self.execute_expression(arg);
+                    }
+                    return JsValue::ResolvedPromise;
+                }
+                "all" | "allSettled" | "race" | "any"
+                    if matches!(&method.object, Expression::Identifier(n) if n == "Promise") =>
+                {
+                    for arg in arguments {
+                        self.execute_expression(arg);
+                    }
                     return JsValue::ResolvedPromise;
                 }
                 "then" => {
@@ -1538,10 +1624,14 @@ impl BrowserExecutionState {
                     if let Some(stripped) = event_type.strip_prefix("on") {
                         event_type = stripped.to_owned();
                     }
-                    // document.addEventListener("DOMContentLoaded", fn) — DOM is already
-                    // parsed by the time scripts run, so fire as a microtask immediately.
-                    if matches!(&method.object, Expression::Identifier(n) if n == "document")
-                        && event_type == "DOMContentLoaded"
+                    // DOM is already parsed and page is loaded by the time scripts run, so
+                    // DOMContentLoaded and load fire as immediate microtasks.
+                    let is_document =
+                        matches!(&method.object, Expression::Identifier(n) if n == "document");
+                    let is_window = matches!(&method.object, Expression::Identifier(n) if n == "window")
+                        || matches!(receiver, JsValue::WindowRef);
+                    if (is_document && event_type == "DOMContentLoaded")
+                        || (is_window && (event_type == "load" || event_type == "DOMContentLoaded"))
                     {
                         if let Some(Expression::Function(func)) = arguments.get(1) {
                             self.pending_microtasks.push(PendingMicrotask {
@@ -1792,6 +1882,73 @@ impl BrowserExecutionState {
                         let args = self.eval_args(arguments);
                         return self.call_function(func, args);
                     }
+                }
+                // Mutating array methods: compute new array state and write back to the
+                // receiver expression so value-semantics arrays stay consistent.
+                match method_name.as_str() {
+                    "push" => {
+                        let mut new_arr = arr;
+                        for arg in arguments {
+                            match arg {
+                                Expression::Spread(inner) => {
+                                    if let JsValue::Array(spread_items) = self.execute_expression(inner) {
+                                        new_arr.extend(spread_items);
+                                    }
+                                }
+                                _ => new_arr.push(self.execute_expression(arg)),
+                            }
+                        }
+                        let len = new_arr.len();
+                        self.assign_target(object, JsValue::Array(new_arr));
+                        return JsValue::Number(len as f64);
+                    }
+                    "pop" => {
+                        let mut new_arr = arr;
+                        let result = new_arr.pop().unwrap_or(JsValue::Undefined);
+                        self.assign_target(object, JsValue::Array(new_arr));
+                        return result;
+                    }
+                    "shift" => {
+                        let mut new_arr = arr;
+                        let result = if new_arr.is_empty() {
+                            JsValue::Undefined
+                        } else {
+                            new_arr.remove(0)
+                        };
+                        self.assign_target(object, JsValue::Array(new_arr));
+                        return result;
+                    }
+                    "unshift" => {
+                        let new_items: Vec<JsValue> = arguments
+                            .iter()
+                            .map(|a| self.execute_expression(a))
+                            .collect();
+                        let len = new_items.len() + arr.len();
+                        let mut new_arr = new_items;
+                        new_arr.extend(arr);
+                        self.assign_target(object, JsValue::Array(new_arr));
+                        return JsValue::Number(len as f64);
+                    }
+                    "splice" => {
+                        let mut new_arr = arr;
+                        let start = arguments
+                            .first()
+                            .map(|a| Self::value_to_number(&self.execute_expression(a)) as usize)
+                            .unwrap_or(0)
+                            .min(new_arr.len());
+                        let delete_count = arguments
+                            .get(1)
+                            .map(|a| Self::value_to_number(&self.execute_expression(a)) as usize)
+                            .unwrap_or(new_arr.len() - start)
+                            .min(new_arr.len() - start);
+                        let removed: Vec<JsValue> = new_arr.drain(start..start + delete_count).collect();
+                        for (i, arg) in arguments.iter().skip(2).enumerate() {
+                            new_arr.insert(start + i, self.execute_expression(arg));
+                        }
+                        self.assign_target(object, JsValue::Array(new_arr));
+                        return JsValue::Array(removed);
+                    }
+                    _ => {}
                 }
                 if let Some(v) = self.call_array_method(&method_name, arr, arguments) {
                     return v;
@@ -2092,6 +2249,76 @@ impl BrowserExecutionState {
                         .unwrap_or_default();
                     return self.canvas_context_ref(&context_name);
                 }
+                if method_name == "getBoundingClientRect" {
+                    for arg in arguments {
+                        self.execute_expression(arg);
+                    }
+                    let mut rect = HashMap::new();
+                    for key in &["top", "left", "right", "bottom", "width", "height", "x", "y"] {
+                        rect.insert((*key).to_owned(), JsValue::Number(0.0));
+                    }
+                    return JsValue::Object(rect);
+                }
+                if matches!(
+                    method_name.as_str(),
+                    "matches" | "webkitMatchesSelector" | "mozMatchesSelector"
+                ) {
+                    for arg in arguments {
+                        self.execute_expression(arg);
+                    }
+                    return JsValue::Boolean(false);
+                }
+                if matches!(method_name.as_str(), "closest") {
+                    for arg in arguments {
+                        self.execute_expression(arg);
+                    }
+                    return JsValue::Null;
+                }
+                if matches!(method_name.as_str(), "contains") {
+                    for arg in arguments {
+                        self.execute_expression(arg);
+                    }
+                    return JsValue::Boolean(false);
+                }
+                if matches!(method_name.as_str(), "hasAttribute" | "hasAttributes") {
+                    let name = arguments
+                        .first()
+                        .map(|a| Self::value_to_string(&self.execute_expression(a)))
+                        .unwrap_or_default();
+                    return JsValue::Boolean(
+                        self.get_element_attribute(&element_ref, &name).is_some(),
+                    );
+                }
+                if method_name == "removeAttribute" {
+                    for arg in arguments {
+                        self.execute_expression(arg);
+                    }
+                    return JsValue::Undefined;
+                }
+                if method_name == "querySelector" {
+                    for arg in arguments {
+                        self.execute_expression(arg);
+                    }
+                    return JsValue::Null;
+                }
+                if method_name == "querySelectorAll" {
+                    for arg in arguments {
+                        self.execute_expression(arg);
+                    }
+                    return JsValue::Array(vec![]);
+                }
+                if method_name == "getElementsByTagName" || method_name == "getElementsByClassName" {
+                    for arg in arguments {
+                        self.execute_expression(arg);
+                    }
+                    return JsValue::Array(vec![]);
+                }
+                if method_name == "focus" || method_name == "blur" || method_name == "click" {
+                    for arg in arguments {
+                        self.execute_expression(arg);
+                    }
+                    return JsValue::Undefined;
+                }
                 if Self::element_plugin_method_returns_empty(&method_name) {
                     for argument in arguments {
                         self.execute_expression(argument);
@@ -2147,6 +2374,15 @@ impl BrowserExecutionState {
             }
 
             if let JsValue::HostFunction(name) = receiver.clone() {
+                // Dispatch static method calls such as Symbol.for(...) via compound name.
+                let compound = format!("{name}.{method_name}");
+                if !matches!(method_name.as_str(), "call" | "apply" | "bind") {
+                    let args = self.eval_args(arguments);
+                    let result = self.call_host_function(&compound, JsValue::Undefined, args);
+                    if !matches!(result, JsValue::Undefined) {
+                        return result;
+                    }
+                }
                 match method_name.as_str() {
                     "call" => {
                         let mut args = self.eval_args(arguments);
@@ -2164,6 +2400,30 @@ impl BrowserExecutionState {
                             Some(JsValue::Array(items)) => std::mem::take(items),
                             _ => vec![],
                         };
+                        // For array-mutating host methods, write the updated array back to
+                        // the first argument expression so `f.push.apply(f, items)` reflects
+                        // the change on `f` (value-semantics arrays are not shared by reference).
+                        if let JsValue::Array(mut arr) = this_arg.clone() {
+                            let mut wrote_back = false;
+                            match name.as_str() {
+                                "Array.prototype.push" => {
+                                    arr.extend(real_args.clone());
+                                    wrote_back = true;
+                                }
+                                "Array.prototype.unshift" => {
+                                    let old = std::mem::take(&mut arr);
+                                    arr = real_args.clone();
+                                    arr.extend(old);
+                                    wrote_back = true;
+                                }
+                                _ => {}
+                            }
+                            if wrote_back {
+                                if let Some(expr) = arguments.first() {
+                                    self.assign_target(expr, JsValue::Array(arr));
+                                }
+                            }
+                        }
                         return self.call_host_function(&name, this_arg, real_args);
                     }
                     "bind" => {
@@ -3089,30 +3349,6 @@ impl BrowserExecutionState {
                 Some(JsValue::Array(entries))
             }
             "values" => Some(JsValue::Array(arr)),
-            "push" => {
-                let new_len = arr.len()
-                    + arguments
-                        .iter()
-                        .filter(|a| !matches!(a, Expression::Spread(_)))
-                        .count();
-                for arg in arguments {
-                    self.execute_expression(arg);
-                }
-                Some(JsValue::Number(new_len as f64))
-            }
-            "unshift" => {
-                let added = arguments.len();
-                for arg in arguments {
-                    self.execute_expression(arg);
-                }
-                Some(JsValue::Number((arr.len() + added) as f64))
-            }
-            "splice" => Some(JsValue::Array(Vec::new())),
-            "pop" => {
-                // read-only approximation: return last element
-                Some(arr.into_iter().last().unwrap_or(JsValue::Undefined))
-            }
-            "shift" => Some(arr.into_iter().next().unwrap_or(JsValue::Undefined)),
             "fill" => {
                 let val = arguments
                     .first()
@@ -3422,6 +3658,9 @@ impl BrowserExecutionState {
                         self.assign_target(object, JsValue::Array(arr));
                     }
                 }
+                JsValue::WindowRef => {
+                    self.globals.insert(key, value);
+                }
                 _ => {}
             }
             return;
@@ -3501,9 +3740,99 @@ impl BrowserExecutionState {
         }
 
         if let Expression::Identifier(name) = target {
-            self.set_binding(name, value);
+            // Before overwriting, capture the old value so we can propagate the update
+            // to any Object in scope that holds it as an entry (handles the Webpack pattern:
+            // `var module = installedModules[id] = {...}` where both sides are aliases).
+            let old_val = self.get_binding(name).unwrap_or(JsValue::Undefined);
+            self.set_binding(name, value.clone());
+            if matches!(&old_val, JsValue::Object(_)) {
+                self.propagate_object_alias_update(old_val, value);
+            }
         } else if matches!(target, Expression::This) {
             self.set_binding("this", value);
+        }
+    }
+
+    /// When an Object identifier is overwritten with a new value, scan all accessible
+    /// Object bindings for entries equal to the old value and update those entries to
+    /// the new value. This gives shallow alias semantics for the Webpack pattern:
+    ///   `var module = installedModules[id] = {exports:{}}` — both sides start equal;
+    /// when writeback updates `module`, `installedModules[id]` must reflect the change.
+    fn propagate_object_alias_update(&mut self, old_val: JsValue, new_val: JsValue) {
+        // Scan globals
+        let global_keys: Vec<String> = self.globals.keys().cloned().collect();
+        for key in global_keys {
+            if let Some(JsValue::Object(mut map)) = self.globals.get(&key).cloned() {
+                let mut changed = false;
+                for v in map.values_mut() {
+                    if Self::safe_objects_equal(v, &old_val) {
+                        *v = new_val.clone();
+                        changed = true;
+                    }
+                }
+                if changed {
+                    self.globals.insert(key, JsValue::Object(map));
+                }
+            }
+        }
+        // Scan all stack frames (including captured closure frames)
+        for frame in &self.stack {
+            let frame_keys: Vec<String> = frame.locals.borrow().keys().cloned().collect();
+            for key in frame_keys {
+                let current = frame.locals.borrow().get(&key).cloned();
+                if let Some(JsValue::Object(mut map)) = current {
+                    let mut changed = false;
+                    for v in map.values_mut() {
+                        if Self::safe_objects_equal(v, &old_val) {
+                            *v = new_val.clone();
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        frame.locals.borrow_mut().insert(key, JsValue::Object(map));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Structural equality check that never recurses into Function values.
+    /// When a named function declaration runs in statement order, any method override
+    /// that was stored with the earlier hoisted (empty-closure) version of the same
+    /// function is refreshed with the now-complete closure. Matching is done by
+    /// `JsFunction::name` to avoid comparing closures (which can cause stack overflows).
+    fn refresh_overrides_for_named_func(&mut self, func_name: &str, new_val: JsValue) {
+        for val in self.array_method_overrides.values_mut() {
+            if let JsValue::Function(f) = val {
+                if f.name.as_deref() == Some(func_name) {
+                    *val = new_val.clone();
+                }
+            }
+        }
+    }
+
+    /// Any comparison involving a Function (or other complex host type) returns false,
+    /// preventing the PartialEq stack overflow that occurs when closures contain
+    /// self-referential captured frames (e.g. a function stored in exports that
+    /// captures the same globals map containing it).
+    fn safe_objects_equal(a: &JsValue, b: &JsValue) -> bool {
+        match (a, b) {
+            (JsValue::Undefined, JsValue::Undefined) | (JsValue::Null, JsValue::Null) => true,
+            (JsValue::Boolean(x), JsValue::Boolean(y)) => x == y,
+            (JsValue::Number(x), JsValue::Number(y)) => x == y,
+            (JsValue::String(x), JsValue::String(y)) => x == y,
+            (JsValue::Object(a), JsValue::Object(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .all(|(k, v)| b.get(k).is_some_and(|bv| Self::safe_objects_equal(v, bv)))
+            }
+            (JsValue::Array(a), JsValue::Array(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|(av, bv)| Self::safe_objects_equal(av, bv))
+            }
+            _ => false,
         }
     }
 
@@ -3619,6 +3948,10 @@ impl BrowserExecutionState {
                             JsValue::Undefined
                         }
                     }
+                    JsValue::WindowRef => {
+                        let key = Self::value_to_string(&index);
+                        self.globals.get(&key).cloned().unwrap_or(JsValue::Undefined)
+                    }
                     _ => JsValue::Undefined,
                 }
             }
@@ -3635,6 +3968,9 @@ impl BrowserExecutionState {
                         "document" if property == "documentElement" => {
                             return JsValue::ElementRef(existing_element_ref("html"));
                         }
+                        "document" if property == "readyState" => {
+                            return JsValue::String("complete".to_owned());
+                        }
                         "window" if property == "ActiveXObject" => {
                             return JsValue::HostFunction("ActiveXObject".into());
                         }
@@ -3649,6 +3985,27 @@ impl BrowserExecutionState {
                         }
                         "Function" if property == "prototype" => {
                             return Self::native_prototype_object("Function");
+                        }
+                        "Symbol" => {
+                            return match property.as_str() {
+                                "iterator" => JsValue::String("Symbol(Symbol.iterator)".into()),
+                                "toPrimitive" => {
+                                    JsValue::String("Symbol(Symbol.toPrimitive)".into())
+                                }
+                                "toStringTag" => {
+                                    JsValue::String("Symbol(Symbol.toStringTag)".into())
+                                }
+                                "hasInstance" => {
+                                    JsValue::String("Symbol(Symbol.hasInstance)".into())
+                                }
+                                "species" => JsValue::String("Symbol(Symbol.species)".into()),
+                                "asyncIterator" => {
+                                    JsValue::String("Symbol(Symbol.asyncIterator)".into())
+                                }
+                                "for" => JsValue::HostFunction("Symbol.for".into()),
+                                "keyFor" => JsValue::HostFunction("Symbol.keyFor".into()),
+                                _ => JsValue::Undefined,
+                            };
                         }
                         "Math" => {
                             return match property.as_str() {
@@ -3702,6 +4059,53 @@ impl BrowserExecutionState {
                                 JsValue::Undefined
                             };
                         }
+                        // Layout/position dimensions — safe zero stubs (no layout engine).
+                        if matches!(
+                            property.as_str(),
+                            "offsetWidth"
+                                | "offsetHeight"
+                                | "clientWidth"
+                                | "clientHeight"
+                                | "scrollWidth"
+                                | "scrollHeight"
+                                | "offsetTop"
+                                | "offsetLeft"
+                                | "scrollTop"
+                                | "scrollLeft"
+                                | "clientTop"
+                                | "clientLeft"
+                        ) {
+                            return JsValue::Number(0.0);
+                        }
+                        // DOM tree traversal — safe null/empty stubs.
+                        if matches!(
+                            property.as_str(),
+                            "parentNode" | "parentElement" | "offsetParent"
+                        ) {
+                            return JsValue::Null;
+                        }
+                        if matches!(
+                            property.as_str(),
+                            "children" | "childNodes" | "childElementCount"
+                        ) {
+                            return JsValue::Array(vec![]);
+                        }
+                        if matches!(
+                            property.as_str(),
+                            "firstChild"
+                                | "lastChild"
+                                | "firstElementChild"
+                                | "lastElementChild"
+                                | "nextSibling"
+                                | "previousSibling"
+                                | "nextElementSibling"
+                                | "previousElementSibling"
+                        ) {
+                            return JsValue::Null;
+                        }
+                        if property == "nodeType" {
+                            return JsValue::Number(1.0);
+                        }
                         if dom_property_is_text_content(property) {
                             JsValue::String(
                                 self.get_element_text_content(&element_ref)
@@ -3729,6 +4133,14 @@ impl BrowserExecutionState {
                             JsValue::ElementRef(existing_element_ref("head"))
                         } else if property == "documentElement" {
                             JsValue::ElementRef(existing_element_ref("html"))
+                        } else if property == "readyState" {
+                            JsValue::String("complete".to_owned())
+                        } else if property == "cookie" {
+                            JsValue::String(String::new())
+                        } else if property == "title" {
+                            JsValue::String(String::new())
+                        } else if property == "URL" || property == "referrer" || property == "domain" {
+                            JsValue::String(String::new())
                         } else {
                             JsValue::Undefined
                         }
@@ -3764,6 +4176,16 @@ impl BrowserExecutionState {
                                 | "webkitOfflineAudioContext" => {
                                     JsValue::HostFunction(property.clone())
                                 }
+                                "Symbol" => JsValue::HostFunction("Symbol".into()),
+                                "performance" => {
+                                    let mut map = HashMap::new();
+                                    map.insert(
+                                        "now".to_owned(),
+                                        JsValue::HostFunction("performance.now".into()),
+                                    );
+                                    JsValue::Object(map)
+                                }
+                                "globalThis" => JsValue::WindowRef,
                                 _ => JsValue::Undefined,
                             }
                         })
@@ -4032,8 +4454,10 @@ impl BrowserExecutionState {
             "document" => JsValue::DocumentRef,
             "window" => JsValue::WindowRef,
             "navigator" => JsValue::NavigatorRef,
+            "globalThis" => JsValue::WindowRef,
             "ActiveXObject" => JsValue::HostFunction("ActiveXObject".into()),
             "Function" => JsValue::HostFunction("Function".into()),
+            "Symbol" => JsValue::HostFunction("Symbol".into()),
             "AudioContext"
             | "webkitAudioContext"
             | "OfflineAudioContext"
@@ -4127,6 +4551,7 @@ impl BrowserExecutionState {
         self.bind_params(&func.params, args);
         let result = match func.body {
             FunctionBody::Block(block) => {
+                self.hoist_function_declarations(&block.body);
                 for stmt in &block.body {
                     self.execute_statement(stmt);
                     if self.early_exit.is_some() {
@@ -4177,6 +4602,9 @@ impl BrowserExecutionState {
             })
             .collect();
 
+        // Snapshot the initial arg values so we can detect which params changed.
+        let initial_values: Vec<JsValue> = args.clone();
+
         let saved_stack = std::mem::replace(&mut self.stack, func.captured);
         self.ensure_global_frame();
         self.stack.push(StackFrame::default());
@@ -4184,6 +4612,7 @@ impl BrowserExecutionState {
         self.bind_params(&func.params, args);
         let result = match func.body {
             FunctionBody::Block(block) => {
+                self.hoist_function_declarations(&block.body);
                 for stmt in &block.body {
                     self.execute_statement(stmt);
                     if self.early_exit.is_some() {
@@ -4212,10 +4641,20 @@ impl BrowserExecutionState {
         self.ensure_global_frame();
         let _ = std::mem::replace(&mut self.stack, saved_stack);
 
-        // Write mutated Objects/Arrays back to the caller's argument expressions.
-        for (final_val_opt, arg_expr) in final_values.iter().zip(arg_exprs.iter()) {
+        // Write back only params that changed.  Skipping unchanged params avoids overwriting
+        // sibling writebacks: e.g. if `module.exports = fn` was written through the `module`
+        // param, the unchanged `exports` clone must not clobber `module.exports`.
+        // Function values are never written back: comparing them recurses through captured
+        // stack frames and can cause a stack overflow when a closure captures the global scope.
+        // In practice, Webpack function exports always reach the caller through a mutated
+        // `module.exports` (Object), which IS written back correctly.
+        for ((final_val_opt, initial_val), arg_expr) in final_values
+            .iter()
+            .zip(initial_values.iter())
+            .zip(arg_exprs.iter())
+        {
             if let Some(final_val) = final_val_opt {
-                if matches!(final_val, JsValue::Object(_) | JsValue::Array(_)) {
+                if Self::writeback_value_changed(initial_val, final_val) {
                     self.assign_target(arg_expr, final_val.clone());
                 }
             }
@@ -4482,6 +4921,19 @@ impl BrowserExecutionState {
             JsValue::XhrInstance { .. } => "[object XMLHttpRequest]".to_owned(),
             JsValue::Proxy { .. } => "[object Object]".to_owned(),
             JsValue::WeakMap(_) => "[object WeakMap]".to_owned(),
+        }
+    }
+
+    /// Returns true if a param value changed in a way that warrants writing back to the caller.
+    /// Function values are never written back: their PartialEq descends into captured stack
+    /// frames that may form reference cycles, causing a stack overflow.  Webpack function
+    /// exports always travel through a mutated Object/Array (e.g. `module.exports = fn`),
+    /// which is detected by the Object writeback path.
+    fn writeback_value_changed(initial: &JsValue, final_val: &JsValue) -> bool {
+        // Same variant heuristic — skip expensive deep comparison for functions.
+        match (initial, final_val) {
+            (JsValue::Function(_), JsValue::Function(_)) => false,
+            (a, b) => a != b,
         }
     }
 
@@ -4803,6 +5255,23 @@ impl BrowserExecutionState {
             "Function.prototype.toString" => {
                 JsValue::String("function () { [native code] }".into())
             }
+            "Symbol" => {
+                self.symbol_counter += 1;
+                let desc = args
+                    .first()
+                    .map(Self::value_to_string)
+                    .unwrap_or_default();
+                JsValue::String(format!("__sym_{}_{}", self.symbol_counter, desc))
+            }
+            "Symbol.for" => {
+                let key = args
+                    .first()
+                    .map(Self::value_to_string)
+                    .unwrap_or_default();
+                JsValue::String(format!("__sym_for_{key}"))
+            }
+            "Symbol.keyFor" => JsValue::Undefined,
+            "performance.now" => JsValue::Number(self.current_time_ms as f64),
             _ => Self::host_function_default_return(name),
         }
     }
@@ -5336,11 +5805,27 @@ fn window_member_name(expression: &Expression) -> Option<String> {
     Some(name.clone())
 }
 
-/// For `window.X` and `(window.X = ...)` expressions, return the global name `X`.
-/// Used to detect calls like `(window.webpackJsonp = ...).push(data)`.
+/// For `window.X`, `window["X"]`, and `(window.X = ...)` / `(window["X"] = ...)` expressions,
+/// return the global name `X`. Used to detect calls like `(window.webpackJsonp = ...).push(data)`.
 fn extract_window_global_name(expr: &Expression) -> Option<String> {
     if let Some(name) = window_member_name(expr) {
         return Some(name);
+    }
+    // window["name"] computed access
+    if let Expression::Member {
+        object,
+        property: MemberProperty::Computed(key_expr),
+        ..
+    } = expr
+    {
+        if matches!(object.as_ref(), Expression::Identifier(n) if n == "window") {
+            match key_expr.as_ref() {
+                Expression::String(name) | Expression::Identifier(name) => {
+                    return Some(name.clone());
+                }
+                _ => {}
+            }
+        }
     }
     if let Expression::Assignment { target, .. } = expr {
         return extract_window_global_name(target);
@@ -7334,6 +7819,81 @@ mod tests {
     }
 
     #[test]
+    fn t065b_call_writeback_function_export() {
+        // Webpack factories that do `module.exports = function() {...}` must propagate
+        // the function value back through call_function_with_writeback (not just Objects).
+        let effects = run(r#"
+            function factory(module, exports, require) {
+                module.exports = function greet() { return "hello"; };
+            }
+            var mod = { exports: {} };
+            factory.call(mod.exports, mod, mod.exports, function(){});
+            var fn = mod.exports;
+            document.getElementById("result").textContent = fn();
+        "#);
+        assert_eq!(effects, vec![text("result", "hello")]);
+    }
+
+    #[test]
+    fn t065c_symbol_produces_unique_strings() {
+        // Symbol() must return a value usable as an object key without collision.
+        let effects = run(r#"
+            var s1 = Symbol("iter");
+            var s2 = Symbol("iter");
+            var obj = {};
+            obj[s1] = "first";
+            obj[s2] = "second";
+            var sameKey = s1 === s2;
+            document.getElementById("same").textContent = String(sameKey);
+            document.getElementById("v1").textContent = obj[s1];
+            document.getElementById("v2").textContent = obj[s2];
+        "#);
+        // s1 and s2 must be different strings, so they store different values.
+        assert!(
+            effects.contains(&text("same", "false")),
+            "Symbol() values should be unique: {effects:?}"
+        );
+        assert!(
+            effects.contains(&text("v1", "first")),
+            "first symbol slot should hold 'first': {effects:?}"
+        );
+        assert!(
+            effects.contains(&text("v2", "second")),
+            "second symbol slot should hold 'second': {effects:?}"
+        );
+    }
+
+    #[test]
+    fn t065d_document_ready_state_is_complete() {
+        let effects = run(r#"
+            var ready = document.readyState === "complete";
+            document.getElementById("result").textContent = String(ready);
+        "#);
+        assert_eq!(effects, vec![text("result", "true")]);
+    }
+
+    #[test]
+    fn t065e_window_load_event_fires_as_microtask() {
+        let effects = run(r#"
+            window.addEventListener("load", function() {
+                document.getElementById("result").textContent = "loaded";
+            });
+        "#);
+        assert_eq!(effects, vec![text("result", "loaded")]);
+    }
+
+    #[test]
+    fn t065f_promise_all_returns_resolved_promise() {
+        // Promise.all must not crash and should allow .then chains to proceed.
+        let effects = run(r#"
+            Promise.all([Promise.resolve(1), Promise.resolve(2)]).then(function() {
+                document.getElementById("result").textContent = "done";
+            });
+        "#);
+        assert_eq!(effects, vec![text("result", "done")]);
+    }
+
+    #[test]
     fn t065_proxy_and_weakmap_basic_semantics() {
         // The AMIUnique Nuxt chunks reference Proxy and WeakMap. This smoke test
         // captures the minimum behavior needed before those constructs can be
@@ -7352,5 +7912,491 @@ mod tests {
                 proxy.name + "/" + proxy.unknown + "/" + map.get(target);
         "#);
         assert_eq!(effects, vec![text("result", "Alice/missing/stored")]);
+    }
+
+    // Webpack computed-access diagnostics — these pin-point the bootstrap failure.
+
+    #[test]
+    fn t066a_window_computed_write_then_named_read() {
+        // window["x"] = 5 must set globals["x"] so that a later `x` identifier read
+        // and a `window.x` named read both return 5.
+        let effects = run(r#"
+            window["myGlobal"] = "hello";
+            document.getElementById("a").textContent = myGlobal;
+            document.getElementById("b").textContent = window.myGlobal;
+        "#);
+        assert_eq!(
+            effects,
+            vec![text("a", "hello"), text("b", "hello")],
+            "window[\"x\"] = val must set the global so identifier and window.x reads agree: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn t066b_window_computed_read_returns_named_global() {
+        // window.x = 5 set via named write; window["x"] computed read must return 5.
+        let effects = run(r#"
+            window.myGlobal = "world";
+            var v = window["myGlobal"];
+            document.getElementById("out").textContent = v;
+        "#);
+        assert_eq!(
+            effects,
+            vec![text("out", "world")],
+            "window[\"x\"] computed read must return the previously-set global: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn t066c_webpack_computed_jsonp_init_pattern() {
+        // Actual Webpack runtime pattern:
+        //   var jsonpArray = window["webpackJsonp"] = window["webpackJsonp"] || [];
+        // This requires both computed read (to get existing value or undefined) and
+        // computed write (to persist the new array as globals["webpackJsonp"]).
+        // Note: `===` on two Array values is reference equality in JS and always false
+        // in JBS (value semantics), so we only check that both sides are arrays.
+        let effects = run(r#"
+            var jsonpArray = window["webpackJsonp"] = window["webpackJsonp"] || [];
+            document.getElementById("type").textContent = Array.isArray(jsonpArray) ? "array" : "not-array";
+            document.getElementById("glob").textContent = Array.isArray(window["webpackJsonp"]) ? "array" : "not-array";
+        "#);
+        assert!(
+            effects.contains(&text("type", "array")),
+            "jsonpArray must be an array after computed init: {effects:?}"
+        );
+        assert!(
+            effects.contains(&text("glob", "array")),
+            "window[\"webpackJsonp\"] must also be an array after computed init: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn t066d_webpack_push_override_propagates_after_computed_write() {
+        // Full real Webpack runtime pattern (using computed access throughout):
+        //   var jsonpArray = window["webpackJsonp"] = window["webpackJsonp"] || [];
+        //   var oldPush = jsonpArray.push.bind(jsonpArray);
+        //   jsonpArray.push = webpackJsonpCallback;
+        // Then a chunk does:
+        //   (window["webpackJsonp"] = window["webpackJsonp"] || []).push([chunkData]);
+        // The overridden push must fire, not native Array.prototype.push.
+        let effects = run(r#"
+            var jsonpArray = window["webpackJsonp"] = window["webpackJsonp"] || [];
+            jsonpArray.push = function(chunk) {
+                document.getElementById("result").textContent = "callback:" + chunk[0];
+            };
+            (window["webpackJsonp"] = window["webpackJsonp"] || []).push(["chunk1"]);
+        "#);
+        assert_eq!(
+            effects,
+            vec![text("result", "callback:chunk1")],
+            "push override must fire when chunk calls window[\"webpackJsonp\"].push: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn t066e_webpack_require_module_cache_semantics() {
+        // __webpack_require__ caches modules in installedModules[moduleId].
+        // After first call, second call must return the cached module.exports, not {}.
+        // The tricky part: `installedModules[id] = module = {exports:{}}` uses
+        // value semantics in JBS — the module local and installedModules[id] diverge
+        // if we don't write back properly.
+        let effects = run(r#"
+            var installedModules = {};
+            function __webpack_require__(moduleId) {
+                if (installedModules[moduleId]) {
+                    return installedModules[moduleId].exports;
+                }
+                var module = installedModules[moduleId] = { id: moduleId, exports: {} };
+                var factory = modules[moduleId];
+                factory.call(module.exports, module, module.exports, __webpack_require__);
+                return module.exports;
+            }
+            var modules = {
+                42: function(module, exports, require) {
+                    exports.answer = "forty-two";
+                }
+            };
+            var result1 = __webpack_require__(42);
+            var result2 = __webpack_require__(42);
+            document.getElementById("r1").textContent = result1.answer;
+            document.getElementById("r2").textContent = result2.answer;
+            document.getElementById("cached").textContent = String(installedModules[42] !== undefined);
+        "#);
+        assert!(
+            effects.contains(&text("r1", "forty-two")),
+            "first __webpack_require__ call must return module.exports with factory output: {effects:?}"
+        );
+        assert!(
+            effects.contains(&text("r2", "forty-two")),
+            "second __webpack_require__ call must return cached exports, not {{}}: {effects:?}"
+        );
+        assert!(
+            effects.contains(&text("cached", "true")),
+            "installedModules[42] must be set after first require: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn t066f_webpack_full_bootstrap_computed_access() {
+        // Full end-to-end Webpack bootstrap using computed member access throughout,
+        // matching what the real amiunique _nuxt/13ede67.js Webpack runtime does.
+        // The runtime sets up webpackJsonp via computed access, registers the push
+        // override, then a chunk script adds its factories. The factory runs,
+        // sets exports.value, and the entry module produces a DOM effect.
+        let effects = run(r#"
+            var installedModules = {};
+            var modules = {};
+            function __webpack_require__(moduleId) {
+                if (installedModules[moduleId]) {
+                    return installedModules[moduleId].exports;
+                }
+                var module = installedModules[moduleId] = { id: moduleId, exports: {} };
+                modules[moduleId].call(module.exports, module, module.exports, __webpack_require__);
+                return module.exports;
+            }
+            function webpackJsonpCallback(data) {
+                var chunkIds = data[0];
+                var moreModules = data[1];
+                var executeModules = data[2];
+                for (var moduleId in moreModules) {
+                    modules[moduleId] = moreModules[moduleId];
+                }
+                if (executeModules) {
+                    for (var i = 0; i < executeModules.length; i++) {
+                        var result = __webpack_require__(executeModules[i]);
+                        if (result && result.default) {
+                            result.default();
+                        }
+                    }
+                }
+            }
+            var jsonpArray = window["webpackJsonp"] = window["webpackJsonp"] || [];
+            jsonpArray.push = webpackJsonpCallback;
+
+            // Simulate a chunk script call (what _nuxt/66e1ca0.js etc. do):
+            (window["webpackJsonp"] = window["webpackJsonp"] || []).push([
+                ["app"],
+                {
+                    "entry": function(module, exports, require) {
+                        exports.default = function() {
+                            document.getElementById("app").textContent = "vue-mounted";
+                        };
+                    }
+                },
+                ["entry"]
+            ]);
+        "#);
+        assert_eq!(
+            effects,
+            vec![text("app", "vue-mounted")],
+            "full Webpack bootstrap with computed access must reach the entry module effect: {effects:?}"
+        );
+    }
+
+    // ── Multi-script execution tests ──────────────────────────────────────────
+    // The browser runs each <script> tag as a separate execute_program call on
+    // the SAME BrowserExecutionState. The Webpack runtime (script 5) sets up
+    // the push override; the chunk scripts (6-14) call push on a separate program.
+    // These tests pin down whether that inter-script state transfer works.
+
+    #[test]
+    fn t067e_function_declaration_hoisting_within_block() {
+        // In JS, function declarations are hoisted to the top of their containing
+        // function scope, so they can be referenced before the declaration site.
+        // JBS currently executes statements in order — if a FunctionDeclaration
+        // appears after a reference to that name, the name reads as Undefined.
+        // This test confirms the bug: the Webpack IIFE assigns `arr.push = fn`
+        // before the `function fn(data){...}` declaration appears in source order.
+        let effects = run(r#"
+            (function() {
+                var arr = [];
+                arr[0] = earlyRef;          // read name before declaration
+                var called = (typeof earlyRef === "function") ? "hoisted" : "not-hoisted";
+                document.getElementById("hoist").textContent = called;
+                function earlyRef(x) { return x * 2; }
+                // also verify the declaration itself works after its position
+                document.getElementById("late").textContent = String(earlyRef(21));
+            })();
+        "#);
+        assert!(
+            effects.contains(&text("hoist", "hoisted")),
+            "function declaration must be hoisted so it is visible before its source position: {effects:?}"
+        );
+        assert!(
+            effects.contains(&text("late", "42")),
+            "function declaration must also be callable after its source position: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn t067f_webpack_iife_push_override_with_hoisted_callback() {
+        // The real Webpack 4 runtime assigns `jsonpArray.push = webpackJsonpCallback`
+        // BEFORE the `function webpackJsonpCallback(data){...}` declaration appears
+        // in source order. Without hoisting, webpackJsonpCallback is Undefined at the
+        // assignment site and the override is silently not stored.
+        let effects = run_two_scripts(
+            // Script A — Webpack runtime with function declaration AFTER assignment
+            r#"
+                (function(modules) {
+                    var jsonpArray = window["webpackJsonp"] = window["webpackJsonp"] || [];
+                    var oldPush = jsonpArray.push.bind(jsonpArray);
+                    jsonpArray.push = webpackJsonpCallback;   // ← uses fn before declaration
+                    jsonpArray = jsonpArray.slice();
+
+                    function webpackJsonpCallback(data) {     // ← declared after usage
+                        document.getElementById("app").textContent = "callback:" + data[0];
+                    }
+                })({});
+            "#,
+            // Script B — chunk calls push
+            r#"
+                (window["webpackJsonp"] = window["webpackJsonp"] || []).push(["chunk6"]);
+            "#,
+        );
+        assert_eq!(
+            effects,
+            vec![text("app", "callback:chunk6")],
+            "webpackJsonpCallback must be hoisted so push override is set correctly: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn t067g_webpack_hoisted_callback_uses_iife_closure() {
+        // t067f proved the override fires. This test adds closure variables (installedModules,
+        // __webpack_require__) to verify the re-registered function has the full closure,
+        // not the early hoisted snapshot.
+        let effects = run_two_scripts(
+            r#"
+                (function(modules) {
+                    var installedModules = {};
+                    var jsonpArray = window["webpackJsonp"] = window["webpackJsonp"] || [];
+                    jsonpArray.push = webpackJsonpCallback;
+
+                    function __webpack_require__(id) {
+                        if (installedModules[id]) { return installedModules[id].exports; }
+                        var mod = installedModules[id] = { exports: {} };
+                        modules[id].call(mod.exports, mod, mod.exports, __webpack_require__);
+                        return mod.exports;
+                    }
+
+                    function webpackJsonpCallback(data) {
+                        var moreModules = data[1];
+                        for (var id in moreModules) { modules[id] = moreModules[id]; }
+                        __webpack_require__(data[2][0]);
+                    }
+                })({
+                    "entry": function(module, exports) {
+                        document.getElementById("app").textContent = "webpack-loaded";
+                    }
+                });
+            "#,
+            r#"
+                (window["webpackJsonp"] = window["webpackJsonp"] || []).push([
+                    "chunk1",
+                    {},
+                    ["entry"]
+                ]);
+            "#,
+        );
+        assert!(
+            effects.contains(&text("app", "webpack-loaded")),
+            "callback must use IIFE-captured installedModules and __webpack_require__: {effects:?}"
+        );
+    }
+
+    fn run_two_scripts(script_a: &str, script_b: &str) -> Vec<BrowserEffect> {
+        let prog_a = crate::parse_script(script_a).expect("parse script_a");
+        let prog_b = crate::parse_script(script_b).expect("parse script_b");
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&prog_a);
+        let _ = state.drain_effects(); // discard script_a effects (as the browser does)
+        state.execute_program(&prog_b);
+        state.drain_effects()
+    }
+
+    #[test]
+    fn t067a_webpack_push_override_survives_script_boundary() {
+        // Script A (Webpack runtime, single-script): sets up the webpackJsonp global
+        // and overrides push. Script B (chunk): calls push. The override must fire.
+        let effects = run_two_scripts(
+            // Script A — Webpack runtime IIFE
+            r#"
+                (function() {
+                    var jsonpArray = window["webpackJsonp"] = window["webpackJsonp"] || [];
+                    jsonpArray.push = function(data) {
+                        document.getElementById("app").textContent = "chunk:" + data[0];
+                    };
+                    jsonpArray = jsonpArray.slice();
+                })();
+            "#,
+            // Script B — chunk push call (separate script)
+            r#"
+                (window["webpackJsonp"] = window["webpackJsonp"] || []).push(["chunk6"]);
+            "#,
+        );
+        assert_eq!(
+            effects,
+            vec![text("app", "chunk:chunk6")],
+            "push override from script A must fire when script B calls push: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn t067b_window_named_push_after_computed_init_cross_script() {
+        // Script A uses computed init; Script B calls push via named window.webpackJsonp.
+        let effects = run_two_scripts(
+            r#"
+                (function() {
+                    var arr = window["webpackJsonp"] = window["webpackJsonp"] || [];
+                    arr.push = function(data) {
+                        document.getElementById("result").textContent = "named:" + data[0];
+                    };
+                })();
+            "#,
+            r#"
+                window.webpackJsonp.push(["via-named"]);
+            "#,
+        );
+        assert_eq!(
+            effects,
+            vec![text("result", "named:via-named")],
+            "push override must be reachable via named window.webpackJsonp after computed init: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn t067c_globals_webpackjsonp_set_by_computed_write_in_iife() {
+        // Verify that window["webpackJsonp"] = [] inside an IIFE actually persists
+        // to globals, so a subsequent script can read it via window.webpackJsonp.
+        let effects = run_two_scripts(
+            r#"
+                (function() {
+                    window["webpackJsonp"] = window["webpackJsonp"] || [];
+                })();
+            "#,
+            r#"
+                var arr = window.webpackJsonp;
+                document.getElementById("out").textContent = Array.isArray(arr) ? "array" : "not-array";
+            "#,
+        );
+        assert_eq!(
+            effects,
+            vec![text("out", "array")],
+            "window[\"webpackJsonp\"] set inside IIFE must be readable as window.webpackJsonp in next script: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn t067d_push_override_set_in_iife_fires_from_chunk_script() {
+        // Full Webpack-style two-script test: IIFE sets override, chunk calls push,
+        // callback invokes __webpack_require__, factory produces a DOM effect.
+        let effects = run_two_scripts(
+            // Webpack runtime IIFE (script 5 analogue)
+            r#"
+                (function(modules) {
+                    var installedModules = {};
+                    function __webpack_require__(moduleId) {
+                        if (installedModules[moduleId]) {
+                            return installedModules[moduleId].exports;
+                        }
+                        var module = installedModules[moduleId] = { id: moduleId, exports: {} };
+                        modules[moduleId].call(module.exports, module, module.exports, __webpack_require__);
+                        return module.exports;
+                    }
+                    function webpackJsonpCallback(data) {
+                        var moreModules = data[1];
+                        var executeModules = data[2];
+                        for (var id in moreModules) {
+                            modules[id] = moreModules[id];
+                        }
+                        if (executeModules) {
+                            for (var i = 0; i < executeModules.length; i++) {
+                                __webpack_require__(executeModules[i]);
+                            }
+                        }
+                    }
+                    var jsonpArray = window["webpackJsonp"] = window["webpackJsonp"] || [];
+                    var oldPush = jsonpArray.push.bind(jsonpArray);
+                    jsonpArray.push = webpackJsonpCallback;
+                    jsonpArray = jsonpArray.slice();
+                })({});
+            "#,
+            // Chunk script (script 6 analogue) — registers module and triggers entry
+            r#"
+                (window["webpackJsonp"] = window["webpackJsonp"] || []).push([
+                    ["app"],
+                    {
+                        "entry": function(module, exports, require) {
+                            document.getElementById("app").textContent = "booted";
+                        }
+                    },
+                    ["entry"]
+                ]);
+            "#,
+        );
+        assert_eq!(
+            effects,
+            vec![text("app", "booted")],
+            "webpackJsonpCallback must run from chunk script and execute the entry module: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn t068a_array_push_apply_writes_back() {
+        // f.push.apply(f, [1,2,3]) must actually mutate f.
+        // Accessing f.push emits a prototype.lookup trace — filter it out and check only DOM effects.
+        let effects = run(r#"
+            var f = [];
+            f.push.apply(f, [1, 2, 3]);
+            document.getElementById("out").textContent = String(f.length);
+        "#);
+        let dom: Vec<_> = effects.iter()
+            .filter(|e| !matches!(e, BrowserEffect::RuntimeTrace { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(dom, vec![text("out", "3")], "push.apply must write items back to f: {effects:?}");
+    }
+
+    #[test]
+    fn t068b_webpack_entry_chain_via_push_apply() {
+        // Minimal Webpack 4 pattern: runtime's r(data) uses f.push.apply(f, executeModules)
+        // to collect entry module IDs, then drains f with __webpack_require__.
+        // Entry module triggers a DOM effect — confirms the full chain works.
+        let effects = run(r#"
+            var installedModules = {};
+            var modules = {};
+            var f = [];
+            function __webpack_require__(id) {
+                if (installedModules[id]) return installedModules[id].exports;
+                var mod = installedModules[id] = { id: id, exports: {} };
+                modules[id].call(mod.exports, mod, mod.exports, __webpack_require__);
+                return mod.exports;
+            }
+            function r(data) {
+                var moreModules = data[1] || {};
+                var executeModules = data[2];
+                for (var id in moreModules) {
+                    modules[id] = moreModules[id];
+                }
+                f.push.apply(f, executeModules || []);
+                while (f.length) {
+                    __webpack_require__(f.shift());
+                }
+            }
+            r([
+                ["chunk0"],
+                {
+                    374: function(mod, exports, require) {
+                        document.getElementById("root").textContent = "webpack-loaded";
+                    }
+                },
+                [374]
+            ]);
+        "#);
+        let dom: Vec<_> = effects.iter()
+            .filter(|e| !matches!(e, BrowserEffect::RuntimeTrace { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(dom, vec![text("root", "webpack-loaded")], "entry module must execute via push.apply: {effects:?}");
     }
 }
