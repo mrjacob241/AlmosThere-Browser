@@ -2507,6 +2507,12 @@ fn collect_page_scripts(html: &str, source: Option<&str>) -> Vec<PageScript> {
         let inline_source = &html[open_end..close_start];
 
         index += 1;
+        if !script_type_is_executable(open_tag) {
+            offset = close_start + "</script>".len();
+            remaining = &html[offset..];
+            continue;
+        }
+
         let defer = tag_has_bool_attr(open_tag, "defer");
         let script = if let Some(src) = extract_attr(open_tag, "src") {
             load_external_page_script(source, &src, index, defer)
@@ -2555,6 +2561,28 @@ fn collect_page_scripts(html: &str, source: Option<&str>) -> Vec<PageScript> {
 
     normal.extend(deferred);
     normal
+}
+
+fn script_type_is_executable(open_tag: &str) -> bool {
+    let Some(script_type) = extract_attr(open_tag, "type") else {
+        return true;
+    };
+    let script_type = script_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        script_type.as_str(),
+        "" | "module"
+            | "text/javascript"
+            | "application/javascript"
+            | "application/ecmascript"
+            | "text/ecmascript"
+            | "text/jscript"
+            | "text/livescript"
+    )
 }
 
 fn emit_script_parse_telemetry(index: usize, script: &PageScript) {
@@ -12559,6 +12587,30 @@ mod tests {
         assert!(messages.iter().any(|message| message.level
             == justbarelyscript::ConsoleLevel::Error
             && message.text.contains("Parse error")));
+    }
+
+    #[test]
+    fn non_executable_script_types_are_not_parsed_as_javascript() {
+        let messages = script_console_messages_from_html(
+            r#"
+            <script type="application/json">{"page":"state"}</script>
+            <script type="application/ld+json">{"@context":"https://schema.org"}</script>
+            <script type="importmap">{"imports":{"x":"/x.js"}}</script>
+            <script type="module">console.log("module ran");</script>
+            <script>console.log("plain ran");</script>
+            "#,
+        );
+
+        assert!(messages.iter().any(|message| {
+            message.level == justbarelyscript::ConsoleLevel::Log && message.text == "module ran"
+        }));
+        assert!(messages.iter().any(|message| {
+            message.level == justbarelyscript::ConsoleLevel::Log && message.text == "plain ran"
+        }));
+        assert!(!messages.iter().any(|message| {
+            message.level == justbarelyscript::ConsoleLevel::Error
+                && message.text.contains("Parse error")
+        }));
     }
 
     #[test]

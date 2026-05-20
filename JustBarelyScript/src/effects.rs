@@ -160,6 +160,11 @@ enum JsValue {
     WindowRef,
     NavigatorRef,
     HostFunction(String),
+    BoundHostFunction {
+        name: String,
+        this_arg: Box<JsValue>,
+        bound_args: Vec<JsValue>,
+    },
     HostObject(String),
     RegExp {
         pattern: String,
@@ -604,6 +609,43 @@ impl BrowserExecutionState {
             kind: kind.to_owned(),
             detail: detail.into(),
         });
+    }
+
+    fn trace_member_read(
+        &mut self,
+        object: &Expression,
+        property: &str,
+        receiver: &JsValue,
+        result: &JsValue,
+        prototype_attempted: bool,
+    ) {
+        let receiver_missing = matches!(receiver, JsValue::Undefined | JsValue::Null);
+        if receiver_missing {
+            self.trace_runtime(
+                "member.receiver.warning",
+                format!(
+                    "property={} receiver_tag={} result_tag={} prototype_attempted={} object={:?}",
+                    property,
+                    Self::object_tag(receiver),
+                    Self::object_tag(result),
+                    prototype_attempted,
+                    object
+                ),
+            );
+        } else if matches!(result, JsValue::Undefined) && Self::diagnostic_member_property(property)
+        {
+            self.trace_runtime(
+                "member.read.undefined",
+                format!(
+                    "property={} receiver_tag={} result_tag={} prototype_attempted={} object={:?}",
+                    property,
+                    Self::object_tag(receiver),
+                    Self::object_tag(result),
+                    prototype_attempted,
+                    object
+                ),
+            );
+        }
     }
 
     fn emit_network_request(&mut self, method: &str, url: String, body: String) {
@@ -1088,6 +1130,13 @@ impl BrowserExecutionState {
             Expression::New { callee, arguments } => {
                 if matches!(callee.as_ref(), Expression::Identifier(name) if name == "Date") {
                     JsValue::DateInstance
+                } else if let Some(name) =
+                    Self::soft_failure_constructor_name_from_expr(callee.as_ref())
+                {
+                    for argument in arguments {
+                        self.execute_expression(argument);
+                    }
+                    JsValue::HostObject(name)
                 } else if matches!(callee.as_ref(), Expression::Identifier(name) if name == "Function")
                 {
                     JsValue::HostFunction("Function".into())
@@ -1162,7 +1211,11 @@ impl BrowserExecutionState {
                     for argument in arguments {
                         self.execute_expression(argument);
                     }
-                    JsValue::HostObject(name)
+                    if Self::soft_failure_constructor_name(&name) {
+                        JsValue::HostObject(Self::soft_failure_host_name(callee.as_ref()))
+                    } else {
+                        JsValue::HostObject(name)
+                    }
                 } else {
                     self.trace_runtime("unsupported.constructor", format!("{:?}", callee.as_ref()));
                     JsValue::Undefined
@@ -1836,12 +1889,28 @@ impl BrowserExecutionState {
             }
 
             if matches!(receiver, JsValue::NavigatorRef) {
-                if method_name == "javaEnabled" {
-                    for arg in arguments {
-                        self.execute_expression(arg);
+                match method_name.as_str() {
+                    "javaEnabled" => {
+                        for arg in arguments {
+                            self.execute_expression(arg);
+                        }
+                        return JsValue::Boolean(false);
                     }
-                    return JsValue::Boolean(false);
+                    "getBattery" => {
+                        for arg in arguments {
+                            self.execute_expression(arg);
+                        }
+                        return JsValue::ResolvedPromise;
+                    }
+                    _ => {}
                 }
+            }
+
+            if let JsValue::HostObject(name) = receiver.clone() {
+                for argument in arguments {
+                    self.execute_expression(argument);
+                }
+                return Self::host_object_method_return(&name, &method_name);
             }
 
             if let JsValue::XhrInstance {
@@ -2021,7 +2090,13 @@ impl BrowserExecutionState {
                         .map(|argument| self.execute_expression(argument))
                         .map(|value| Self::value_to_string(&value))
                         .unwrap_or_default();
-                    return JsValue::CanvasContextRef(context_name);
+                    return self.canvas_context_ref(&context_name);
+                }
+                if Self::element_plugin_method_returns_empty(&method_name) {
+                    for argument in arguments {
+                        self.execute_expression(argument);
+                    }
+                    return JsValue::String(String::new());
                 }
             }
 
@@ -2073,17 +2148,82 @@ impl BrowserExecutionState {
 
             if let JsValue::HostFunction(name) = receiver.clone() {
                 match method_name.as_str() {
-                    "call" | "apply" => {
-                        for argument in arguments {
-                            self.execute_expression(argument);
-                        }
-                        return Self::host_function_default_return(&name);
+                    "call" => {
+                        let mut args = self.eval_args(arguments);
+                        let this_arg = if args.is_empty() {
+                            JsValue::Undefined
+                        } else {
+                            args.remove(0)
+                        };
+                        return self.call_host_function(&name, this_arg, args);
+                    }
+                    "apply" => {
+                        let mut args = self.eval_args(arguments);
+                        let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let real_args = match args.get_mut(1) {
+                            Some(JsValue::Array(items)) => std::mem::take(items),
+                            _ => vec![],
+                        };
+                        return self.call_host_function(&name, this_arg, real_args);
                     }
                     "bind" => {
-                        for argument in arguments {
-                            self.execute_expression(argument);
+                        let mut args = self.eval_args(arguments);
+                        let this_arg = if args.is_empty() {
+                            JsValue::Undefined
+                        } else {
+                            args.remove(0)
+                        };
+                        return JsValue::BoundHostFunction {
+                            name,
+                            this_arg: Box::new(this_arg),
+                            bound_args: args,
+                        };
+                    }
+                    _ => {}
+                }
+            }
+
+            if let JsValue::BoundHostFunction {
+                name,
+                this_arg,
+                bound_args,
+            } = receiver.clone()
+            {
+                match method_name.as_str() {
+                    "call" => {
+                        let mut args = self.eval_args(arguments);
+                        let call_this = if args.is_empty() {
+                            *this_arg
+                        } else {
+                            args.remove(0)
+                        };
+                        let mut real_args = bound_args;
+                        real_args.extend(args);
+                        return self.call_host_function(&name, call_this, real_args);
+                    }
+                    "apply" => {
+                        let mut args = self.eval_args(arguments);
+                        let call_this = args.first().cloned().unwrap_or(*this_arg);
+                        let mut real_args = bound_args;
+                        if let Some(JsValue::Array(items)) = args.get_mut(1) {
+                            real_args.extend(std::mem::take(items));
                         }
-                        return JsValue::HostFunction(name);
+                        return self.call_host_function(&name, call_this, real_args);
+                    }
+                    "bind" => {
+                        let mut args = self.eval_args(arguments);
+                        let next_this = if args.is_empty() {
+                            *this_arg
+                        } else {
+                            args.remove(0)
+                        };
+                        let mut next_args = bound_args;
+                        next_args.extend(args);
+                        return JsValue::BoundHostFunction {
+                            name,
+                            this_arg: Box::new(next_this),
+                            bound_args: next_args,
+                        };
                     }
                     _ => {}
                 }
@@ -2149,10 +2289,8 @@ impl BrowserExecutionState {
                     return result;
                 }
                 if let Some(JsValue::HostFunction(name)) = map.get(&method_name).cloned() {
-                    for argument in arguments {
-                        self.execute_expression(argument);
-                    }
-                    return Self::host_function_default_return(&name);
+                    let args = self.eval_args(arguments);
+                    return self.call_host_function(&name, receiver.clone(), args);
                 }
                 // hasOwnProperty on any object
                 if method_name == "hasOwnProperty" {
@@ -2166,7 +2304,12 @@ impl BrowserExecutionState {
             // Evaluated receiver but method not found; trace it and still evaluate args for side effects.
             self.trace_runtime(
                 "unsupported.method",
-                format!("{} on {}", method_name, Self::value_to_string(&receiver)),
+                format!(
+                    "{} on {} via {:?}",
+                    method_name,
+                    Self::value_to_string(&receiver),
+                    callee
+                ),
             );
             for arg in arguments {
                 self.execute_expression(arg);
@@ -2180,7 +2323,21 @@ impl BrowserExecutionState {
             return self.call_function(func, args);
         }
         if let JsValue::HostFunction(name) = func_val {
-            return JsValue::HostObject(name);
+            let value = self.call_host_function(&name, JsValue::Undefined, args);
+            return if matches!(value, JsValue::Undefined) {
+                JsValue::HostObject(name)
+            } else {
+                value
+            };
+        }
+        if let JsValue::BoundHostFunction {
+            name,
+            this_arg,
+            mut bound_args,
+        } = func_val
+        {
+            bound_args.extend(args);
+            return self.call_host_function(&name, *this_arg, bound_args);
         }
         if !matches!(func_val, JsValue::Undefined | JsValue::Null) {
             self.trace_runtime(
@@ -2252,6 +2409,32 @@ impl BrowserExecutionState {
             }
             _ => JsValue::Undefined,
         }
+    }
+
+    fn canvas_context_ref(&self, context_name: &str) -> JsValue {
+        match context_name {
+            "2d" => JsValue::CanvasContextRef(context_name.to_owned()),
+            "webgl" | "experimental-webgl" | "webgl2" => {
+                if self
+                    .fingerprint_suite
+                    .as_ref()
+                    .map(|suite| suite.webgl.is_supported)
+                    .unwrap_or(true)
+                {
+                    JsValue::CanvasContextRef(context_name.to_owned())
+                } else {
+                    JsValue::Null
+                }
+            }
+            _ => JsValue::Null,
+        }
+    }
+
+    fn element_plugin_method_returns_empty(method_name: &str) -> bool {
+        matches!(
+            method_name,
+            "getComponentVersion" | "getVariable" | "GetVariable" | "IsVersionSupported"
+        )
     }
 
     fn storage_map(&self, kind: &StorageKind) -> &HashMap<String, String> {
@@ -3386,6 +3569,15 @@ impl BrowserExecutionState {
             MemberProperty::Computed(index_expr) => {
                 let receiver = self.execute_expression(object);
                 let index = self.execute_expression(index_expr);
+                if matches!(receiver, JsValue::Undefined | JsValue::Null) {
+                    self.trace_member_read(
+                        object,
+                        "[computed]",
+                        &receiver,
+                        &JsValue::Undefined,
+                        false,
+                    );
+                }
                 match receiver {
                     JsValue::Proxy { target, get } => {
                         let key = Self::value_to_string(&index);
@@ -3446,6 +3638,18 @@ impl BrowserExecutionState {
                         "window" if property == "ActiveXObject" => {
                             return JsValue::HostFunction("ActiveXObject".into());
                         }
+                        "Object" if property == "prototype" => {
+                            return Self::native_prototype_object("Object");
+                        }
+                        "Array" if property == "prototype" => {
+                            return Self::native_prototype_object("Array");
+                        }
+                        "String" if property == "prototype" => {
+                            return Self::native_prototype_object("String");
+                        }
+                        "Function" if property == "prototype" => {
+                            return Self::native_prototype_object("Function");
+                        }
                         "Math" => {
                             return match property.as_str() {
                                 "PI" => JsValue::Number(std::f64::consts::PI),
@@ -3477,14 +3681,20 @@ impl BrowserExecutionState {
                 }
 
                 let receiver = self.execute_expression(object);
-                match receiver {
+                let result = match receiver.clone() {
                     JsValue::Proxy { target, get } => {
                         self.proxy_get_property(*target, get, property)
                     }
                     JsValue::String(ref s) if property == "length" => {
                         JsValue::Number(s.chars().count() as f64)
                     }
+                    JsValue::String(_) => self
+                        .native_prototype_property("String", property)
+                        .unwrap_or(JsValue::Undefined),
                     JsValue::ElementRef(element_ref) => {
+                        if let Some(value) = self.native_prototype_property("Object", property) {
+                            return value;
+                        }
                         if property == "style" {
                             return if let Some(id) = existing_id_from_ref(&element_ref) {
                                 JsValue::StyleRef(id)
@@ -3533,7 +3743,7 @@ impl BrowserExecutionState {
                                 None
                             }
                         })
-                        .unwrap_or(JsValue::Undefined),
+                        .unwrap_or_else(|| Self::navigator_soft_failure_property(property)),
                     JsValue::WindowRef => {
                         self.globals.get(property).cloned().unwrap_or_else(|| {
                             match property.as_str() {
@@ -3547,6 +3757,12 @@ impl BrowserExecutionState {
                                 }
                                 "msActiveXFilteringEnabled" => {
                                     JsValue::HostFunction("msActiveXFilteringEnabled".into())
+                                }
+                                "AudioContext"
+                                | "webkitAudioContext"
+                                | "OfflineAudioContext"
+                                | "webkitOfflineAudioContext" => {
+                                    JsValue::HostFunction(property.clone())
                                 }
                                 _ => JsValue::Undefined,
                             }
@@ -3581,11 +3797,37 @@ impl BrowserExecutionState {
                         "VENDOR" | "RENDERER" | "VERSION" | "SHADING_LANGUAGE_VERSION" => {
                             JsValue::String(property.clone())
                         }
-                        _ => JsValue::Undefined,
+                        _ => self
+                            .native_prototype_property("Object", property)
+                            .unwrap_or(JsValue::Undefined),
                     },
-                    JsValue::Object(map) => map
-                        .get(property.as_str())
-                        .cloned()
+                    JsValue::HostFunction(name) => match property.as_str() {
+                        "call" | "apply" | "bind" => JsValue::HostFunction(name.clone()),
+                        "prototype" => Self::constructor_prototype_object(&name)
+                            .unwrap_or_else(|| Self::host_function_prototype(&name)),
+                        _ => self
+                            .native_prototype_property("Function", property)
+                            .unwrap_or(JsValue::Undefined),
+                    },
+                    JsValue::BoundHostFunction { .. } => match property.as_str() {
+                        "call" | "apply" | "bind" => {
+                            JsValue::HostFunction(format!("Function.prototype.{property}"))
+                        }
+                        _ => self
+                            .native_prototype_property("Function", property)
+                            .unwrap_or(JsValue::Undefined),
+                    },
+                    JsValue::HostObject(name) => {
+                        let value = Self::host_object_property(&name, property);
+                        if matches!(value, JsValue::Undefined) {
+                            self.native_prototype_property("Object", property)
+                                .unwrap_or(JsValue::Undefined)
+                        } else {
+                            value
+                        }
+                    }
+                    JsValue::Object(map) => self
+                        .object_property_or_native_fallback(&map, property)
                         .unwrap_or(JsValue::Undefined),
                     JsValue::Function(func) => {
                         if property == "prototype" {
@@ -3593,10 +3835,13 @@ impl BrowserExecutionState {
                                 .get(property.as_str())
                                 .cloned()
                                 .unwrap_or_else(|| JsValue::Object(HashMap::new()))
+                        } else if matches!(property.as_str(), "call" | "apply" | "bind") {
+                            JsValue::HostFunction(format!("Function.prototype.{property}"))
                         } else {
                             func.properties
                                 .get(property.as_str())
                                 .cloned()
+                                .or_else(|| self.native_prototype_property("Function", property))
                                 .unwrap_or(JsValue::Undefined)
                         }
                     }
@@ -3606,8 +3851,15 @@ impl BrowserExecutionState {
                     JsValue::Array(items) if property == "length" => {
                         JsValue::Number(items.len() as f64)
                     }
+                    JsValue::Array(_) => self
+                        .native_prototype_property("Array", property)
+                        .unwrap_or(JsValue::Undefined),
                     _ => JsValue::Undefined,
-                }
+                };
+                let prototype_attempted =
+                    Self::member_prototype_fallback_owner(&receiver).is_some();
+                self.trace_member_read(object, property, &receiver, &result, prototype_attempted);
+                result
             }
         }
     }
@@ -3781,6 +4033,11 @@ impl BrowserExecutionState {
             "window" => JsValue::WindowRef,
             "navigator" => JsValue::NavigatorRef,
             "ActiveXObject" => JsValue::HostFunction("ActiveXObject".into()),
+            "Function" => JsValue::HostFunction("Function".into()),
+            "AudioContext"
+            | "webkitAudioContext"
+            | "OfflineAudioContext"
+            | "webkitOfflineAudioContext" => JsValue::HostFunction(name.to_owned()),
             _ => JsValue::Undefined,
         })
     }
@@ -4100,6 +4357,7 @@ impl BrowserExecutionState {
             | JsValue::WindowRef
             | JsValue::NavigatorRef
             | JsValue::HostFunction(_)
+            | JsValue::BoundHostFunction { .. }
             | JsValue::HostObject(_)
             | JsValue::RegExp { .. }
             | JsValue::CanvasContextRef(_)
@@ -4131,6 +4389,7 @@ impl BrowserExecutionState {
             | JsValue::WindowRef
             | JsValue::NavigatorRef
             | JsValue::HostFunction(_)
+            | JsValue::BoundHostFunction { .. }
             | JsValue::HostObject(_)
             | JsValue::RegExp { .. }
             | JsValue::CanvasContextRef(_)
@@ -4180,6 +4439,7 @@ impl BrowserExecutionState {
             JsValue::String(_) => "string",
             JsValue::Function(_) => "function",
             JsValue::HostFunction(_) => "function",
+            JsValue::BoundHostFunction { .. } => "function",
             _ => "object",
         }
         .to_owned()
@@ -4213,6 +4473,7 @@ impl BrowserExecutionState {
             JsValue::WindowRef => "[object Window]".to_owned(),
             JsValue::NavigatorRef => "[object Navigator]".to_owned(),
             JsValue::HostFunction(_) => "[object Function]".to_owned(),
+            JsValue::BoundHostFunction { .. } => "[object Function]".to_owned(),
             JsValue::HostObject(name) => format!("[object {name}]"),
             JsValue::CanvasContextRef(_) => "[object CanvasRenderingContext]".to_owned(),
             JsValue::DateInstance => "[object Date]".to_owned(),
@@ -4235,10 +4496,608 @@ impl BrowserExecutionState {
     }
 
     fn host_function_default_return(name: &str) -> JsValue {
-        if name.ends_with("Enabled") || name.starts_with("ms") {
+        if matches!(
+            name,
+            "permissions.query"
+                | "mediaDevices.enumerateDevices"
+                | "mediaDevices.getUserMedia"
+                | "navigator.getBattery"
+                | "AudioContext.close"
+                | "AudioContext.resume"
+                | "AudioContext.suspend"
+                | "OfflineAudioContext.startRendering"
+        ) {
+            JsValue::ResolvedPromise
+        } else if name.ends_with("Enabled") || name.starts_with("ms") {
             JsValue::Boolean(false)
+        } else if name.starts_with("Function.prototype.") {
+            JsValue::HostFunction(name.to_owned())
         } else {
             JsValue::Undefined
+        }
+    }
+
+    fn call_host_function(&mut self, name: &str, this_arg: JsValue, args: Vec<JsValue>) -> JsValue {
+        match name {
+            "Object.prototype.toString" => {
+                JsValue::String(format!("[object {}]", Self::object_tag(&this_arg)))
+            }
+            "Object.prototype.valueOf" => this_arg,
+            "Object.prototype.hasOwnProperty" => {
+                let key = args.first().map(Self::value_to_string).unwrap_or_default();
+                match this_arg {
+                    JsValue::Object(map) => JsValue::Boolean(map.contains_key(&key)),
+                    _ => JsValue::Boolean(false),
+                }
+            }
+            "Array.prototype.push" => {
+                if let JsValue::Array(mut items) = this_arg {
+                    items.extend(args);
+                    JsValue::Number(items.len() as f64)
+                } else {
+                    JsValue::Number(0.0)
+                }
+            }
+            "Array.prototype.pop" => {
+                if let JsValue::Array(mut items) = this_arg {
+                    items.pop().unwrap_or(JsValue::Undefined)
+                } else {
+                    JsValue::Undefined
+                }
+            }
+            "Array.prototype.shift" => {
+                if let JsValue::Array(mut items) = this_arg {
+                    if items.is_empty() {
+                        JsValue::Undefined
+                    } else {
+                        items.remove(0)
+                    }
+                } else {
+                    JsValue::Undefined
+                }
+            }
+            "Array.prototype.unshift" => {
+                if let JsValue::Array(mut items) = this_arg {
+                    let added = args.len();
+                    for value in args.into_iter().rev() {
+                        items.insert(0, value);
+                    }
+                    JsValue::Number((items.len().max(added)) as f64)
+                } else {
+                    JsValue::Number(0.0)
+                }
+            }
+            "Array.prototype.join" => {
+                let sep = args
+                    .first()
+                    .map(Self::value_to_string)
+                    .unwrap_or_else(|| ",".to_owned());
+                if let JsValue::Array(items) = this_arg {
+                    JsValue::String(
+                        items
+                            .iter()
+                            .map(Self::value_to_string)
+                            .collect::<Vec<_>>()
+                            .join(&sep),
+                    )
+                } else {
+                    JsValue::String(String::new())
+                }
+            }
+            "Array.prototype.slice" => {
+                if let JsValue::Array(items) = this_arg {
+                    JsValue::Array(items)
+                } else {
+                    JsValue::Array(vec![])
+                }
+            }
+            "Array.prototype.concat" => {
+                let mut result = match this_arg {
+                    JsValue::Array(items) => items,
+                    other => vec![other],
+                };
+                for arg in args {
+                    match arg {
+                        JsValue::Array(items) => result.extend(items),
+                        other => result.push(other),
+                    }
+                }
+                JsValue::Array(result)
+            }
+            "Array.prototype.indexOf" => {
+                let needle = args.first().cloned().unwrap_or(JsValue::Undefined);
+                if let JsValue::Array(items) = this_arg {
+                    JsValue::Number(
+                        items
+                            .iter()
+                            .position(|value| Self::js_equal(value, &needle))
+                            .map(|index| index as f64)
+                            .unwrap_or(-1.0),
+                    )
+                } else {
+                    JsValue::Number(-1.0)
+                }
+            }
+            "Array.prototype.includes" => {
+                let needle = args.first().cloned().unwrap_or(JsValue::Undefined);
+                if let JsValue::Array(items) = this_arg {
+                    JsValue::Boolean(items.iter().any(|value| Self::js_equal(value, &needle)))
+                } else {
+                    JsValue::Boolean(false)
+                }
+            }
+            "Array.prototype.lastIndexOf" => {
+                let needle = args.first().cloned().unwrap_or(JsValue::Undefined);
+                if let JsValue::Array(items) = this_arg {
+                    JsValue::Number(
+                        items
+                            .iter()
+                            .rposition(|value| Self::js_equal(value, &needle))
+                            .map(|index| index as f64)
+                            .unwrap_or(-1.0),
+                    )
+                } else {
+                    JsValue::Number(-1.0)
+                }
+            }
+            "Array.prototype.toString" => {
+                if let JsValue::Array(items) = this_arg {
+                    JsValue::String(
+                        items
+                            .iter()
+                            .map(Self::value_to_string)
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    )
+                } else {
+                    JsValue::String(String::new())
+                }
+            }
+            "String.prototype.toString" => JsValue::String(Self::value_to_string(&this_arg)),
+            "String.prototype.replace" => {
+                let source = Self::value_to_string(&this_arg);
+                let needle = args.first().map(Self::value_to_string).unwrap_or_default();
+                let replacement = args.get(1).map(Self::value_to_string).unwrap_or_default();
+                JsValue::String(source.replacen(&needle, &replacement, 1))
+            }
+            "String.prototype.indexOf" => {
+                let source = Self::value_to_string(&this_arg);
+                let needle = args.first().map(Self::value_to_string).unwrap_or_default();
+                JsValue::Number(
+                    source
+                        .find(&needle)
+                        .map(|index| index as f64)
+                        .unwrap_or(-1.0),
+                )
+            }
+            "String.prototype.includes" => {
+                let source = Self::value_to_string(&this_arg);
+                let needle = args.first().map(Self::value_to_string).unwrap_or_default();
+                JsValue::Boolean(source.contains(&needle))
+            }
+            "String.prototype.slice" => {
+                let source = Self::value_to_string(&this_arg);
+                let len = source.chars().count() as i64;
+                let start = args
+                    .first()
+                    .map(Self::value_to_number)
+                    .map(|n| if n < 0.0 { len + n as i64 } else { n as i64 })
+                    .unwrap_or(0)
+                    .clamp(0, len) as usize;
+                let end = args
+                    .get(1)
+                    .map(Self::value_to_number)
+                    .map(|n| if n < 0.0 { len + n as i64 } else { n as i64 })
+                    .unwrap_or(len)
+                    .clamp(start as i64, len) as usize;
+                JsValue::String(source.chars().skip(start).take(end - start).collect())
+            }
+            "String.prototype.trim" => {
+                JsValue::String(Self::value_to_string(&this_arg).trim().to_owned())
+            }
+            "String.prototype.charAt" => {
+                let source = Self::value_to_string(&this_arg);
+                let index = args.first().map(Self::value_to_number).unwrap_or(0.0) as usize;
+                JsValue::String(
+                    source
+                        .chars()
+                        .nth(index)
+                        .map(|ch| ch.to_string())
+                        .unwrap_or_default(),
+                )
+            }
+            "String.prototype.split" => {
+                let source = Self::value_to_string(&this_arg);
+                let sep = args.first().map(Self::value_to_string).unwrap_or_default();
+                if sep.is_empty() {
+                    JsValue::Array(
+                        source
+                            .chars()
+                            .map(|ch| JsValue::String(ch.to_string()))
+                            .collect(),
+                    )
+                } else {
+                    JsValue::Array(
+                        source
+                            .split(&sep)
+                            .map(|part| JsValue::String(part.to_owned()))
+                            .collect(),
+                    )
+                }
+            }
+            "Function.prototype.call" => {
+                let mut real_args = args;
+                let call_this = if real_args.is_empty() {
+                    JsValue::Undefined
+                } else {
+                    real_args.remove(0)
+                };
+                match this_arg {
+                    JsValue::HostFunction(host_name) => {
+                        self.call_host_function(&host_name, call_this, real_args)
+                    }
+                    JsValue::BoundHostFunction {
+                        name,
+                        this_arg,
+                        mut bound_args,
+                    } => {
+                        bound_args.extend(real_args);
+                        self.call_host_function(&name, *this_arg, bound_args)
+                    }
+                    _ => JsValue::Undefined,
+                }
+            }
+            "Function.prototype.apply" => {
+                let call_this = args.first().cloned().unwrap_or(JsValue::Undefined);
+                let real_args = match args.get(1) {
+                    Some(JsValue::Array(items)) => items.clone(),
+                    _ => vec![],
+                };
+                match this_arg {
+                    JsValue::HostFunction(host_name) => {
+                        self.call_host_function(&host_name, call_this, real_args)
+                    }
+                    JsValue::BoundHostFunction {
+                        name,
+                        this_arg,
+                        mut bound_args,
+                    } => {
+                        bound_args.extend(real_args);
+                        self.call_host_function(&name, *this_arg, bound_args)
+                    }
+                    _ => JsValue::Undefined,
+                }
+            }
+            "Function.prototype.bind" => {
+                let mut real_args = args;
+                let bound_this = if real_args.is_empty() {
+                    JsValue::Undefined
+                } else {
+                    real_args.remove(0)
+                };
+                match this_arg {
+                    JsValue::HostFunction(host_name) => JsValue::BoundHostFunction {
+                        name: host_name,
+                        this_arg: Box::new(bound_this),
+                        bound_args: real_args,
+                    },
+                    JsValue::BoundHostFunction {
+                        name,
+                        this_arg,
+                        mut bound_args,
+                    } => {
+                        bound_args.extend(real_args);
+                        JsValue::BoundHostFunction {
+                            name,
+                            this_arg,
+                            bound_args,
+                        }
+                    }
+                    _ => JsValue::BoundHostFunction {
+                        name: "Function.prototype.bind".to_owned(),
+                        this_arg: Box::new(bound_this),
+                        bound_args: real_args,
+                    },
+                }
+            }
+            "Function.prototype.toString" => {
+                JsValue::String("function () { [native code] }".into())
+            }
+            _ => Self::host_function_default_return(name),
+        }
+    }
+
+    fn native_prototype_object(owner: &str) -> JsValue {
+        let mut map = HashMap::new();
+        for method in Self::native_prototype_methods(owner) {
+            let value = if *method == "constructor" {
+                JsValue::HostFunction(owner.to_owned())
+            } else {
+                JsValue::HostFunction(format!("{owner}.prototype.{method}"))
+            };
+            map.insert((*method).to_owned(), value);
+        }
+        JsValue::Object(map)
+    }
+
+    fn native_prototype_property(&mut self, owner: &str, property: &str) -> Option<JsValue> {
+        if Self::native_prototype_methods(owner).contains(&property) {
+            self.trace_runtime("prototype.lookup", format!("{owner}.prototype.{property}"));
+            if property == "constructor" {
+                Some(JsValue::HostFunction(owner.to_owned()))
+            } else {
+                Some(JsValue::HostFunction(format!(
+                    "{owner}.prototype.{property}"
+                )))
+            }
+        } else {
+            None
+        }
+    }
+
+    fn native_prototype_methods(owner: &str) -> &'static [&'static str] {
+        match owner {
+            "Object" => &["constructor", "toString", "valueOf", "hasOwnProperty"],
+            "Array" => &[
+                "constructor",
+                "push",
+                "pop",
+                "shift",
+                "unshift",
+                "join",
+                "slice",
+                "concat",
+                "indexOf",
+                "lastIndexOf",
+                "includes",
+                "forEach",
+                "map",
+                "filter",
+                "reduce",
+                "some",
+                "every",
+                "find",
+                "flat",
+                "at",
+                "toString",
+            ],
+            "String" => &[
+                "constructor",
+                "toString",
+                "replace",
+                "split",
+                "includes",
+                "indexOf",
+                "slice",
+                "trim",
+                "charAt",
+            ],
+            "Function" => &["constructor", "call", "apply", "bind", "toString"],
+            _ => &[],
+        }
+    }
+
+    fn object_property_or_native_fallback(
+        &mut self,
+        map: &HashMap<String, JsValue>,
+        property: &str,
+    ) -> Option<JsValue> {
+        match map.get(property) {
+            Some(JsValue::Undefined) if Self::soft_native_shadow_property(property) => self
+                .native_prototype_property("Object", property)
+                .inspect(|_| {
+                    self.trace_runtime(
+                        "prototype.shadowed_undefined",
+                        format!("Object.prototype.{property}"),
+                    );
+                }),
+            Some(value) => Some(value.clone()),
+            None => self.native_prototype_property("Object", property),
+        }
+    }
+
+    fn soft_native_shadow_property(property: &str) -> bool {
+        matches!(
+            property,
+            "toString" | "valueOf" | "hasOwnProperty" | "constructor"
+        )
+    }
+
+    fn member_prototype_fallback_owner(value: &JsValue) -> Option<&'static str> {
+        match value {
+            JsValue::String(_) => Some("String"),
+            JsValue::Array(_) => Some("Array"),
+            JsValue::Function(_) | JsValue::HostFunction(_) | JsValue::BoundHostFunction { .. } => {
+                Some("Function")
+            }
+            JsValue::Object(_)
+            | JsValue::ElementRef(_)
+            | JsValue::NodeList(_)
+            | JsValue::StyleRef(_)
+            | JsValue::StorageRef(_)
+            | JsValue::DocumentRef
+            | JsValue::WindowRef
+            | JsValue::NavigatorRef
+            | JsValue::HostObject(_)
+            | JsValue::RegExp { .. }
+            | JsValue::CanvasContextRef(_)
+            | JsValue::DateInstance
+            | JsValue::ResolvedPromise
+            | JsValue::XhrInstance { .. }
+            | JsValue::Proxy { .. }
+            | JsValue::WeakMap(_) => Some("Object"),
+            JsValue::Undefined | JsValue::Null | JsValue::Boolean(_) | JsValue::Number(_) => None,
+        }
+    }
+
+    fn diagnostic_member_property(property: &str) -> bool {
+        matches!(
+            property,
+            "toString"
+                | "valueOf"
+                | "hasOwnProperty"
+                | "constructor"
+                | "call"
+                | "apply"
+                | "bind"
+                | "push"
+                | "replace"
+        )
+    }
+
+    fn object_tag(value: &JsValue) -> &'static str {
+        match value {
+            JsValue::Undefined => "Undefined",
+            JsValue::Null => "Null",
+            JsValue::Boolean(_) => "Boolean",
+            JsValue::Number(_) => "Number",
+            JsValue::String(_) => "String",
+            JsValue::Object(_) | JsValue::Proxy { .. } => "Object",
+            JsValue::Array(_) => "Array",
+            JsValue::Function(_) | JsValue::HostFunction(_) | JsValue::BoundHostFunction { .. } => {
+                "Function"
+            }
+            JsValue::ElementRef(_) => "Element",
+            JsValue::NodeList(_) => "NodeList",
+            JsValue::StyleRef(_) => "CSSStyleDeclaration",
+            JsValue::StorageRef(_) => "Storage",
+            JsValue::DocumentRef => "Document",
+            JsValue::WindowRef => "Window",
+            JsValue::NavigatorRef => "Navigator",
+            JsValue::HostObject(_) => "Object",
+            JsValue::RegExp { .. } => "RegExp",
+            JsValue::CanvasContextRef(_) => "CanvasRenderingContext",
+            JsValue::DateInstance => "Date",
+            JsValue::ResolvedPromise => "Promise",
+            JsValue::XhrInstance { .. } => "XMLHttpRequest",
+            JsValue::WeakMap(_) => "WeakMap",
+        }
+    }
+
+    fn host_function_prototype(name: &str) -> JsValue {
+        let mut map = HashMap::new();
+        for method in ["call", "apply", "bind"] {
+            map.insert(
+                method.to_owned(),
+                JsValue::HostFunction(format!("{name}.prototype.{method}")),
+            );
+        }
+        JsValue::Object(map)
+    }
+
+    fn constructor_prototype_object(name: &str) -> Option<JsValue> {
+        match name {
+            "Object" | "Array" | "String" | "Function" => Some(Self::native_prototype_object(name)),
+            _ => None,
+        }
+    }
+
+    fn navigator_soft_failure_property(property: &str) -> JsValue {
+        match property {
+            "permissions" => {
+                let mut map = HashMap::new();
+                map.insert(
+                    "query".to_owned(),
+                    JsValue::HostFunction("permissions.query".to_owned()),
+                );
+                JsValue::Object(map)
+            }
+            "mediaDevices" => {
+                let mut map = HashMap::new();
+                map.insert(
+                    "enumerateDevices".to_owned(),
+                    JsValue::HostFunction("mediaDevices.enumerateDevices".to_owned()),
+                );
+                map.insert(
+                    "getUserMedia".to_owned(),
+                    JsValue::HostFunction("mediaDevices.getUserMedia".to_owned()),
+                );
+                JsValue::Object(map)
+            }
+            "getBattery" => JsValue::HostFunction("navigator.getBattery".to_owned()),
+            _ => JsValue::Undefined,
+        }
+    }
+
+    fn host_object_property(name: &str, property: &str) -> JsValue {
+        if name.contains("AudioContext") {
+            return match property {
+                "state" => JsValue::String("suspended".to_owned()),
+                "sampleRate" => JsValue::Number(44100.0),
+                "currentTime" => JsValue::Number(0.0),
+                "destination" | "listener" => JsValue::HostObject("AudioNode".to_owned()),
+                _ => JsValue::Undefined,
+            };
+        }
+        JsValue::Undefined
+    }
+
+    fn host_object_method_return(name: &str, method_name: &str) -> JsValue {
+        if name.contains("AudioContext") {
+            return match method_name {
+                "close" | "resume" | "suspend" => JsValue::ResolvedPromise,
+                "startRendering" => JsValue::ResolvedPromise,
+                "createAnalyser"
+                | "createOscillator"
+                | "createDynamicsCompressor"
+                | "createGain"
+                | "createScriptProcessor"
+                | "createBiquadFilter"
+                | "createConvolver"
+                | "createDelay"
+                | "createBufferSource" => JsValue::HostObject("AudioNode".to_owned()),
+                "createBuffer" => JsValue::HostObject("AudioBuffer".to_owned()),
+                _ => JsValue::Undefined,
+            };
+        }
+        if name == "AudioNode" {
+            return match method_name {
+                "connect" => JsValue::HostObject("AudioNode".to_owned()),
+                "disconnect" | "start" | "stop" => JsValue::Undefined,
+                "getFloatFrequencyData" | "getByteFrequencyData" => JsValue::Undefined,
+                _ => JsValue::Undefined,
+            };
+        }
+        if name == "AudioBuffer" {
+            return match method_name {
+                "getChannelData" => JsValue::Array(vec![]),
+                _ => JsValue::Undefined,
+            };
+        }
+        JsValue::Undefined
+    }
+
+    fn soft_failure_constructor_name(name: &str) -> bool {
+        matches!(
+            name,
+            "AudioContext"
+                | "webkitAudioContext"
+                | "OfflineAudioContext"
+                | "webkitOfflineAudioContext"
+        )
+    }
+
+    fn soft_failure_host_name(expr: &Expression) -> String {
+        match expr {
+            Expression::Identifier(name) => name.clone(),
+            Expression::Member {
+                property: MemberProperty::Named(name),
+                ..
+            } => name.clone(),
+            _ => "HostObject".to_owned(),
+        }
+    }
+
+    fn soft_failure_constructor_name_from_expr(expr: &Expression) -> Option<String> {
+        match expr {
+            Expression::Identifier(name) if Self::soft_failure_constructor_name(name) => {
+                Some(name.clone())
+            }
+            Expression::Member {
+                property: MemberProperty::Named(name),
+                ..
+            } if Self::soft_failure_constructor_name(name) => Some(name.clone()),
+            _ => None,
         }
     }
 
@@ -4740,6 +5599,7 @@ fn json_stringify(value: &JsValue) -> String {
         | JsValue::WindowRef
         | JsValue::NavigatorRef
         | JsValue::HostFunction(_)
+        | JsValue::BoundHostFunction { .. }
         | JsValue::HostObject(_)
         | JsValue::RegExp { .. }
         | JsValue::CanvasContextRef(_)
@@ -5176,6 +6036,306 @@ mod tests {
     }
 
     #[test]
+    fn plugin_element_methods_soft_fail_as_empty_values() {
+        let effects = run(r#"
+            let plugin = document.createElement("object");
+            document.getElementById("result").textContent =
+                "[" + plugin.getComponentVersion("Flash") + "]";
+            "#);
+
+        assert_eq!(effects, vec![text("result", "[]")]);
+    }
+
+    #[test]
+    fn plugin_element_soft_fail_methods_do_not_emit_unsupported_traces() {
+        let effects = run(r#"
+            let plugin = document.createElement("embed");
+            document.getElementById("result").textContent =
+                [
+                    plugin.getComponentVersion("Flash"),
+                    plugin.GetVariable("$version"),
+                    plugin.IsVersionSupported("1")
+                ].join("|");
+            "#);
+
+        assert_eq!(effects, vec![text("result", "||")]);
+        assert!(!has_runtime_trace(&effects, "unsupported.method"));
+    }
+
+    #[test]
+    fn canvas_context_soft_failure_returns_null_for_unknown_contexts() {
+        let effects = run(r#"
+            let canvas = document.createElement("canvas");
+            document.getElementById("result").textContent =
+                String(canvas.getContext("2d")) + ":" + String(canvas.getContext("bitmaprenderer"));
+            "#);
+
+        assert_eq!(
+            effects,
+            vec![text("result", "[object CanvasRenderingContext]:null")]
+        );
+    }
+
+    #[test]
+    fn permissions_media_and_battery_soft_fail_as_promises() {
+        let effects = run(r#"
+            navigator.permissions.query({ name: "camera" }).then(function () {
+                document.getElementById("permissions").textContent = "ok";
+            });
+            navigator.mediaDevices.getUserMedia({ audio: true }).then(function () {
+                document.getElementById("gum").textContent = "ok";
+            });
+            navigator.getBattery().then(function () {
+                document.getElementById("battery").textContent = "ok";
+            });
+            "#);
+
+        assert_eq!(
+            effects,
+            vec![
+                text("permissions", "ok"),
+                text("gum", "ok"),
+                text("battery", "ok"),
+            ]
+        );
+    }
+
+    #[test]
+    fn audio_context_soft_failure_exposes_inert_nodes_and_promises() {
+        let effects = run(r#"
+            let audio = new window.webkitAudioContext();
+            let node = audio.createOscillator();
+            let buffer = audio.createBuffer(1, 16, 44100);
+            audio.resume().then(function () {
+                document.getElementById("resume").textContent = "ok";
+            });
+            document.getElementById("result").textContent =
+                audio.state + ":" + String(audio.destination) + ":" +
+                String(node.connect(audio.destination)) + ":" +
+                String(buffer.getChannelData(0).length);
+            "#);
+
+        assert_eq!(
+            effects,
+            vec![
+                text(
+                    "result",
+                    "suspended:[object AudioNode]:[object AudioNode]:0",
+                ),
+                text("resume", "ok"),
+            ]
+        );
+    }
+
+    #[test]
+    fn offline_audio_context_start_rendering_soft_fails_as_promise() {
+        let effects = run(r#"
+            let ctx = new window.OfflineAudioContext(1, 16, 44100);
+            ctx.startRendering().then(function () {
+                document.getElementById("result").textContent = ctx.state;
+            });
+            "#);
+
+        assert_eq!(effects, vec![text("result", "suspended")]);
+    }
+
+    #[test]
+    fn unsupported_method_traces_include_callee_context() {
+        let effects = run(r#"
+            let missing;
+            missing.replace("a", "b");
+            "#);
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            BrowserEffect::RuntimeTrace { kind, detail }
+                if kind == "unsupported.method"
+                    && detail.contains("replace on undefined via")
+                    && detail.contains("replace")
+        )));
+    }
+
+    #[test]
+    fn undefined_member_receiver_emits_warning_trace() {
+        let effects = run(r#"
+            let j;
+            let value = j.toString;
+            "#);
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            BrowserEffect::RuntimeTrace { kind, detail }
+                if kind == "member.receiver.warning"
+                    && detail.contains("property=toString")
+                    && detail.contains("receiver_tag=Undefined")
+                    && detail.contains("prototype_attempted=false")
+                    && detail.contains("Identifier(\"j\")")
+        )));
+    }
+
+    #[test]
+    fn diagnostic_member_read_emits_undefined_result_trace() {
+        let effects = run(r#"
+            let n = 5;
+            let value = n.toString;
+            "#);
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            BrowserEffect::RuntimeTrace { kind, detail }
+                if kind == "member.read.undefined"
+                    && detail.contains("property=toString")
+                    && detail.contains("receiver_tag=Number")
+                    && detail.contains("result_tag=Undefined")
+        )));
+    }
+
+    #[test]
+    fn object_prototype_to_string_call_works_for_browser_values() {
+        let effects = run(r#"
+            let j = {};
+            document.getElementById("result").textContent =
+                j.toString.call([]) + ":" +
+                Object.prototype.toString.call(function () {}) + ":" +
+                Object.prototype.toString.call(window);
+            "#);
+
+        assert!(effects.contains(&text(
+            "result",
+            "[object Array]:[object Function]:[object Window]",
+        )));
+        assert!(!has_runtime_trace(&effects, "unsupported.method"));
+    }
+
+    #[test]
+    fn native_constructor_prototype_chain_exposes_object_methods() {
+        let effects = run(r#"
+            let objectProto = ({}).constructor.prototype;
+            document.getElementById("result").textContent =
+                objectProto.toString.call([]) + ":" +
+                objectProto.hasOwnProperty.call({ a: 1 }, "a") + ":" +
+                objectProto.valueOf.call({ marker: "ok" }).marker;
+            "#);
+
+        assert!(effects.contains(&text("result", "[object Array]:true:ok")));
+        assert!(!has_runtime_trace(&effects, "unsupported.method"));
+    }
+
+    #[test]
+    fn undefined_native_method_slots_soft_fallback_to_object_prototype() {
+        let effects = run(r#"
+            let j = { toString: undefined };
+            document.getElementById("result").textContent = j.toString.call([]);
+            "#);
+
+        assert!(effects.contains(&text("result", "[object Array]")));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            BrowserEffect::RuntimeTrace { kind, detail }
+                if kind == "prototype.shadowed_undefined"
+                    && detail == "Object.prototype.toString"
+        )));
+        assert!(!has_runtime_trace(&effects, "unsupported.method"));
+    }
+
+    #[test]
+    fn constructor_prototype_lookup_works_for_array_string_and_function() {
+        let effects = run(r#"
+            let arrayProto = [].constructor.prototype;
+            let stringProto = "abc".constructor.prototype;
+            let functionProto = (function () {}).constructor.prototype;
+            document.getElementById("result").textContent =
+                arrayProto.join.call(["a", "b"], "-") + ":" +
+                stringProto.replace.call("abc", "b", "B") + ":" +
+                functionProto.toString.call(function () {});
+            "#);
+
+        assert!(effects.contains(&text("result", "a-b:aBc:function () { [native code] }",)));
+        assert!(!has_runtime_trace(&effects, "unsupported.method"));
+    }
+
+    #[test]
+    fn array_method_references_bind_as_callable_native_functions() {
+        let effects = run(r#"
+            let d = [];
+            let bound = d.push.bind(d);
+            document.getElementById("result").textContent =
+                typeof d.push + ":" + String(bound("x")) + ":" + String(bound);
+            "#);
+
+        assert!(effects.contains(&text("result", "function:1:[object Function]")));
+        assert!(!has_runtime_trace(&effects, "unsupported.method"));
+    }
+
+    #[test]
+    fn native_function_call_apply_dispatch_with_this_values() {
+        let effects = run(r#"
+            let arr = ["a", "b"];
+            let join = arr.join;
+            let replace = "abc".replace;
+            document.getElementById("result").textContent =
+                join.call(arr, "-") + ":" +
+                replace.call("abc", "b", "B") + ":" +
+                Array.prototype.indexOf.apply(arr, ["b"]);
+            "#);
+
+        assert!(effects.contains(&text("result", "a-b:aBc:1")));
+        assert!(!has_runtime_trace(&effects, "unsupported.method"));
+    }
+
+    #[test]
+    fn prototype_fallbacks_emit_lookup_telemetry() {
+        let effects = run(r#"
+            let arr = [];
+            let push = arr.push;
+            document.getElementById("result").textContent = typeof push;
+            "#);
+
+        assert!(effects.contains(&text("result", "function")));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            BrowserEffect::RuntimeTrace { kind, detail }
+                if kind == "prototype.lookup" && detail == "Array.prototype.push"
+        )));
+    }
+
+    #[test]
+    fn browser_sensitive_apis_have_soft_failure_surfaces() {
+        let effects = run(r#"
+            let canvas = document.createElement("canvas");
+            let unsupported = canvas.getContext("bitmaprenderer");
+            let ctx = new AudioContext();
+            navigator.permissions.query({ name: "camera" }).then(function () {
+                document.getElementById("permissions").textContent = "resolved";
+            });
+            navigator.mediaDevices.enumerateDevices().then(function () {
+                document.getElementById("media").textContent = "resolved";
+            });
+            document.getElementById("result").textContent =
+                String(unsupported) + ":" + ctx.state + ":" + String(ctx.createAnalyser());
+            "#);
+
+        assert_eq!(
+            effects,
+            vec![
+                text("result", "null:suspended:[object AudioNode]"),
+                text("permissions", "resolved"),
+                text("media", "resolved"),
+            ]
+        );
+    }
+
+    #[test]
+    fn function_prototype_host_fallbacks_are_callable() {
+        let effects = run(r#"
+            let bind = Function.prototype.bind;
+            document.getElementById("result").textContent = String(bind.call(null));
+            "#);
+
+        assert_eq!(effects, vec![text("result", "[object Function]")]);
+    }
+
+    #[test]
     fn execution_budget_stops_long_running_loop() {
         let program = crate::parse_script("while (true) { var x = 1; }").expect("valid program");
         let mut state = BrowserExecutionState::default();
@@ -5451,6 +6611,15 @@ mod tests {
             element_id: id.to_owned(),
             value: value.to_owned(),
         }
+    }
+
+    fn has_runtime_trace(effects: &[BrowserEffect], expected_kind: &str) -> bool {
+        effects.iter().any(|effect| {
+            matches!(
+                effect,
+                BrowserEffect::RuntimeTrace { kind, .. } if kind == expected_kind
+            )
+        })
     }
 
     // 031 – default parameters
