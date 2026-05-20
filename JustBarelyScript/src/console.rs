@@ -196,7 +196,8 @@ fn collect_expression_console_messages(expression: &Expression, out: &mut Vec<Co
         | Expression::Boolean(_)
         | Expression::Null
         | Expression::Undefined
-        | Expression::This => {}
+        | Expression::This
+        | Expression::Sequence(_) => {}
     }
 }
 
