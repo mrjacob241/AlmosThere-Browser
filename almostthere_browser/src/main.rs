@@ -1,21 +1,27 @@
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{self, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, TryRecvError},
+    sync::{
+        Arc, Mutex, OnceLock,
+        mpsc::{self, Receiver, TryRecvError},
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use eframe::{App, Frame, NativeOptions, egui};
 use rich_canvas::{
-    BrowserCanvas, BrowserDocument, BrowserStyle, CanvasBlock, CanvasClipObject, CanvasGraph,
-    CanvasImageObject, CanvasInputObject, CanvasMediaObject, CanvasObject, CanvasRectObject,
-    CanvasSvgObject, CanvasTextObject, CssAlignItems, CssBoxStyle, CssDisplay, CssEdges,
-    CssFlexDirection, CssJustifyContent, CssLength, CssPosition, CssTextAlign, ElementStyleKey,
+    BrowserCanvas, BrowserCanvasResponse, BrowserDocument, BrowserStyle, CanvasBlock,
+    CanvasButtonObject, CanvasClipObject, CanvasGraph, CanvasImageObject, CanvasInputKind,
+    CanvasInputObject, CanvasMediaObject, CanvasObject, CanvasRectObject, CanvasSvgObject,
+    CanvasTextObject, CssAlignItems, CssBoxStyle, CssDisplay, CssEdges, CssFlexDirection,
+    CssJustifyContent, CssLength, CssObjectFit, CssPosition, CssTextAlign, ElementStyleKey,
     HitTarget, ImageBlock, InlineSpan, ResolvedBoxStyle, SvgBlock, SvgShape, computed_box_style,
-    configure_browser_fonts, parse_basic_css_for_viewport, parse_inline_box_style,
-    wrap_browser_textboxes,
+    configure_browser_fonts, parse_basic_css_for_viewport_with_root_classes,
+    parse_inline_box_style, wrap_browser_textboxes,
 };
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
 
@@ -26,11 +32,181 @@ const DEFAULT_PAGE_PATH: &str = concat!(
 );
 const DEFAULT_URL: &str = "https://latex.vercel.app/elements";
 const BOOKMARKS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bookmarks.txt");
+const DEBUG_EXPORT_DIR: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../target/render_debug_export");
+const URL_SCREENSHOTS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/url_screenshots");
 const DEFAULT_BOOKMARK_TITLE: &str = "AlmostThere Sample Page";
 const DEFAULT_URL_BOOKMARK_TITLE: &str = "HTML5 Test Page";
 const LOCAL_BOOKMARK_TOKEN: &str = "[local]";
+const SCRIPT_TEST_BOOKMARKS: &[(&str, &str)] = &[
+    (
+        "001 Basic Script Execution",
+        "JustBarelyScript/UnitTest/001-basic-script-execution/index.html",
+    ),
+    (
+        "002 Multiple Script Tags Execute In Order",
+        "JustBarelyScript/UnitTest/002-multiple-script-tags-execute-in-order/index.html",
+    ),
+    (
+        "003 Console Logging",
+        "JustBarelyScript/UnitTest/003-console-logging/index.html",
+    ),
+    (
+        "004 Element Creation",
+        "JustBarelyScript/UnitTest/004-element-creation/index.html",
+    ),
+    (
+        "005 CSS Class Assignment",
+        "JustBarelyScript/UnitTest/005-css-class-assignment/index.html",
+    ),
+    (
+        "006 setAttribute And getAttribute",
+        "JustBarelyScript/UnitTest/006-setattribute-and-getattribute/index.html",
+    ),
+    (
+        "007 innerHTML Basic Replacement",
+        "JustBarelyScript/UnitTest/007-innerhtml-basic-replacement/index.html",
+    ),
+    (
+        "008 Query Selector By ID",
+        "JustBarelyScript/UnitTest/008-query-selector-by-id/index.html",
+    ),
+    (
+        "009 Query Selector By Class",
+        "JustBarelyScript/UnitTest/009-query-selector-by-class/index.html",
+    ),
+    (
+        "010 querySelectorAll And Length",
+        "JustBarelyScript/UnitTest/010-queryselectorall-and-length/index.html",
+    ),
+    (
+        "011 For Loop DOM Update",
+        "JustBarelyScript/UnitTest/011-for-loop-dom-update/index.html",
+    ),
+    (
+        "012 Event Listener Click",
+        "JustBarelyScript/UnitTest/012-event-listener-click/index.html",
+    ),
+    (
+        "013 Event Object Target",
+        "JustBarelyScript/UnitTest/013-event-object-target/index.html",
+    ),
+    (
+        "014 Input Value Reading",
+        "JustBarelyScript/UnitTest/014-input-value-reading/index.html",
+    ),
+    (
+        "015 Input Event",
+        "JustBarelyScript/UnitTest/015-input-event/index.html",
+    ),
+    (
+        "016 Style Property Mutation",
+        "JustBarelyScript/UnitTest/016-style-property-mutation/index.html",
+    ),
+    (
+        "017 Computed Style Smoke Test",
+        "JustBarelyScript/UnitTest/017-computed-style-smoke-test/index.html",
+    ),
+    (
+        "018 setTimeout",
+        "JustBarelyScript/UnitTest/018-settimeout/index.html",
+    ),
+    (
+        "019 Promise Microtask",
+        "JustBarelyScript/UnitTest/019-promise-microtask/index.html",
+    ),
+    (
+        "020 JSON Parse And Stringify",
+        "JustBarelyScript/UnitTest/020-json-parse-and-stringify/index.html",
+    ),
+    (
+        "021 Array Operations",
+        "JustBarelyScript/UnitTest/021-array-operations/index.html",
+    ),
+    (
+        "022 Object Literals And Properties",
+        "JustBarelyScript/UnitTest/022-object-literals-and-properties/index.html",
+    ),
+    (
+        "023 Closures In Event Handlers",
+        "JustBarelyScript/UnitTest/023-closures-in-event-handlers/index.html",
+    ),
+    (
+        "024 DOMContentLoaded",
+        "JustBarelyScript/UnitTest/024-domcontentloaded/index.html",
+    ),
+    (
+        "025 Minimal Todo App",
+        "JustBarelyScript/UnitTest/025-minimal-todo-app/index.html",
+    ),
+    (
+        "026 Decorator Skip",
+        "JustBarelyScript/UnitTest/026-decorator-skip/index.html",
+    ),
+    (
+        "027 XOR Operator",
+        "JustBarelyScript/UnitTest/027-xor-operator/index.html",
+    ),
+    (
+        "028 Increment Decrement",
+        "JustBarelyScript/UnitTest/028-increment-decrement/index.html",
+    ),
+    (
+        "029 Compound Assignment",
+        "JustBarelyScript/UnitTest/029-compound-assignment/index.html",
+    ),
+    (
+        "030 Nullish Coalescing",
+        "JustBarelyScript/UnitTest/030-nullish-coalescing/index.html",
+    ),
+    (
+        "031 Default Parameters",
+        "JustBarelyScript/UnitTest/031-default-parameters/index.html",
+    ),
+    (
+        "032 Arrow Functions",
+        "JustBarelyScript/UnitTest/032-arrow-functions/index.html",
+    ),
+    (
+        "033 Spread Operator",
+        "JustBarelyScript/UnitTest/033-spread-operator/index.html",
+    ),
+    (
+        "034 Optional Chaining",
+        "JustBarelyScript/UnitTest/034-optional-chaining/index.html",
+    ),
+    (
+        "035 Template Literals",
+        "JustBarelyScript/UnitTest/035-template-literals/index.html",
+    ),
+    (
+        "036 Try Catch Finally",
+        "JustBarelyScript/UnitTest/036-try-catch-finally/index.html",
+    ),
+    (
+        "037 For Of",
+        "JustBarelyScript/UnitTest/037-for-of/index.html",
+    ),
+    (
+        "038 Class Syntax",
+        "JustBarelyScript/UnitTest/038-class-syntax/index.html",
+    ),
+    (
+        "039 ES Modules",
+        "JustBarelyScript/UnitTest/039-es-modules/index.html",
+    ),
+    (
+        "040 Async Await",
+        "JustBarelyScript/UnitTest/040-async-await/index.html",
+    ),
+    (
+        "041 Proxy",
+        "JustBarelyScript/UnitTest/041-proxy/index.html",
+    ),
+];
 
 fn main() -> eframe::Result<()> {
+    let config = AppConfig::from_args();
     let options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1040.0, 720.0])
@@ -41,19 +217,47 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         APP_TITLE,
         options,
-        Box::new(|cc| Ok(Box::new(AlmostThereApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(AlmostThereApp::new(cc, config)))),
     )
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AppConfig {
+    record_events: bool,
+    debug_socket: bool,
+}
+
+impl AppConfig {
+    fn from_args() -> Self {
+        let args: Vec<String> = std::env::args().collect();
+        Self {
+            record_events: args.iter().any(|a| a == "--record-events"),
+            debug_socket: args.iter().any(|a| a == "--debug-socket"),
+        }
+    }
 }
 
 struct AlmostThereApp {
     canvas: BrowserCanvas,
+    debug_canvas: BrowserCanvas,
     document: BrowserDocument,
+    current_html: String,
+    live_html: String,
+    script_state: justbarelyscript::BrowserExecutionState,
+    last_hovered_element_id: Option<String>,
+    render_graph_debug_text: String,
     url_input: String,
     bookmarks: Vec<Bookmark>,
+    console_messages: Vec<justbarelyscript::ConsoleMessage>,
+    live_js_debug_text: String,
     status: String,
     telemetry: TelemetrySession,
     text_metrics_ready: bool,
     pending_navigation: Option<PendingNavigation>,
+    render_debug: PageRenderDebugState,
+    page_loaded_at: std::time::Instant,
+    record_events: bool,
+    recorded_event_count: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,11 +277,55 @@ struct LoadedPageSource {
     source: String,
 }
 
+#[derive(Clone, Debug, Default)]
+struct PageRenderDebugState {
+    open: bool,
+    object_limit: usize,
+    active_tab: DebugPanelTab,
+    /// Staged input values for the Events tab, keyed by element id.
+    event_staged_values: std::collections::HashMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+enum DebugPanelTab {
+    #[default]
+    RenderGraph,
+    CanvasGraph,
+    Html,
+    Console,
+    LiveJs,
+    Events,
+}
+
 impl AlmostThereApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, config: AppConfig) -> Self {
         configure_browser_fonts(&cc.egui_ctx);
         let telemetry = TelemetrySession::start().unwrap_or_else(|_| TelemetrySession::disabled());
-        telemetry.emit("session.started", &[("app", APP_TITLE)]);
+        install_global_telemetry(&telemetry);
+        install_telemetry_panic_hook();
+        if config.debug_socket {
+            install_debug_server();
+        }
+        telemetry.emit(
+            "session.started",
+            &[
+                ("app", APP_TITLE),
+                (
+                    "record_events",
+                    if config.record_events {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                ),
+            ],
+        );
+        if config.record_events {
+            telemetry.emit(
+                "event_recording.started",
+                &[("source", "cli"), ("flag", "--record-events")],
+            );
+        }
 
         let mut bookmarks = load_bookmarks().unwrap_or_default();
         let inserted_default_bookmark = ensure_bookmark(&mut bookmarks, default_sample_bookmark())
@@ -86,8 +334,39 @@ impl AlmostThereApp {
             let _ = save_bookmarks(&bookmarks);
         }
 
-        let (document, status) = match load_url_document(DEFAULT_URL) {
-            Ok(document) => {
+        let (
+            document,
+            current_html,
+            live_html,
+            script_state,
+            render_graph_debug_text,
+            console_messages,
+            live_js_debug_text,
+            status,
+        ) = match load_url_source(DEFAULT_URL) {
+            Ok(source) => {
+                let document =
+                    parse_html_document_with_text_metrics(&source.html, &source.source, None);
+                let live_html = apply_safe_script_browser_effects_with_source(
+                    &remove_html_comments(&source.html),
+                    Some(&source.source),
+                );
+                let script_state =
+                    build_script_state_with_source(&source.html, Some(&source.source));
+                let render_graph_debug_text =
+                    parse_render_graph_debug_dump(&source.html, &source.source);
+                let console_messages = script_console_messages_from_html_with_source(
+                    &source.html,
+                    Some(&source.source),
+                );
+                let live_js_debug_text = live_js_debug_report(&source.html, Some(&source.source));
+                if config.record_events {
+                    write_recorded_live_js_debug_artifact(
+                        &telemetry,
+                        &source.source,
+                        &live_js_debug_text,
+                    );
+                }
                 telemetry.emit(
                     "navigation.loaded",
                     &[
@@ -96,37 +375,74 @@ impl AlmostThereApp {
                         ("blocks", &document.blocks.len().to_string()),
                     ],
                 );
-                (document, format!("Loaded {DEFAULT_URL}"))
+                (
+                    document,
+                    source.html,
+                    live_html,
+                    script_state,
+                    render_graph_debug_text,
+                    console_messages,
+                    live_js_debug_text,
+                    format!("Loaded {DEFAULT_URL}"),
+                )
             }
             Err(error) => {
                 telemetry.emit(
                     "navigation.failed",
                     &[("url", DEFAULT_URL), ("error", &error.to_string())],
                 );
+                let document = BrowserDocument {
+                    title: "Load failed".to_owned(),
+                    source: DEFAULT_URL.to_owned(),
+                    style: Default::default(),
+                    canvas_graph: CanvasGraph::default(),
+                    blocks: vec![CanvasBlock::Paragraph {
+                        text: format!("Failed to load default page {DEFAULT_URL}: {error}"),
+                    }],
+                };
                 (
-                    BrowserDocument {
-                        title: "Load failed".to_owned(),
-                        source: DEFAULT_URL.to_owned(),
-                        style: Default::default(),
-                        canvas_graph: CanvasGraph::default(),
-                        blocks: vec![CanvasBlock::Paragraph {
-                            text: format!("Failed to load default page {DEFAULT_URL}: {error}"),
-                        }],
-                    },
+                    document,
+                    String::new(),
+                    String::new(),
+                    justbarelyscript::BrowserExecutionState::default(),
+                    String::new(),
+                    vec![console_error_message(format!(
+                        "Failed to load default page {DEFAULT_URL}: {error}"
+                    ))],
+                    String::new(),
                     format!("Failed to load default page {DEFAULT_URL}: {error}"),
                 )
             }
         };
 
+        let render_debug = PageRenderDebugState {
+            open: false,
+            object_limit: document.canvas_graph.objects.len(),
+            active_tab: DebugPanelTab::RenderGraph,
+            event_staged_values: std::collections::HashMap::new(),
+        };
+
         Self {
             canvas: BrowserCanvas::new(),
+            debug_canvas: BrowserCanvas::new(),
             document,
+            current_html,
+            live_html,
+            script_state,
+            last_hovered_element_id: None,
+            render_graph_debug_text,
             url_input: DEFAULT_URL.to_owned(),
             bookmarks,
+            console_messages,
+            live_js_debug_text,
             status,
             telemetry,
             text_metrics_ready: false,
             pending_navigation: None,
+            render_debug,
+            page_loaded_at: std::time::Instant::now(),
+            record_events: config.record_events,
+            recorded_event_count: 0,
         }
     }
 
@@ -145,7 +461,23 @@ impl AlmostThereApp {
         let (sender, receiver) = mpsc::channel();
         let thread_url = url.clone();
         thread::spawn(move || {
-            let _ = sender.send(load_url_source(&thread_url));
+            emit_global_telemetry("navigation.fetch.started", &[("url", &thread_url)]);
+            let result = load_url_source(&thread_url);
+            match &result {
+                Ok(source) => emit_global_telemetry(
+                    "navigation.fetch.completed",
+                    &[
+                        ("url", &thread_url),
+                        ("final_url", &source.source),
+                        ("html_bytes", &source.html.len().to_string()),
+                    ],
+                ),
+                Err(error) => emit_global_telemetry(
+                    "navigation.fetch.failed",
+                    &[("url", &thread_url), ("error", &error.to_string())],
+                ),
+            }
+            let _ = sender.send(result);
         });
         self.pending_navigation = Some(PendingNavigation {
             url,
@@ -164,10 +496,102 @@ impl AlmostThereApp {
                 let pending = self.pending_navigation.take().expect("pending navigation");
                 match result {
                     Ok(source) => {
+                        self.telemetry.emit(
+                            "navigation.scripts.started",
+                            &[
+                                ("url", &source.source),
+                                ("html_bytes", &source.html.len().to_string()),
+                            ],
+                        );
+                        self.current_html = source.html.clone();
+                        self.live_html = apply_safe_script_browser_effects_with_source(
+                            &remove_html_comments(&source.html),
+                            Some(&source.source),
+                        );
+                        self.telemetry.emit(
+                            "navigation.scripts.completed",
+                            &[
+                                ("url", &source.source),
+                                ("live_html_bytes", &self.live_html.len().to_string()),
+                            ],
+                        );
+                        self.telemetry.emit(
+                            "navigation.script_state.started",
+                            &[("url", &source.source)],
+                        );
+                        self.script_state =
+                            build_script_state_with_source(&source.html, Some(&source.source));
+                        self.telemetry.emit(
+                            "navigation.script_state.completed",
+                            &[("url", &source.source)],
+                        );
+                        self.page_loaded_at = std::time::Instant::now();
+                        self.last_hovered_element_id = None;
+                        self.telemetry.emit(
+                            "navigation.render_graph.started",
+                            &[("url", &source.source)],
+                        );
+                        self.render_graph_debug_text =
+                            parse_render_graph_debug_dump(&source.html, &source.source);
+                        self.telemetry.emit(
+                            "navigation.render_graph.completed",
+                            &[
+                                ("url", &source.source),
+                                ("bytes", &self.render_graph_debug_text.len().to_string()),
+                            ],
+                        );
+                        self.telemetry
+                            .emit("navigation.console.started", &[("url", &source.source)]);
+                        self.console_messages = script_console_messages_from_html_with_source(
+                            &source.html,
+                            Some(&source.source),
+                        );
+                        self.telemetry.emit(
+                            "navigation.console.completed",
+                            &[
+                                ("url", &source.source),
+                                ("messages", &self.console_messages.len().to_string()),
+                            ],
+                        );
+                        self.telemetry.emit(
+                            "navigation.live_js_debug.started",
+                            &[("url", &source.source)],
+                        );
+                        self.live_js_debug_text =
+                            live_js_debug_report(&source.html, Some(&source.source));
+                        if self.record_events {
+                            write_recorded_live_js_debug_artifact(
+                                &self.telemetry,
+                                &source.source,
+                                &self.live_js_debug_text,
+                            );
+                        }
+                        self.telemetry.emit(
+                            "navigation.live_js_debug.completed",
+                            &[
+                                ("url", &source.source),
+                                ("bytes", &self.live_js_debug_text.len().to_string()),
+                            ],
+                        );
+                        self.telemetry.emit(
+                            "navigation.canvas_graph.started",
+                            &[("url", &source.source)],
+                        );
                         let document = parse_html_document_with_text_metrics(
                             &source.html,
                             &source.source,
                             Some(ctx),
+                        );
+                        self.telemetry.emit(
+                            "navigation.canvas_graph.completed",
+                            &[
+                                ("url", &source.source),
+                                ("blocks", &document.blocks.len().to_string()),
+                                (
+                                    "canvas_objects",
+                                    &document.canvas_graph.objects.len().to_string(),
+                                ),
+                            ],
                         );
                         self.telemetry.emit(
                             "navigation.loaded",
@@ -181,6 +605,8 @@ impl AlmostThereApp {
                         self.status = format!("Loaded {}", document.source);
                         self.document = document;
                         self.canvas.scroll_offset = egui::Vec2::ZERO;
+                        self.debug_canvas.scroll_offset = egui::Vec2::ZERO;
+                        self.render_debug.object_limit = self.document.canvas_graph.objects.len();
                         if let Some(fragment) = pending.fragment {
                             self.scroll_to_fragment(&fragment);
                         }
@@ -191,6 +617,9 @@ impl AlmostThereApp {
                             &[("url", &pending.url), ("error", &error.to_string())],
                         );
                         self.status = format!("Load failed: {error}");
+                        self.console_messages
+                            .push(console_error_message(format!("Load failed: {error}")));
+                        self.live_js_debug_text.clear();
                     }
                 }
                 ctx.request_repaint();
@@ -201,6 +630,10 @@ impl AlmostThereApp {
             Err(TryRecvError::Disconnected) => {
                 let pending = self.pending_navigation.take().expect("pending navigation");
                 self.status = format!("Load failed: loader stopped for {}", pending.url);
+                self.console_messages.push(console_error_message(format!(
+                    "Load failed: loader stopped for {}",
+                    pending.url
+                )));
                 ctx.request_repaint();
             }
         }
@@ -254,6 +687,10 @@ impl AlmostThereApp {
         let Some(bookmark) = self.bookmarks.get(index).cloned() else {
             return;
         };
+        self.open_bookmark_value(bookmark, ctx);
+    }
+
+    fn open_bookmark_value(&mut self, bookmark: Bookmark, ctx: &egui::Context) {
         self.url_input = bookmark.url;
         self.telemetry.emit(
             "bookmark.opened",
@@ -298,6 +735,1129 @@ impl AlmostThereApp {
     fn scroll_to_fragment(&mut self, fragment: &str) {
         self.canvas.scroll_offset.y = estimated_fragment_scroll_y(&self.document, fragment);
     }
+
+    fn report_user_error(&mut self) {
+        let console_errors = self
+            .console_messages
+            .iter()
+            .filter(|message| message.level == justbarelyscript::ConsoleLevel::Error)
+            .count();
+        let budget_stops = self
+            .live_js_debug_text
+            .matches("statement budget exhausted")
+            .count();
+        let skipped_scripts = self
+            .live_js_debug_text
+            .matches("status: not executed")
+            .count();
+        self.telemetry.emit(
+            "user.error",
+            &[
+                ("url", &self.document.source),
+                ("title", &self.document.title),
+                ("status", &self.status),
+                ("blocks", &self.document.blocks.len().to_string()),
+                (
+                    "canvas_objects",
+                    &self.document.canvas_graph.objects.len().to_string(),
+                ),
+                ("console_errors", &console_errors.to_string()),
+                ("script_budget_stops", &budget_stops.to_string()),
+                ("skipped_scripts", &skipped_scripts.to_string()),
+            ],
+        );
+        self.status = format!("Recorded user.error telemetry for {}", self.document.source);
+    }
+
+    fn record_frame_events(&mut self, ctx: &egui::Context) {
+        if !self.record_events {
+            return;
+        }
+
+        let events = ctx.input(|input| input.events.clone());
+        for event in events {
+            self.recorded_event_count += 1;
+            let sequence = self.recorded_event_count.to_string();
+            let (kind, detail) = telemetry_event_kind_and_detail(&event);
+            self.telemetry.emit(
+                "input.event",
+                &[
+                    ("seq", &sequence),
+                    ("kind", kind),
+                    ("detail", &detail),
+                    ("url", &self.document.source),
+                ],
+            );
+        }
+    }
+
+    fn apply_script_effects(
+        &mut self,
+        effects: Vec<justbarelyscript::BrowserEffect>,
+        ctx: &egui::Context,
+    ) {
+        if effects.is_empty() {
+            return;
+        }
+
+        // Snapshot live input values so the re-parse doesn't reset what the user typed.
+        let live_input_values: std::collections::HashMap<String, String> = self
+            .document
+            .canvas_graph
+            .objects
+            .iter()
+            .filter_map(|obj| {
+                if let CanvasObject::Input(input) = obj {
+                    input
+                        .element_id
+                        .as_ref()
+                        .map(|id| (id.clone(), input.value.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for effect in effects {
+            match effect {
+                justbarelyscript::BrowserEffect::SetTextContent { element_id, value } => {
+                    self.live_html =
+                        set_element_text_content_by_id(&self.live_html, &element_id, &value);
+                }
+                justbarelyscript::BrowserEffect::SetAttribute {
+                    element_id,
+                    name,
+                    value,
+                } => {
+                    self.live_html =
+                        set_element_attribute_by_id(&self.live_html, &element_id, &name, &value);
+                }
+                justbarelyscript::BrowserEffect::SetInnerHtml { element_id, value } => {
+                    self.live_html =
+                        set_element_inner_html_by_id(&self.live_html, &element_id, &value);
+                }
+                justbarelyscript::BrowserEffect::AppendChild { parent_id, child } => {
+                    self.live_html = append_child_html_by_id(&self.live_html, &parent_id, &child);
+                }
+                justbarelyscript::BrowserEffect::ConsoleLog { level, text } => {
+                    self.console_messages
+                        .push(justbarelyscript::ConsoleMessage {
+                            level: match level.as_str() {
+                                "warn" => justbarelyscript::ConsoleLevel::Warn,
+                                "error" => justbarelyscript::ConsoleLevel::Error,
+                                "info" => justbarelyscript::ConsoleLevel::Info,
+                                _ => justbarelyscript::ConsoleLevel::Log,
+                            },
+                            text,
+                        });
+                }
+                justbarelyscript::BrowserEffect::NetworkRequest { method, url, body } => {
+                    self.perform_script_network_request(&method, &url, &body);
+                }
+                justbarelyscript::BrowserEffect::RuntimeTrace { kind, detail } => {
+                    self.telemetry.emit(
+                        "js.runtime.trace",
+                        &[
+                            ("kind", &kind),
+                            ("detail", &detail),
+                            ("url", &self.document.source),
+                        ],
+                    );
+                }
+            }
+        }
+
+        self.document = parse_html_document_from_live_html(
+            &self.live_html,
+            &self.document.source.clone(),
+            Some(ctx),
+        );
+
+        // Restore live input values that the re-parse reset to their HTML attribute defaults.
+        for obj in &mut self.document.canvas_graph.objects {
+            if let CanvasObject::Input(input) = obj {
+                if let Some(id) = &input.element_id {
+                    if let Some(live_value) = live_input_values.get(id) {
+                        input.value = live_value.clone();
+                    }
+                }
+            }
+        }
+
+        ctx.request_repaint();
+    }
+
+    fn perform_script_network_request(&mut self, method: &str, url: &str, body: &str) {
+        let resolved = resolve_resource_url(&self.document.source, url);
+        let body_bytes = body.len().to_string();
+        self.telemetry.emit(
+            "js.network.request",
+            &[
+                ("method", method),
+                ("url", &resolved),
+                ("body_bytes", &body_bytes),
+                ("page_url", &self.document.source),
+            ],
+        );
+
+        let client = match http_client() {
+            Ok(client) => client,
+            Err(error) => {
+                self.telemetry.emit(
+                    "js.network.failed",
+                    &[("url", &resolved), ("error", &error.to_string())],
+                );
+                return;
+            }
+        };
+
+        let response = match method.to_ascii_uppercase().as_str() {
+            "POST" => client.post(&resolved).body(body.to_owned()).send(),
+            "PUT" => client.put(&resolved).body(body.to_owned()).send(),
+            "DELETE" => client.delete(&resolved).send(),
+            _ => client.get(&resolved).send(),
+        };
+
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16().to_string();
+                let bytes = response
+                    .text()
+                    .map(|text| text.len().to_string())
+                    .unwrap_or_else(|_| "0".to_owned());
+                self.telemetry.emit(
+                    "js.network.completed",
+                    &[("url", &resolved), ("status", &status), ("bytes", &bytes)],
+                );
+            }
+            Err(error) => {
+                self.telemetry.emit(
+                    "js.network.failed",
+                    &[("url", &resolved), ("error", &error.to_string())],
+                );
+            }
+        }
+    }
+
+    fn debug_canvas_graph(&self) -> CanvasGraph {
+        let mut graph = self.document.canvas_graph.clone();
+        let limit = self.render_debug.object_limit.min(graph.objects.len());
+        graph.objects.truncate(limit);
+        close_truncated_canvas_clips(&mut graph.objects);
+        graph
+    }
+}
+
+fn close_truncated_canvas_clips(objects: &mut Vec<CanvasObject>) {
+    let mut open_clips = 0usize;
+    for object in objects.iter() {
+        match object {
+            CanvasObject::ClipStart(_) => open_clips += 1,
+            CanvasObject::ClipEnd => {
+                open_clips = open_clips.saturating_sub(1);
+            }
+            CanvasObject::Text(_)
+            | CanvasObject::Rect(_)
+            | CanvasObject::Button(_)
+            | CanvasObject::Input(_)
+            | CanvasObject::Image(_)
+            | CanvasObject::Svg(_)
+            | CanvasObject::Media(_) => {}
+        }
+    }
+    objects.extend((0..open_clips).map(|_| CanvasObject::ClipEnd));
+}
+
+fn canvas_graph_debug_string(graph: &CanvasGraph) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "CanvasGraph viewport={:.1}x{:.1} objects={}",
+        graph.viewport.x,
+        graph.viewport.y,
+        graph.objects.len()
+    );
+    for (index, object) in graph.objects.iter().enumerate() {
+        match object {
+            CanvasObject::Text(text) => {
+                let _ = writeln!(
+                    out,
+                    "{index:04} Text rect={} size={:.1} bold={} italic={} underline={} href={} text=\"{}\"",
+                    rect_debug(text.rect),
+                    text.font_size,
+                    text.font_weight_bold,
+                    text.font_style_italic,
+                    text.text_decoration_underline,
+                    text.href.as_deref().unwrap_or(""),
+                    shorten_debug_text(&text.text)
+                );
+            }
+            CanvasObject::Rect(rect) => {
+                let _ = writeln!(
+                    out,
+                    "{index:04} Rect rect={} fill={} border={} border_width={:.1} radius={}",
+                    rect_debug(rect.rect),
+                    color_debug(rect.fill),
+                    color_debug(rect.border_color),
+                    rect.border_width,
+                    rect.border_radius
+                );
+            }
+            CanvasObject::Button(button) => {
+                let _ = writeln!(
+                    out,
+                    "{index:04} Button rect={} type={} form={} text=\"{}\"",
+                    rect_debug(button.rect),
+                    button.button_type,
+                    button.form_id.as_deref().unwrap_or(""),
+                    shorten_debug_text(&button.text)
+                );
+            }
+            CanvasObject::Input(input) => {
+                let _ = writeln!(
+                    out,
+                    "{index:04} Input rect={} font_size={:.1} color={} label=\"{}\" value_len={}",
+                    rect_debug(input.rect),
+                    input.font_size,
+                    color_debug(input.color),
+                    shorten_debug_text(&input.label),
+                    input.value.chars().count()
+                );
+            }
+            CanvasObject::Image(image) => {
+                let _ = writeln!(
+                    out,
+                    "{index:04} Image rect={} fit={:?} src=\"{}\" alt=\"{}\" intrinsic={:.1}x{:.1}",
+                    rect_debug(image.rect),
+                    image.object_fit,
+                    shorten_debug_text(&image.src),
+                    shorten_debug_text(&image.alt),
+                    image.image.size.x,
+                    image.image.size.y
+                );
+            }
+            CanvasObject::Svg(svg) => {
+                let _ = writeln!(
+                    out,
+                    "{index:04} Svg rect={} intrinsic={:.1}x{:.1} shapes={}",
+                    rect_debug(svg.rect),
+                    svg.svg.size.x,
+                    svg.svg.size.y,
+                    svg.svg.shapes.len()
+                );
+            }
+            CanvasObject::Media(media) => {
+                let _ = writeln!(
+                    out,
+                    "{index:04} Media rect={} label=\"{}\"",
+                    rect_debug(media.rect),
+                    shorten_debug_text(&media.label)
+                );
+            }
+            CanvasObject::ClipStart(clip) => {
+                let _ = writeln!(
+                    out,
+                    "{index:04} ClipStart rect={} radius={}",
+                    rect_debug(clip.rect),
+                    clip.border_radius
+                );
+            }
+            CanvasObject::ClipEnd => {
+                let _ = writeln!(out, "{index:04} ClipEnd");
+            }
+        }
+    }
+    out
+}
+
+fn rect_debug(rect: egui::Rect) -> String {
+    format!(
+        "({:.1},{:.1}) {:.1}x{:.1}",
+        rect.left(),
+        rect.top(),
+        rect.width(),
+        rect.height()
+    )
+}
+
+fn paint_alternating_debug_text(ui: &mut egui::Ui, text: &str) {
+    paint_alternating_debug_text_with_canvas_thumbs(ui, text, None);
+}
+
+fn paint_console_messages(ui: &mut egui::Ui, messages: &[justbarelyscript::ConsoleMessage]) {
+    egui::ScrollArea::vertical()
+        .id_salt("debug_console_messages")
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            if messages.is_empty() {
+                ui.label("Console is empty.");
+                return;
+            }
+
+            for (index, message) in messages.iter().enumerate() {
+                let is_error = message.level == justbarelyscript::ConsoleLevel::Error;
+                let fill = if is_error {
+                    egui::Color32::from_rgb(255, 244, 179)
+                } else if index % 2 == 0 {
+                    egui::Color32::from_rgb(248, 249, 251)
+                } else {
+                    egui::Color32::from_rgb(237, 240, 244)
+                };
+                let text_color = if is_error {
+                    egui::Color32::from_rgb(176, 0, 32)
+                } else {
+                    ui.visuals().text_color()
+                };
+                let level = match message.level {
+                    justbarelyscript::ConsoleLevel::Log => "log",
+                    justbarelyscript::ConsoleLevel::Info => "info",
+                    justbarelyscript::ConsoleLevel::Warn => "warn",
+                    justbarelyscript::ConsoleLevel::Error => "error",
+                };
+
+                egui::Frame::new()
+                    .fill(fill)
+                    .inner_margin(egui::Margin::symmetric(8, 5))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.monospace(format!("[{level}]"));
+                            ui.label(egui::RichText::new(&message.text).color(text_color));
+                        });
+                    });
+            }
+        });
+}
+
+fn paint_alternating_debug_text_with_canvas_thumbs(
+    ui: &mut egui::Ui,
+    text: &str,
+    canvas_graph: Option<&CanvasGraph>,
+) {
+    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+    let row_height = ui.text_style_height(&egui::TextStyle::Monospace).max(18.0);
+    let char_width = ui.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap("0".to_owned(), font_id.clone(), egui::Color32::WHITE)
+            .size()
+            .x
+            .max(1.0)
+    });
+    let text_color = ui.visuals().text_color();
+    let even_fill = egui::Color32::from_rgb(248, 249, 251);
+    let odd_fill = egui::Color32::from_rgb(237, 240, 244);
+    let width = ui.available_width().max(1.0);
+    let mut in_quote = false;
+
+    for (index, line) in text.lines().enumerate() {
+        let thumb = canvas_graph.and_then(|graph| debug_line_thumbnail(graph, line));
+        let thumb_slot_width = if thumb.is_some() { 42.0 } else { 0.0 };
+        let text_width = (width - 12.0 - thumb_slot_width).max(1.0);
+        let chars_per_line = (text_width / char_width).floor().max(1.0) as usize;
+        let visual_lines = wrap_debug_line(line, chars_per_line);
+        let text_height = row_height * visual_lines.len().max(1) as f32;
+        let height = if thumb.is_some() {
+            text_height.max(38.0)
+        } else {
+            text_height
+        };
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+        let fill = if index % 2 == 0 { even_fill } else { odd_fill };
+        ui.painter().rect_filled(rect, 0.0, fill);
+        response.context_menu(|ui| {
+            if ui.button("Copy Line").clicked() {
+                ui.ctx().copy_text(line.to_owned());
+                ui.close();
+            }
+        });
+        for (line_index, visual_line) in visual_lines.iter().enumerate() {
+            let display_line = debug_line_with_color_spacing(visual_line);
+            let text_pos =
+                rect.left_top() + egui::vec2(6.0, row_height * (line_index as f32 + 0.5));
+            paint_debug_colored_line(
+                ui,
+                &display_line,
+                text_pos,
+                &font_id,
+                text_color,
+                char_width,
+                &mut in_quote,
+            );
+            paint_debug_hex_swatches(
+                ui,
+                &display_line,
+                text_pos,
+                row_height,
+                char_width,
+                font_id.size * 0.2,
+            );
+        }
+        if let Some(thumb) = thumb {
+            paint_debug_line_thumbnail(ui, rect, thumb);
+        }
+    }
+
+    if text.is_empty() {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 0.0, even_fill);
+    }
+}
+
+enum DebugLineThumbnail<'a> {
+    Image {
+        index: usize,
+        src: &'a str,
+        image: &'a ImageBlock,
+    },
+    Svg(&'a SvgBlock),
+}
+
+fn debug_line_thumbnail<'a>(graph: &'a CanvasGraph, line: &str) -> Option<DebugLineThumbnail<'a>> {
+    let index = parse_canvas_debug_line_index(line)?;
+    match graph.objects.get(index)? {
+        CanvasObject::Image(image) => Some(DebugLineThumbnail::Image {
+            index,
+            src: &image.src,
+            image: &image.image,
+        }),
+        CanvasObject::Svg(svg) => Some(DebugLineThumbnail::Svg(&svg.svg)),
+        _ => None,
+    }
+}
+
+fn parse_canvas_debug_line_index(line: &str) -> Option<usize> {
+    let prefix = line.get(0..4)?;
+    if !prefix.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    if line.as_bytes().get(4).is_some_and(|byte| *byte != b' ') {
+        return None;
+    }
+    prefix.parse().ok()
+}
+
+fn paint_debug_line_thumbnail(
+    ui: &mut egui::Ui,
+    row_rect: egui::Rect,
+    thumb: DebugLineThumbnail<'_>,
+) {
+    let size = egui::vec2(34.0, 28.0);
+    let rect = egui::Rect::from_center_size(
+        egui::pos2(row_rect.right() - 24.0, row_rect.center().y),
+        size,
+    );
+    ui.painter().rect_filled(
+        rect.expand(2.0),
+        3.0,
+        egui::Color32::from_rgb(225, 229, 235),
+    );
+    ui.painter().rect_stroke(
+        rect.expand(2.0),
+        3.0,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 158, 168)),
+        egui::StrokeKind::Outside,
+    );
+
+    match thumb {
+        DebugLineThumbnail::Image { index, src, image } => {
+            let texture = ui.ctx().load_texture(
+                format!("render-debug-thumb-{index}-{src}"),
+                image.color_image.clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            let image_rect = fit_rect_into(image.size, rect);
+            ui.painter().image(
+                texture.id(),
+                image_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+        DebugLineThumbnail::Svg(svg) => {
+            let svg_rect = fit_rect_into(svg.size, rect);
+            svg.paint_in_rect(ui, svg_rect);
+        }
+    }
+}
+
+fn fit_rect_into(content_size: egui::Vec2, bounds: egui::Rect) -> egui::Rect {
+    let content_size = content_size.max(egui::Vec2::splat(1.0));
+    let scale = (bounds.width() / content_size.x)
+        .min(bounds.height() / content_size.y)
+        .min(1.0)
+        .max(0.01);
+    egui::Rect::from_center_size(bounds.center(), content_size * scale)
+}
+
+fn paint_debug_colored_line(
+    ui: &mut egui::Ui,
+    line: &str,
+    text_pos: egui::Pos2,
+    font_id: &egui::FontId,
+    default_color: egui::Color32,
+    char_width: f32,
+    in_quote: &mut bool,
+) {
+    let quote_color = egui::Color32::from_rgb(190, 35, 45);
+    let mut segment_start = 0usize;
+    let mut segment_start_char = 0usize;
+
+    for (byte_index, character) in line.char_indices() {
+        if character != '"' {
+            continue;
+        }
+
+        if *in_quote {
+            let end = byte_index + character.len_utf8();
+            paint_debug_line_segment(
+                ui,
+                &line[segment_start..end],
+                text_pos,
+                font_id,
+                quote_color,
+                segment_start_char,
+                char_width,
+            );
+            segment_start = end;
+            segment_start_char = line[..end].chars().count();
+            *in_quote = false;
+        } else {
+            paint_debug_line_segment(
+                ui,
+                &line[segment_start..byte_index],
+                text_pos,
+                font_id,
+                default_color,
+                segment_start_char,
+                char_width,
+            );
+            segment_start = byte_index;
+            segment_start_char = line[..byte_index].chars().count();
+            *in_quote = true;
+        }
+    }
+
+    if segment_start < line.len() {
+        paint_debug_line_segment(
+            ui,
+            &line[segment_start..],
+            text_pos,
+            font_id,
+            if *in_quote {
+                quote_color
+            } else {
+                default_color
+            },
+            segment_start_char,
+            char_width,
+        );
+    }
+}
+
+fn paint_debug_line_segment(
+    ui: &mut egui::Ui,
+    segment: &str,
+    text_pos: egui::Pos2,
+    font_id: &egui::FontId,
+    color: egui::Color32,
+    start_char: usize,
+    char_width: f32,
+) {
+    if segment.is_empty() {
+        return;
+    }
+    ui.painter().text(
+        text_pos + egui::vec2(start_char as f32 * char_width, 0.0),
+        egui::Align2::LEFT_CENTER,
+        segment,
+        font_id.clone(),
+        color,
+    );
+}
+
+fn wrap_debug_line(line: &str, chars_per_line: usize) -> Vec<String> {
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut wrapped = Vec::new();
+    let mut current = String::new();
+    for character in line.chars() {
+        if current.chars().count() >= chars_per_line {
+            wrapped.push(current);
+            current = String::new();
+        }
+        current.push(character);
+    }
+    if !current.is_empty() {
+        wrapped.push(current);
+    }
+    wrapped
+}
+
+fn debug_line_with_color_spacing(line: &str) -> String {
+    let mut out = String::new();
+    let mut byte_index = 0usize;
+
+    while byte_index < line.len() {
+        let Some(relative_index) = line[byte_index..].find('#') else {
+            out.push_str(&line[byte_index..]);
+            break;
+        };
+        let start = byte_index + relative_index;
+        out.push_str(&line[byte_index..start]);
+        let candidate = &line[start..];
+        let Some((hex_len, _)) = parse_debug_hex_color(candidate) else {
+            out.push('#');
+            byte_index = start + 1;
+            continue;
+        };
+
+        out.push_str(&line[start..start + hex_len]);
+        out.push(' ');
+        byte_index = start + hex_len;
+    }
+
+    out
+}
+
+fn paint_debug_hex_swatches(
+    ui: &mut egui::Ui,
+    line: &str,
+    text_pos: egui::Pos2,
+    row_height: f32,
+    char_width: f32,
+    swatch_margin: f32,
+) {
+    let swatch_height = (row_height - 9.0).clamp(6.0, 11.0);
+    let swatch_width = swatch_height * 0.75;
+    let mut byte_index = 0usize;
+
+    while let Some(relative_index) = line[byte_index..].find('#') {
+        let start = byte_index + relative_index;
+        let candidate = &line[start..];
+        let Some((hex_len, color)) = parse_debug_hex_color(candidate) else {
+            byte_index = start + 1;
+            continue;
+        };
+
+        let before_chars = line[..start].chars().count() as f32;
+        let token_chars = line[start..start + hex_len].chars().count() as f32;
+        let left = text_pos.x + (before_chars + token_chars) * char_width + swatch_margin;
+        let top = text_pos.y - swatch_height * 0.5;
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(left, top),
+            egui::vec2(swatch_width, swatch_height),
+        );
+        ui.painter().rect_filled(rect, 2.0, color);
+        ui.painter().rect_stroke(
+            rect,
+            2.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 96, 104)),
+            egui::StrokeKind::Outside,
+        );
+
+        byte_index = start + hex_len;
+    }
+}
+
+fn parse_debug_hex_color(candidate: &str) -> Option<(usize, egui::Color32)> {
+    let hex_digits: String = candidate
+        .chars()
+        .skip(1)
+        .take_while(|character| character.is_ascii_hexdigit())
+        .take(8)
+        .collect();
+    let len = hex_digits.len();
+    if !matches!(len, 3 | 4 | 6 | 8) {
+        return None;
+    }
+
+    let next = candidate.chars().nth(len + 1);
+    if next.is_some_and(|character| character.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let parse_pair = |value: &str| u8::from_str_radix(value, 16).ok();
+    let double_digit = |character: char| -> Option<u8> {
+        let mut value = String::new();
+        value.push(character);
+        value.push(character);
+        parse_pair(&value)
+    };
+
+    let color = match len {
+        3 | 4 => {
+            let mut chars = hex_digits.chars();
+            let r = double_digit(chars.next()?)?;
+            let g = double_digit(chars.next()?)?;
+            let b = double_digit(chars.next()?)?;
+            let a = if len == 4 {
+                double_digit(chars.next()?)?
+            } else {
+                255
+            };
+            egui::Color32::from_rgba_unmultiplied(r, g, b, a)
+        }
+        6 | 8 => {
+            let r = parse_pair(&hex_digits[0..2])?;
+            let g = parse_pair(&hex_digits[2..4])?;
+            let b = parse_pair(&hex_digits[4..6])?;
+            let a = if len == 8 {
+                parse_pair(&hex_digits[6..8])?
+            } else {
+                255
+            };
+            egui::Color32::from_rgba_unmultiplied(r, g, b, a)
+        }
+        _ => return None,
+    };
+
+    Some((len + 1, color))
+}
+
+fn export_render_debug_steps(graph: &CanvasGraph) -> io::Result<usize> {
+    let output_dir = Path::new(DEBUG_EXPORT_DIR);
+    if output_dir.exists() {
+        fs::remove_dir_all(output_dir)?;
+    }
+    fs::create_dir_all(output_dir)?;
+
+    for object_limit in 0..=graph.objects.len() {
+        let mut frame_graph = graph.clone();
+        frame_graph.objects.truncate(object_limit);
+        close_truncated_canvas_clips(&mut frame_graph.objects);
+        let image = rasterize_canvas_graph_debug_frame(&frame_graph);
+        let path = output_dir.join(format!("render_debug_{object_limit:04}.png"));
+        image.save(&path).map_err(io::Error::other)?;
+    }
+
+    Ok(graph.objects.len() + 1)
+}
+
+fn rasterize_canvas_graph_debug_frame(graph: &CanvasGraph) -> image::RgbaImage {
+    let width = graph.viewport.x.ceil().max(1.0) as u32;
+    let height = graph.viewport.y.ceil().max(1.0) as u32;
+    let mut image = image::RgbaImage::from_pixel(width, height, image::Rgba([255, 255, 255, 255]));
+    let canvas =
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width as f32, height as f32));
+    let mut clip_stack = Vec::new();
+    let mut clip = canvas;
+
+    for object in &graph.objects {
+        match object {
+            CanvasObject::ClipStart(clip_object) => {
+                clip_stack.push(clip);
+                clip = clip.intersect(clip_object.rect);
+            }
+            CanvasObject::ClipEnd => {
+                clip = clip_stack.pop().unwrap_or(canvas);
+            }
+            CanvasObject::Rect(rect) => draw_canvas_rect(&mut image, rect, clip),
+            CanvasObject::Button(_) => {}
+            CanvasObject::Input(input) => draw_canvas_input(&mut image, input, clip),
+            CanvasObject::Image(canvas_image) => draw_canvas_image(&mut image, canvas_image, clip),
+            CanvasObject::Svg(svg) => draw_canvas_svg(&mut image, svg, clip),
+            CanvasObject::Media(media) => draw_canvas_media(&mut image, media, clip),
+            CanvasObject::Text(text) => draw_canvas_text_placeholder(&mut image, text, clip),
+        }
+    }
+
+    image
+}
+
+fn draw_canvas_rect(image: &mut image::RgbaImage, rect: &CanvasRectObject, clip: egui::Rect) {
+    draw_filled_rect(image, rect.rect, rect.fill, clip);
+    if rect.border_width > 0.0 {
+        draw_rect_border(image, rect.rect, rect.border_color, rect.border_width, clip);
+    }
+}
+
+fn draw_canvas_input(image: &mut image::RgbaImage, input: &CanvasInputObject, clip: egui::Rect) {
+    draw_filled_rect(image, input.rect, egui::Color32::WHITE, clip);
+    draw_rect_border(
+        image,
+        input.rect,
+        egui::Color32::from_rgb(170, 180, 190),
+        1.0,
+        clip,
+    );
+    draw_text_marker(image, input.rect.shrink(4.0), input.font_size, clip);
+}
+
+fn draw_canvas_image(
+    image: &mut image::RgbaImage,
+    canvas_image: &CanvasImageObject,
+    clip: egui::Rect,
+) {
+    let src_size = canvas_image.image.color_image.size;
+    if src_size[0] == 0 || src_size[1] == 0 || canvas_image.image.color_image.pixels.is_empty() {
+        draw_canvas_media(
+            image,
+            &CanvasMediaObject {
+                rect: canvas_image.rect,
+                label: canvas_image.alt.clone(),
+            },
+            clip,
+        );
+        return;
+    }
+
+    let dest = canvas_image.rect.intersect(clip);
+    let min_x = dest.left().floor().max(0.0) as u32;
+    let min_y = dest.top().floor().max(0.0) as u32;
+    let max_x = dest.right().ceil().min(image.width() as f32) as u32;
+    let max_y = dest.bottom().ceil().min(image.height() as f32) as u32;
+    if min_x >= max_x || min_y >= max_y {
+        return;
+    }
+
+    let uv = match canvas_image.object_fit {
+        CssObjectFit::Cover => {
+            cover_debug_image_uv(canvas_image.image.size, canvas_image.rect.size())
+        }
+        CssObjectFit::Contain | CssObjectFit::Fill => {
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0))
+        }
+    };
+    let dest_width = canvas_image.rect.width().max(1.0);
+    let dest_height = canvas_image.rect.height().max(1.0);
+
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            let tx = ((x as f32 + 0.5 - canvas_image.rect.left()) / dest_width).clamp(0.0, 1.0);
+            let ty = ((y as f32 + 0.5 - canvas_image.rect.top()) / dest_height).clamp(0.0, 1.0);
+            let sx = (uv.left() + uv.width() * tx) * (src_size[0].saturating_sub(1) as f32);
+            let sy = (uv.top() + uv.height() * ty) * (src_size[1].saturating_sub(1) as f32);
+            let source_index = sy.round() as usize * src_size[0] + sx.round() as usize;
+            if let Some(color) = canvas_image.image.color_image.pixels.get(source_index) {
+                image.put_pixel(x, y, color_to_rgba(*color));
+            }
+        }
+    }
+}
+
+fn draw_canvas_svg(image: &mut image::RgbaImage, svg: &CanvasSvgObject, clip: egui::Rect) {
+    let scale_x = svg.rect.width() / svg.svg.size.x.max(1.0);
+    let scale_y = svg.rect.height() / svg.svg.size.y.max(1.0);
+    for shape in &svg.svg.shapes {
+        match shape {
+            SvgShape::Rect {
+                x,
+                y,
+                width,
+                height,
+                fill,
+            } => {
+                let rect = egui::Rect::from_min_size(
+                    egui::Pos2::new(svg.rect.left() + x * scale_x, svg.rect.top() + y * scale_y),
+                    egui::vec2(width * scale_x, height * scale_y),
+                );
+                draw_filled_rect(image, rect, *fill, clip);
+            }
+            SvgShape::Circle {
+                cx,
+                cy,
+                r,
+                fill,
+                stroke,
+                stroke_width,
+            } => {
+                let center = egui::Pos2::new(
+                    svg.rect.left() + cx * scale_x,
+                    svg.rect.top() + cy * scale_y,
+                );
+                draw_filled_circle(image, center, r * scale_x.min(scale_y), *fill, clip);
+                if let Some(stroke) = stroke {
+                    let border_rect = egui::Rect::from_center_size(
+                        center,
+                        egui::vec2(r * 2.0 * scale_x, r * 2.0 * scale_y),
+                    );
+                    draw_rect_border(image, border_rect, *stroke, *stroke_width, clip);
+                }
+            }
+            SvgShape::PathFallback { fill } => {
+                draw_filled_circle(
+                    image,
+                    svg.rect.center(),
+                    svg.rect.width().min(svg.rect.height()) * 0.14,
+                    *fill,
+                    clip,
+                );
+            }
+        }
+    }
+}
+
+fn draw_canvas_media(image: &mut image::RgbaImage, media: &CanvasMediaObject, clip: egui::Rect) {
+    draw_filled_rect(
+        image,
+        media.rect,
+        egui::Color32::from_rgb(238, 241, 245),
+        clip,
+    );
+    draw_rect_border(
+        image,
+        media.rect,
+        egui::Color32::from_rgb(195, 205, 215),
+        1.0,
+        clip,
+    );
+    draw_text_marker(image, media.rect.shrink(8.0), 14.0, clip);
+}
+
+fn draw_canvas_text_placeholder(
+    image: &mut image::RgbaImage,
+    text: &CanvasTextObject,
+    clip: egui::Rect,
+) {
+    if text.text_background != egui::Color32::TRANSPARENT {
+        draw_filled_rect(image, text.rect, text.text_background, clip);
+    }
+    draw_text_marker(image, text.rect, text.font_size, clip);
+}
+
+fn draw_text_marker(
+    image: &mut image::RgbaImage,
+    rect: egui::Rect,
+    font_size: f32,
+    clip: egui::Rect,
+) {
+    let marker_height = (font_size * 0.12).round().clamp(1.0, 3.0);
+    let marker_top = rect.center().y - marker_height * 0.5;
+    let marker = egui::Rect::from_min_max(
+        egui::Pos2::new(rect.left(), marker_top),
+        egui::Pos2::new(rect.right(), marker_top + marker_height),
+    );
+    draw_filled_rect(image, marker, egui::Color32::from_rgb(45, 50, 58), clip);
+}
+
+fn draw_filled_rect(
+    image: &mut image::RgbaImage,
+    rect: egui::Rect,
+    color: egui::Color32,
+    clip: egui::Rect,
+) {
+    if color == egui::Color32::TRANSPARENT {
+        return;
+    }
+    let rect = rect.intersect(clip);
+    let min_x = rect.left().floor().max(0.0) as u32;
+    let min_y = rect.top().floor().max(0.0) as u32;
+    let max_x = rect.right().ceil().min(image.width() as f32) as u32;
+    let max_y = rect.bottom().ceil().min(image.height() as f32) as u32;
+    let color = color_to_rgba(color);
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            image.put_pixel(x, y, color);
+        }
+    }
+}
+
+fn draw_rect_border(
+    image: &mut image::RgbaImage,
+    rect: egui::Rect,
+    color: egui::Color32,
+    width: f32,
+    clip: egui::Rect,
+) {
+    if color == egui::Color32::TRANSPARENT || width <= 0.0 {
+        return;
+    }
+    let width = width.ceil().max(1.0);
+    draw_filled_rect(
+        image,
+        egui::Rect::from_min_max(
+            rect.left_top(),
+            egui::Pos2::new(rect.right(), rect.top() + width),
+        ),
+        color,
+        clip,
+    );
+    draw_filled_rect(
+        image,
+        egui::Rect::from_min_max(
+            egui::Pos2::new(rect.left(), rect.bottom() - width),
+            rect.right_bottom(),
+        ),
+        color,
+        clip,
+    );
+    draw_filled_rect(
+        image,
+        egui::Rect::from_min_max(
+            rect.left_top(),
+            egui::Pos2::new(rect.left() + width, rect.bottom()),
+        ),
+        color,
+        clip,
+    );
+    draw_filled_rect(
+        image,
+        egui::Rect::from_min_max(
+            egui::Pos2::new(rect.right() - width, rect.top()),
+            rect.right_bottom(),
+        ),
+        color,
+        clip,
+    );
+}
+
+fn draw_filled_circle(
+    image: &mut image::RgbaImage,
+    center: egui::Pos2,
+    radius: f32,
+    color: egui::Color32,
+    clip: egui::Rect,
+) {
+    if color == egui::Color32::TRANSPARENT || radius <= 0.0 {
+        return;
+    }
+    let bounds =
+        egui::Rect::from_center_size(center, egui::Vec2::splat(radius * 2.0)).intersect(clip);
+    let min_x = bounds.left().floor().max(0.0) as u32;
+    let min_y = bounds.top().floor().max(0.0) as u32;
+    let max_x = bounds.right().ceil().min(image.width() as f32) as u32;
+    let max_y = bounds.bottom().ceil().min(image.height() as f32) as u32;
+    let radius_sq = radius * radius;
+    let color = color_to_rgba(color);
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            let dx = x as f32 + 0.5 - center.x;
+            let dy = y as f32 + 0.5 - center.y;
+            if dx * dx + dy * dy <= radius_sq {
+                image.put_pixel(x, y, color);
+            }
+        }
+    }
+}
+
+fn cover_debug_image_uv(source_size: egui::Vec2, target_size: egui::Vec2) -> egui::Rect {
+    let source_size = source_size.max(egui::Vec2::splat(1.0));
+    let target_size = target_size.max(egui::Vec2::splat(1.0));
+    let source_ratio = source_size.x / source_size.y;
+    let target_ratio = target_size.x / target_size.y;
+    if source_ratio > target_ratio {
+        let visible_width = target_ratio / source_ratio;
+        let left = (1.0 - visible_width) * 0.5;
+        egui::Rect::from_min_max(
+            egui::Pos2::new(left, 0.0),
+            egui::Pos2::new(left + visible_width, 1.0),
+        )
+    } else {
+        let visible_height = source_ratio / target_ratio;
+        let top = (1.0 - visible_height) * 0.5;
+        egui::Rect::from_min_max(
+            egui::Pos2::new(0.0, top),
+            egui::Pos2::new(1.0, top + visible_height),
+        )
+    }
+}
+
+fn color_to_rgba(color: egui::Color32) -> image::Rgba<u8> {
+    image::Rgba([color.r(), color.g(), color.b(), color.a()])
 }
 
 fn input_to_path(input: &str) -> PathBuf {
@@ -319,6 +1879,1209 @@ fn default_url_bookmark() -> Bookmark {
     Bookmark {
         title: DEFAULT_URL_BOOKMARK_TITLE.to_owned(),
         url: DEFAULT_URL.to_owned(),
+    }
+}
+
+fn script_test_bookmarks() -> Vec<Bookmark> {
+    SCRIPT_TEST_BOOKMARKS
+        .iter()
+        .map(|(title, relative_path)| Bookmark {
+            title: (*title).to_owned(),
+            url: path_to_file_url(&workspace_root_path().join(relative_path)),
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct PageScript {
+    label: String,
+    kind: PageScriptKind,
+    source_url: Option<String>,
+    byte_len: usize,
+    deferred: bool,
+    diagnostics: Vec<String>,
+    program: Result<justbarelyscript::Program, justbarelyscript::JsError>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageScriptKind {
+    Inline,
+    External,
+}
+
+const MAX_EXTERNAL_SCRIPT_PARSE_BYTES: usize = 5 * 1024 * 1024;
+const MAX_SCRIPT_DIAGNOSTIC_BYTES: usize = MAX_EXTERNAL_SCRIPT_PARSE_BYTES;
+const LIVE_JS_DEBUG_STATEMENT_BUDGET: usize = 50_000;
+
+fn script_console_messages_from_html(html: &str) -> Vec<justbarelyscript::ConsoleMessage> {
+    script_console_messages_from_html_with_source(html, None)
+}
+
+fn script_console_messages_from_html_with_source(
+    html: &str,
+    source: Option<&str>,
+) -> Vec<justbarelyscript::ConsoleMessage> {
+    let scripts = collect_page_scripts(html, source);
+    let mut messages = Vec::new();
+
+    if scripts.is_empty() {
+        messages.push(justbarelyscript::ConsoleMessage {
+            level: justbarelyscript::ConsoleLevel::Info,
+            text: "No scripts found.".to_owned(),
+        });
+        return messages;
+    }
+
+    messages.push(justbarelyscript::ConsoleMessage {
+        level: justbarelyscript::ConsoleLevel::Info,
+        text: format!(
+            "Parsed {} script(s). ConsoleSink is parser-only; filesystem, process, shell, deletion, creation, and network APIs are not exposed.",
+            scripts.len()
+        ),
+    });
+
+    for script in scripts {
+        match script.program {
+            Ok(program) => {
+                messages.extend(justbarelyscript::collect_static_console_messages(&program));
+                let mut state = justbarelyscript::BrowserExecutionState::default();
+                seed_script_browser_globals(&mut state, source);
+                state.set_execution_budget(LIVE_JS_DEBUG_STATEMENT_BUDGET);
+                emit_global_telemetry(
+                    "js.script.execute.started",
+                    &[("phase", "console"), ("label", &script.label)],
+                );
+                let start = std::time::Instant::now();
+                state.execute_program(&program);
+                let elapsed = start.elapsed().as_millis().to_string();
+                let budget_exhausted = if state.execution_budget_exhausted() {
+                    "true"
+                } else {
+                    "false"
+                };
+                emit_global_telemetry(
+                    "js.script.execute.completed",
+                    &[
+                        ("phase", "console"),
+                        ("label", &script.label),
+                        ("elapsed_ms", &elapsed),
+                        ("budget_exhausted", budget_exhausted),
+                    ],
+                );
+                if state.execution_budget_exhausted() {
+                    messages.push(console_error_message(format!(
+                        "{}: execution stopped after {} statements; continuing page load with partial JavaScript",
+                        script.label, LIVE_JS_DEBUG_STATEMENT_BUDGET
+                    )));
+                }
+            }
+            Err(error) => {
+                let diagnostic_suffix = if script.diagnostics.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " Unsupported constructs: {}.",
+                        script.diagnostics.join(", ")
+                    )
+                };
+                messages.push(console_error_message(format!(
+                    "{}: {}{}",
+                    script.label,
+                    error.diagnostic_message(),
+                    diagnostic_suffix
+                )));
+            }
+        }
+    }
+
+    messages
+}
+
+fn live_js_debug_report(html: &str, source: Option<&str>) -> String {
+    let html = remove_html_comments(html);
+    let scripts = collect_page_scripts(&html, source);
+    let mut out = String::new();
+    out.push_str("Live JS Debug\n");
+    out.push_str("================\n");
+    out.push_str(&format!("source: {}\n", source.unwrap_or("<unknown>")));
+    out.push_str(&format!("html_bytes: {}\n", html.len()));
+    out.push_str(&format!("script_count: {}\n", scripts.len()));
+    out.push_str(&format!(
+        "statement_budget_per_script: {}\n\n",
+        LIVE_JS_DEBUG_STATEMENT_BUDGET
+    ));
+
+    if scripts.is_empty() {
+        out.push_str("No scripts found.\n");
+        return out;
+    }
+
+    let mut state = justbarelyscript::BrowserExecutionState::default();
+    seed_script_browser_globals(&mut state, source);
+    seed_script_dom_state_from_html(&html, &mut state);
+    seed_script_computed_styles_from_html(&html, &mut state);
+
+    let mut parsed = 0usize;
+    let mut skipped_or_failed = 0usize;
+    let mut executed = 0usize;
+    let mut budget_exhausted = 0usize;
+    let mut total_effects = 0usize;
+
+    for (index, script) in scripts.iter().enumerate() {
+        out.push_str(&format!("{}. {}\n", index + 1, script.label));
+        out.push_str(&format!(
+            "   kind: {}{}\n",
+            match script.kind {
+                PageScriptKind::Inline => "inline",
+                PageScriptKind::External => "external",
+            },
+            if script.deferred { " defer" } else { "" }
+        ));
+        if let Some(url) = &script.source_url {
+            out.push_str(&format!("   url: {url}\n"));
+        }
+        out.push_str(&format!("   bytes: {}\n", script.byte_len));
+        if !script.diagnostics.is_empty() {
+            out.push_str(&format!(
+                "   constructs: {}\n",
+                script.diagnostics.join(", ")
+            ));
+        }
+
+        match &script.program {
+            Ok(program) => {
+                parsed += 1;
+                state.set_execution_budget(LIVE_JS_DEBUG_STATEMENT_BUDGET);
+                emit_global_telemetry(
+                    "js.script.execute.started",
+                    &[("phase", "live_js_debug"), ("label", &script.label)],
+                );
+                let start = std::time::Instant::now();
+                state.execute_program(program);
+                let elapsed = start.elapsed();
+                let effects = state.drain_effects();
+                let effect_count = effects.len();
+                total_effects += effect_count;
+                executed += 1;
+                out.push_str(&format!(
+                    "   status: executed in {:.2?}; effects={}; {}\n",
+                    elapsed,
+                    effect_count,
+                    browser_effect_summary(&effects)
+                ));
+                for effect in effects.iter().take(8) {
+                    match effect {
+                        justbarelyscript::BrowserEffect::RuntimeTrace { kind, detail } => {
+                            out.push_str(&format!("   trace: {kind}: {detail}\n"));
+                            emit_global_telemetry(
+                                "js.runtime.trace",
+                                &[
+                                    ("phase", "live_js_debug"),
+                                    ("label", &script.label),
+                                    ("kind", kind),
+                                    ("detail", detail),
+                                ],
+                            );
+                        }
+                        justbarelyscript::BrowserEffect::NetworkRequest { method, url, body } => {
+                            out.push_str(&format!(
+                                "   network: {method} {url} body_bytes={}\n",
+                                body.len()
+                            ));
+                            emit_global_telemetry(
+                                "js.network.request",
+                                &[
+                                    ("phase", "live_js_debug"),
+                                    ("label", &script.label),
+                                    ("method", method),
+                                    ("url", url),
+                                    ("body_bytes", &body.len().to_string()),
+                                ],
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                if effects.len() > 8 {
+                    out.push_str(&format!(
+                        "   trace: ... {} additional effect(s) omitted\n",
+                        effects.len() - 8
+                    ));
+                }
+                if state.execution_budget_exhausted() {
+                    budget_exhausted += 1;
+                    out.push_str(
+                        "   stop: statement budget exhausted; possible long-running script\n",
+                    );
+                }
+                let elapsed_ms = elapsed.as_millis().to_string();
+                let effect_count_string = effect_count.to_string();
+                let budget_exhausted_string = if state.execution_budget_exhausted() {
+                    "true"
+                } else {
+                    "false"
+                };
+                emit_global_telemetry(
+                    "js.script.execute.completed",
+                    &[
+                        ("phase", "live_js_debug"),
+                        ("label", &script.label),
+                        ("elapsed_ms", &elapsed_ms),
+                        ("effects", &effect_count_string),
+                        ("budget_exhausted", budget_exhausted_string),
+                    ],
+                );
+                out.push_str(&format!(
+                    "   state: listeners={} pending_timers={}\n",
+                    state.listener_count(),
+                    state.pending_timer_count()
+                ));
+            }
+            Err(error) => {
+                skipped_or_failed += 1;
+                out.push_str(&format!(
+                    "   status: not executed; {}\n",
+                    error.diagnostic_message()
+                ));
+            }
+        }
+        out.push('\n');
+    }
+
+    out.push_str("Summary\n");
+    out.push_str("-------\n");
+    out.push_str(&format!("parsed: {parsed}\n"));
+    out.push_str(&format!("executed: {executed}\n"));
+    out.push_str(&format!("not_executed: {skipped_or_failed}\n"));
+    out.push_str(&format!("budget_exhausted: {budget_exhausted}\n"));
+    out.push_str(&format!("dom_effects: {total_effects}\n"));
+    out.push_str(&format!("listeners: {}\n", state.listener_count()));
+    out.push_str(&format!(
+        "pending_timers: {}\n",
+        state.pending_timer_count()
+    ));
+    out
+}
+
+fn browser_effect_summary(effects: &[justbarelyscript::BrowserEffect]) -> String {
+    let mut text = 0usize;
+    let mut attr = 0usize;
+    let mut html = 0usize;
+    let mut append = 0usize;
+    let mut console = 0usize;
+    let mut network = 0usize;
+    let mut trace = 0usize;
+    for effect in effects {
+        match effect {
+            justbarelyscript::BrowserEffect::SetTextContent { .. } => text += 1,
+            justbarelyscript::BrowserEffect::SetAttribute { .. } => attr += 1,
+            justbarelyscript::BrowserEffect::SetInnerHtml { .. } => html += 1,
+            justbarelyscript::BrowserEffect::AppendChild { .. } => append += 1,
+            justbarelyscript::BrowserEffect::ConsoleLog { .. } => console += 1,
+            justbarelyscript::BrowserEffect::NetworkRequest { .. } => network += 1,
+            justbarelyscript::BrowserEffect::RuntimeTrace { .. } => trace += 1,
+        }
+    }
+    format!(
+        "text={text} attr={attr} inner_html={html} append={append} console={console} network={network} trace={trace}"
+    )
+}
+
+fn build_script_state(html: &str) -> justbarelyscript::BrowserExecutionState {
+    build_script_state_with_source(html, None)
+}
+
+fn build_script_state_with_source(
+    html: &str,
+    source: Option<&str>,
+) -> justbarelyscript::BrowserExecutionState {
+    let html = remove_html_comments(html);
+    let scripts = collect_page_scripts(&html, source);
+    let mut state = justbarelyscript::BrowserExecutionState::default();
+    seed_script_browser_globals(&mut state, source);
+    seed_script_dom_state_from_html(&html, &mut state);
+    seed_script_computed_styles_from_html(&html, &mut state);
+    for script in scripts {
+        let Ok(program) = script.program else {
+            continue;
+        };
+        state.set_execution_budget(LIVE_JS_DEBUG_STATEMENT_BUDGET);
+        emit_global_telemetry(
+            "js.script.execute.started",
+            &[("phase", "script_state"), ("label", &script.label)],
+        );
+        let start = std::time::Instant::now();
+        state.execute_program(&program);
+        let elapsed = start.elapsed().as_millis().to_string();
+        let budget_exhausted = if state.execution_budget_exhausted() {
+            "true"
+        } else {
+            "false"
+        };
+        state.drain_effects(); // discard initial DOM effects; we only keep event handlers
+        emit_global_telemetry(
+            "js.script.execute.completed",
+            &[
+                ("phase", "script_state"),
+                ("label", &script.label),
+                ("elapsed_ms", &elapsed),
+                ("budget_exhausted", budget_exhausted),
+                ("listeners", &state.listener_count().to_string()),
+                ("pending_timers", &state.pending_timer_count().to_string()),
+            ],
+        );
+    }
+    state
+}
+
+fn seed_script_computed_styles_from_html(
+    html: &str,
+    state: &mut justbarelyscript::BrowserExecutionState,
+) {
+    let css = extract_tag_inner(html, "style").unwrap_or("");
+    let browser_style = parse_basic_css_for_viewport_with_root_classes(css, 1280.0, &[]);
+
+    let mut offset = 0;
+    let mut remaining = html;
+    while let Some(rel_open_start) = remaining.find('<') {
+        let open_start = offset + rel_open_start;
+        let after_open = &html[open_start..];
+        if after_open.starts_with("</") || after_open.starts_with("<!") {
+            offset = open_start + 1;
+            remaining = &html[offset..];
+            continue;
+        }
+        let Some(open_end_rel) = after_open.find('>') else {
+            break;
+        };
+        let open_end = open_start + open_end_rel + 1;
+        let open_tag = &html[open_start..open_end];
+        let Some(id) = extract_attr(open_tag, "id") else {
+            offset = open_end;
+            remaining = &html[offset..];
+            continue;
+        };
+        let Some(tag) = tag_name(open_tag) else {
+            offset = open_end;
+            remaining = &html[offset..];
+            continue;
+        };
+        let classes: Vec<String> = extract_attr(open_tag, "class")
+            .unwrap_or_default()
+            .split_ascii_whitespace()
+            .map(str::to_owned)
+            .collect();
+        let key = ElementStyleKey {
+            tag: tag.to_owned(),
+            id: Some(id.clone()),
+            classes,
+            attributes: vec![],
+            parent: None,
+            previous_sibling: None,
+        };
+        let computed = computed_box_style(&browser_style, &key);
+        let mut props = std::collections::HashMap::new();
+        if let Some(display) = computed.display {
+            let display_str = match display {
+                CssDisplay::None => "none",
+                CssDisplay::Block => "block",
+                CssDisplay::Inline => "inline",
+                CssDisplay::InlineBlock => "inline-block",
+                CssDisplay::Flex => "flex",
+                CssDisplay::Grid => "grid",
+                CssDisplay::Table => "table",
+                CssDisplay::ListItem => "list-item",
+            };
+            props.insert("display".to_owned(), display_str.to_owned());
+        }
+        if !props.is_empty() {
+            state.seed_computed_style(&id, props);
+        }
+        offset = open_end;
+        remaining = &html[offset..];
+    }
+}
+
+fn parse_html_document_from_live_html(
+    live_html: &str,
+    source: &str,
+    text_metrics: Option<&egui::Context>,
+) -> BrowserDocument {
+    let reveal_hydration_hidden_content =
+        page_has_unexecuted_hydration_script(live_html, Some(source));
+    let mut css = extract_tag_inner(live_html, "style")
+        .unwrap_or("")
+        .to_owned();
+    css.push_str(&load_linked_stylesheets(live_html, source).unwrap_or_default());
+    let live_html = remove_non_visual_metadata_elements(live_html);
+    let dom = parse_dom_document(&live_html);
+    let title = dom
+        .first_descendant_by_tag("title")
+        .map(DomElement::text_content)
+        .or_else(|| extract_tag_text(&live_html, "title"))
+        .unwrap_or_else(|| "Untitled".to_owned())
+        .trim()
+        .to_owned();
+    let root_classes = document_theme_root_classes(&dom, text_metrics);
+    let style = parse_basic_css_for_viewport_with_root_classes(&css, 1280.0, &root_classes);
+    let render_graph = build_render_graph(&dom, &style);
+    let canvas_graph = render_graph_to_canvas_graph(
+        &render_graph,
+        source,
+        style.image_height_auto,
+        text_metrics,
+        reveal_hydration_hidden_content,
+    );
+    let blocks = render_graph_to_blocks(&render_graph, source, style.image_height_auto);
+    BrowserDocument {
+        title,
+        source: source.to_owned(),
+        style,
+        canvas_graph,
+        blocks,
+    }
+}
+
+fn apply_safe_script_browser_effects(html: &str) -> String {
+    apply_safe_script_browser_effects_with_source(html, None)
+}
+
+fn apply_safe_script_browser_effects_with_source(html: &str, source: Option<&str>) -> String {
+    apply_safe_script_browser_effects_detailed(html, source).html
+}
+
+#[derive(Debug)]
+struct ScriptApplicationResult {
+    html: String,
+    hydration_failed: bool,
+}
+
+fn apply_safe_script_browser_effects_detailed(
+    html: &str,
+    source: Option<&str>,
+) -> ScriptApplicationResult {
+    let scripts = collect_page_scripts(html, source);
+    let mut output = html.to_owned();
+    let mut state = justbarelyscript::BrowserExecutionState::default();
+    seed_script_browser_globals(&mut state, source);
+    seed_script_dom_state_from_html(html, &mut state);
+    seed_script_computed_styles_from_html(html, &mut state);
+    let mut hydration_failed = false;
+
+    for script in scripts {
+        let script_hydration_candidate = page_script_is_hydration_candidate(&script);
+        let Ok(program) = script.program else {
+            if script_hydration_candidate {
+                hydration_failed = true;
+            }
+            continue;
+        };
+        state.set_execution_budget(LIVE_JS_DEBUG_STATEMENT_BUDGET);
+        emit_global_telemetry(
+            "js.script.execute.started",
+            &[("phase", "dom_effects"), ("label", &script.label)],
+        );
+        let start = std::time::Instant::now();
+        state.execute_program(&program);
+        let elapsed = start.elapsed().as_millis().to_string();
+        let budget_exhausted = if state.execution_budget_exhausted() {
+            "true"
+        } else {
+            "false"
+        };
+        let effects = state.drain_effects();
+        let effect_count = effects.len().to_string();
+        emit_global_telemetry(
+            "js.script.execute.completed",
+            &[
+                ("phase", "dom_effects"),
+                ("label", &script.label),
+                ("elapsed_ms", &elapsed),
+                ("effects", &effect_count),
+                ("budget_exhausted", budget_exhausted),
+            ],
+        );
+        for effect in effects {
+            match effect {
+                justbarelyscript::BrowserEffect::SetTextContent { element_id, value } => {
+                    output = set_element_text_content_by_id(&output, &element_id, &value);
+                }
+                justbarelyscript::BrowserEffect::SetAttribute {
+                    element_id,
+                    name,
+                    value,
+                } => {
+                    output = set_element_attribute_by_id(&output, &element_id, &name, &value);
+                }
+                justbarelyscript::BrowserEffect::SetInnerHtml { element_id, value } => {
+                    output = set_element_inner_html_by_id(&output, &element_id, &value);
+                }
+                justbarelyscript::BrowserEffect::AppendChild { parent_id, child } => {
+                    output = append_child_html_by_id(&output, &parent_id, &child);
+                }
+                justbarelyscript::BrowserEffect::ConsoleLog { .. } => {}
+                justbarelyscript::BrowserEffect::NetworkRequest { method, url, body } => {
+                    emit_global_telemetry(
+                        "js.network.request",
+                        &[
+                            ("phase", "dom_effects"),
+                            ("method", &method),
+                            ("url", &url),
+                            ("body_bytes", &body.len().to_string()),
+                        ],
+                    );
+                }
+                justbarelyscript::BrowserEffect::RuntimeTrace { kind, detail } => {
+                    emit_global_telemetry(
+                        "js.runtime.trace",
+                        &[
+                            ("phase", "dom_effects"),
+                            ("kind", &kind),
+                            ("detail", &detail),
+                        ],
+                    );
+                }
+            }
+        }
+    }
+
+    ScriptApplicationResult {
+        html: output,
+        hydration_failed,
+    }
+}
+
+fn page_has_unexecuted_hydration_script(html: &str, source: Option<&str>) -> bool {
+    collect_page_scripts(html, source)
+        .iter()
+        .any(|script| script.program.is_err() && page_script_is_hydration_candidate(script))
+}
+
+fn page_script_is_hydration_candidate(script: &PageScript) -> bool {
+    script.kind == PageScriptKind::External
+        || script.diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.as_str(),
+                "ES modules"
+                    | "arrow functions"
+                    | "optional chaining"
+                    | "nullish coalescing"
+                    | "spread/rest"
+                    | "template literals"
+                    | "async/await"
+                    | "Promise constructor"
+            )
+        })
+}
+
+fn seed_script_browser_globals(
+    state: &mut justbarelyscript::BrowserExecutionState,
+    source: Option<&str>,
+) {
+    let navigator = justbarelyscript::NavigatorInfo::detect();
+    let screen = justbarelyscript::ScreenInfo::detect();
+    let fingerprint = justbarelyscript::FingerprintSuite::detect();
+    state.seed_browser_basics();
+    state.seed_navigator(&navigator);
+    state.seed_screen(&screen);
+    state.seed_fingerprint_suite(fingerprint);
+    if let Some(source) = source {
+        state.seed_location(source);
+    }
+}
+
+fn collect_page_scripts(html: &str, source: Option<&str>) -> Vec<PageScript> {
+    let mut normal = Vec::new();
+    let mut deferred = Vec::new();
+    let mut remaining = html;
+    let mut offset = 0usize;
+    let mut index = 0usize;
+
+    while let Some(rel_open_start) = find_ascii_case_insensitive_local(remaining, "<script") {
+        let open_start = offset + rel_open_start;
+        let after_open = &html[open_start..];
+        let Some(open_end_rel) = after_open.find('>') else {
+            break;
+        };
+        let open_end = open_start + open_end_rel + 1;
+        let open_tag = &html[open_start..open_end];
+        let after_content_start = &html[open_end..];
+        let Some(close_rel) = find_ascii_case_insensitive_local(after_content_start, "</script>")
+        else {
+            break;
+        };
+        let close_start = open_end + close_rel;
+        let inline_source = &html[open_end..close_start];
+
+        index += 1;
+        if !script_type_is_executable(open_tag) {
+            offset = close_start + "</script>".len();
+            remaining = &html[offset..];
+            continue;
+        }
+
+        let defer = tag_has_bool_attr(open_tag, "defer");
+        let script = if let Some(src) = extract_attr(open_tag, "src") {
+            load_external_page_script(source, &src, index, defer)
+        } else {
+            let label = format!("Inline script {index}");
+            if inline_source.len() > MAX_EXTERNAL_SCRIPT_PARSE_BYTES {
+                let diagnostics = oversized_script_diagnostics(inline_source.len());
+                PageScript {
+                    label,
+                    kind: PageScriptKind::Inline,
+                    source_url: None,
+                    byte_len: inline_source.len(),
+                    deferred: defer,
+                    diagnostics,
+                    program: Err(synthetic_script_error(&format!(
+                        "inline script skipped: {} bytes exceeds parser budget of {} bytes",
+                        inline_source.len(),
+                        MAX_EXTERNAL_SCRIPT_PARSE_BYTES
+                    ))),
+                }
+            } else {
+                let diagnostics = script_construct_diagnostics(inline_source);
+                PageScript {
+                    label,
+                    kind: PageScriptKind::Inline,
+                    source_url: None,
+                    byte_len: inline_source.len(),
+                    deferred: defer,
+                    diagnostics,
+                    program: justbarelyscript::parse_script(inline_source),
+                }
+            }
+        };
+
+        emit_script_parse_telemetry(index, &script);
+
+        if defer {
+            deferred.push(script);
+        } else {
+            normal.push(script);
+        }
+
+        offset = close_start + "</script>".len();
+        remaining = &html[offset..];
+    }
+
+    normal.extend(deferred);
+    normal
+}
+
+fn script_type_is_executable(open_tag: &str) -> bool {
+    let Some(script_type) = extract_attr(open_tag, "type") else {
+        return true;
+    };
+    let script_type = script_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        script_type.as_str(),
+        "" | "module"
+            | "text/javascript"
+            | "application/javascript"
+            | "application/ecmascript"
+            | "text/ecmascript"
+            | "text/jscript"
+            | "text/livescript"
+    )
+}
+
+fn emit_script_parse_telemetry(index: usize, script: &PageScript) {
+    let index = index.to_string();
+    let bytes = script.byte_len.to_string();
+    let deferred = if script.deferred { "true" } else { "false" };
+    let kind = page_script_kind_str(script.kind);
+    let url = script.source_url.as_deref().unwrap_or("");
+    match &script.program {
+        Ok(program) => {
+            let statements = program.body.len().to_string();
+            emit_global_telemetry(
+                "js.script.parsed",
+                &[
+                    ("index", &index),
+                    ("label", &script.label),
+                    ("kind", kind),
+                    ("url", url),
+                    ("bytes", &bytes),
+                    ("defer", deferred),
+                    ("statements", &statements),
+                ],
+            );
+        }
+        Err(error) => {
+            let constructs = script.diagnostics.join(", ");
+            let reason = error.diagnostic_message();
+            emit_global_telemetry(
+                "js.script.skipped",
+                &[
+                    ("index", &index),
+                    ("label", &script.label),
+                    ("kind", kind),
+                    ("url", url),
+                    ("bytes", &bytes),
+                    ("defer", deferred),
+                    ("reason", &reason),
+                    ("constructs", &constructs),
+                ],
+            );
+        }
+    }
+}
+
+fn page_script_kind_str(kind: PageScriptKind) -> &'static str {
+    match kind {
+        PageScriptKind::Inline => "inline",
+        PageScriptKind::External => "external",
+    }
+}
+
+fn load_external_page_script(
+    document_source: Option<&str>,
+    src: &str,
+    index: usize,
+    deferred: bool,
+) -> PageScript {
+    let Some(document_source) = document_source else {
+        let label = format!("External script {index} ({src})");
+        return PageScript {
+            label,
+            kind: PageScriptKind::External,
+            source_url: Some(src.to_owned()),
+            byte_len: 0,
+            deferred,
+            diagnostics: Vec::new(),
+            program: Err(synthetic_script_error(
+                "external script skipped: document source unavailable",
+            )),
+        };
+    };
+
+    let resolved = resolve_resource_url(document_source, src);
+    let label = format!("External script {index} ({resolved})");
+    if !script_allowed_for_document(document_source, &resolved) {
+        return PageScript {
+            label,
+            kind: PageScriptKind::External,
+            source_url: Some(resolved),
+            byte_len: 0,
+            deferred,
+            diagnostics: Vec::new(),
+            program: Err(synthetic_script_error(
+                "external script blocked by document policy",
+            )),
+        };
+    }
+
+    match read_script_resource(&resolved) {
+        Ok(source) => {
+            if source.len() > MAX_EXTERNAL_SCRIPT_PARSE_BYTES {
+                let diagnostics = oversized_script_diagnostics(source.len());
+                return PageScript {
+                    label,
+                    kind: PageScriptKind::External,
+                    source_url: Some(resolved),
+                    byte_len: source.len(),
+                    deferred,
+                    diagnostics,
+                    program: Err(synthetic_script_error(&format!(
+                        "external script skipped: {} bytes exceeds parser budget of {} bytes",
+                        source.len(),
+                        MAX_EXTERNAL_SCRIPT_PARSE_BYTES
+                    ))),
+                };
+            }
+            let diagnostics = script_construct_diagnostics(&source);
+            let program = justbarelyscript::parse_script(&source);
+            PageScript {
+                label,
+                kind: PageScriptKind::External,
+                source_url: Some(resolved),
+                byte_len: source.len(),
+                deferred,
+                diagnostics,
+                program,
+            }
+        }
+        Err(error) => PageScript {
+            label,
+            kind: PageScriptKind::External,
+            source_url: Some(resolved),
+            byte_len: 0,
+            deferred,
+            diagnostics: Vec::new(),
+            program: Err(synthetic_script_error(&format!(
+                "external script load failed: {error}"
+            ))),
+        },
+    }
+}
+
+fn oversized_script_diagnostics(byte_len: usize) -> Vec<String> {
+    vec![format!(
+        "diagnostics skipped: {byte_len} bytes exceeds diagnostic budget of {MAX_SCRIPT_DIAGNOSTIC_BYTES} bytes"
+    )]
+}
+
+fn script_construct_diagnostics(source: &str) -> Vec<String> {
+    let checks = [
+        ("import ", "ES modules"),
+        ("export ", "ES modules"),
+        ("=>", "arrow functions"),
+        ("?.", "optional chaining"),
+        ("??", "nullish coalescing"),
+        ("...", "spread/rest"),
+        ("`", "template literals"),
+        ("async ", "async/await"),
+        ("await ", "async/await"),
+        ("class ", "class syntax"),
+        ("new Promise", "Promise constructor"),
+        ("regeneratorRuntime", "regenerator runtime"),
+        ("webpackJsonp", "Webpack runtime"),
+        ("XMLHttpRequest", "XMLHttpRequest"),
+        ("fetch(", "fetch"),
+        ("axios", "axios"),
+        ("Object.defineProperty", "property descriptors"),
+        ("Object.getOwnPropertyDescriptor", "property descriptors"),
+        ("Object.getPrototypeOf", "prototype reflection"),
+        ("Object.create", "prototype creation"),
+        ("Proxy", "Proxy"),
+        ("WeakMap", "WeakMap"),
+        ("Symbol", "Symbol"),
+    ];
+
+    let mut diagnostics = Vec::new();
+    for (needle, label) in checks {
+        let count = source.matches(needle).count();
+        if count > 0 {
+            let entry = format!("{label} x{count}");
+            if !diagnostics.contains(&entry) {
+                diagnostics.push(entry);
+            }
+        }
+    }
+    diagnostics
+}
+
+fn read_script_resource(resolved: &str) -> io::Result<String> {
+    let cache = SCRIPT_RESOURCE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.get(resolved).cloned()
+    {
+        let status = if cached.is_ok() { "ok" } else { "error" };
+        let bytes = cached
+            .as_ref()
+            .map(|source| source.len().to_string())
+            .unwrap_or_else(|_| "0".to_owned());
+        emit_global_telemetry(
+            "js.resource.cache_hit",
+            &[("url", resolved), ("status", status), ("bytes", &bytes)],
+        );
+        return cached.map_err(io::Error::other);
+    }
+
+    emit_global_telemetry("js.resource.cache_miss", &[("url", resolved)]);
+    let loaded = if is_remote_url(resolved) {
+        http_client()?
+            .get(resolved)
+            .send()
+            .map_err(io::Error::other)?
+            .error_for_status()
+            .map_err(io::Error::other)?
+            .text()
+            .map_err(io::Error::other)
+    } else {
+        fs::read_to_string(input_to_path(resolved))
+    };
+
+    let cached = loaded
+        .as_ref()
+        .map(|source| source.to_owned())
+        .map_err(|error| error.to_string());
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(resolved.to_owned(), cached);
+    }
+
+    loaded
+}
+
+fn script_allowed_for_document(source: &str, resource: &str) -> bool {
+    if !resource_allowed_for_document(source, resource) {
+        return false;
+    }
+    if is_remote_url(source) && is_remote_url(resource) {
+        return same_origin_url(source, resource);
+    }
+    true
+}
+
+fn same_origin_url(a: &str, b: &str) -> bool {
+    let Ok(a) = reqwest::Url::parse(a) else {
+        return false;
+    };
+    let Ok(b) = reqwest::Url::parse(b) else {
+        return false;
+    };
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+fn tag_has_bool_attr(tag: &str, attr: &str) -> bool {
+    let lower_tag = tag.to_ascii_lowercase();
+    let attr = attr.to_ascii_lowercase();
+    lower_tag
+        .split(|ch: char| ch.is_whitespace() || ch == '<' || ch == '>' || ch == '/')
+        .any(|part| part == attr || part.starts_with(&format!("{attr}=")))
+}
+
+fn synthetic_script_error(message: &str) -> justbarelyscript::JsError {
+    justbarelyscript::JsError {
+        kind: justbarelyscript::JsErrorKind::Parse,
+        message: message.to_owned(),
+        span: None,
+    }
+}
+
+fn find_ascii_case_insensitive_local(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn seed_script_dom_state_from_html(
+    html: &str,
+    state: &mut justbarelyscript::BrowserExecutionState,
+) {
+    let mut offset = 0;
+    let mut remaining = html;
+    let mut generated_id = 0usize;
+
+    while let Some(rel_open_start) = remaining.find('<') {
+        let open_start = offset + rel_open_start;
+        let after_open = &html[open_start..];
+        if after_open.starts_with("</") || after_open.starts_with("<!") {
+            offset = open_start + 1;
+            remaining = &html[offset..];
+            continue;
+        }
+
+        let Some(open_end_rel) = after_open.find('>') else {
+            break;
+        };
+        let open_end = open_start + open_end_rel + 1;
+        let open_tag = &html[open_start..open_end];
+        let real_id = extract_attr(open_tag, "id");
+        let id = real_id.clone().unwrap_or_else(|| {
+            generated_id += 1;
+            format!("__dom_seed_{generated_id}")
+        });
+
+        let mut attributes = std::collections::HashMap::new();
+        if let Some(real_id) = real_id {
+            attributes.insert("id".to_owned(), real_id);
+        }
+        if let Some(classes) = extract_attr(open_tag, "class") {
+            attributes.insert("class".to_owned(), classes);
+        }
+
+        let text_content = tag_name(open_tag)
+            .and_then(|tag| {
+                let close = format!("</{tag}>");
+                let close_start = html[open_end..].find(&close)? + open_end;
+                Some(decode_basic_entities(&strip_tags(
+                    &html[open_end..close_start],
+                )))
+            })
+            .unwrap_or_default();
+
+        state.seed_existing_element(&id, text_content, attributes);
+        offset = open_end;
+        remaining = &html[offset..];
+    }
+}
+
+fn append_child_html_by_id(
+    html: &str,
+    parent_id: &str,
+    child: &justbarelyscript::DomElementSnapshot,
+) -> String {
+    let Some((_open_start, open_end, close_start, close_end)) =
+        find_element_range_by_id(html, parent_id)
+    else {
+        return html.to_owned();
+    };
+
+    let child_html = serialize_dom_snapshot(child);
+    let mut output = String::with_capacity(html.len() + child_html.len());
+    output.push_str(&html[..open_end]);
+    output.push_str(&html[open_end..close_start]);
+    output.push_str(&child_html);
+    output.push_str(&html[close_start..close_end]);
+    output.push_str(&html[close_end..]);
+    output
+}
+
+fn serialize_dom_snapshot(element: &justbarelyscript::DomElementSnapshot) -> String {
+    let tag_name = sanitize_tag_name(&element.tag_name);
+    let mut html = String::new();
+    html.push('<');
+    html.push_str(&tag_name);
+    for (name, value) in &element.attributes {
+        html.push(' ');
+        html.push_str(&sanitize_attr_name(name));
+        html.push_str("=\"");
+        html.push_str(&encode_basic_attr(value));
+        html.push('"');
+    }
+    html.push('>');
+    if element.inner_html.is_empty() {
+        html.push_str(&encode_basic_text(&element.text_content));
+        for child in &element.children {
+            html.push_str(&serialize_dom_snapshot(child));
+        }
+    } else {
+        html.push_str(&element.inner_html);
+    }
+    html.push_str("</");
+    html.push_str(&tag_name);
+    html.push('>');
+    html
+}
+
+fn set_element_text_content_by_id(html: &str, element_id: &str, value: &str) -> String {
+    let Some((open_start, open_end, close_start, close_end)) =
+        find_element_range_by_id(html, element_id)
+    else {
+        return html.to_owned();
+    };
+
+    let mut output = String::with_capacity(html.len() + value.len());
+    output.push_str(&html[..open_end]);
+    output.push_str(&encode_basic_text(value));
+    output.push_str(&html[close_start..close_end]);
+    output.push_str(&html[close_end..]);
+    debug_assert!(output.starts_with(&html[..open_start]));
+    output
+}
+
+fn set_element_inner_html_by_id(html: &str, element_id: &str, value: &str) -> String {
+    let Some((open_start, open_end, close_start, close_end)) =
+        find_element_range_by_id(html, element_id)
+    else {
+        return html.to_owned();
+    };
+
+    let mut output = String::with_capacity(html.len() + value.len());
+    output.push_str(&html[..open_end]);
+    output.push_str(value);
+    output.push_str(&html[close_start..close_end]);
+    output.push_str(&html[close_end..]);
+    debug_assert!(output.starts_with(&html[..open_start]));
+    output
+}
+
+fn set_element_attribute_by_id(html: &str, element_id: &str, name: &str, value: &str) -> String {
+    let Some((open_start, open_end, close_start, close_end)) =
+        find_element_range_by_id(html, element_id)
+    else {
+        return html.to_owned();
+    };
+
+    let open_tag = &html[open_start..open_end];
+    let Some(insert_at) = open_tag.rfind('>') else {
+        return html.to_owned();
+    };
+    let attr = format!(
+        " {}=\"{}\"",
+        sanitize_attr_name(name),
+        encode_basic_attr(value)
+    );
+    let mut output = String::with_capacity(html.len() + attr.len());
+    output.push_str(&html[..open_start + insert_at]);
+    output.push_str(&attr);
+    output.push_str(&html[open_start + insert_at..close_start]);
+    output.push_str(&html[close_start..close_end]);
+    output.push_str(&html[close_end..]);
+    output
+}
+
+fn find_element_range_by_id(html: &str, element_id: &str) -> Option<(usize, usize, usize, usize)> {
+    let mut offset = 0;
+    let mut remaining = html;
+
+    while let Some(rel_open_start) = remaining.find('<') {
+        let open_start = offset + rel_open_start;
+        let after_open = &html[open_start..];
+        if after_open.starts_with("</") || after_open.starts_with("<!") {
+            offset = open_start + 1;
+            remaining = &html[offset..];
+            continue;
+        }
+
+        let open_end = open_start + after_open.find('>')? + 1;
+        let open_tag = &html[open_start..open_end];
+        if extract_attr(open_tag, "id").as_deref() != Some(element_id) {
+            offset = open_end;
+            remaining = &html[offset..];
+            continue;
+        }
+
+        let tag = tag_name(open_tag)?;
+        let close = format!("</{tag}>");
+        let close_rel = html[open_end..].find(&close)?;
+        let close_start = open_end + close_rel;
+        let close_end = close_start + close.len();
+        return Some((open_start, open_end, close_start, close_end));
+    }
+
+    None
+}
+
+fn encode_basic_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn encode_basic_attr(text: &str) -> String {
+    encode_basic_text(text).replace('"', "&quot;")
+}
+
+fn sanitize_tag_name(tag_name: &str) -> String {
+    let sanitized: String = tag_name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+        .collect();
+    if sanitized.is_empty() {
+        "div".to_owned()
+    } else {
+        sanitized.to_ascii_lowercase()
+    }
+}
+
+fn sanitize_attr_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+        .collect();
+    if sanitized.is_empty() {
+        "data-empty".to_owned()
+    } else {
+        sanitized.to_ascii_lowercase()
+    }
+}
+
+fn console_error_message(text: impl Into<String>) -> justbarelyscript::ConsoleMessage {
+    justbarelyscript::ConsoleMessage {
+        level: justbarelyscript::ConsoleLevel::Error,
+        text: text.into(),
     }
 }
 
@@ -405,18 +3168,38 @@ fn local_bookmark_path_token() -> String {
 }
 
 fn workspace_root_file_url() -> String {
+    path_to_file_url(&workspace_root_path())
+}
+
+fn workspace_root_path() -> PathBuf {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir.parent().unwrap_or(manifest_dir);
-    path_to_file_url(workspace_root)
+    manifest_dir.parent().unwrap_or(manifest_dir).to_path_buf()
 }
 
 impl App for AlmostThereApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+        self.record_frame_events(ctx);
         self.poll_pending_navigation(ctx);
+
+        if self.script_state.has_pending_timers() {
+            let elapsed_ms = self.page_loaded_at.elapsed().as_millis() as u64;
+            let timer_effects = self.script_state.poll_timers(elapsed_ms);
+            if !timer_effects.is_empty() {
+                self.apply_script_effects(timer_effects, ctx);
+            }
+            if self.script_state.has_pending_timers() {
+                ctx.request_repaint();
+            }
+        }
 
         if !self.text_metrics_ready {
             if let Ok(document) = load_url_document_with_text_metrics(&self.url_input, ctx) {
                 self.document = document;
+                self.render_debug.object_limit = self.document.canvas_graph.objects.len();
+                if !self.current_html.is_empty() {
+                    self.render_graph_debug_text =
+                        parse_render_graph_debug_dump(&self.current_html, &self.document.source);
+                }
             }
             self.text_metrics_ready = true;
         }
@@ -433,6 +3216,20 @@ impl App for AlmostThereApp {
                 ui.add_enabled(false, egui::Button::new("Forward"));
                 if ui.button("Reload").clicked() {
                     self.load_current_input(ctx);
+                }
+                let debug_label = if self.render_debug.open {
+                    "Close Debug"
+                } else {
+                    "Debug"
+                };
+                if ui.button(debug_label).clicked() {
+                    self.render_debug.open = !self.render_debug.open;
+                    if self.render_debug.open {
+                        self.render_debug.object_limit = self.document.canvas_graph.objects.len();
+                    }
+                }
+                if ui.button("Report Error").clicked() {
+                    self.report_user_error();
                 }
                 if self.pending_navigation.is_some() {
                     ui.add(egui::Spinner::new().size(16.0));
@@ -464,6 +3261,23 @@ impl App for AlmostThereApp {
                     self.open_bookmark(index, ctx);
                 }
 
+                let mut script_test_to_open = None;
+                ui.menu_button("Script Tests", |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(400.0)
+                        .show(ui, |ui| {
+                            for bookmark in script_test_bookmarks() {
+                                if ui.button(&bookmark.title).clicked() {
+                                    script_test_to_open = Some(bookmark);
+                                    ui.close();
+                                }
+                            }
+                        });
+                });
+                if let Some(bookmark) = script_test_to_open {
+                    self.open_bookmark_value(bookmark, ctx);
+                }
+
                 let response = ui.add_sized(
                     [ui.available_width(), 24.0],
                     egui::TextEdit::singleline(&mut self.url_input),
@@ -485,10 +3299,248 @@ impl App for AlmostThereApp {
             });
         });
 
+        if self.render_debug.open {
+            // Snapshot interactive elements before the closure to avoid split-borrow conflicts.
+            #[derive(Clone)]
+            struct DebugElement {
+                id: String,
+                label: String,
+                event_type: &'static str,
+            }
+            let interactive_elements: Vec<DebugElement> = self
+                .document
+                .canvas_graph
+                .objects
+                .iter()
+                .filter_map(|obj| match obj {
+                    CanvasObject::Input(input) => {
+                        input.element_id.as_ref().map(|id| DebugElement {
+                            id: id.clone(),
+                            label: input.label.clone(),
+                            event_type: "input",
+                        })
+                    }
+                    CanvasObject::Button(button) => {
+                        button.element_id.as_ref().map(|id| DebugElement {
+                            id: id.clone(),
+                            label: button.text.clone(),
+                            event_type: "click",
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            let mut pending_debug_events: Vec<(String, &'static str)> = Vec::new();
+
+            egui::SidePanel::right("render_debug_inspector")
+                .resizable(true)
+                .default_width(380.0)
+                .width_range(260.0..=720.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.render_debug.active_tab,
+                            DebugPanelTab::RenderGraph,
+                            "RenderGraph",
+                        );
+                        ui.selectable_value(
+                            &mut self.render_debug.active_tab,
+                            DebugPanelTab::CanvasGraph,
+                            "CanvasGraph",
+                        );
+                        ui.selectable_value(
+                            &mut self.render_debug.active_tab,
+                            DebugPanelTab::Html,
+                            "HTML",
+                        );
+                        ui.selectable_value(
+                            &mut self.render_debug.active_tab,
+                            DebugPanelTab::Console,
+                            "Console",
+                        );
+                        ui.selectable_value(
+                            &mut self.render_debug.active_tab,
+                            DebugPanelTab::LiveJs,
+                            "Live JS",
+                        );
+                        ui.selectable_value(
+                            &mut self.render_debug.active_tab,
+                            DebugPanelTab::Events,
+                            "Events",
+                        );
+                    });
+                    ui.separator();
+
+                    if self.render_debug.active_tab == DebugPanelTab::Console {
+                        paint_console_messages(ui, &self.console_messages);
+                        return;
+                    }
+
+                    if self.render_debug.active_tab == DebugPanelTab::Events {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink(false)
+                            .show(ui, |ui| {
+                                if interactive_elements.is_empty() {
+                                    ui.label("No interactive elements with an id on this page.");
+                                    return;
+                                }
+                                for elem in &interactive_elements {
+                                    ui.separator();
+                                    if elem.event_type == "input" {
+                                        ui.label(format!("input  #{}", elem.id));
+                                        let staged = self
+                                            .render_debug
+                                            .event_staged_values
+                                            .entry(elem.id.clone())
+                                            .or_default();
+                                        ui.add(
+                                            egui::TextEdit::singleline(staged)
+                                                .desired_width(ui.available_width() - 100.0)
+                                                .hint_text(&elem.label),
+                                        );
+                                        if ui.button("Fire input event").clicked() {
+                                            pending_debug_events
+                                                .push((elem.id.clone(), elem.event_type));
+                                        }
+                                    } else {
+                                        ui.label(format!(
+                                            "button #{}  \"{}\"",
+                                            elem.id, elem.label
+                                        ));
+                                        if ui.button("Fire click event").clicked() {
+                                            pending_debug_events
+                                                .push((elem.id.clone(), elem.event_type));
+                                        }
+                                    }
+                                }
+                            });
+                        return;
+                    }
+
+                    let text = match self.render_debug.active_tab {
+                        DebugPanelTab::RenderGraph => self.render_graph_debug_text.clone(),
+                        DebugPanelTab::CanvasGraph => {
+                            canvas_graph_debug_string(&self.document.canvas_graph)
+                        }
+                        DebugPanelTab::Html => self.current_html.clone(),
+                        DebugPanelTab::LiveJs => self.live_js_debug_text.clone(),
+                        DebugPanelTab::Console | DebugPanelTab::Events => String::new(),
+                    };
+
+                    egui::ScrollArea::both()
+                        .id_salt(("render_debug_text", self.render_debug.active_tab))
+                        .auto_shrink(false)
+                        .show(ui, |ui| {
+                            if self.render_debug.active_tab == DebugPanelTab::CanvasGraph {
+                                paint_alternating_debug_text_with_canvas_thumbs(
+                                    ui,
+                                    &text,
+                                    Some(&self.document.canvas_graph),
+                                );
+                            } else {
+                                paint_alternating_debug_text(ui, &text);
+                            }
+                        });
+                });
+
+            // Apply events fired from the Events tab.
+            for (id, event_type) in pending_debug_events {
+                if event_type == "input" {
+                    let value = self
+                        .render_debug
+                        .event_staged_values
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_default();
+                    self.script_state
+                        .dom
+                        .attributes_by_id
+                        .entry(id.clone())
+                        .or_default()
+                        .insert("value".to_owned(), value);
+                }
+                if self.script_state.has_listener(&id, event_type) {
+                    let effects = self.script_state.fire_event(&id, event_type, None);
+                    self.apply_script_effects(effects, ctx);
+                }
+            }
+        }
+
+        let central_frame = if self.render_debug.open {
+            egui::Frame::new()
+                .fill(self.document.style.page_background)
+                .inner_margin(egui::Margin::same(0))
+        } else {
+            egui::Frame::new().fill(self.document.style.page_background)
+        };
+
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(self.document.style.page_background))
+            .frame(central_frame)
             .show(ctx, |ui| {
-                let response = self.canvas.ui(ui, &mut self.document);
+                let response = if self.render_debug.open {
+                    ui.horizontal(|ui| {
+                        ui.label("RenderGraph -> CanvasGraph");
+                        ui.separator();
+                        ui.label(format!(
+                            "{} / {} canvas objects",
+                            self.render_debug.object_limit,
+                            self.document.canvas_graph.objects.len()
+                        ));
+                        ui.separator();
+                        if ui.button("Export Debug").clicked() {
+                            match export_render_debug_steps(&self.document.canvas_graph) {
+                                Ok(count) => {
+                                    self.status = format!(
+                                        "Exported {count} debug frames to {}",
+                                        Path::new(DEBUG_EXPORT_DIR).display()
+                                    );
+                                }
+                                Err(error) => {
+                                    self.status = format!("Debug export failed: {error}");
+                                }
+                            }
+                        }
+                        ui.separator();
+                        if let Some(pointer) = ui.ctx().pointer_hover_pos() {
+                            ui.label(format!("Mouse x={:.0} y={:.0}", pointer.x, pointer.y));
+                        } else {
+                            ui.label("Mouse outside window");
+                        }
+                    });
+                    let max_objects = self.document.canvas_graph.objects.len();
+                    ui.scope(|ui| {
+                        let slider_margin = 8.0;
+                        let slider_width = (ui.available_width() - slider_margin * 2.0).max(280.0);
+                        ui.spacing_mut().slider_width = slider_width;
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.horizontal(|ui| {
+                            ui.add_space(slider_margin);
+                            ui.add_sized(
+                                [slider_width, 32.0],
+                                egui::Slider::new(
+                                    &mut self.render_debug.object_limit,
+                                    0..=max_objects,
+                                )
+                                .show_value(false),
+                            );
+                            ui.add_space(slider_margin);
+                        });
+                    });
+                    self.render_debug.object_limit =
+                        self.render_debug.object_limit.min(max_objects);
+                    ui.separator();
+
+                    let mut debug_graph = self.debug_canvas_graph();
+                    let _ = self.debug_canvas.canvas_graph_ui(
+                        ui,
+                        &self.document.style,
+                        &mut debug_graph,
+                    );
+                    BrowserCanvasResponse::default()
+                } else {
+                    self.canvas.ui(ui, &mut self.document)
+                };
                 for input_change in &response.changed_inputs {
                     self.telemetry.emit(
                         "input.changed",
@@ -501,33 +3553,69 @@ impl App for AlmostThereApp {
                         "Input changed: {} ({} chars)",
                         input_change.label, input_change.value_len
                     );
-                }
-                for input_submit in &response.submitted_inputs {
-                    self.telemetry.emit(
-                        "input.submitted",
-                        &[
-                            ("label", &input_submit.label),
-                            ("value", &input_submit.value),
-                        ],
-                    );
-                    if let Some(search_url) =
-                        ecosia_search_url_for_input(&input_submit.label, &input_submit.value)
-                    {
-                        self.open_link(&search_url, ctx);
+                    if let Some(ref id) = input_change.element_id {
+                        self.script_state
+                            .dom
+                            .attributes_by_id
+                            .entry(id.clone())
+                            .or_default()
+                            .insert("value".to_owned(), input_change.value.clone());
+                        if self.script_state.has_listener(id, "input") {
+                            let effects = self.script_state.fire_event(id, "input", None);
+                            self.apply_script_effects(effects, ctx);
+                        }
                     }
                 }
+                if !response.submitted_inputs.is_empty() {
+                    for input_submit in &response.submitted_inputs {
+                        self.telemetry.emit(
+                            "input.submitted",
+                            &[
+                                ("label", &input_submit.label),
+                                ("value", &input_submit.value),
+                            ],
+                        );
+                    }
+                    if let Some(url) =
+                        form_get_url_for_inputs(&response.submitted_inputs, &self.document.source)
+                    {
+                        self.open_link(&url, ctx);
+                    }
+                }
+                let hovered_element_id = response.hovered.as_ref().and_then(|t| match t {
+                    HitTarget::Button { element_id, .. } | HitTarget::Input { element_id, .. } => {
+                        element_id.clone()
+                    }
+                    HitTarget::Link { .. } => None,
+                });
                 if let Some(target) = response.hovered {
                     match target {
                         HitTarget::Link { href } => {
                             self.status = format!("Link: {href}");
                         }
-                        HitTarget::Button { text } => {
+                        HitTarget::Button { text, .. } => {
                             self.status = format!("Button: {text}");
                         }
-                        HitTarget::Input { label } => {
+                        HitTarget::Input { label, .. } => {
                             self.status = format!("Input: {label}");
                         }
                     }
+                }
+                // Fire mouseover when hover enters a new element with a listener.
+                if hovered_element_id != self.last_hovered_element_id {
+                    if let Some(ref old_id) = self.last_hovered_element_id.clone() {
+                        if self.script_state.has_listener(old_id, "mouseout") {
+                            let effects = self.script_state.fire_event(old_id, "mouseout", None);
+                            self.apply_script_effects(effects, ctx);
+                        }
+                    }
+                    if let Some(ref new_id) = hovered_element_id {
+                        if self.script_state.has_listener(new_id, "mouseover") {
+                            let effects = self.script_state.fire_event(new_id, "mouseover", None);
+                            self.apply_script_effects(effects, ctx);
+                        }
+                    }
+                    self.last_hovered_element_id = hovered_element_id;
                 }
                 if let Some(target) = response.clicked {
                     match target {
@@ -536,20 +3624,62 @@ impl App for AlmostThereApp {
                                 .emit("hit_test.clicked", &[("target", "link"), ("href", &href)]);
                             self.open_link(&href, ctx);
                         }
-                        HitTarget::Button { text } => {
+                        HitTarget::Button { text, element_id } => {
                             self.telemetry
                                 .emit("hit_test.clicked", &[("target", "button"), ("text", &text)]);
                             self.status = format!("Clicked button {text}");
+                            if let Some(id) = element_id {
+                                if self.script_state.has_listener(&id, "click") {
+                                    let effects = self.script_state.fire_event(&id, "click", None);
+                                    self.apply_script_effects(effects, ctx);
+                                }
+                            }
                         }
-                        HitTarget::Input { label } => {
+                        HitTarget::Input { label, element_id } => {
                             self.telemetry.emit(
                                 "hit_test.clicked",
                                 &[("target", "input"), ("label", &label)],
                             );
+                            if let Some(id) = element_id {
+                                if self.script_state.has_listener(&id, "click") {
+                                    let effects = self.script_state.fire_event(&id, "click", None);
+                                    self.apply_script_effects(effects, ctx);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Fire keydown for any registered listeners.
+                let key_presses: Vec<String> = ctx.input(|state| {
+                    state
+                        .events
+                        .iter()
+                        .filter_map(|event| {
+                            if let egui::Event::Key {
+                                key, pressed: true, ..
+                            } = event
+                            {
+                                Some(key.name().to_owned())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                });
+                if !key_presses.is_empty() {
+                    let keydown_ids = self.script_state.all_element_ids_with_listener("keydown");
+                    for key in &key_presses {
+                        for id in &keydown_ids {
+                            let effects = self.script_state.fire_event(id, "keydown", Some(key));
+                            self.apply_script_effects(effects, ctx);
                         }
                     }
                 }
             });
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.telemetry.emit("app.window_closed", &[]);
     }
 }
 
@@ -560,19 +3690,34 @@ fn resolve_navigation_url(source: &str, href: &str) -> String {
     resolve_resource_url(source, href)
 }
 
-fn ecosia_search_url_for_input(label: &str, value: &str) -> Option<String> {
-    let query = value.trim();
+fn form_get_url_for_inputs(
+    inputs: &[rich_canvas::InputSubmit],
+    page_source: &str,
+) -> Option<String> {
+    let action = inputs.iter().find_map(|i| i.form_action.as_deref())?;
+    let base_url = resolve_resource_url(page_source, action);
+    let query: String = inputs
+        .iter()
+        .filter(|i| !i.value.trim().is_empty())
+        .map(|i| {
+            let key = i.name.as_deref().unwrap_or("q");
+            format!(
+                "{}={}",
+                percent_encode_query(key),
+                percent_encode_query(i.value.trim())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&");
     if query.is_empty() {
         return None;
     }
-    let label = label.to_ascii_lowercase();
-    if !(label.contains("search") || label.contains("web")) {
-        return None;
-    }
-    Some(format!(
-        "https://www.ecosia.org/search?q={}",
-        percent_encode_query(query)
-    ))
+    let base = if base_url.contains('?') {
+        format!("{base_url}&{query}")
+    } else {
+        format!("{base_url}?{query}")
+    };
+    Some(base)
 }
 
 fn percent_encode_query(value: &str) -> String {
@@ -1199,6 +4344,12 @@ fn parse_html_document_with_text_metrics(
     text_metrics: Option<&egui::Context>,
 ) -> BrowserDocument {
     let html = remove_html_comments(html);
+    let script_result = apply_safe_script_browser_effects_detailed(&html, Some(source));
+    let reveal_hydration_hidden_content = script_result.hydration_failed;
+    let html = script_result.html;
+    let mut css = extract_tag_inner(&html, "style").unwrap_or("").to_owned();
+    css.push_str(&load_linked_stylesheets(&html, source).unwrap_or_default());
+    let html = remove_non_visual_metadata_elements(&html);
     let dom = parse_dom_document(&html);
     let title = dom
         .first_descendant_by_tag("title")
@@ -1207,12 +4358,16 @@ fn parse_html_document_with_text_metrics(
         .unwrap_or_else(|| "Untitled".to_owned())
         .trim()
         .to_owned();
-    let mut css = extract_tag_inner(&html, "style").unwrap_or("").to_owned();
-    css.push_str(&load_linked_stylesheets(&html, source).unwrap_or_default());
-    let style = parse_basic_css_for_viewport(&css, 1280.0);
+    let root_classes = document_theme_root_classes(&dom, text_metrics);
+    let style = parse_basic_css_for_viewport_with_root_classes(&css, 1280.0, &root_classes);
     let render_graph = build_render_graph(&dom, &style);
-    let canvas_graph =
-        render_graph_to_canvas_graph(&render_graph, source, style.image_height_auto, text_metrics);
+    let canvas_graph = render_graph_to_canvas_graph(
+        &render_graph,
+        source,
+        style.image_height_auto,
+        text_metrics,
+        reveal_hydration_hidden_content,
+    );
     let blocks = render_graph_to_blocks(&render_graph, source, style.image_height_auto);
 
     BrowserDocument {
@@ -1226,12 +4381,44 @@ fn parse_html_document_with_text_metrics(
 
 fn parse_render_graph_debug_dump(html: &str, source: &str) -> String {
     let html = remove_html_comments(html);
-    let dom = parse_dom_document(&html);
+    let html = apply_safe_script_browser_effects_with_source(&html, Some(source));
     let mut css = extract_tag_inner(&html, "style").unwrap_or("").to_owned();
     css.push_str(&load_linked_stylesheets(&html, source).unwrap_or_default());
-    let style = parse_basic_css_for_viewport(&css, 1280.0);
+    let html = remove_non_visual_metadata_elements(&html);
+    let dom = parse_dom_document(&html);
+    let root_classes = document_theme_root_classes(&dom, None);
+    let style = parse_basic_css_for_viewport_with_root_classes(&css, 1280.0, &root_classes);
     let render_graph = build_render_graph(&dom, &style);
     render_graph_debug_string(&render_graph)
+}
+
+fn document_theme_root_classes(
+    dom: &DomDocument,
+    text_metrics: Option<&egui::Context>,
+) -> Vec<String> {
+    let mut classes: Vec<String> = dom
+        .first_descendant_by_tag("html")
+        .and_then(|element| element.attr("class"))
+        .map(|classes| {
+            classes
+                .split_ascii_whitespace()
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let has_explicit_theme = classes
+        .iter()
+        .any(|class| matches!(class.as_str(), "dark" | "light"));
+    if !has_explicit_theme {
+        if let Some(ctx) = text_metrics {
+            classes.push(if ctx.style().visuals.dark_mode {
+                "dark".to_owned()
+            } else {
+                "light".to_owned()
+            });
+        }
+    }
+    classes
 }
 
 #[derive(Clone, Debug)]
@@ -1515,6 +4702,61 @@ fn inherited_style_for_element(
             style.color = document_style.link_color;
             style.text_decoration_underline = true;
         }
+        "fieldset" => {
+            style.border_width = 2.0;
+            style.border_color = egui::Color32::from_rgb(160, 160, 160);
+            style.padding = CssEdges {
+                top: 6.0,
+                right: 12.0,
+                bottom: 10.0,
+                left: 12.0,
+            };
+            style.margin = CssEdges {
+                top: 0.0,
+                right: 2.0,
+                bottom: 4.0,
+                left: 2.0,
+            };
+        }
+        "button" => {
+            style.background = egui::Color32::from_rgb(224, 224, 224);
+            style.border_width = 1.0;
+            style.border_color = egui::Color32::from_rgb(118, 118, 118);
+            style.border_radius = 3;
+            style.padding = CssEdges {
+                top: 2.0,
+                right: 8.0,
+                bottom: 2.0,
+                left: 8.0,
+            };
+            style.margin = CssEdges {
+                top: 0.0,
+                right: 4.0,
+                bottom: 0.0,
+                left: 0.0,
+            };
+        }
+        "input" => {
+            let input_type = element.attr("type").unwrap_or("text").to_ascii_lowercase();
+            if matches!(input_type.as_str(), "submit" | "button" | "reset") {
+                style.background = egui::Color32::from_rgb(224, 224, 224);
+                style.border_width = 1.0;
+                style.border_color = egui::Color32::from_rgb(118, 118, 118);
+                style.border_radius = 3;
+                style.padding = CssEdges {
+                    top: 2.0,
+                    right: 8.0,
+                    bottom: 2.0,
+                    left: 8.0,
+                };
+                style.margin = CssEdges {
+                    top: 0.0,
+                    right: 4.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                };
+            }
+        }
         _ => {}
     }
 
@@ -1556,6 +4798,18 @@ fn apply_css_box_style(
     if let Some(margin) = source.margin {
         target.margin = margin;
     }
+    if let Some(auto) = source.margin_auto.top {
+        target.margin_auto.top = auto;
+    }
+    if let Some(auto) = source.margin_auto.right {
+        target.margin_auto.right = auto;
+    }
+    if let Some(auto) = source.margin_auto.bottom {
+        target.margin_auto.bottom = auto;
+    }
+    if let Some(auto) = source.margin_auto.left {
+        target.margin_auto.left = auto;
+    }
     if let Some(margin_top) = source.margin_top {
         target.margin.top = margin_top;
     }
@@ -1593,22 +4847,33 @@ fn apply_css_box_style(
         target.border_radius = radius;
     }
     if let Some(width) = source.width {
-        target.width = Some(resolve_css_length(width, parent_width));
+        target.width_percent = match width {
+            CssLength::Percent(percent) => Some(percent),
+            _ => None,
+        };
+        target.width = resolve_css_width(width, parent_width);
     }
     if let Some(max_width) = source.max_width {
         target.max_width = match max_width {
+            CssLength::Auto => None,
             CssLength::Percent(percent) if percent >= 99.0 => None,
             _ => Some(resolve_css_length(max_width, parent_width)),
         };
     }
     if let Some(min_width) = source.min_width {
-        target.min_width = Some(resolve_css_length(min_width, parent_width));
+        target.min_width = resolve_optional_css_length(min_width, parent_width);
     }
     if let Some(height) = source.height {
-        target.height = Some(height);
+        target.height = match height {
+            CssLength::Auto => None,
+            _ => Some(height),
+        };
     }
     if let Some(min_height) = source.min_height {
-        target.min_height = Some(min_height);
+        target.min_height = match min_height {
+            CssLength::Auto => None,
+            _ => Some(min_height),
+        };
     }
     if let Some(font_size) = source.font_size {
         target.font_size = font_size;
@@ -1646,14 +4911,29 @@ fn apply_css_box_style(
     if let Some(grid_template_columns) = source.grid_template_columns {
         target.grid_template_columns = Some(grid_template_columns);
     }
+    if let Some(grid_template_areas) = &source.grid_template_areas {
+        target.grid_template_areas = Some(grid_template_areas.clone());
+    }
+    if let Some(grid_area) = &source.grid_area {
+        target.grid_area = Some(grid_area.clone());
+    }
     if let Some(gap) = source.gap {
         target.gap = gap;
+    }
+    if let Some(visibility_visible) = source.visibility_visible {
+        target.visibility_visible = visibility_visible;
+    }
+    if let Some(opacity) = source.opacity {
+        target.opacity = opacity;
     }
     if let Some(overflow_hidden) = source.overflow_hidden {
         target.overflow_hidden = overflow_hidden;
     }
     if let Some(position) = source.position {
         target.position = position;
+    }
+    if let Some(z_index) = source.z_index {
+        target.z_index = Some(z_index);
     }
     if let Some(inset) = source.inset {
         target.inset = Some(inset);
@@ -1677,8 +4957,23 @@ fn apply_css_box_style(
 
 fn resolve_css_length(length: CssLength, parent_width: f32) -> f32 {
     match length {
+        CssLength::Auto => parent_width,
         CssLength::Px(px) => px,
         CssLength::Percent(percent) => parent_width * percent / 100.0,
+    }
+}
+
+fn resolve_optional_css_length(length: CssLength, parent_width: f32) -> Option<f32> {
+    match length {
+        CssLength::Auto => None,
+        _ => Some(resolve_css_length(length, parent_width)),
+    }
+}
+
+fn resolve_css_width(length: CssLength, parent_width: f32) -> Option<f32> {
+    match length {
+        CssLength::Auto => None,
+        _ => Some(resolve_css_length(length, parent_width)),
     }
 }
 
@@ -1697,12 +4992,20 @@ struct CanvasLayoutCursor {
     width: f32,
     list_depth: usize,
     list_stack: Vec<CanvasListContext>,
+    form_stack: Vec<CanvasFormContext>,
+    next_form_index: usize,
 }
 
 #[derive(Clone, Debug)]
 struct CanvasListContext {
     ordered: bool,
     next_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CanvasFormContext {
+    id: String,
+    action: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1816,7 +5119,9 @@ fn build_css_layout_boxes(node: &RenderNode) -> Vec<CssLayoutBox<'_>> {
                 .iter()
                 .flat_map(build_css_layout_boxes)
                 .collect();
-            let children = if css_layout_box_is_block_container(kind) {
+            let children = if matches!(node.style.display, CssDisplay::Flex | CssDisplay::Grid) {
+                raw_children
+            } else if css_layout_box_is_block_container(kind) {
                 fix_css_anonymous_blocks(raw_children, &node.style)
             } else {
                 raw_children
@@ -1954,14 +5259,21 @@ fn layout_css_box(
     image_height_auto: bool,
     text_metrics: Option<&egui::Context>,
 ) {
-    box_.dimensions.margin = box_.style.margin;
-    box_.dimensions.padding = box_.style.padding;
-    box_.dimensions.border = CssEdges {
-        top: box_.style.border_width,
-        right: box_.style.border_width,
-        bottom: box_.style.border_width,
-        left: box_.style.border_width,
-    };
+    // Anonymous blocks are synthetic wrappers; they must not apply their parent's box model.
+    if box_.kind == CssLayoutKind::AnonymousBlock {
+        box_.dimensions.margin = CssEdges::default();
+        box_.dimensions.padding = CssEdges::default();
+        box_.dimensions.border = CssEdges::default();
+    } else {
+        box_.dimensions.margin = box_.style.margin;
+        box_.dimensions.padding = box_.style.padding;
+        box_.dimensions.border = CssEdges {
+            top: box_.style.border_width,
+            right: box_.style.border_width,
+            bottom: box_.style.border_width,
+            left: box_.style.border_width,
+        };
+    }
 
     let horizontal_non_content = box_.dimensions.margin.left
         + box_.dimensions.margin.right
@@ -1969,19 +5281,24 @@ fn layout_css_box(
         + box_.dimensions.border.right
         + box_.dimensions.padding.left
         + box_.dimensions.padding.right;
-    let mut content_width = if let Some(width) = box_.style.width.or(box_.style.max_width) {
-        width
-    } else if matches!(box_.kind, CssLayoutKind::Inline)
-        && (box_.style.flex_grow > 0.0 || css_layout_box_contains_text_form_control(box_))
-    {
-        (containing_width - horizontal_non_content).max(1.0)
-    } else if matches!(box_.kind, CssLayoutKind::Inline) {
-        css_layout_preferred_content_width(box_, text_metrics)
-    } else {
-        (containing_width - horizontal_non_content).max(1.0)
-    }
-    .min(containing_width)
-    .max(box_.style.min_width.unwrap_or(1.0));
+    let percent_width = box_
+        .style
+        .width_percent
+        .map(|percent| (containing_width * percent / 100.0 - horizontal_non_content).max(1.0));
+    let mut content_width =
+        if let Some(width) = percent_width.or(box_.style.width).or(box_.style.max_width) {
+            width
+        } else if matches!(box_.kind, CssLayoutKind::Inline)
+            && (box_.style.flex_grow > 0.0 || css_layout_box_contains_text_form_control(box_))
+        {
+            (containing_width - horizontal_non_content).max(1.0)
+        } else if matches!(box_.kind, CssLayoutKind::Inline) {
+            css_layout_preferred_content_width(box_, text_metrics)
+        } else {
+            (containing_width - horizontal_non_content).max(1.0)
+        }
+        .min(containing_width)
+        .max(box_.style.min_width.unwrap_or(1.0));
     if box_.style.width.is_none()
         && box_.style.max_width.is_none()
         && let Some(node) = box_.node
@@ -2019,7 +5336,19 @@ fn layout_css_box(
             layout_css_block_children(box_, source, image_height_auto, text_metrics)
         }
         CssLayoutKind::AnonymousBlock => {
-            measure_css_inline_children_height(&box_.children, content_width, text_metrics)
+            if css_layout_box_contains_visual_replaced_content(box_) {
+                layout_css_inline_visual_children(
+                    box_,
+                    source,
+                    image_height_auto,
+                    text_metrics,
+                    content_width,
+                )
+            } else if css_layout_box_contains_replaced_or_special(box_) {
+                layout_css_block_children(box_, source, image_height_auto, text_metrics)
+            } else {
+                measure_css_inline_children_height(&box_.children, content_width, text_metrics)
+            }
         }
         CssLayoutKind::Text => box_
             .text
@@ -2033,7 +5362,10 @@ fn layout_css_box(
             .unwrap_or(0.0),
         CssLayoutKind::Inline => {
             if let Some(node) = box_.node {
-                if css_layout_node_is_replaced_or_special(node) {
+                if css_layout_node_is_button(node) {
+                    layout_css_block_children(box_, source, image_height_auto, text_metrics)
+                        .max((box_.style.font_size * 1.35).max(1.0))
+                } else if css_layout_node_is_replaced_or_special(node) {
                     estimate_special_css_box_height(
                         node,
                         content_width,
@@ -2056,7 +5388,10 @@ fn layout_css_box(
             } else if box_.style.display == CssDisplay::Grid {
                 layout_css_grid_children(box_, source, image_height_auto, text_metrics)
             } else if let Some(node) = box_.node {
-                if css_layout_node_is_replaced_or_special(node) {
+                if css_layout_node_is_button(node) {
+                    layout_css_block_children(box_, source, image_height_auto, text_metrics)
+                        .max((box_.style.font_size * 1.35).max(1.0))
+                } else if css_layout_node_is_replaced_or_special(node) {
                     estimate_special_css_box_height(
                         node,
                         content_width,
@@ -2088,7 +5423,196 @@ fn layout_css_box(
         content_width,
     );
     box_.dimensions.content.max.y = box_.dimensions.content.min.y + content_height.max(0.0);
+    if box_.node.is_some_and(css_layout_node_is_button) {
+        center_css_button_children(box_);
+    }
     layout_css_out_of_flow_children(box_, source, image_height_auto, text_metrics);
+}
+
+fn layout_css_inline_visual_children(
+    box_: &mut CssLayoutBox<'_>,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+    containing_width: f32,
+) -> f32 {
+    let mut cursor_x = box_.dimensions.content.left();
+    let cursor_y = box_.dimensions.content.top();
+    let max_x = box_.dimensions.content.right();
+    let mut line_height: f32 = 0.0;
+    let mut max_bottom = cursor_y;
+
+    for child in &mut box_.children {
+        if css_layout_box_is_out_of_flow(child) {
+            continue;
+        }
+        let child_size = layout_css_inline_visual_box(
+            child,
+            cursor_x,
+            cursor_y,
+            (max_x - cursor_x).max(1.0).min(containing_width.max(1.0)),
+            source,
+            image_height_auto,
+            text_metrics,
+        );
+        cursor_x += child_size.x;
+        line_height = line_height.max(child_size.y);
+        max_bottom = max_bottom.max(css_margin_box(child).bottom());
+    }
+
+    (max_bottom - cursor_y).max(line_height).max(0.0)
+}
+
+fn layout_css_inline_visual_box(
+    box_: &mut CssLayoutBox<'_>,
+    containing_x: f32,
+    cursor_y: f32,
+    containing_width: f32,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+) -> egui::Vec2 {
+    box_.dimensions.margin = box_.style.margin;
+    box_.dimensions.padding = box_.style.padding;
+    box_.dimensions.border = CssEdges {
+        top: box_.style.border_width,
+        right: box_.style.border_width,
+        bottom: box_.style.border_width,
+        left: box_.style.border_width,
+    };
+
+    let horizontal_non_content = box_.dimensions.margin.left
+        + box_.dimensions.margin.right
+        + box_.dimensions.border.left
+        + box_.dimensions.border.right
+        + box_.dimensions.padding.left
+        + box_.dimensions.padding.right;
+    let content_x = containing_x
+        + box_.dimensions.margin.left
+        + box_.dimensions.border.left
+        + box_.dimensions.padding.left;
+    let content_y = cursor_y
+        + box_.dimensions.margin.top
+        + box_.dimensions.border.top
+        + box_.dimensions.padding.top;
+    let available_content_width = (containing_width - horizontal_non_content).max(1.0);
+
+    if let Some(size) =
+        css_visual_replaced_content_size(box_, available_content_width, source, image_height_auto)
+    {
+        box_.dimensions.content = egui::Rect::from_min_size(egui::pos2(content_x, content_y), size);
+        return css_margin_box(box_).size();
+    }
+
+    if box_.kind == CssLayoutKind::Text {
+        let text_width = box_
+            .text
+            .as_deref()
+            .map(|text| measure_canvas_text_run(text_metrics, &normalize_ws(text), &box_.style).x)
+            .unwrap_or(1.0)
+            .min(available_content_width)
+            .max(1.0);
+        let text_height = (box_.style.font_size * 1.35).max(1.0);
+        box_.dimensions.content = egui::Rect::from_min_size(
+            egui::pos2(content_x, content_y),
+            egui::vec2(text_width, text_height),
+        );
+        return css_margin_box(box_).size();
+    }
+
+    let mut child_x = content_x;
+    let mut content_width: f32 = 0.0;
+    let mut content_height: f32 = 0.0;
+    for child in &mut box_.children {
+        if css_layout_box_is_out_of_flow(child) {
+            continue;
+        }
+        let child_size = layout_css_inline_visual_box(
+            child,
+            child_x,
+            content_y,
+            (available_content_width - content_width).max(1.0),
+            source,
+            image_height_auto,
+            text_metrics,
+        );
+        child_x += child_size.x;
+        content_width += child_size.x;
+        content_height = content_height.max(child_size.y);
+    }
+    box_.dimensions.content = egui::Rect::from_min_size(
+        egui::pos2(content_x, content_y),
+        egui::vec2(
+            content_width.max(1.0),
+            content_height.max((box_.style.font_size * 1.35).max(1.0)),
+        ),
+    );
+    css_margin_box(box_).size()
+}
+
+fn css_visual_replaced_content_size(
+    box_: &CssLayoutBox<'_>,
+    containing_width: f32,
+    source: &str,
+    image_height_auto: bool,
+) -> Option<egui::Vec2> {
+    let node = box_.node?;
+    if !css_layout_node_is_visual_replaced_content(node) {
+        return None;
+    }
+    let RenderNodeKind::Element(element) = &node.kind else {
+        return None;
+    };
+    let content = replaced_content_from_dom_element(element, source, image_height_auto);
+    Some(replaced_content_size(
+        &content,
+        containing_width,
+        box_.style.font_size,
+    ))
+}
+
+fn css_layout_node_is_button(node: &RenderNode) -> bool {
+    matches!(
+        &node.kind,
+        RenderNodeKind::Element(element) if element.tag_name == "button"
+    )
+}
+
+fn center_css_button_children(box_: &mut CssLayoutBox<'_>) {
+    if box_.children.is_empty() {
+        return;
+    }
+    let mut bounds: Option<egui::Rect> = None;
+    for child in &box_.children {
+        if css_layout_box_is_out_of_flow(child) {
+            continue;
+        }
+        let child_rect = css_margin_box(child);
+        bounds = Some(match bounds {
+            Some(bounds) => bounds.union(child_rect),
+            None => child_rect,
+        });
+    }
+    let Some(bounds) = bounds else {
+        return;
+    };
+    let content = box_.dimensions.content;
+    let delta = egui::vec2(
+        if box_.style.text_align == CssTextAlign::Center {
+            content.center().x - bounds.center().x
+        } else {
+            0.0
+        },
+        content.center().y - bounds.center().y,
+    );
+    if delta == egui::Vec2::ZERO {
+        return;
+    }
+    for child in &mut box_.children {
+        if !css_layout_box_is_out_of_flow(child) {
+            translate_css_layout_box(child, delta);
+        }
+    }
 }
 
 fn layout_css_flex_children(
@@ -2178,16 +5702,44 @@ fn layout_css_flex_children(
             .max(total_main)
     };
     let free_space = (available_main - total_main).max(0.0);
-    let mut main_cursor = match container.style.justify_content {
-        CssJustifyContent::Center => free_space * 0.5,
-        CssJustifyContent::FlexStart | CssJustifyContent::SpaceBetween => 0.0,
+    let main_auto_margin_count = if is_row {
+        flow_indices
+            .iter()
+            .map(|index| {
+                let auto = container.children[*index].style.margin_auto;
+                auto.left as usize + auto.right as usize
+            })
+            .sum::<usize>()
+    } else {
+        flow_indices
+            .iter()
+            .map(|index| {
+                let auto = container.children[*index].style.margin_auto;
+                auto.top as usize + auto.bottom as usize
+            })
+            .sum::<usize>()
     };
-    let distributed_gap =
-        if container.style.justify_content == CssJustifyContent::SpaceBetween && child_count > 1 {
-            gap + free_space / (child_count - 1) as f32
-        } else {
-            gap
-        };
+    let auto_margin_share = if main_auto_margin_count > 0 {
+        free_space / main_auto_margin_count as f32
+    } else {
+        0.0
+    };
+    let mut main_cursor = if main_auto_margin_count > 0 {
+        0.0
+    } else {
+        match container.style.justify_content {
+            CssJustifyContent::Center => free_space * 0.5,
+            CssJustifyContent::FlexStart | CssJustifyContent::SpaceBetween => 0.0,
+        }
+    };
+    let distributed_gap = if main_auto_margin_count == 0
+        && container.style.justify_content == CssJustifyContent::SpaceBetween
+        && child_count > 1
+    {
+        gap + free_space / (child_count - 1) as f32
+    } else {
+        gap
+    };
 
     for (slot, index) in flow_indices.iter().enumerate() {
         let child = &mut container.children[*index];
@@ -2195,6 +5747,20 @@ fn layout_css_flex_children(
         let child_margin = child.dimensions.margin;
         let child_border = child.dimensions.border;
         let child_padding = child.dimensions.padding;
+        let main_auto_before = if is_row && child.style.margin_auto.left {
+            auto_margin_share
+        } else if !is_row && child.style.margin_auto.top {
+            auto_margin_share
+        } else {
+            0.0
+        };
+        let main_auto_after = if is_row && child.style.margin_auto.right {
+            auto_margin_share
+        } else if !is_row && child.style.margin_auto.bottom {
+            auto_margin_share
+        } else {
+            0.0
+        };
         let cross_offset = match container.style.align_items {
             CssAlignItems::Center => {
                 ((available_cross - if is_row { size.y } else { size.x }) * 0.5).max(0.0)
@@ -2205,6 +5771,7 @@ fn layout_css_flex_children(
         let content_x = if is_row {
             content.left()
                 + main_cursor
+                + main_auto_before
                 + child_margin.left
                 + child_border.left
                 + child_padding.left
@@ -2218,12 +5785,20 @@ fn layout_css_flex_children(
         let content_y = if is_row {
             content.top() + cross_offset + child_margin.top + child_border.top + child_padding.top
         } else {
-            content.top() + main_cursor + child_margin.top + child_border.top + child_padding.top
+            content.top()
+                + main_cursor
+                + main_auto_before
+                + child_margin.top
+                + child_border.top
+                + child_padding.top
         };
         let current_min = child.dimensions.content.min;
         let new_min = egui::pos2(content_x, content_y);
         translate_css_layout_box(child, new_min - current_min);
-        main_cursor += if is_row { size.x } else { size.y } + distributed_gap;
+        main_cursor += main_auto_before
+            + if is_row { size.x } else { size.y }
+            + main_auto_after
+            + distributed_gap;
     }
 
     layout_css_out_of_flow_children(container, source, image_height_auto, text_metrics);
@@ -2262,13 +5837,8 @@ fn css_flex_row_item_widths(
         return widths;
     }
 
-    let fixed_total = children
-        .iter()
-        .zip(base_widths.iter())
-        .filter(|(child, _)| css_flex_item_effective_grow(child) <= 0.0)
-        .map(|(_, width)| *width)
-        .sum::<f32>();
-    let grow_available = (available_for_items - fixed_total).max(1.0);
+    let base_total = base_widths.iter().sum::<f32>();
+    let grow_available = (available_for_items - base_total).max(0.0);
 
     let mut widths = children
         .iter()
@@ -2276,7 +5846,8 @@ fn css_flex_row_item_widths(
         .map(|(child, base_width)| {
             let grow = css_flex_item_effective_grow(child);
             if grow > 0.0 {
-                (grow_available * grow / total_grow).max(css_flex_item_min_width(child))
+                (base_width + grow_available * grow / total_grow)
+                    .max(css_flex_item_min_width(child))
             } else {
                 base_width.max(css_flex_item_min_width(child))
             }
@@ -2380,34 +5951,72 @@ fn css_layout_preferred_content_width(
                 .node
                 .is_some_and(css_layout_node_is_replaced_or_special)
             {
-                let text_width = box_
-                    .node
-                    .map(render_node_text_content)
-                    .filter(|text| !text.is_empty())
-                    .map(|text| measure_canvas_text_run(text_metrics, &text, &box_.style).x)
-                    .unwrap_or(0.0);
+                if let Some(width) = box_.style.width.or(box_.style.max_width) {
+                    return width.max(box_.style.min_width.unwrap_or(1.0)).max(1.0);
+                }
+                let text_width = if let Some(node) = box_.node {
+                    if let RenderNodeKind::Element(element) = &node.kind {
+                        if element.tag_name == "input" {
+                            let input_type =
+                                element.attr("type").unwrap_or("text").to_ascii_lowercase();
+                            if matches!(input_type.as_str(), "submit" | "button" | "reset") {
+                                let label = canvas_button_label(element, node);
+                                measure_canvas_text_run(text_metrics, &label, &box_.style).x
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            let text = render_node_text_content(node);
+                            if text.is_empty() {
+                                0.0
+                            } else {
+                                measure_canvas_text_run(text_metrics, &text, &box_.style).x
+                            }
+                        }
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
                 return text_width.max(box_.style.font_size * 1.35).max(1.0);
             }
             box_.children
                 .iter()
-                .map(|child| css_layout_preferred_content_width(child, text_metrics))
+                .map(|child| css_layout_preferred_outer_width(child, text_metrics))
                 .sum::<f32>()
                 .max(1.0)
         }
         CssLayoutKind::Document => box_
             .children
             .iter()
-            .map(|child| css_layout_preferred_content_width(child, text_metrics))
+            .map(|child| css_layout_preferred_outer_width(child, text_metrics))
             .fold(0.0, f32::max)
             .max(1.0),
     }
 }
 
+fn css_layout_preferred_outer_width(
+    box_: &CssLayoutBox<'_>,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    css_layout_preferred_content_width(box_, text_metrics)
+        + box_.style.margin.left
+        + box_.style.margin.right
+        + box_.style.border_width * 2.0
+        + box_.style.padding.left
+        + box_.style.padding.right
+}
+
 fn css_definite_box_height(style: &ResolvedBoxStyle, containing_width: f32) -> Option<f32> {
-    style
-        .height
-        .or(style.min_height)
-        .map(|height| resolve_css_box_length(height, 0.0, containing_width))
+    let _ = containing_width;
+    [style.height, style.min_height]
+        .into_iter()
+        .flatten()
+        .find_map(|height| match height {
+            CssLength::Px(px) => Some(px),
+            CssLength::Auto | CssLength::Percent(_) => None,
+        })
 }
 
 fn translate_css_layout_box(box_: &mut CssLayoutBox<'_>, delta: egui::Vec2) {
@@ -2437,6 +6046,12 @@ fn layout_css_grid_children(
 
     let gap = container.style.gap.max(0.0);
     let content = container.dimensions.content;
+    if let Some(height) =
+        layout_named_css_grid_children(container, source, image_height_auto, text_metrics, gap)
+    {
+        return height;
+    }
+
     let columns = container
         .style
         .grid_template_columns
@@ -2485,6 +6100,186 @@ fn layout_css_grid_children(
     (max_bottom - content.top()).max(0.0)
 }
 
+fn layout_named_css_grid_children(
+    container: &mut CssLayoutBox<'_>,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+    gap: f32,
+) -> Option<f32> {
+    let areas = container.style.grid_template_areas.clone()?;
+    if areas.is_empty() {
+        return None;
+    }
+
+    let content = container.dimensions.content;
+    let explicit_columns = container.style.grid_template_columns.unwrap_or(0);
+    let area_columns = areas.iter().map(Vec::len).max().unwrap_or(0);
+    let columns = explicit_columns.max(area_columns);
+    if columns == 0 {
+        return None;
+    }
+
+    let auto_width =
+        ((content.width() - gap * columns.saturating_sub(1) as f32) / columns as f32).max(1.0);
+    let mut placed_named_child = false;
+    let mut row_heights: Vec<f32> = vec![0.0; areas.len()];
+
+    for child in &mut container.children {
+        if css_layout_box_is_out_of_flow(child) {
+            continue;
+        }
+        let Some(bounds) = child
+            .style
+            .grid_area
+            .as_deref()
+            .and_then(|name| css_grid_area_bounds(&areas, name))
+        else {
+            continue;
+        };
+        placed_named_child = true;
+        let item_width = css_grid_area_width(auto_width, gap, bounds);
+        layout_css_box(
+            child,
+            content.left() + bounds.2 as f32 * (auto_width + gap),
+            content.top(),
+            item_width,
+            content.height().max(0.0),
+            source,
+            image_height_auto,
+            text_metrics,
+        );
+        let row_span = (bounds.1 - bounds.0 + 1).max(1);
+        let height = (css_margin_box(child).height() - gap * row_span.saturating_sub(1) as f32)
+            .max(0.0)
+            / row_span as f32;
+        for row_height in &mut row_heights[bounds.0..=bounds.1] {
+            *row_height = (*row_height).max(height);
+        }
+    }
+
+    if !placed_named_child {
+        return None;
+    }
+
+    let mut row_tops = Vec::with_capacity(row_heights.len());
+    let mut cursor_y = content.top();
+    for row_height in &row_heights {
+        row_tops.push(cursor_y);
+        cursor_y += *row_height + gap;
+    }
+    let named_grid_bottom = row_heights
+        .last()
+        .and_then(|last_height| row_tops.last().map(|top| top + *last_height))
+        .unwrap_or(content.top());
+    let mut max_bottom = named_grid_bottom;
+
+    for child in &mut container.children {
+        if css_layout_box_is_out_of_flow(child) {
+            continue;
+        }
+        let Some(bounds) = child
+            .style
+            .grid_area
+            .as_deref()
+            .and_then(|name| css_grid_area_bounds(&areas, name))
+        else {
+            continue;
+        };
+        let item_width = css_grid_area_width(auto_width, gap, bounds);
+        layout_css_box(
+            child,
+            content.left() + bounds.2 as f32 * (auto_width + gap),
+            row_tops[bounds.0],
+            item_width,
+            content.height().max(0.0),
+            source,
+            image_height_auto,
+            text_metrics,
+        );
+        max_bottom = max_bottom.max(css_margin_box(child).bottom());
+    }
+
+    let mut column = 0usize;
+    let mut fallback_y = if max_bottom > content.top() {
+        max_bottom + gap
+    } else {
+        content.top()
+    };
+    let mut fallback_row_height: f32 = 0.0;
+
+    for child in &mut container.children {
+        if css_layout_box_is_out_of_flow(child)
+            || child
+                .style
+                .grid_area
+                .as_deref()
+                .and_then(|name| css_grid_area_bounds(&areas, name))
+                .is_some()
+        {
+            continue;
+        }
+        if column >= columns {
+            fallback_y += fallback_row_height + gap;
+            column = 0;
+            fallback_row_height = 0.0;
+        }
+        let cursor_x = content.left() + column as f32 * (auto_width + gap);
+        let item_width = child
+            .style
+            .width
+            .or(child.style.max_width)
+            .unwrap_or(auto_width)
+            .min(auto_width)
+            .max(child.style.min_width.unwrap_or(1.0));
+        layout_css_box(
+            child,
+            cursor_x,
+            fallback_y,
+            item_width,
+            content.height().max(0.0),
+            source,
+            image_height_auto,
+            text_metrics,
+        );
+        let margin_box = css_margin_box(child);
+        fallback_row_height = fallback_row_height.max(margin_box.height());
+        max_bottom = max_bottom.max(margin_box.bottom());
+        column += 1;
+    }
+
+    Some((max_bottom - content.top()).max(0.0))
+}
+
+fn css_grid_area_width(column_width: f32, gap: f32, bounds: (usize, usize, usize, usize)) -> f32 {
+    let column_span = (bounds.3 - bounds.2 + 1).max(1);
+    (column_width * column_span as f32 + gap * column_span.saturating_sub(1) as f32).max(1.0)
+}
+
+fn css_grid_area_bounds(areas: &[Vec<String>], name: &str) -> Option<(usize, usize, usize, usize)> {
+    if name.is_empty() || name == "." {
+        return None;
+    }
+    let mut bounds: Option<(usize, usize, usize, usize)> = None;
+    for (row_index, row) in areas.iter().enumerate() {
+        for (column_index, area_name) in row.iter().enumerate() {
+            if area_name != name {
+                continue;
+            }
+            bounds = Some(match bounds {
+                Some((min_row, max_row, min_column, max_column)) => (
+                    min_row.min(row_index),
+                    max_row.max(row_index),
+                    min_column.min(column_index),
+                    max_column.max(column_index),
+                ),
+                None => (row_index, row_index, column_index, column_index),
+            });
+        }
+    }
+    bounds
+}
+
 fn css_layout_box_is_out_of_flow(box_: &CssLayoutBox<'_>) -> bool {
     if matches!(
         box_.style.position,
@@ -2501,31 +6296,26 @@ fn css_resolve_used_height(
     containing_height: f32,
     containing_width: f32,
 ) -> f32 {
+    let _ = containing_width;
     let mut height = style
         .height
-        .map(|height| resolve_css_box_length(height, containing_height, containing_width))
+        .and_then(|height| resolve_css_used_height_length(height, containing_height))
         .unwrap_or(intrinsic_height);
-    if let Some(min_height) = style.min_height {
-        height = height.max(resolve_css_box_length(
-            min_height,
-            containing_height,
-            containing_width,
-        ));
+    if let Some(min_height) = style
+        .min_height
+        .and_then(|height| resolve_css_used_height_length(height, containing_height))
+    {
+        height = height.max(min_height);
     }
     height.max(0.0)
 }
 
-fn resolve_css_box_length(length: CssLength, percent_basis: f32, fallback_basis: f32) -> f32 {
+fn resolve_css_used_height_length(length: CssLength, percent_basis: f32) -> Option<f32> {
     match length {
-        CssLength::Px(px) => px,
-        CssLength::Percent(percent) => {
-            let basis = if percent_basis > 0.0 {
-                percent_basis
-            } else {
-                fallback_basis
-            };
-            basis * percent / 100.0
-        }
+        CssLength::Auto => None,
+        CssLength::Px(px) => Some(px),
+        CssLength::Percent(percent) if percent_basis > 0.0 => Some(percent_basis * percent / 100.0),
+        CssLength::Percent(_) => None,
     }
 }
 
@@ -2535,47 +6325,94 @@ fn layout_css_out_of_flow_children(
     image_height_auto: bool,
     text_metrics: Option<&egui::Context>,
 ) {
-    let containing = parent.dimensions.content;
-    if containing.width() <= 0.0 || containing.height() <= 0.0 {
+    let containing = css_padding_box(&parent.dimensions);
+    if containing.width() <= 0.0 {
         return;
     }
 
     for child in &mut parent.children {
         if !css_layout_box_is_out_of_flow(child) {
+            if child.style.position == CssPosition::Static {
+                layout_css_out_of_flow_descendants_for_containing_block(
+                    child,
+                    containing,
+                    source,
+                    image_height_auto,
+                    text_metrics,
+                );
+            }
             continue;
         }
-        let inset = child.style.inset.unwrap_or_default();
-        let left = child.style.inset_sides.left;
-        let right = child.style.inset_sides.right;
-        let top = child.style.inset_sides.top;
-        let bottom = child.style.inset_sides.bottom;
-        let containing_width = if left.is_some() && right.is_some() {
-            (containing.width() - inset.left - inset.right).max(1.0)
-        } else {
-            containing.width().max(1.0)
-        };
-        let containing_height = (containing.height() - inset.top - inset.bottom).max(0.0);
-        layout_css_box(
-            child,
-            containing.left() + left.unwrap_or(0.0),
-            containing.top() + top.unwrap_or(0.0),
-            containing_width,
-            containing_height,
-            source,
-            image_height_auto,
-            text_metrics,
-        );
-        let child_margin_box = css_margin_box(child);
-        let mut delta = egui::Vec2::ZERO;
-        if let (Some(right), None) = (right, left) {
-            delta.x = containing.right() - right - child_margin_box.right();
+        layout_css_out_of_flow_child(child, containing, source, image_height_auto, text_metrics);
+    }
+}
+
+fn layout_css_out_of_flow_descendants_for_containing_block(
+    box_: &mut CssLayoutBox<'_>,
+    containing: egui::Rect,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+) {
+    for child in &mut box_.children {
+        if css_layout_box_is_out_of_flow(child) {
+            layout_css_out_of_flow_child(
+                child,
+                containing,
+                source,
+                image_height_auto,
+                text_metrics,
+            );
+        } else if child.style.position == CssPosition::Static {
+            layout_css_out_of_flow_descendants_for_containing_block(
+                child,
+                containing,
+                source,
+                image_height_auto,
+                text_metrics,
+            );
         }
-        if let (Some(bottom), None) = (bottom, top) {
-            delta.y = containing.bottom() - bottom - child_margin_box.bottom();
-        }
-        if delta != egui::Vec2::ZERO {
-            translate_css_layout_box(child, delta);
-        }
+    }
+}
+
+fn layout_css_out_of_flow_child(
+    child: &mut CssLayoutBox<'_>,
+    containing: egui::Rect,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+) {
+    let inset = child.style.inset.unwrap_or_default();
+    let left = child.style.inset_sides.left;
+    let right = child.style.inset_sides.right;
+    let top = child.style.inset_sides.top;
+    let bottom = child.style.inset_sides.bottom;
+    let containing_width = if left.is_some() && right.is_some() {
+        (containing.width() - inset.left - inset.right).max(1.0)
+    } else {
+        containing.width().max(1.0)
+    };
+    let containing_height = (containing.height() - inset.top - inset.bottom).max(0.0);
+    layout_css_box(
+        child,
+        containing.left() + left.unwrap_or(0.0),
+        containing.top() + top.unwrap_or(0.0),
+        containing_width,
+        containing_height,
+        source,
+        image_height_auto,
+        text_metrics,
+    );
+    let child_margin_box = css_margin_box(child);
+    let mut delta = egui::Vec2::ZERO;
+    if let (Some(right), None) = (right, left) {
+        delta.x = containing.right() - right - child_margin_box.right();
+    }
+    if let (Some(bottom), None) = (bottom, top) {
+        delta.y = containing.bottom() - bottom - child_margin_box.bottom();
+    }
+    if delta != egui::Vec2::ZERO {
+        translate_css_layout_box(child, delta);
     }
 }
 
@@ -2645,7 +6482,14 @@ fn estimate_special_css_box_height(
             let block = replaced_content_from_dom_element(element, source, image_height_auto);
             replaced_content_size(&block, width, node.style.font_size).y
         }
-        "input" | "textarea" | "select" | "button" => (node.style.font_size * 1.35).max(1.0),
+        "textarea" => {
+            let rows = element
+                .attr("rows")
+                .and_then(|r| r.parse::<f32>().ok())
+                .unwrap_or(2.0);
+            (node.style.font_size * 1.35 * rows).max(1.0)
+        }
+        "input" | "select" | "button" => (node.style.font_size * 1.35).max(1.0),
         _ => (node.style.font_size * 3.0).max(48.0),
     }
 }
@@ -2696,6 +6540,7 @@ fn render_graph_to_canvas_graph(
     source: &str,
     image_height_auto: bool,
     text_metrics: Option<&egui::Context>,
+    reveal_hydration_hidden_content: bool,
 ) -> CanvasGraph {
     let viewport = egui::vec2(graph.root.style.max_width.unwrap_or(1280.0), 0.0);
     let mut layout_root = build_css_layout_tree(&graph.root);
@@ -2709,6 +6554,8 @@ fn render_graph_to_canvas_graph(
         width: viewport.x,
         list_depth: 0,
         list_stack: Vec::new(),
+        form_stack: Vec::new(),
+        next_form_index: 0,
     };
     layout_css_layout_tree(
         &mut layout_root,
@@ -2717,6 +6564,9 @@ fn render_graph_to_canvas_graph(
         image_height_auto,
         text_metrics,
     );
+    if reveal_hydration_hidden_content {
+        apply_hydration_visibility_fallback(&mut layout_root);
+    }
 
     for child in &layout_root.children {
         push_canvas_graph_layout_box(
@@ -2733,6 +6583,87 @@ fn render_graph_to_canvas_graph(
     canvas_graph
 }
 
+fn apply_hydration_visibility_fallback(box_: &mut CssLayoutBox<'_>) {
+    if css_layout_box_should_reveal_for_hydration_fallback(box_) {
+        set_css_layout_subtree_visibility_visible(box_);
+        return;
+    }
+
+    for child in &mut box_.children {
+        apply_hydration_visibility_fallback(child);
+    }
+}
+
+fn set_css_layout_subtree_visibility_visible(box_: &mut CssLayoutBox<'_>) {
+    box_.style.visibility_visible = true;
+    for child in &mut box_.children {
+        set_css_layout_subtree_visibility_visible(child);
+    }
+}
+
+fn css_layout_box_should_reveal_for_hydration_fallback(box_: &CssLayoutBox<'_>) -> bool {
+    !box_.style.visibility_visible
+        && box_.style.opacity > 0.0
+        && matches!(
+            box_.style.display,
+            CssDisplay::Block | CssDisplay::Flex | CssDisplay::Grid | CssDisplay::ListItem
+        )
+        && box_.style.position == CssPosition::Static
+        && css_layout_box_has_meaningful_ssr_content(box_)
+}
+
+fn css_layout_box_has_meaningful_ssr_content(box_: &CssLayoutBox<'_>) -> bool {
+    let text_len = css_layout_box_visible_text_len(box_);
+    let link_count = css_layout_box_link_count(box_);
+    css_layout_box_contains_tag(box_, &["article", "main"]) || (text_len >= 24 && link_count > 0)
+}
+
+fn css_layout_box_visible_text_len(box_: &CssLayoutBox<'_>) -> usize {
+    let mut total = box_
+        .text
+        .as_deref()
+        .map(str::trim)
+        .map(str::len)
+        .unwrap_or(0);
+    for child in &box_.children {
+        total += css_layout_box_visible_text_len(child);
+    }
+    total
+}
+
+fn css_layout_box_link_count(box_: &CssLayoutBox<'_>) -> usize {
+    let own = match &box_.node {
+        Some(RenderNode {
+            kind: RenderNodeKind::Element(element),
+            ..
+        }) if element.tag_name.eq_ignore_ascii_case("a") && element.attr("href").is_some() => 1,
+        _ => 0,
+    };
+    own + box_
+        .children
+        .iter()
+        .map(css_layout_box_link_count)
+        .sum::<usize>()
+}
+
+fn css_layout_box_contains_tag(box_: &CssLayoutBox<'_>, tags: &[&str]) -> bool {
+    if let Some(RenderNode {
+        kind: RenderNodeKind::Element(element),
+        ..
+    }) = box_.node
+    {
+        if tags
+            .iter()
+            .any(|tag| element.tag_name.eq_ignore_ascii_case(tag))
+        {
+            return true;
+        }
+    }
+    box_.children
+        .iter()
+        .any(|child| css_layout_box_contains_tag(child, tags))
+}
+
 fn push_canvas_graph_layout_box(
     box_: &CssLayoutBox<'_>,
     source: &str,
@@ -2742,6 +6673,14 @@ fn push_canvas_graph_layout_box(
     cursor: &mut CanvasLayoutCursor,
     graph: &mut CanvasGraph,
 ) {
+    let pushed_form = push_canvas_form_context_for_layout_box(box_, cursor);
+    if !css_style_paints(&box_.style) {
+        cursor.y = cursor.y.max(css_margin_box(box_).bottom());
+        if pushed_form {
+            cursor.form_stack.pop();
+        }
+        return;
+    }
     match box_.kind {
         CssLayoutKind::Document => {
             for child in &box_.children {
@@ -2758,10 +6697,10 @@ fn push_canvas_graph_layout_box(
         }
         CssLayoutKind::AnonymousBlock => {
             if !box_.children.is_empty()
-                && box_
-                    .children
-                    .iter()
-                    .all(css_layout_box_contains_visual_replaced_content)
+                && box_.children.iter().all(|c| {
+                    css_layout_box_contains_visual_replaced_content(c)
+                        || css_layout_box_contains_replaced_or_special(c)
+                })
             {
                 push_canvas_graph_layout_children_at_used_positions(
                     &box_.children,
@@ -2796,15 +6735,66 @@ fn push_canvas_graph_layout_box(
         }
         CssLayoutKind::Inline => {
             if let Some(node) = box_.node {
-                push_canvas_graph_node(
-                    node,
-                    source,
-                    image_height_auto,
-                    text_metrics,
-                    inherited_href,
-                    cursor,
-                    graph,
-                );
+                let href = if let RenderNodeKind::Element(element) = &node.kind {
+                    if element.tag_name == "a" {
+                        element.attr("href").or(inherited_href)
+                    } else {
+                        inherited_href
+                    }
+                } else {
+                    inherited_href
+                };
+
+                let previous_x = cursor.x;
+                let previous_y = cursor.y;
+                let previous_width = cursor.width;
+                cursor.x = box_.dimensions.content.left();
+                cursor.y = box_.dimensions.content.top();
+                cursor.width = box_.dimensions.content.width().max(1.0);
+
+                if css_layout_node_is_replaced_or_special(node) {
+                    push_canvas_graph_layout_replaced_or_special(
+                        box_,
+                        node,
+                        source,
+                        image_height_auto,
+                        text_metrics,
+                        href,
+                        cursor,
+                        graph,
+                    );
+                } else {
+                    push_canvas_graph_layout_box_background(box_, graph);
+                    let clips_children = push_canvas_graph_layout_clip_start(box_, graph);
+                    if !node.children.is_empty() && children_are_inline_flow(&node.children) {
+                        push_canvas_graph_inline_children(
+                            &node.children,
+                            text_metrics,
+                            href,
+                            cursor,
+                            graph,
+                        );
+                    } else {
+                        for child in &node.children {
+                            push_canvas_graph_node(
+                                child,
+                                source,
+                                image_height_auto,
+                                text_metrics,
+                                href,
+                                cursor,
+                                graph,
+                            );
+                        }
+                    }
+                    if clips_children {
+                        graph.objects.push(CanvasObject::ClipEnd);
+                    }
+                }
+
+                cursor.x = previous_x;
+                cursor.width = previous_width;
+                cursor.y = previous_y.max(css_margin_box(box_).bottom());
             }
         }
         CssLayoutKind::Block => {
@@ -2959,6 +6949,36 @@ fn push_canvas_graph_layout_box(
             }
         }
     }
+    if pushed_form {
+        cursor.form_stack.pop();
+    }
+}
+
+fn push_canvas_form_context_for_layout_box(
+    box_: &CssLayoutBox<'_>,
+    cursor: &mut CanvasLayoutCursor,
+) -> bool {
+    let Some(node) = box_.node else {
+        return false;
+    };
+    let RenderNodeKind::Element(element) = &node.kind else {
+        return false;
+    };
+    if element.tag_name != "form" {
+        return false;
+    }
+    let id = element
+        .attr("id")
+        .or_else(|| element.attr("name"))
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let id = format!("form-{}", cursor.next_form_index);
+            cursor.next_form_index += 1;
+            id
+        });
+    let action = element.attr("action").map(str::to_owned);
+    cursor.form_stack.push(CanvasFormContext { id, action });
+    true
 }
 
 fn push_canvas_graph_layout_clip_start(box_: &CssLayoutBox<'_>, graph: &mut CanvasGraph) -> bool {
@@ -3024,6 +7044,45 @@ fn push_canvas_graph_layout_replaced_or_special(
             } else {
                 push_canvas_graph_layout_children_at_used_positions(
                     &box_.children,
+                    source,
+                    image_height_auto,
+                    text_metrics,
+                    inherited_href,
+                    cursor,
+                    graph,
+                );
+            }
+            push_canvas_graph_button_hit_target(
+                element,
+                node,
+                css_border_box(&box_.dimensions),
+                cursor,
+                graph,
+            );
+        }
+        "input" => {
+            let input_type = element.attr("type").unwrap_or("text").to_ascii_lowercase();
+            if matches!(input_type.as_str(), "submit" | "button" | "reset") {
+                push_canvas_graph_layout_box_background(box_, graph);
+                let label = canvas_button_label(element, node);
+                push_canvas_graph_text(
+                    &label,
+                    &node.style,
+                    text_metrics,
+                    inherited_href,
+                    cursor,
+                    graph,
+                );
+                push_canvas_graph_button_hit_target(
+                    element,
+                    node,
+                    css_border_box(&box_.dimensions),
+                    cursor,
+                    graph,
+                );
+            } else {
+                push_canvas_graph_node(
+                    node,
                     source,
                     image_height_auto,
                     text_metrics,
@@ -3099,7 +7158,14 @@ fn push_canvas_graph_layout_children_at_used_positions(
     let previous_x = cursor.x;
     let previous_y = cursor.y;
     let previous_width = cursor.width;
-    for child in children {
+    let mut ordered_children: Vec<_> = children.iter().enumerate().collect();
+    ordered_children.sort_by_key(|(index, child)| {
+        let z_index = child.style.z_index.unwrap_or(0);
+        let positioned_positive_z =
+            child.style.position != CssPosition::Static && child.style.z_index.unwrap_or(0) > 0;
+        (positioned_positive_z, z_index, *index)
+    });
+    for (_, child) in ordered_children {
         let margin_box = css_margin_box(child);
         if css_layout_box_is_block_level(child) {
             cursor.x = margin_box.left();
@@ -3134,7 +7200,7 @@ fn push_canvas_graph_node(
     cursor: &mut CanvasLayoutCursor,
     graph: &mut CanvasGraph,
 ) {
-    if node.style.display == CssDisplay::None {
+    if node.style.display == CssDisplay::None || !css_style_paints(&node.style) {
         return;
     }
 
@@ -3192,6 +7258,7 @@ fn push_canvas_graph_element(
     } else {
         inherited_href
     };
+    let pushed_form = push_canvas_form_context_for_element(element, cursor);
 
     match element.tag_name.as_str() {
         "img" => {
@@ -3205,29 +7272,95 @@ fn push_canvas_graph_element(
             );
         }
         "input" | "textarea" | "select" => {
-            if element
-                .attr("type")
-                .is_some_and(|value| value.eq_ignore_ascii_case("hidden"))
-            {
+            let input_type = element.attr("type").unwrap_or("text");
+            if input_type.eq_ignore_ascii_case("hidden") {
                 return;
             }
+            // Button-like input types go to CanvasObject::Button.
+            if element.tag_name == "input"
+                && matches!(
+                    input_type.to_ascii_lowercase().as_str(),
+                    "submit" | "button" | "reset"
+                )
+            {
+                let button_rect = egui::Rect::from_min_size(
+                    egui::pos2(cursor.x, cursor.y),
+                    egui::vec2(
+                        cursor.width.max(1.0),
+                        (node.style.font_size * 1.35).max(1.0),
+                    ),
+                );
+                let label = canvas_button_label(element, node);
+                push_canvas_graph_text(&label, &node.style, text_metrics, href, cursor, graph);
+                push_canvas_graph_button_hit_target(element, node, button_rect, cursor, graph);
+                return;
+            }
+            let kind = if element.tag_name == "textarea" {
+                CanvasInputKind::TextArea
+            } else if element.tag_name == "select" {
+                let mut options = Vec::new();
+                collect_select_options(&element.children, &mut options);
+                CanvasInputKind::Select { options }
+            } else {
+                match input_type.to_ascii_lowercase().as_str() {
+                    "checkbox" => CanvasInputKind::Checkbox,
+                    "radio" => CanvasInputKind::Radio,
+                    "password" => CanvasInputKind::Password,
+                    _ => CanvasInputKind::Text,
+                }
+            };
+            let line_height = (node.style.font_size * 1.35).max(1.0);
+            let height = if element.tag_name == "textarea" {
+                let rows = element
+                    .attr("rows")
+                    .and_then(|r| r.parse::<f32>().ok())
+                    .unwrap_or(2.0);
+                line_height * rows
+            } else {
+                line_height
+            };
             let block = input_block_from_dom_element(element);
             if let CanvasBlock::Input { label, value } = block {
+                // For checkboxes/radios, derive initial value from the `checked` attribute.
+                let value = if matches!(kind, CanvasInputKind::Checkbox | CanvasInputKind::Radio) {
+                    if element.attr("checked").is_some() {
+                        "true".to_owned()
+                    } else {
+                        "false".to_owned()
+                    }
+                } else if let CanvasInputKind::Select { ref options } = kind {
+                    // Use the first selected option, or the first option, or empty.
+                    let selected = find_selected_option(&element.children);
+                    selected.unwrap_or_else(|| options.first().cloned().unwrap_or(value))
+                } else {
+                    value
+                };
                 graph.objects.push(CanvasObject::Input(CanvasInputObject {
                     label,
+                    name: element.attr("name").map(str::to_owned),
+                    default_value: value.clone(),
                     value,
                     rect: egui::Rect::from_min_size(
                         egui::pos2(cursor.x, cursor.y),
-                        egui::vec2(
-                            cursor.width.max(1.0),
-                            (node.style.font_size * 1.35).max(1.0),
-                        ),
+                        egui::vec2(cursor.width.max(1.0), height),
                     ),
                     font_size: node.style.font_size,
+                    color: node.style.color,
+                    form_id: current_canvas_form_id(cursor),
+                    form_action: current_canvas_form_action(cursor),
+                    element_id: element.attr("id").map(str::to_owned),
+                    kind,
                 }));
             }
         }
         "button" => {
+            let button_rect = egui::Rect::from_min_size(
+                egui::pos2(cursor.x, cursor.y),
+                egui::vec2(
+                    cursor.width.max(1.0),
+                    (node.style.font_size * 1.35).max(1.0),
+                ),
+            );
             if node.children.is_empty() {
                 let text = render_node_text_content(node);
                 push_canvas_graph_text(&text, &node.style, text_metrics, href, cursor, graph);
@@ -3244,6 +7377,7 @@ fn push_canvas_graph_element(
                     );
                 }
             }
+            push_canvas_graph_button_hit_target(element, node, button_rect, cursor, graph);
         }
         "table" => {
             push_canvas_graph_table(node, text_metrics, cursor, graph);
@@ -3354,6 +7488,76 @@ fn push_canvas_graph_element(
             cursor.y += node.style.padding.bottom + node.style.margin.bottom;
         }
     }
+    if pushed_form {
+        cursor.form_stack.pop();
+    }
+}
+
+fn push_canvas_form_context_for_element(
+    element: &DomElement,
+    cursor: &mut CanvasLayoutCursor,
+) -> bool {
+    if element.tag_name != "form" {
+        return false;
+    }
+    let id = element
+        .attr("id")
+        .or_else(|| element.attr("name"))
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let id = format!("form-{}", cursor.next_form_index);
+            cursor.next_form_index += 1;
+            id
+        });
+    let action = element.attr("action").map(str::to_owned);
+    cursor.form_stack.push(CanvasFormContext { id, action });
+    true
+}
+
+fn current_canvas_form_id(cursor: &CanvasLayoutCursor) -> Option<String> {
+    cursor.form_stack.last().map(|form| form.id.clone())
+}
+
+fn current_canvas_form_action(cursor: &CanvasLayoutCursor) -> Option<String> {
+    cursor
+        .form_stack
+        .last()
+        .and_then(|form| form.action.clone())
+}
+
+fn push_canvas_graph_button_hit_target(
+    element: &DomElement,
+    node: &RenderNode,
+    rect: egui::Rect,
+    cursor: &CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    graph.objects.push(CanvasObject::Button(CanvasButtonObject {
+        text: canvas_button_label(element, node),
+        rect,
+        button_type: element.attr("type").unwrap_or("submit").to_owned(),
+        form_id: current_canvas_form_id(cursor),
+        form_action: current_canvas_form_action(cursor),
+        element_id: element.attr("id").map(str::to_owned),
+    }));
+}
+
+fn canvas_button_label(element: &DomElement, node: &RenderNode) -> String {
+    element
+        .attr("aria-label")
+        .or_else(|| element.attr("title"))
+        .or_else(|| element.attr("value"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let text = render_node_text_content(node).trim().to_owned();
+            if text.is_empty() {
+                "Button".to_owned()
+            } else {
+                text
+            }
+        })
 }
 
 fn push_canvas_graph_box_start(
@@ -3471,6 +7675,10 @@ fn collect_canvas_layout_inline_runs(
     pending_space: &mut bool,
     runs: &mut Vec<CanvasInlineRun>,
 ) {
+    if !css_style_paints(&box_.style) {
+        return;
+    }
+
     match box_.kind {
         CssLayoutKind::Text => {
             let Some(text) = &box_.text else {
@@ -3537,7 +7745,7 @@ fn collect_canvas_inline_runs(
     pending_space: &mut bool,
     runs: &mut Vec<CanvasInlineRun>,
 ) {
-    if node.style.display == CssDisplay::None {
+    if node.style.display == CssDisplay::None || !css_style_paints(&node.style) {
         return;
     }
 
@@ -3582,6 +7790,10 @@ fn collect_canvas_inline_runs(
             }
         }
     }
+}
+
+fn css_style_paints(style: &ResolvedBoxStyle) -> bool {
+    style.visibility_visible && style.opacity > 0.0
 }
 
 fn push_canvas_line_boxes(
@@ -4224,7 +8436,7 @@ fn push_render_node_debug(node: &RenderNode, depth: usize, out: &mut String) {
 
 fn resolved_style_debug(style: &ResolvedBoxStyle) -> String {
     format!(
-        "style(display={:?}, color={}, bg={}, margin={}, padding={}, border_width={:.1}, border_color={}, radius={:.1}, width={}, min_width={}, max_width={}, font_size={:.1}, bold={}, align={:?}, overflow_hidden={})",
+        "style(display={:?}, color={}, bg={}, margin={}, padding={}, border_width={:.1}, border_color={}, radius={:.1}, width={}, min_width={}, max_width={}, font_size={:.1}, bold={}, align={:?}, visible={}, opacity={:.2}, overflow_hidden={}, position={:?}, z_index={})",
         style.display,
         color_debug(style.color),
         color_debug(style.background),
@@ -4239,7 +8451,14 @@ fn resolved_style_debug(style: &ResolvedBoxStyle) -> String {
         style.font_size,
         style.font_weight_bold,
         style.text_align,
-        style.overflow_hidden
+        style.visibility_visible,
+        style.opacity,
+        style.overflow_hidden,
+        style.position,
+        style
+            .z_index
+            .map(|z_index| z_index.to_string())
+            .unwrap_or_else(|| "auto".to_owned())
     )
 }
 
@@ -5486,6 +9705,37 @@ fn input_block_from_dom_element(element: &DomElement) -> CanvasBlock {
     }
 }
 
+fn collect_select_options(nodes: &[DomNode], options: &mut Vec<String>) {
+    for child in nodes {
+        if let DomNode::Element(el) = child {
+            if el.tag_name == "option" {
+                let text = el.text_content();
+                let text = text.trim();
+                if !text.is_empty() {
+                    options.push(text.to_owned());
+                }
+            } else if el.tag_name == "optgroup" {
+                collect_select_options(&el.children, options);
+            }
+        }
+    }
+}
+
+fn find_selected_option(nodes: &[DomNode]) -> Option<String> {
+    for child in nodes {
+        if let DomNode::Element(el) = child {
+            if el.tag_name == "option" && el.attr("selected").is_some() {
+                return Some(el.text_content().trim().to_owned());
+            } else if el.tag_name == "optgroup" {
+                if let Some(found) = find_selected_option(&el.children) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn labelize_input_name(value: &str) -> String {
     let value = value
         .split_once(|ch: char| ch == '-' || ch == '_')
@@ -6614,6 +10864,14 @@ fn remove_non_rendered_elements(html: &str) -> String {
     remove_hidden_elements(&cleaned)
 }
 
+fn remove_non_visual_metadata_elements(html: &str) -> String {
+    let mut cleaned = html.to_owned();
+    for tag in ["script", "style", "template", "noscript"] {
+        cleaned = remove_elements_by_tag(&cleaned, tag);
+    }
+    cleaned
+}
+
 fn remove_elements_by_tag(html: &str, tag: &str) -> String {
     let mut out = String::new();
     let mut remaining = html;
@@ -6763,6 +11021,226 @@ fn percent_decode_file_path(path: &str) -> String {
     out
 }
 
+fn telemetry_event_kind_and_detail(event: &egui::Event) -> (&'static str, String) {
+    match event {
+        egui::Event::Copy => ("copy", String::new()),
+        egui::Event::Cut => ("cut", String::new()),
+        egui::Event::Paste(text) => ("paste", format!("chars={}", text.chars().count())),
+        egui::Event::Text(text) => ("text", format!("chars={}", text.chars().count())),
+        egui::Event::Key {
+            key,
+            physical_key: _,
+            pressed,
+            repeat,
+            modifiers,
+        } => (
+            "key",
+            format!("key={key:?} pressed={pressed} repeat={repeat} modifiers={modifiers:?}"),
+        ),
+        egui::Event::PointerMoved(pos) => {
+            ("pointer_moved", format!("x={:.1} y={:.1}", pos.x, pos.y))
+        }
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers,
+        } => (
+            "pointer_button",
+            format!(
+                "x={:.1} y={:.1} button={button:?} pressed={pressed} modifiers={modifiers:?}",
+                pos.x, pos.y
+            ),
+        ),
+        egui::Event::PointerGone => ("pointer_gone", String::new()),
+        egui::Event::MouseWheel {
+            unit,
+            delta,
+            modifiers,
+        } => (
+            "mouse_wheel",
+            format!(
+                "unit={unit:?} dx={:.1} dy={:.1} modifiers={modifiers:?}",
+                delta.x, delta.y
+            ),
+        ),
+        egui::Event::Zoom(value) => ("zoom", format!("value={value:.3}")),
+        egui::Event::Touch { phase, pos, .. } => (
+            "touch",
+            format!("phase={phase:?} x={:.1} y={:.1}", pos.x, pos.y),
+        ),
+        egui::Event::WindowFocused(focused) => ("window_focused", format!("focused={focused}")),
+        _ => ("other", String::new()),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TelemetrySink {
+    session_id: String,
+    session_path: PathBuf,
+}
+
+static GLOBAL_TELEMETRY: OnceLock<Mutex<Option<TelemetrySink>>> = OnceLock::new();
+static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+static SCRIPT_RESOURCE_CACHE: OnceLock<Mutex<HashMap<String, Result<String, String>>>> =
+    OnceLock::new();
+static DEBUG_SERVER: OnceLock<DebugServer> = OnceLock::new();
+
+pub const DEBUG_PORT: u16 = 9876;
+
+struct DebugServer {
+    clients: Arc<Mutex<Vec<TcpStream>>>,
+}
+
+impl DebugServer {
+    fn start(port: u16) -> io::Result<Self> {
+        let listener = TcpListener::bind(format!("127.0.0.1:{port}"))?;
+        let clients: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let clients_clone = clients.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                if let Ok(s) = stream {
+                    let _ = s.set_nodelay(true);
+                    if let Ok(mut guard) = clients_clone.lock() {
+                        guard.push(s);
+                    }
+                }
+            }
+        });
+        Ok(Self { clients })
+    }
+
+    fn broadcast(&self, line: &str) {
+        let Ok(mut guard) = self.clients.lock() else {
+            return;
+        };
+        guard.retain_mut(|c| c.write_all(line.as_bytes()).is_ok());
+    }
+}
+
+fn install_debug_server() {
+    match DebugServer::start(DEBUG_PORT) {
+        Ok(server) => {
+            let _ = DEBUG_SERVER.set(server);
+            eprintln!("[debug] socket listening on 127.0.0.1:{DEBUG_PORT}");
+        }
+        Err(e) => {
+            eprintln!("[debug] socket unavailable (port {DEBUG_PORT}): {e}");
+        }
+    }
+}
+
+fn spawn_debug_terminal() {
+    let client_script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../debug_client.py")
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from("debug_client.py"));
+    let script = client_script.to_string_lossy().into_owned();
+
+    // Try common terminal emulators in preference order.
+    let candidates: &[(&str, &[&str])] = &[
+        ("gnome-terminal", &["--", "python3"] as &[&str]),
+        ("x-terminal-emulator", &["-e", "python3"]),
+        ("xterm", &["-e", "python3"]),
+        ("konsole", &["--", "python3"]),
+        ("alacritty", &["-e", "python3"]),
+    ];
+    for (term, prefix_args) in candidates {
+        let mut cmd = std::process::Command::new(term);
+        cmd.args(*prefix_args).arg(&script);
+        match cmd.spawn() {
+            Ok(_) => {
+                eprintln!("[debug] opened terminal: {term} python3 {script}");
+                return;
+            }
+            Err(_) => continue,
+        }
+    }
+    eprintln!("[debug] no terminal emulator found — run manually: python3 {script}");
+}
+
+fn install_global_telemetry(session: &TelemetrySession) {
+    let Some(sink) = session.sink() else {
+        return;
+    };
+    let slot = GLOBAL_TELEMETRY.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(sink);
+    }
+}
+
+fn emit_global_telemetry(event: &str, fields: &[(&str, &str)]) {
+    let Some(slot) = GLOBAL_TELEMETRY.get() else {
+        return;
+    };
+    let Ok(guard) = slot.lock() else {
+        return;
+    };
+    let Some(sink) = guard.as_ref() else {
+        return;
+    };
+    write_telemetry_line(sink, event, fields);
+}
+
+fn install_telemetry_panic_hook() {
+    PANIC_HOOK_INSTALLED.get_or_init(|| {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let message = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|value| (*value).to_owned())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic payload unavailable".to_owned());
+            let location = info
+                .location()
+                .map(|location| {
+                    format!(
+                        "{}:{}:{}",
+                        location.file(),
+                        location.line(),
+                        location.column()
+                    )
+                })
+                .unwrap_or_else(|| "unknown".to_owned());
+            emit_global_telemetry(
+                "app.panic",
+                &[("message", &message), ("location", &location)],
+            );
+            previous_hook(info);
+        }));
+    });
+}
+
+fn write_telemetry_line(sink: &TelemetrySink, event: &str, fields: &[(&str, &str)]) {
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(sink.session_path.join("session.jsonl"))
+    else {
+        return;
+    };
+
+    let mut line = format!(
+        "{{\"schema_version\":1,\"session_id\":\"{}\",\"timestamp_ms\":{},\"event\":\"{}\"",
+        json_escape(&sink.session_id),
+        unix_ms(),
+        json_escape(event)
+    );
+    for (key, value) in fields {
+        line.push_str(&format!(
+            ",\"{}\":\"{}\"",
+            json_escape(key),
+            json_escape(value)
+        ));
+    }
+    line.push_str("}\n");
+    let _ = file.write_all(line.as_bytes());
+    if let Some(server) = DEBUG_SERVER.get() {
+        server.broadcast(&line);
+    }
+}
+
 struct TelemetrySession {
     session_id: String,
     session_path: Option<PathBuf>,
@@ -6798,32 +11276,9 @@ impl TelemetrySession {
     }
 
     fn emit(&self, event: &str, fields: &[(&str, &str)]) {
-        let Some(path) = &self.session_path else {
-            return;
-        };
-        let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path.join("session.jsonl"))
-        else {
-            return;
-        };
-
-        let mut line = format!(
-            "{{\"schema_version\":1,\"session_id\":\"{}\",\"timestamp_ms\":{},\"event\":\"{}\"",
-            json_escape(&self.session_id),
-            unix_ms(),
-            json_escape(event)
-        );
-        for (key, value) in fields {
-            line.push_str(&format!(
-                ",\"{}\":\"{}\"",
-                json_escape(key),
-                json_escape(value)
-            ));
+        if let Some(sink) = self.sink() {
+            write_telemetry_line(&sink, event, fields);
         }
-        line.push_str("}\n");
-        let _ = file.write_all(line.as_bytes());
     }
 
     fn display_path(&self) -> String {
@@ -6831,6 +11286,40 @@ impl TelemetrySession {
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "disabled".to_owned())
+    }
+
+    fn sink(&self) -> Option<TelemetrySink> {
+        self.session_path.as_ref().map(|path| TelemetrySink {
+            session_id: self.session_id.clone(),
+            session_path: path.clone(),
+        })
+    }
+}
+
+fn write_recorded_live_js_debug_artifact(
+    telemetry: &TelemetrySession,
+    source: &str,
+    live_js_debug_text: &str,
+) {
+    let output_dir = Path::new(URL_SCREENSHOTS_DIR);
+    let output_path = output_dir.join("last_live_js_debug.txt");
+    match fs::create_dir_all(output_dir).and_then(|_| fs::write(&output_path, live_js_debug_text)) {
+        Ok(()) => telemetry.emit(
+            "live_js_debug.artifact.written",
+            &[
+                ("url", source),
+                ("path", &output_path.display().to_string()),
+                ("bytes", &live_js_debug_text.len().to_string()),
+            ],
+        ),
+        Err(error) => telemetry.emit(
+            "live_js_debug.artifact.failed",
+            &[
+                ("url", source),
+                ("path", &output_path.display().to_string()),
+                ("error", &error.to_string()),
+            ],
+        ),
     }
 }
 
@@ -6965,6 +11454,44 @@ mod tests {
         assert_eq!(div.style.width, Some(380.0));
         assert_eq!(leaf.style.color, egui::Color32::from_rgb(68, 85, 102));
         assert_eq!(leaf.style.font_size, 20.0);
+    }
+
+    #[test]
+    fn render_graph_width_auto_overrides_earlier_percentage_width() {
+        let html = r#"
+            <html>
+              <head>
+                <style>
+                  .button { width: 100%; }
+                  .button.compact { width: auto; }
+                </style>
+              </head>
+              <body>
+                <a id="target" class="button compact">Sign in</a>
+              </body>
+            </html>
+        "#;
+        let html = remove_html_comments(html);
+        let dom = parse_dom_document(&html);
+        let style = rich_canvas::parse_basic_css(extract_tag_inner(&html, "style").unwrap_or(""));
+        let graph = build_render_graph(&dom, &style);
+        let target = find_render_element_by_id(&graph.root, "target").unwrap();
+
+        assert_eq!(target.style.width, None);
+    }
+
+    #[test]
+    fn canvas_debug_line_index_parses_only_object_rows() {
+        assert_eq!(
+            parse_canvas_debug_line_index("0004 Image rect=(0,0)"),
+            Some(4)
+        );
+        assert_eq!(
+            parse_canvas_debug_line_index("CanvasGraph viewport=1x1"),
+            None
+        );
+        assert_eq!(parse_canvas_debug_line_index("0004Image rect=(0,0)"), None);
+        assert_eq!(parse_canvas_debug_line_index("abcd Image rect=(0,0)"), None);
     }
 
     #[test]
@@ -7296,6 +11823,295 @@ mod tests {
     }
 
     #[test]
+    fn flex_svg_item_uses_explicit_width_for_rasterized_svg() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  .row { display: flex; width: 200px; }
+                  .logo { display: flex; margin-right: 24px; }
+                  svg { width: 70px; height: 20px; }
+                </style>
+              </head>
+              <body>
+                <div class="row">
+                  <div class="logo">
+                    <svg viewBox="0 0 70 20" aria-label="logo">
+                      <path fill="#ffffff" d="M0 0h70v20H0z"></path>
+                    </svg>
+                  </div>
+                  <span>Next</span>
+                </div>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let image_rect = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Image(image) if image.src == "inline-svg-raster" => Some(image.rect),
+                _ => None,
+            })
+            .expect("expected path-only SVG to rasterize into a visible image");
+
+        assert!(
+            image_rect.width() >= 69.0,
+            "expected 70px rasterized svg width, got {}",
+            image_rect.width()
+        );
+    }
+
+    #[test]
+    fn positioned_positive_z_index_paints_after_normal_siblings() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .header {
+                    position: sticky;
+                    z-index: 3;
+                    width: 200px;
+                    height: 48px;
+                    background: #ff0000;
+                  }
+                  .hero {
+                    margin-top: -24px;
+                    width: 200px;
+                    height: 96px;
+                    background: #00ff00;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="header"></div>
+                <div class="hero"></div>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let mut header_index = None;
+        let mut hero_index = None;
+        for (index, object) in document.canvas_graph.objects.iter().enumerate() {
+            if let CanvasObject::Rect(rect) = object {
+                if rect.fill == egui::Color32::from_rgb(0xff, 0x00, 0x00) {
+                    header_index = Some(index);
+                } else if rect.fill == egui::Color32::from_rgb(0x00, 0xff, 0x00) {
+                    hero_index = Some(index);
+                }
+            }
+        }
+
+        let header_index = header_index.expect("expected header background rect");
+        let hero_index = hero_index.expect("expected hero background rect");
+        assert!(
+            header_index > hero_index,
+            "expected z-index header to paint after hero, got header={header_index}, hero={hero_index}"
+        );
+    }
+
+    #[test]
+    fn absolute_icon_button_in_zero_height_wrapper_keeps_button_rect() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .search { display: flex; width: 120px; height: 56px; background: #333333; }
+                  .left { position: relative; width: 40px; }
+                  button {
+                    position: absolute;
+                    top: 12px;
+                    right: 0;
+                    min-width: 32px;
+                    height: 32px;
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    border-radius: 9999px;
+                    background: #deded9;
+                    border: 0;
+                  }
+                  svg { width: 16px; height: 16px; }
+                </style>
+              </head>
+              <body>
+                <div class="search">
+                  <div class="left">
+                    <button type="submit" aria-label="Search">
+                      <svg viewBox="0 0 16 16" aria-hidden="true">
+                        <path fill="#ffffff" d="M1 1h14v14H1z"></path>
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let button_rect = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0xde, 0xde, 0xd9) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("expected positioned button background");
+        let icon_rect = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Image(image) if image.src == "inline-svg-raster" => Some(image.rect),
+                _ => None,
+            })
+            .expect("expected positioned button icon");
+
+        assert!(
+            button_rect.width() >= 32.0,
+            "expected non-zero button width, got {:?}",
+            button_rect
+        );
+        assert!(
+            button_rect.height() >= 32.0,
+            "expected non-zero button height, got {:?}",
+            button_rect
+        );
+        assert!(
+            button_rect.contains_rect(icon_rect),
+            "expected icon {:?} to be inside button {:?}",
+            icon_rect,
+            button_rect
+        );
+    }
+
+    #[test]
+    fn form_textbox_and_submit_button_share_canvas_form_id() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <body>
+                <form id="search-form">
+                  <input name="q" placeholder="Search the web..." value="trees">
+                  <button type="submit" aria-label="Search">
+                    <svg viewBox="0 0 16 16"><path d="M1 1h14v14H1z"></path></svg>
+                  </button>
+                </form>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let input = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Input(input) if input.label == "Search the web..." => Some(input),
+                _ => None,
+            })
+            .expect("expected form textbox");
+        let button = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Button(button) if button.text == "Search" => Some(button),
+                _ => None,
+            })
+            .expect("expected form submit button");
+
+        assert_eq!(input.form_id.as_deref(), Some("search-form"));
+        assert_eq!(button.form_id.as_deref(), Some("search-form"));
+        assert_eq!(button.button_type, "submit");
+    }
+
+    #[test]
+    fn absolute_child_positions_from_padding_box_not_content_box() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .hero {
+                    position: relative;
+                    padding-top: 64px;
+                    width: 400px;
+                    height: 200px;
+                    overflow: hidden;
+                  }
+                  svg {
+                    position: absolute;
+                    top: 0;
+                    left: 0;
+                    width: 100%;
+                    height: 100%;
+                    object-fit: cover;
+                  }
+                </style>
+              </head>
+              <body>
+                <section class="hero">
+                  <picture>
+                    <svg viewBox="0 0 16 16"><path d="M0 0h16v16H0z"></path></svg>
+                  </picture>
+                </section>
+              </body>
+            </html>
+            "##,
+            "file:///tmp/test.html",
+        );
+
+        let image = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Image(image) if image.src == "inline-svg-raster" => Some(image),
+                _ => None,
+            })
+            .expect("expected absolute image");
+
+        assert_eq!(image.rect.top(), 0.0);
+        assert!(
+            (image.rect.width() - 400.0).abs() < 0.1,
+            "expected absolute image to fill the positioned section width, got {:?}",
+            image.rect
+        );
+        assert!(
+            (image.rect.height() - 264.0).abs() < 0.1,
+            "expected absolute image to fill the positioned section padding box, got {:?}",
+            image.rect
+        );
+    }
+
+    #[test]
+    fn document_without_explicit_theme_uses_context_dark_root_class() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+        let dom = parse_dom_document("<html><body>Dark inferred</body></html>");
+
+        assert_eq!(document_theme_root_classes(&dom, Some(&ctx)), vec!["dark"]);
+    }
+
+    #[test]
     fn flex_textarea_wrapper_grows_between_button_sections() {
         let document = parse_html_document(
             r#"
@@ -7367,6 +12183,50 @@ mod tests {
     }
 
     #[test]
+    fn grid_template_areas_position_items_by_declared_names() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .grid {
+                    display: grid;
+                    grid-template-areas:
+                      "side main"
+                      "foot foot";
+                    grid-template-columns: 1fr 1fr;
+                    gap: 10px;
+                    width: 410px;
+                  }
+                  .main { grid-area: main; }
+                  .side { grid-area: side; }
+                  .foot { grid-area: foot; }
+                </style>
+              </head>
+              <body>
+                <div class="grid">
+                  <div class="main">Main</div>
+                  <div class="side">Side</div>
+                  <div class="foot">Foot</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let main = find_canvas_text(&document.canvas_graph, "Main").expect("expected main");
+        let side = find_canvas_text(&document.canvas_graph, "Side").expect("expected side");
+        let foot = find_canvas_text(&document.canvas_graph, "Foot").expect("expected foot");
+
+        assert_eq!(main.rect.top(), side.rect.top());
+        assert!(main.rect.left() > side.rect.right());
+        assert!(foot.rect.top() > side.rect.top());
+        assert!(foot.rect.left() <= side.rect.left() + 1.0);
+    }
+
+    #[test]
     fn canvas_graph_uses_flex_row_positions_from_layout_tree() {
         let document = parse_html_document(
             r#"
@@ -7394,6 +12254,115 @@ mod tests {
 
         assert_eq!(first.rect.top(), second.rect.top());
         assert!(second.rect.left() - first.rect.left() >= 120.0);
+    }
+
+    #[test]
+    fn flex_row_auto_margin_absorbs_free_space() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  .row {
+                    display: flex;
+                    flex-direction: row;
+                    width: 500px;
+                  }
+                  .left { width: 40px; }
+                  .spacer { margin-left: auto; width: 1px; }
+                  .right { width: 80px; }
+                </style>
+              </head>
+              <body>
+                <div class="row">
+                  <div class="left">Left</div>
+                  <div class="spacer"></div>
+                  <div class="right">Right</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let left = find_canvas_text(&document.canvas_graph, "Left").expect("expected left text");
+        let right = find_canvas_text(&document.canvas_graph, "Right").expect("expected right text");
+
+        assert_eq!(left.rect.top(), right.rect.top());
+        assert!(right.rect.left() > 410.0, "right rect was {:?}", right.rect);
+    }
+
+    #[test]
+    fn flex_grow_item_uses_auto_base_before_free_space_distribution() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .row { display: flex; width: 200px; }
+                  .title { flex-grow: 1; font-size: 32px; }
+                  .tools { width: 160px; }
+                </style>
+              </head>
+              <body>
+                <div class="row">
+                  <h1 class="title">Hello world</h1>
+                  <div class="tools">Tools</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let title =
+            find_canvas_text(&document.canvas_graph, "Hello world").expect("expected full title");
+        let tools = find_canvas_text(&document.canvas_graph, "Tools").expect("expected tools");
+
+        assert!(tools.rect.left() > title.rect.left());
+    }
+
+    #[test]
+    fn flex_row_width_percent_uses_actual_containing_block() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  header { padding: 0 24px; }
+                  .nav {
+                    display: flex;
+                    flex-direction: row;
+                    width: 100%;
+                  }
+                  .logo { width: 70px; }
+                  .spacer { margin-left: auto; width: 1px; }
+                  .action { width: 80px; }
+                </style>
+              </head>
+              <body>
+                <header>
+                  <div class="nav">
+                    <div class="logo">Logo</div>
+                    <div class="spacer"></div>
+                    <div class="action">Action</div>
+                  </div>
+                </header>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let action =
+            find_canvas_text(&document.canvas_graph, "Action").expect("expected action text");
+
+        assert!(
+            action.rect.left() > 1100.0,
+            "action should be near the full header right edge, got {:?}",
+            action.rect
+        );
     }
 
     #[test]
@@ -7446,6 +12415,60 @@ mod tests {
         assert!(ai_chat.rect.left() > placeholder.rect.right());
         assert_eq!(ai_chat.color, egui::Color32::WHITE);
         assert!(ai_chat.font_weight_bold);
+    }
+
+    #[test]
+    fn percent_height_in_auto_height_flex_context_does_not_use_width() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .search {
+                    display: flex;
+                    align-items: center;
+                    width: 800px;
+                    height: 100%;
+                    background: #333333;
+                    border: 1px solid #6c6c6c;
+                    border-radius: 40px;
+                  }
+                  .left { width: 40px; }
+                  .input { flex: 1; }
+                  textarea { margin: 16px 16px 16px 8px; }
+                </style>
+              </head>
+              <body>
+                <div class="search">
+                  <div class="left"></div>
+                  <div class="input"><textarea placeholder="Search the web..."></textarea></div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let search_rect = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0x33, 0x33, 0x33) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("expected search field background");
+
+        assert!(
+            search_rect.height() < 100.0,
+            "percentage height in an indefinite container should stay intrinsic, got {:?}",
+            search_rect
+        );
     }
 
     #[test]
@@ -7613,6 +12636,492 @@ mod tests {
             portable_bookmark_url(&url),
             "file:///[local]/sample_pages/test_basic_page.html"
         );
+    }
+
+    #[test]
+    fn script_test_bookmarks_cover_generated_unit_tests() {
+        let bookmarks = script_test_bookmarks();
+
+        assert_eq!(bookmarks.len(), 41);
+        assert!(bookmarks[0].title.starts_with("001 "));
+        assert!(
+            bookmarks[0]
+                .url
+                .ends_with("/JustBarelyScript/UnitTest/001-basic-script-execution/index.html")
+        );
+        assert!(
+            bookmarks[40]
+                .url
+                .ends_with("/JustBarelyScript/UnitTest/041-proxy/index.html")
+        );
+    }
+
+    #[test]
+    fn script_console_messages_include_logs_and_parse_errors() {
+        let messages = script_console_messages_from_html(
+            r#"
+            <script>console.log("ready");</script>
+            <script>let = ;</script>
+            "#,
+        );
+
+        assert!(messages.iter().any(|message| {
+            message.level == justbarelyscript::ConsoleLevel::Log && message.text == "ready"
+        }));
+        assert!(messages.iter().any(|message| message.level
+            == justbarelyscript::ConsoleLevel::Error
+            && message.text.contains("Parse error")));
+    }
+
+    #[test]
+    fn non_executable_script_types_are_not_parsed_as_javascript() {
+        let messages = script_console_messages_from_html(
+            r#"
+            <script type="application/json">{"page":"state"}</script>
+            <script type="application/ld+json">{"@context":"https://schema.org"}</script>
+            <script type="importmap">{"imports":{"x":"/x.js"}}</script>
+            <script type="module">console.log("module ran");</script>
+            <script>console.log("plain ran");</script>
+            "#,
+        );
+
+        assert!(messages.iter().any(|message| {
+            message.level == justbarelyscript::ConsoleLevel::Log && message.text == "module ran"
+        }));
+        assert!(messages.iter().any(|message| {
+            message.level == justbarelyscript::ConsoleLevel::Log && message.text == "plain ran"
+        }));
+        assert!(!messages.iter().any(|message| {
+            message.level == justbarelyscript::ConsoleLevel::Error
+                && message.text.contains("Parse error")
+        }));
+    }
+
+    #[test]
+    fn script_execution_seeds_navigator_and_screen_globals() {
+        let document = parse_html_document(
+            r#"
+            <div id="ua"></div>
+            <div id="screen"></div>
+            <script>
+            document.getElementById("ua").textContent = navigator.userAgent;
+            document.getElementById("screen").textContent = screen.width;
+            </script>
+            "#,
+            "file:///tmp/seeded-browser-globals.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "AlmostThere Browser/0.1.0").is_some());
+        assert!(
+            document.canvas_graph.objects.iter().any(|object| {
+                matches!(object, CanvasObject::Text(text) if text.text.parse::<u32>().is_ok())
+            }),
+            "expected numeric screen width text in canvas graph"
+        );
+    }
+
+    #[test]
+    fn same_origin_external_scripts_execute_in_document_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "almostthere-script-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp script dir");
+        fs::write(dir.join("a.js"), r#"window.value = "A";"#).expect("write first script");
+        fs::write(
+            dir.join("b.js"),
+            r#"document.getElementById("result").textContent = window.value + "B";"#,
+        )
+        .expect("write second script");
+
+        let html = r#"
+            <div id="result">Before</div>
+            <script src="a.js"></script>
+            <script src="b.js"></script>
+        "#;
+        let source = path_to_file_url(&dir.join("index.html"));
+        let document = parse_html_document(html, &source);
+
+        assert!(find_canvas_text(&document.canvas_graph, "AB").is_some());
+        assert!(find_canvas_text(&document.canvas_graph, "Before").is_none());
+    }
+
+    #[test]
+    fn external_script_parse_errors_are_reported_with_source_label() {
+        let dir = std::env::temp_dir().join(format!(
+            "almostthere-script-error-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp script dir");
+        fs::write(dir.join("bad.js"), "let = ;").expect("write bad script");
+
+        let html = r#"<script src="bad.js"></script>"#;
+        let source = path_to_file_url(&dir.join("index.html"));
+        let messages = script_console_messages_from_html_with_source(html, Some(&source));
+
+        assert!(messages.iter().any(|message| {
+            message.level == justbarelyscript::ConsoleLevel::Error
+                && message.text.contains("bad.js")
+                && message.text.contains("Parse error")
+        }));
+    }
+
+    #[test]
+    fn external_script_parse_errors_include_construct_diagnostics() {
+        let dir = std::env::temp_dir().join(format!(
+            "almostthere-script-diagnostic-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp script dir");
+        fs::write(
+            dir.join("bundle.js"),
+            r#"import runtime from "./runtime.js";
+            (window.webpackJsonp = window.webpackJsonp || []).push([["x"], {
+                1: function(module) {
+                    class Collector {}
+                    const run = async () => await fetch("/fingerprint");
+                    const pick = window?.navigator?.userAgent ?? "";
+                    const broken = ;
+                    module.exports = { Collector, run, pick };
+                }
+            }]);"#,
+        )
+        .expect("write diagnostic bundle");
+
+        let html = r#"<script src="bundle.js"></script>"#;
+        let source = path_to_file_url(&dir.join("index.html"));
+        let messages = script_console_messages_from_html_with_source(html, Some(&source));
+        let error = messages
+            .iter()
+            .find(|message| message.level == justbarelyscript::ConsoleLevel::Error)
+            .expect("expected parse diagnostic");
+
+        assert!(error.text.contains("bundle.js"));
+        assert!(error.text.contains("Unsupported constructs"));
+        assert!(error.text.contains("ES modules"));
+        assert!(error.text.contains("Webpack runtime"));
+        assert!(error.text.contains("class syntax"));
+        assert!(error.text.contains("async/await"));
+        assert!(error.text.contains("optional chaining"));
+        assert!(error.text.contains("nullish coalescing"));
+        assert!(error.text.contains("fetch"));
+    }
+
+    #[test]
+    fn fingerprint_suite_values_are_exposed_to_scripts() {
+        let expected = justbarelyscript::FingerprintSuite::detect();
+        let document = parse_html_document(
+            r#"
+            <div id="timezone"></div>
+            <div id="storage"></div>
+            <div id="canvas"></div>
+            <div id="location"></div>
+            <script>
+            localStorage.setItem("fp", "ok");
+            sessionStorage.session = "yes";
+            document.getElementById("timezone").textContent = new Date().getTimezoneOffset();
+            document.getElementById("storage").textContent = localStorage.getItem("fp") + "/" + sessionStorage.session;
+            var canvas = document.createElement("canvas");
+            document.getElementById("canvas").textContent = canvas.toDataURL();
+            document.getElementById("location").textContent = location.href;
+            </script>
+            "#,
+            "https://www.amiunique.org/fingerprint",
+        );
+
+        assert!(
+            find_canvas_text(
+                &document.canvas_graph,
+                &expected.timezone.offset_minutes.to_string()
+            )
+            .is_some()
+        );
+        assert!(find_canvas_text(&document.canvas_graph, "ok/yes").is_some());
+        assert!(
+            find_canvas_text(&document.canvas_graph, &expected.canvas.data_url).is_some(),
+            "expected precomputed canvas data URL to be exposed"
+        );
+        assert!(
+            find_canvas_text(
+                &document.canvas_graph,
+                "https://www.amiunique.org/fingerprint"
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn synthetic_amiunique_collector_renders_precomputed_js_attributes() {
+        let expected = justbarelyscript::FingerprintSuite::detect();
+        let document = parse_html_document(
+            r#"
+            <table>
+              <tbody id="js-attributes"><tr><td>No data available</td></tr></tbody>
+            </table>
+            <script>
+            var fp = window.__almostthereFingerprint;
+            document.getElementById("js-attributes").innerHTML =
+              "<tr><td>Canvas</td><td>" + fp.canvas + "</td></tr>" +
+              "<tr><td>Fonts</td><td>" + fp.fontsEnum + "</td></tr>" +
+              "<tr><td>Audio</td><td>" + fp.audio + "</td></tr>" +
+              "<tr><td>Modernizr</td><td>" + fp.modernizr + "</td></tr>" +
+              "<tr><td>Touch</td><td>" + fp.touchSupport + "</td></tr>";
+            </script>
+            "#,
+            "https://www.amiunique.org/fingerprint",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "No data available").is_none());
+        assert!(find_canvas_text(&document.canvas_graph, "Canvas").is_some());
+        assert!(find_canvas_text(&document.canvas_graph, &expected.canvas.data_url).is_some());
+        assert!(find_canvas_text(&document.canvas_graph, "Fonts").is_some());
+        assert!(
+            document.canvas_graph.objects.iter().any(|object| {
+                matches!(object, CanvasObject::Text(text) if text.text.contains("Arial--"))
+            }),
+            "expected rendered AMIUnique font availability tokens"
+        );
+        assert!(find_canvas_text(&document.canvas_graph, "Modernizr").is_some());
+        assert!(
+            find_canvas_text(
+                &document.canvas_graph,
+                &expected.modernizr.as_amiunique_string()
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn oversized_external_scripts_are_not_parsed_on_render_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "almostthere-large-script-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp script dir");
+        fs::write(dir.join("large.js"), "var x = 1;\n".repeat(500_000))
+            .expect("write large script");
+
+        let html = r#"
+            <div id="result">Still renders</div>
+            <script src="large.js"></script>
+        "#;
+        let source = path_to_file_url(&dir.join("index.html"));
+        let document = parse_html_document(html, &source);
+        let messages = script_console_messages_from_html_with_source(html, Some(&source));
+
+        assert!(find_canvas_text(&document.canvas_graph, "Still renders").is_some());
+        assert!(messages.iter().any(|message| {
+            message.level == justbarelyscript::ConsoleLevel::Error
+                && message.text.contains("exceeds parser budget")
+        }));
+    }
+
+    #[test]
+    fn oversized_inline_scripts_are_not_parsed_on_render_path() {
+        let html = format!(
+            r#"
+            <div id="result">SSR content remains visible</div>
+            <script>{}</script>
+            "#,
+            "var nuxtState = 1;\n".repeat(280_000)
+        );
+        let document = parse_html_document(&html, "https://example.test/fingerprint");
+        let messages = script_console_messages_from_html_with_source(
+            &html,
+            Some("https://example.test/fingerprint"),
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "SSR content remains visible").is_some());
+        assert!(messages.iter().any(|message| {
+            message.level == justbarelyscript::ConsoleLevel::Error
+                && message.text.contains("inline script skipped")
+                && message.text.contains("exceeds parser budget")
+        }));
+    }
+
+    #[test]
+    fn first_script_test_applies_text_content_effect() {
+        let document = parse_html_document(
+            include_str!("../../JustBarelyScript/UnitTest/001-basic-script-execution/index.html"),
+            "file:///tmp/001-basic-script-execution/index.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "After").is_some());
+        assert!(find_canvas_text(&document.canvas_graph, "Before").is_none());
+    }
+
+    #[test]
+    fn second_script_test_preserves_window_state_between_scripts() {
+        let document = parse_html_document(
+            include_str!(
+                "../../JustBarelyScript/UnitTest/002-multiple-script-tags-execute-in-order/index.html"
+            ),
+            "file:///tmp/002-multiple-script-tags-execute-in-order/index.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "AB").is_some());
+    }
+
+    #[test]
+    fn fourth_script_test_creates_and_appends_element() {
+        let document = parse_html_document(
+            include_str!("../../JustBarelyScript/UnitTest/004-element-creation/index.html"),
+            "file:///tmp/004-element-creation/index.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "Created by script").is_some());
+    }
+
+    #[test]
+    fn fifth_script_test_assigns_class_attribute() {
+        let html = apply_safe_script_browser_effects(include_str!(
+            "../../JustBarelyScript/UnitTest/005-css-class-assignment/index.html"
+        ));
+
+        assert!(html.contains(r#"<div id="box" class="active">Box</div>"#));
+    }
+
+    #[test]
+    fn sixth_script_test_reads_back_set_attribute() {
+        let document = parse_html_document(
+            include_str!(
+                "../../JustBarelyScript/UnitTest/006-setattribute-and-getattribute/index.html"
+            ),
+            "file:///tmp/006-setattribute-and-getattribute/index.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "ready").is_some());
+    }
+
+    #[test]
+    fn seventh_script_test_replaces_inner_html() {
+        let document = parse_html_document(
+            include_str!(
+                "../../JustBarelyScript/UnitTest/007-innerhtml-basic-replacement/index.html"
+            ),
+            "file:///tmp/007-innerhtml-basic-replacement/index.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "Hello").is_some());
+    }
+
+    #[test]
+    fn eighth_script_test_query_selector_by_id_reads_existing_text() {
+        let document = parse_html_document(
+            include_str!("../../JustBarelyScript/UnitTest/008-query-selector-by-id/index.html"),
+            "file:///tmp/008-query-selector-by-id/index.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "Hello").is_some());
+    }
+
+    #[test]
+    fn ninth_script_test_query_selector_by_class_reads_first_match_without_id() {
+        let document = parse_html_document(
+            include_str!("../../JustBarelyScript/UnitTest/009-query-selector-by-class/index.html"),
+            "file:///tmp/009-query-selector-by-class/index.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "First").is_some());
+    }
+
+    #[test]
+    fn tenth_script_test_query_selector_all_length_counts_class_matches() {
+        let document = parse_html_document(
+            include_str!(
+                "../../JustBarelyScript/UnitTest/010-queryselectorall-and-length/index.html"
+            ),
+            "file:///tmp/010-queryselectorall-and-length/index.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "3").is_some());
+    }
+
+    #[test]
+    fn eleventh_script_test_for_loop_appends_list_items() {
+        let html = apply_safe_script_browser_effects(&remove_html_comments(include_str!(
+            "../../JustBarelyScript/UnitTest/011-for-loop-dom-update/index.html"
+        )));
+
+        assert!(html.contains("Item 0"), "html after effects: {html}");
+        assert!(html.contains("Item 1"), "html after effects: {html}");
+        assert!(html.contains("Item 2"), "html after effects: {html}");
+
+        let document = parse_html_document(
+            include_str!("../../JustBarelyScript/UnitTest/011-for-loop-dom-update/index.html"),
+            "file:///tmp/011-for-loop-dom-update/index.html",
+        );
+
+        assert!(find_canvas_text(&document.canvas_graph, "Item 0").is_some());
+        assert!(find_canvas_text(&document.canvas_graph, "Item 1").is_some());
+        assert!(find_canvas_text(&document.canvas_graph, "Item 2").is_some());
+    }
+
+    #[test]
+    fn twelfth_script_test_click_listener_fires_and_updates_result() {
+        let html =
+            include_str!("../../JustBarelyScript/UnitTest/012-event-listener-click/index.html");
+        let source = "file:///tmp/012-event-listener-click/index.html";
+
+        // Initial render shows "Not clicked".
+        let document = parse_html_document(html, source);
+        assert!(find_canvas_text(&document.canvas_graph, "Not clicked").is_some());
+        assert!(find_canvas_text(&document.canvas_graph, "Clicked").is_none());
+
+        // Button has element_id="button" in the canvas graph.
+        let button = document.canvas_graph.objects.iter().find_map(|o| {
+            if let CanvasObject::Button(b) = o {
+                Some(b)
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            button.map(|b| b.element_id.as_deref()),
+            Some(Some("button"))
+        );
+
+        // Script state registers a click listener on "button".
+        let mut state = build_script_state(html);
+        assert!(state.has_listener("button", "click"));
+
+        // Firing the click produces SetTextContent for "result".
+        let effects = state.fire_event("button", "click", None);
+        assert_eq!(
+            effects,
+            vec![justbarelyscript::BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "Clicked".to_owned(),
+            }]
+        );
+
+        // Applying the effect to live_html and re-parsing shows "Clicked".
+        let live_html = apply_safe_script_browser_effects(&remove_html_comments(html));
+        let live_html = set_element_text_content_by_id(&live_html, "result", "Clicked");
+        let updated = parse_html_document_from_live_html(&live_html, source, None);
+        assert!(find_canvas_text(&updated.canvas_graph, "Clicked").is_some());
+        assert!(find_canvas_text(&updated.canvas_graph, "Not clicked").is_none());
+    }
+
+    #[test]
+    fn safe_script_effect_replaces_element_text_by_id() {
+        let html = apply_safe_script_browser_effects(
+            r#"<div id="result">Before</div><script>document.getElementById("result").textContent = "After";</script>"#,
+        );
+
+        assert!(html.contains(r#"<div id="result">After</div>"#));
     }
 
     #[test]
@@ -7786,12 +13295,51 @@ mod tests {
                     && image.color_image.size == [2, 2]
         )));
         assert!(document.canvas_graph.objects.iter().any(|object| matches!(
-            object,
-            CanvasObject::Image(image)
-                if image.alt == "AVIF sample"
-                    && image.src.ends_with("/sample_pages/test_2x2.avif")
-                    && image.image.color_image.size == [2, 2]
+        object,
+        CanvasObject::Image(image)
+            if image.alt == "AVIF sample"
+                && image.src.ends_with("/sample_pages/test_2x2.avif")
+                && image.image.color_image.size == [2, 2]
         )));
+    }
+
+    #[test]
+    fn linked_inline_image_inside_block_gets_used_position() {
+        let html = r#"
+            <html>
+              <body>
+                <p>Before image.</p>
+                <figure>
+                  <a href="https://example.test/image">
+                    <img src="test_2x2.avif" alt="Linked image" width="40" height="40">
+                  </a>
+                  <figcaption>Caption</figcaption>
+                </figure>
+              </body>
+            </html>
+        "#;
+        let source = path_to_file_url(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../sample_pages/avif_test_page.html"
+        )));
+        let document = parse_html_document(html, &source);
+
+        let image = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Image(image) if image.alt == "Linked image" => Some(image),
+                _ => None,
+            })
+            .expect("expected linked image canvas object");
+
+        assert_eq!(image.rect.size(), egui::vec2(40.0, 40.0));
+        assert!(
+            image.rect.left() > 0.0 && image.rect.top() > 0.0,
+            "linked inline image should use its layout position, got {:?}",
+            image.rect
+        );
     }
 
     #[test]
@@ -7856,6 +13404,135 @@ mod tests {
         assert!(!rendered_text.contains("hidden attr text"));
         assert!(!rendered_text.contains("display none text"));
         assert!(!rendered_text.contains("aria hidden text"));
+    }
+
+    #[test]
+    fn render_graph_dump_excludes_non_visual_metadata_text() {
+        let html = r#"
+            <html>
+              <head>
+                <style>p { color: rgb(10, 20, 30); }</style>
+              </head>
+              <body>
+                <script>window.__NUXT__ = "large state payload";</script>
+                <template>template payload</template>
+                <noscript>noscript payload</noscript>
+                <p>Visible text</p>
+              </body>
+            </html>
+        "#;
+        let dump = parse_render_graph_debug_dump(html, "https://example.test/");
+
+        assert!(dump.contains("Visible text"));
+        assert!(!dump.contains("window.__NUXT__"));
+        assert!(!dump.contains("template payload"));
+        assert!(!dump.contains("noscript payload"));
+    }
+
+    #[test]
+    fn live_js_debug_report_marks_budget_exhaustion() {
+        let html = r#"
+            <html>
+              <body>
+                <script>while (true) { var x = 1; }</script>
+              </body>
+            </html>
+        "#;
+        let report = live_js_debug_report(html, Some("https://example.test/"));
+
+        assert!(report.contains("Live JS Debug"));
+        assert!(report.contains("status: executed"));
+        assert!(report.contains("statement budget exhausted"));
+        assert!(report.contains("budget_exhausted: 1"));
+    }
+
+    #[test]
+    fn page_load_continues_when_script_budget_is_exhausted() {
+        let html = r#"
+            <html>
+              <body>
+                <p>Still visible</p>
+                <script>while (true) { var x = 1; }</script>
+              </body>
+            </html>
+        "#;
+        let document = parse_html_document(html, "https://example.test/");
+        let messages =
+            script_console_messages_from_html_with_source(html, Some("https://example.test/"));
+
+        assert!(find_canvas_text(&document.canvas_graph, "Still visible").is_some());
+        assert!(messages.iter().any(|message| {
+            message.level == justbarelyscript::ConsoleLevel::Error
+                && message.text.contains("execution stopped")
+        }));
+    }
+
+    #[test]
+    fn hydration_fallback_reveals_hidden_ssr_article_content() {
+        let dir = std::env::temp_dir().join(format!(
+            "almostthere-hydration-fallback-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp script dir");
+        fs::write(dir.join("hydrate.js"), "function () {").expect("write hydration script");
+
+        let html = r#"
+            <style>
+              .ssr-card { visibility: hidden; }
+            </style>
+            <main>
+              <div class="ssr-card">
+                <article>
+                  <a href="https://example.test/result">Server rendered result title</a>
+                  <p>Server rendered result body that should remain available without hydration.</p>
+                </article>
+              </div>
+            </main>
+            <script src="hydrate.js" type="module"></script>
+        "#;
+        let source = path_to_file_url(&dir.join("index.html"));
+        let document = parse_html_document(html, &source);
+
+        assert!(document.canvas_graph.objects.iter().any(|object| matches!(
+            object,
+            CanvasObject::Text(text) if text.text.contains("Server rendered result title")
+        )));
+    }
+
+    #[test]
+    fn hydration_fallback_does_not_reveal_absolute_hidden_menus() {
+        let dir = std::env::temp_dir().join(format!(
+            "almostthere-hydration-menu-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp script dir");
+        fs::write(dir.join("hydrate.js"), "function () {").expect("write hydration script");
+
+        let html = r#"
+            <style>
+              .menu { visibility: hidden; position: absolute; }
+            </style>
+            <nav class="menu">
+              <a href="/settings">Hidden menu link with enough text to look meaningful</a>
+            </nav>
+            <p>Visible page text</p>
+            <script src="hydrate.js" type="module"></script>
+        "#;
+        let source = path_to_file_url(&dir.join("index.html"));
+        let document = parse_html_document(html, &source);
+
+        assert!(find_canvas_text(&document.canvas_graph, "Visible page text").is_some());
+        assert!(!document.canvas_graph.objects.iter().any(|object| matches!(
+            object,
+            CanvasObject::Text(text)
+                if text.text.contains("Hidden menu link with enough text to look meaningful")
+        )));
     }
 
     #[test]

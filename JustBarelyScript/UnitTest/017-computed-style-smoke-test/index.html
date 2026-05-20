@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    #box {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div id="box"></div>
+  <div id="result"></div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0017]: Computed style smoke test. Expected: #result text becomes block.");
+    let style = getComputedStyle(document.getElementById("box"));
+    document.getElementById("result").textContent = style.display;
+  </script>
+</body>
+</html>

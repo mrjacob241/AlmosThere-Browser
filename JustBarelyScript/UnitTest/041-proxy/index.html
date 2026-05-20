@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    #result { font-weight: bold; }
+    #result.pass { color: green; }
+    #result.fail { color: red; }
+    pre { background: #f4f4f4; padding: 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <p>Test 041: <code>Proxy</code></p>
+  <pre id="detail"></pre>
+  <div id="result">fail</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0041]: Proxy. get trap returns fallback for missing properties. set trap intercepts writes. Expected: #result text becomes Alice/missing/intercepted.");
+
+    // get trap: return fallback for missing properties
+    // uses undefined check — no 'in' operator needed
+    var readHandler = {
+      get: function(target, prop) {
+        var value = target[prop];
+        if (value === undefined) { return "missing"; }
+        return value;
+      }
+    };
+    var user = new Proxy({ name: "Alice", age: 30 }, readHandler);
+    var r1 = user.name;
+    var r2 = user.unknown;
+
+    // set trap: intercept writes and log them
+    var log = [];
+    var writeHandler = {
+      set: function(target, prop, value) {
+        log.push(prop + "=" + String(value));
+        target[prop] = value;
+        return true;
+      }
+    };
+    var store = new Proxy({}, writeHandler);
+    store.x = 42;
+    store.y = 99;
+    var r3 = log[0];
+    var r4 = log[1];
+    var r5 = store.x;
+
+    var passed = r1 === "Alice" && r2 === "missing" && r3 === "x=42" && r4 === "y=99" && r5 === 42;
+
+    document.getElementById("detail").textContent =
+      "get known:   " + r1 + "\n" +
+      "get missing: " + r2 + "\n" +
+      "set log[0]:  " + r3 + "\n" +
+      "set log[1]:  " + r4 + "\n" +
+      "store.x:     " + String(r5);
+
+    document.getElementById("result").textContent = passed
+      ? "Alice/missing/intercepted"
+      : "fail (r1=" + r1 + " r2=" + r2 + " r3=" + r3 + " r4=" + r4 + " r5=" + String(r5) + ")";
+    document.getElementById("result").className = passed ? "pass" : "fail";
+  </script>
+</body>
+</html>

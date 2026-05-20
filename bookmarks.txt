@@ -3,8 +3,6 @@ HTML5 Test Page	https://latex.vercel.app/elements
 Ecosia	https://www.ecosia.org/
 Ecosia - Offline	file:///[local]/sample_pages/Ecosia%20-%20Offline.html
 hello world - Ecosia	file:///[local]/sample_pages/hello%20world%20-%20Ecosia.html
+hello world - Ecosia - Live Unhidden	file:///[local]/sample_pages/diagnostics/ecosia_hello_world_live_unhidden.html
 Hello world - Wikipedia	file:///[local]/sample_pages/Hello%20world%20-%20Wikipedia.html
 Ecosia Fixture 03 - Hero Picture AVIF Overlay	file:///[local]/sample_pages/Ecosia_Offline_Test/03_hero_picture_avif_overlay.html
-AlmostThere Sample Page	file:///[local]/sample_pages/test_basic_page.html
-AlmostThere Sample Page	file:///[local]/sample_pages/test_basic_page.html
-AlmostThere Sample Page	file:///[local]/sample_pages/test_basic_page.html

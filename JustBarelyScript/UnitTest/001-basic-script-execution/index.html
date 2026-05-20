@@ -1,0 +1,12 @@
+<!doctype html>
+<html>
+<body>
+  <div id="result">Before</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0001]: Basic script execution. Expected: #result text changes from Before to After.");
+    document.getElementById("result").textContent = "After";
+  </script>
+</body>
+</html>

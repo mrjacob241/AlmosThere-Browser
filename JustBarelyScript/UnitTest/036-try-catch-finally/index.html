@@ -1,0 +1,76 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    #result { font-weight: bold; }
+    #result.pass { color: green; }
+    #result.fail { color: red; }
+    pre { background: #f4f4f4; padding: 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <p>Test 036: <code>try</code> / <code>catch</code> / <code>finally</code></p>
+  <pre id="detail"></pre>
+  <div id="result">fail</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0036]: try/catch/finally. throw should be caught, finally should always run, code after try block should continue. Expected: #result text becomes caught/finally/ok.");
+
+    var log = "";
+
+    // throw a plain string — no Error constructor needed
+    try {
+      throw "oops";
+      log += "unreachable";
+    } catch (e) {
+      log += "caught";
+    }
+
+    // finally always runs whether or not there was a throw
+    try {
+      throw "again";
+    } catch (e) {
+      log += "/finally-catch";
+    } finally {
+      log += "/finally";
+    }
+
+    // execution continues after try/catch
+    log += "/ok";
+
+    // finally without throw
+    var cleanupRan = false;
+    try {
+      var x = 1 + 1;
+    } finally {
+      cleanupRan = true;
+    }
+
+    // re-throw: outer catch picks it up
+    var rethrown = false;
+    try {
+      try {
+        throw "inner";
+      } catch (e) {
+        throw e;
+      }
+    } catch (e) {
+      rethrown = e === "inner";
+    }
+
+    var passed = log === "caught/finally-catch/finally/ok" && cleanupRan && rethrown;
+
+    document.getElementById("detail").textContent =
+      "log:         " + log + "\n" +
+      "cleanupRan:  " + String(cleanupRan) + "\n" +
+      "rethrown:    " + String(rethrown);
+
+    document.getElementById("result").textContent = passed
+      ? "caught/finally/ok"
+      : "fail (log=" + log + " cleanup=" + String(cleanupRan) + " rethrown=" + String(rethrown) + ")";
+    document.getElementById("result").className = passed ? "pass" : "fail";
+  </script>
+</body>
+</html>

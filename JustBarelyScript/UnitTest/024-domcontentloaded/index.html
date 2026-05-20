@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+<body>
+  <div id="result">Before</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0024]: DOMContentLoaded. Expected: after parsing completes, #result text becomes Ready.");
+    document.addEventListener("DOMContentLoaded", function () {
+      document.getElementById("result").textContent = "Ready";
+    });
+  </script>
+</body>
+</html>

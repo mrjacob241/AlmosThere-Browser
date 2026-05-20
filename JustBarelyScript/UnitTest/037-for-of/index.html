@@ -1,0 +1,59 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    #result { font-weight: bold; }
+    #result.pass { color: green; }
+    #result.fail { color: red; }
+    pre { background: #f4f4f4; padding: 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <p>Test 037: <code>for...of</code></p>
+  <pre id="detail"></pre>
+  <div id="result">fail</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0037]: for...of loop. Iterating arrays and strings with for...of. Expected: #result text becomes 6/hello.");
+
+    // iterate array, sum values
+    var nums = [1, 2, 3];
+    var sum = 0;
+    for (var n of nums) {
+      sum = sum + n;
+    }
+
+    // iterate string characters
+    var word = "";
+    for (var ch of "hello") {
+      word = word + ch;
+    }
+
+    // for...of with NodeList (querySelectorAll result)
+    var items = document.querySelectorAll(".item");
+    var nodeCount = 0;
+    for (var el of items) {
+      nodeCount = nodeCount + 1;
+    }
+
+    var passed = sum === 6 && word === "hello";
+    document.getElementById("detail").textContent =
+      "sum:       " + String(sum) + "\n" +
+      "word:      " + word + "\n" +
+      "nodeCount: " + String(nodeCount);
+
+    document.getElementById("result").textContent = passed
+      ? "6/hello"
+      : "fail (sum=" + String(sum) + " word=" + word + ")";
+    document.getElementById("result").className = passed ? "pass" : "fail";
+  </script>
+
+  <ul>
+    <li class="item">A</li>
+    <li class="item">B</li>
+    <li class="item">C</li>
+  </ul>
+</body>
+</html>

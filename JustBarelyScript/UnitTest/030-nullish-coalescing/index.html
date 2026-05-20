@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    #result { font-weight: bold; }
+    #result.pass { color: green; }
+    #result.fail { color: red; }
+    pre { background: #f4f4f4; padding: 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <p>Test 030: nullish coalescing <code>??</code></p>
+  <pre id="detail"></pre>
+  <div id="result">fail</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0030]: Nullish coalescing. null ?? 'default' should give 'default'. A real value should not be replaced. Expected: #result text becomes default/kept.");
+
+    var a = null;
+    var b = undefined;
+    var c = "kept";
+    var d = 0;
+
+    var ra = a ?? "default";
+    var rb = b ?? "default";
+    var rc = c ?? "replaced";
+    var rd = d ?? 99;
+
+    var passed = ra === "default" && rb === "default" && rc === "kept" && rd === 0;
+
+    document.getElementById("detail").textContent =
+      "null ?? 'default'     = " + ra + "\n" +
+      "undefined ?? 'default'= " + rb + "\n" +
+      "'kept' ?? 'replaced'  = " + rc + "\n" +
+      "0 ?? 99               = " + String(rd) + " (0 is not nullish)";
+
+    document.getElementById("result").textContent = passed ? "default/kept" : "fail (ra=" + ra + " rb=" + rb + " rc=" + rc + " rd=" + String(rd) + ")";
+    document.getElementById("result").className = passed ? "pass" : "fail";
+  </script>
+</body>
+</html>

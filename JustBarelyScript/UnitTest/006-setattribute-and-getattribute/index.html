@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<body>
+  <div id="box"></div>
+  <div id="result"></div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0006]: Attribute manipulation. Expected: data-state is set to ready and #result text becomes ready.");
+    let box = document.getElementById("box");
+    box.setAttribute("data-state", "ready");
+
+    document.getElementById("result").textContent =
+      box.getAttribute("data-state");
+  </script>
+</body>
+</html>

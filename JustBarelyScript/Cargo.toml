@@ -1,0 +1,7 @@
+[package]
+name = "justbarelyscript"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+libc = { workspace = true }

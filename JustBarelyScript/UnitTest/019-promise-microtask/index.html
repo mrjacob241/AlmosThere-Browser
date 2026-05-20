@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<body>
+  <div id="result"></div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0019]: Promise microtask ordering. Expected: #result text becomes AB after the timer observes microtask completion.");
+    let output = "";
+
+    Promise.resolve().then(function () {
+      output = output + "B";
+    });
+
+    output = output + "A";
+
+    setTimeout(function () {
+      document.getElementById("result").textContent = output;
+    }, 0);
+  </script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+<body>
+  <div id="root"></div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0004]: Element creation. Expected: #root receives a p element with text Created by script.");
+    let p = document.createElement("p");
+    p.textContent = "Created by script";
+    document.getElementById("root").appendChild(p);
+  </script>
+</body>
+</html>

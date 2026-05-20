@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    #result { font-weight: bold; }
+    #result.pass { color: green; }
+    #result.fail { color: red; }
+    pre { background: #f4f4f4; padding: 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <p>Test 028: increment and decrement <code>++</code> <code>--</code></p>
+  <pre id="detail"></pre>
+  <div id="result">fail</div>
+
+  <script>
+    console.log("Script test fixture loaded");
+    console.log("[TEST-0028]: Increment and decrement. n starts at 0, n++ twice then n-- once, result should be 1. Expected: #result text becomes 1.");
+
+    var n = 0;
+    var start = n;
+    n++;
+    var after1 = n;
+    n++;
+    var after2 = n;
+    n--;
+    var after3 = n;
+
+    var passed = after3 === 1;
+
+    document.getElementById("detail").textContent =
+      "start:     " + String(start) + "\n" +
+      "after n++: " + String(after1) + "\n" +
+      "after n++: " + String(after2) + "\n" +
+      "after n--: " + String(after3);
+
+    document.getElementById("result").textContent = passed ? String(after3) : "fail (got " + String(after3) + ")";
+    document.getElementById("result").className = passed ? "pass" : "fail";
+  </script>
+</body>
+</html>

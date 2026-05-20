@@ -29,6 +29,10 @@ mod browser_app {
         let html = response.text().map_err(std::io::Error::other)?;
         Ok((final_url, html))
     }
+
+    pub fn live_js_debug_for_capture(html: &str, source: &str) -> String {
+        live_js_debug_report(html, Some(source))
+    }
 }
 
 const OUTPUT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/url_screenshots");
@@ -48,9 +52,13 @@ fn main() -> io::Result<()> {
     if url.starts_with("http://") || url.starts_with("https://") {
         if let Ok((final_url, html)) = browser_app::fetch_html_for_capture(&url) {
             let html_path = Path::new(OUTPUT_DIR).join("last_capture.html");
+            let live_js_debug = browser_app::live_js_debug_for_capture(&html, &final_url);
+            let live_js_debug_path = Path::new(OUTPUT_DIR).join("last_live_js_debug.txt");
             fs::write(&html_path, html)?;
+            fs::write(&live_js_debug_path, live_js_debug)?;
             println!("html_url: {final_url}");
             println!("html_dump: {}", html_path.display());
+            println!("live_js_debug: {}", live_js_debug_path.display());
         }
     }
 
@@ -101,6 +109,7 @@ fn print_canvas_graph_summary(document: &BrowserDocument) {
             CanvasObject::Image(_) => images += 1,
             CanvasObject::Svg(_) => svgs += 1,
             CanvasObject::Media(_) => media += 1,
+            CanvasObject::Button(_) => {}
             CanvasObject::ClipStart(_) | CanvasObject::ClipEnd => {}
         }
     }
@@ -387,6 +396,7 @@ fn capture_browser_window_screenshot(
                 canvas: BrowserCanvas {
                     zoom: 1.0,
                     scroll_offset: egui::vec2(0.0, scroll_y),
+                    hovered_link_href: None,
                 },
                 document,
                 output_path,
