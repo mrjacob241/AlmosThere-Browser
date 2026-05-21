@@ -162,6 +162,7 @@ enum JsValue {
     Null,
     Boolean(bool),
     Number(f64),
+    BigInt(i64),
     String(String),
     Object(HashMap<String, JsValue>),
     Array(Vec<JsValue>),
@@ -390,6 +391,8 @@ impl BrowserExecutionState {
             "Symbol".into(),
             JsValue::HostFunction("Symbol".into()),
         );
+        self.globals.insert("escape".into(), JsValue::HostFunction("escape".into()));
+        self.globals.insert("unescape".into(), JsValue::HostFunction("unescape".into()));
         let mut perf = HashMap::new();
         perf.insert(
             "now".to_owned(),
@@ -914,8 +917,8 @@ impl BrowserExecutionState {
                 if let Some(EarlyExit::Throw(err_val)) = self.early_exit.take() {
                     if let Some(catch_body) = &tc.catch_body.clone() {
                         self.stack.push(StackFrame::default());
-                        if let Some(param) = &tc.catch_param {
-                            self.set_local(param, err_val);
+                        if let Some(param) = tc.catch_param.clone() {
+                            self.execute_binding(&param, err_val);
                         }
                         for stmt in &catch_body.body {
                             self.execute_statement(stmt);
@@ -1413,6 +1416,7 @@ impl BrowserExecutionState {
             Expression::Spread(_) | Expression::Super => JsValue::Undefined,
             Expression::Identifier(name) => self.get_identifier_value(name),
             Expression::Number(value) => JsValue::Number(*value),
+            Expression::BigInt(s) => JsValue::BigInt(s.parse().unwrap_or(0)),
             Expression::String(value) => JsValue::String(value.clone()),
             Expression::Regex(value) => {
                 let (pattern, flags) = parse_regex_literal(value);
@@ -4613,6 +4617,7 @@ impl BrowserExecutionState {
             | "webkitAudioContext"
             | "OfflineAudioContext"
             | "webkitOfflineAudioContext" => JsValue::HostFunction(name.to_owned()),
+            "escape" | "unescape" => JsValue::HostFunction(name.to_owned()),
             _ => JsValue::Undefined,
         })
     }
@@ -4668,6 +4673,15 @@ impl BrowserExecutionState {
         out
     }
 
+    fn build_arguments_object(args: &[JsValue]) -> JsValue {
+        let mut map = HashMap::new();
+        map.insert("length".to_owned(), JsValue::Number(args.len() as f64));
+        for (i, v) in args.iter().enumerate() {
+            map.insert(i.to_string(), v.clone());
+        }
+        JsValue::Object(map)
+    }
+
     fn bind_params(&mut self, params: &[Param], args: Vec<JsValue>) {
         let mut arg_idx = 0;
         for param in params {
@@ -4710,7 +4724,9 @@ impl BrowserExecutionState {
         self.ensure_global_frame();
         self.stack.push(StackFrame::function_scope());
         self.set_local("this", this_value);
+        let arguments_obj = Self::build_arguments_object(&args);
         self.bind_params(&func.params, args);
+        self.set_local("arguments", arguments_obj);
         let result = match func.body {
             FunctionBody::Block(block) => {
                 self.hoist_function_declarations(&block.body);
@@ -4771,7 +4787,9 @@ impl BrowserExecutionState {
         self.ensure_global_frame();
         self.stack.push(StackFrame::function_scope());
         self.set_local("this", this_value);
+        let arguments_obj = Self::build_arguments_object(&args);
         self.bind_params(&func.params, args);
+        self.set_local("arguments", arguments_obj);
         let result = match func.body {
             FunctionBody::Block(block) => {
                 self.hoist_function_declarations(&block.body);
@@ -4864,6 +4882,7 @@ impl BrowserExecutionState {
         match op {
             BinaryOperator::Add => match (&lv, &rv) {
                 (JsValue::Number(a), JsValue::Number(b)) => JsValue::Number(a + b),
+                (JsValue::BigInt(a), JsValue::BigInt(b)) => JsValue::BigInt(a + b),
                 _ => JsValue::String(format!(
                     "{}{}",
                     Self::value_to_string(&lv),
@@ -4946,6 +4965,7 @@ impl BrowserExecutionState {
             JsValue::Undefined | JsValue::Null => false,
             JsValue::Boolean(b) => *b,
             JsValue::Number(n) => *n != 0.0 && !n.is_nan(),
+            JsValue::BigInt(n) => *n != 0,
             JsValue::String(s) => !s.is_empty(),
             JsValue::Object(_)
             | JsValue::Array(_)
@@ -4973,6 +4993,7 @@ impl BrowserExecutionState {
     fn value_to_number(value: &JsValue) -> f64 {
         match value {
             JsValue::Number(n) => *n,
+            JsValue::BigInt(n) => *n as f64,
             JsValue::Boolean(true) => 1.0,
             JsValue::Boolean(false) => 0.0,
             JsValue::String(s) => s.trim().parse::<f64>().unwrap_or(f64::NAN),
@@ -5026,6 +5047,7 @@ impl BrowserExecutionState {
             | (JsValue::Null, JsValue::Undefined) => true,
             (JsValue::Boolean(a), JsValue::Boolean(b)) => a == b,
             (JsValue::Number(a), JsValue::Number(b)) => a == b,
+            (JsValue::BigInt(a), JsValue::BigInt(b)) => a == b,
             (JsValue::String(a), JsValue::String(b)) => a == b,
             _ => false,
         }
@@ -5037,6 +5059,7 @@ impl BrowserExecutionState {
             JsValue::Null => "object",
             JsValue::Boolean(_) => "boolean",
             JsValue::Number(_) => "number",
+            JsValue::BigInt(_) => "bigint",
             JsValue::String(_) => "string",
             JsValue::Function(_) => "function",
             JsValue::HostFunction(_) => "function",
@@ -5051,6 +5074,7 @@ impl BrowserExecutionState {
             JsValue::Undefined => "undefined".to_owned(),
             JsValue::Null => "null".to_owned(),
             JsValue::Boolean(value) => value.to_string(),
+            JsValue::BigInt(n) => n.to_string(),
             JsValue::Number(value) => {
                 if value.fract() == 0.0 && value.is_finite() {
                     (*value as i64).to_string()
@@ -5434,6 +5458,14 @@ impl BrowserExecutionState {
             }
             "Symbol.keyFor" => JsValue::Undefined,
             "performance.now" => JsValue::Number(self.current_time_ms as f64),
+            "escape" => {
+                let s = args.first().map(Self::value_to_string).unwrap_or_default();
+                JsValue::String(js_escape(&s))
+            }
+            "unescape" => {
+                let s = args.first().map(Self::value_to_string).unwrap_or_default();
+                JsValue::String(js_unescape(&s))
+            }
             _ => Self::host_function_default_return(name),
         }
     }
@@ -5557,7 +5589,7 @@ impl BrowserExecutionState {
             | JsValue::XhrInstance { .. }
             | JsValue::Proxy { .. }
             | JsValue::WeakMap(_) => Some("Object"),
-            JsValue::Undefined | JsValue::Null | JsValue::Boolean(_) | JsValue::Number(_) => None,
+            JsValue::Undefined | JsValue::Null | JsValue::Boolean(_) | JsValue::Number(_) | JsValue::BigInt(_) => None,
         }
     }
 
@@ -5602,6 +5634,7 @@ impl BrowserExecutionState {
             JsValue::ResolvedPromise => "Promise",
             JsValue::XhrInstance { .. } => "XMLHttpRequest",
             JsValue::WeakMap(_) => "WeakMap",
+            JsValue::BigInt(_) => "BigInt",
         }
     }
 
@@ -5732,15 +5765,54 @@ impl BrowserExecutionState {
         }
     }
 
+    fn normalize_regex_pattern(pattern: &str) -> String {
+        let chars: Vec<char> = pattern.chars().collect();
+        let mut out = String::with_capacity(pattern.len());
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '\\' && i + 1 < chars.len() {
+                match chars[i + 1] {
+                    '.' => { out.push('.'); i += 2; }
+                    '/' => { out.push('/'); i += 2; }
+                    '-' => { out.push('-'); i += 2; }
+                    '_' => { out.push('_'); i += 2; }
+                    's' => { out.push(' '); i += 2; }
+                    'n' => { out.push('\n'); i += 2; }
+                    't' => { out.push('\t'); i += 2; }
+                    'r' => { out.push('\r'); i += 2; }
+                    'd' => { out.push_str("[0-9]"); i += 2; }
+                    'w' => { out.push_str("[a-zA-Z0-9_]"); i += 2; }
+                    'x' => {
+                        // \xNN → char; incomplete \x (Annex B) → literal 'x'
+                        if i + 3 < chars.len()
+                            && chars[i + 2].is_ascii_hexdigit()
+                            && chars[i + 3].is_ascii_hexdigit()
+                        {
+                            let hex: String = chars[i + 2..=i + 3].iter().collect();
+                            if let Ok(n) = u8::from_str_radix(&hex, 16) {
+                                out.push(n as char);
+                            }
+                            i += 4;
+                        } else {
+                            // Annex B: treat as literal 'x'
+                            out.push('x');
+                            i += 2;
+                        }
+                    }
+                    c => { out.push('\\'); out.push(c); i += 2; }
+                }
+            } else {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
     fn simple_regex_test(pattern: &str, flags: &str, haystack: &str) -> bool {
-        let mut needle = pattern
-            .trim_start_matches('^')
-            .trim_end_matches('$')
-            .replace("\\.", ".")
-            .replace("\\/", "/")
-            .replace("\\-", "-")
-            .replace("\\_", "_")
-            .replace("\\s", " ");
+        let mut needle = Self::normalize_regex_pattern(
+            pattern.trim_start_matches('^').trim_end_matches('$'),
+        );
         needle = needle.replace(".*", "");
         let haystack = if flags.contains('i') {
             haystack.to_ascii_lowercase()
@@ -6246,6 +6318,7 @@ fn json_stringify(value: &JsValue) -> String {
         | JsValue::XhrInstance { .. }
         | JsValue::Proxy { .. }
         | JsValue::WeakMap(_) => "null".to_owned(),
+        JsValue::BigInt(n) => n.to_string(),
     }
 }
 
@@ -6291,6 +6364,56 @@ fn merge_inline_style(existing: &str, prop: &str, value: &str) -> String {
         .map(|(k, v)| format!("{k}: {v}"))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+fn js_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '@' | '*' | '_' | '+' | '-' | '.' | '/' => {
+                out.push(c);
+            }
+            c if (c as u32) < 256 => {
+                out.push_str(&format!("%{:02X}", c as u32));
+            }
+            c => {
+                out.push_str(&format!("%u{:04X}", c as u32));
+            }
+        }
+    }
+    out
+}
+
+fn js_unescape(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 1 < bytes.len() {
+            if i + 5 < bytes.len() && bytes[i + 1] == b'u' {
+                if let Ok(hex) = std::str::from_utf8(&bytes[i + 2..i + 6]) {
+                    if let Ok(n) = u32::from_str_radix(hex, 16) {
+                        if let Some(c) = char::from_u32(n) {
+                            out.push(c);
+                            i += 6;
+                            continue;
+                        }
+                    }
+                }
+            } else if i + 2 < bytes.len() {
+                if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                    if let Ok(n) = u8::from_str_radix(hex, 16) {
+                        out.push(n as char);
+                        i += 3;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -8887,5 +9010,114 @@ mod tests {
         let dom: Vec<_> = effects.iter().filter(|e| !matches!(e, BrowserEffect::RuntimeTrace{..})).cloned().collect();
         assert!(dom.iter().any(|e| matches!(e, BrowserEffect::SetTextContent{element_id,..} if element_id=="e374")),
             "e[374] must be set to the module factory: {dom:?}");
+    }
+
+    // ── ECMAScript conformance pinpoints ────────────────────────────────────
+    // Each test below currently FAILS, pinpointing a specific runtime-level
+    // root cause identified from the test262 first-1000 failure analysis.
+
+    #[test]
+    fn ecma_pinpoint_arguments_object_length() {
+        // Root cause 1: `arguments` implicit object not available inside functions.
+        // ~90 test262 failures; `verifyProperty` in propertyHelper.js guards on
+        // `arguments.length > 2` before doing anything useful.
+        let effects = run(r#"
+            function f(a, b, c) {
+                document.getElementById("result").textContent = String(arguments.length);
+            }
+            f(1, 2, 3);
+        "#);
+        assert!(
+            effects.iter().any(|e| matches!(e,
+                BrowserEffect::SetTextContent { element_id, value }
+                if element_id == "result" && value == "3"
+            )),
+            "arguments.length inside f(1,2,3) must be 3; got: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn ecma_pinpoint_arguments_object_index_access() {
+        // Root cause 1 (cont): `arguments[0]` indexed access.
+        let effects = run(r#"
+            function first() {
+                document.getElementById("result").textContent = String(arguments[0]);
+            }
+            first(42);
+        "#);
+        assert!(
+            effects.iter().any(|e| matches!(e,
+                BrowserEffect::SetTextContent { element_id, value }
+                if element_id == "result" && value == "42"
+            )),
+            "arguments[0] inside first(42) must be 42; got: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn ecma_pinpoint_typeof_escape_is_function() {
+        // Root cause 2: `escape` / `unescape` legacy built-ins not exposed as
+        // HostFunction in JBS globals. ~19 test262 failures (also Date annex,
+        // String HTML methods). `isConstructor.js` harness checks typeof.
+        let effects = run(r#"
+            document.getElementById("result").textContent = typeof escape;
+        "#);
+        assert!(
+            effects.iter().any(|e| matches!(e,
+                BrowserEffect::SetTextContent { element_id, value }
+                if element_id == "result" && value == "function"
+            )),
+            "typeof escape must be 'function'; got: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn ecma_pinpoint_typeof_unescape_is_function() {
+        // Root cause 2 (cont): `unescape` must also be a function.
+        let effects = run(r#"
+            document.getElementById("result").textContent = typeof unescape;
+        "#);
+        assert!(
+            effects.iter().any(|e| matches!(e,
+                BrowserEffect::SetTextContent { element_id, value }
+                if element_id == "result" && value == "function"
+            )),
+            "typeof unescape must be 'function'; got: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn ecma_pinpoint_regex_annex_b_incomplete_hex_escape() {
+        // Root cause 7: Annex B RegExp — `\x` with no following hex digits should
+        // match the literal character 'x' rather than being a parse error.
+        // ~6 test262 failures in annexB/language/literals/regexp.
+        let effects = run(r#"
+            var r = /\x/;
+            document.getElementById("result").textContent = String(r.test("x"));
+        "#);
+        assert!(
+            effects.iter().any(|e| matches!(e,
+                BrowserEffect::SetTextContent { element_id, value }
+                if element_id == "result" && value == "true"
+            )),
+            "/\\x/ must match literal 'x' per Annex B; got: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn ecma_pinpoint_bigint_runtime_typeof() {
+        // Root cause 4 (runtime): parser accepts `1n` but the runtime produces a
+        // Number not a BigInt, so `typeof 1n` returns "number" instead of "bigint".
+        // ~6 test262 failures in language/expressions/typeof and numeric-literals.
+        let effects = run(r#"
+            document.getElementById("result").textContent = typeof 1n;
+        "#);
+        assert!(
+            effects.iter().any(|e| matches!(e,
+                BrowserEffect::SetTextContent { element_id, value }
+                if element_id == "result" && value == "bigint"
+            )),
+            "typeof 1n must be 'bigint'; got: {effects:?}"
+        );
     }
 }

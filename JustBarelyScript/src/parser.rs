@@ -502,9 +502,13 @@ impl Parser {
 
         let catch = if self.eat(TokenKind::Catch) {
             let catch_param = if self.eat(TokenKind::LeftParen) {
-                let name = self.expect_identifier()?;
+                let binding = if matches!(self.current_kind(), TokenKind::LeftBrace | TokenKind::LeftBracket) {
+                    self.parse_binding()?
+                } else {
+                    Binding::Name(self.expect_identifier()?)
+                };
                 self.expect(TokenKind::RightParen)?;
-                Some(name)
+                Some(binding)
             } else {
                 None
             };
@@ -829,6 +833,11 @@ impl Parser {
                 };
                 self.advance();
                 Ok(Expression::Number(number))
+            }
+            TokenKind::BigInt(value) => {
+                let value = value.clone();
+                self.advance();
+                Ok(Expression::BigInt(value))
             }
             TokenKind::String(value) => {
                 let value = value.clone();
@@ -1353,6 +1362,9 @@ impl Parser {
             TokenKind::ShiftLeftEquals => Some(BinaryOperator::ShiftLeft),
             TokenKind::ShiftRightEquals => Some(BinaryOperator::ShiftRight),
             TokenKind::UnsignedShiftRightEquals => Some(BinaryOperator::UnsignedShiftRight),
+            TokenKind::AmpAmpEquals => Some(BinaryOperator::LogicalAnd),
+            TokenKind::PipePipeEquals => Some(BinaryOperator::LogicalOr),
+            TokenKind::QuestionQuestionEquals => Some(BinaryOperator::NullishCoalescing),
             _ => None,
         }
     }
@@ -1821,5 +1833,49 @@ mod tests {
         // const {[d]:n,[h]:o} = t — computed key in object destructuring.
         assert!(parse_script("const {[d]:n,[h]:o} = t;").is_ok());
         assert!(parse_script("var {[key]:val} = obj;").is_ok());
+    }
+
+    // ── ECMAScript conformance pinpoints ────────────────────────────────────
+    // Each test below currently FAILS, pinpointing a specific parse-level root
+    // cause identified from the test262 first-1000 failure analysis.
+
+    #[test]
+    fn ecma_pinpoint_catch_destructuring_object_pattern() {
+        // Root cause 3: `catch ({ binding })` object-pattern catch parameter not parsed.
+        // Affects ~8 tests in annexB/language/function-code and global-code.
+        assert!(parse_script("try { throw {}; } catch ({ message }) { }").is_ok());
+        assert!(parse_script("try { throw {}; } catch ({ a, b }) { }").is_ok());
+    }
+
+    #[test]
+    fn ecma_pinpoint_catch_destructuring_array_pattern() {
+        // Root cause 3 (cont): `catch ([a, b])` array-pattern catch parameter not parsed.
+        assert!(parse_script("try { throw [1,2]; } catch ([a, b]) { }").is_ok());
+    }
+
+    #[test]
+    fn ecma_pinpoint_bigint_literal_suffix() {
+        // Root cause 4: numeric literal with `n` suffix (BigInt) not lexed.
+        // Affects ~6 tests in language/expressions/numeric-literals and typeof.
+        assert!(parse_script("var x = 1n;").is_ok());
+        assert!(parse_script("var x = 0n;").is_ok());
+        assert!(parse_script("var x = 9007199254740991n;").is_ok());
+    }
+
+    #[test]
+    fn ecma_pinpoint_logical_assignment_operators() {
+        // Root cause 5: `&&=`, `||=`, `??=` compound-assignment operators not parsed.
+        // Affects ~3 tests in language/expressions/assignment.
+        assert!(parse_script("var x = 1; x &&= 2;").is_ok());
+        assert!(parse_script("var x = null; x ||= 2;").is_ok());
+        assert!(parse_script("var x = null; x ??= 2;").is_ok());
+    }
+
+    #[test]
+    fn ecma_pinpoint_generator_function_declaration() {
+        // Root cause 9: `function*` generator declaration and `yield` expression not parsed.
+        // Affects ~2 tests; generators are low-priority, skip-worthy via flag.
+        assert!(parse_script("function* gen() { yield 1; yield 2; }").is_ok());
+        assert!(parse_script("function* gen() { yield; }").is_ok());
     }
 }

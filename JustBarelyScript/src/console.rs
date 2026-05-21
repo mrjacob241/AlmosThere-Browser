@@ -191,6 +191,7 @@ fn collect_expression_console_messages(expression: &Expression, out: &mut Vec<Co
         | Expression::Super
         | Expression::Identifier(_)
         | Expression::Number(_)
+        | Expression::BigInt(_)
         | Expression::String(_)
         | Expression::Regex(_)
         | Expression::Boolean(_)
@@ -229,6 +230,7 @@ fn display_static_console_argument(expression: &Expression) -> String {
     match expression {
         Expression::String(value) => value.clone(),
         Expression::Number(value) => value.to_string(),
+        Expression::BigInt(value) => value.clone(),
         Expression::Boolean(value) => value.to_string(),
         Expression::Null => "null".to_owned(),
         Expression::Undefined => "undefined".to_owned(),

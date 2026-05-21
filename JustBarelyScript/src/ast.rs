@@ -190,7 +190,7 @@ pub struct ForInStatement {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TryCatchStatement {
     pub body: BlockStatement,
-    pub catch_param: Option<String>,
+    pub catch_param: Option<Binding>,
     pub catch_body: Option<BlockStatement>,
     pub finally_body: Option<BlockStatement>,
     pub span: Span,
@@ -213,6 +213,7 @@ pub enum FunctionBody {
 pub enum Expression {
     Identifier(String),
     Number(f64),
+    BigInt(String), // integer literal with `n` suffix; string is base-10 digits
     String(String),
     Regex(String),
     TemplateLiteral(Vec<TemplateElement>),

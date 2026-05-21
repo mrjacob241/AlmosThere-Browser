@@ -22,6 +22,7 @@ pub enum TemplatePart {
 pub enum TokenKind {
     Identifier(String),
     Number(String),
+    BigInt(String), // integer literal with `n` suffix (e.g. `42n`)
     String(String),
     Regex(String), // /pattern/flags — treated as opaque string
     TemplateLiteral(Vec<TemplatePart>),
@@ -98,6 +99,10 @@ pub enum TokenKind {
     AmpAmp,
     PipePipe,
     QuestionQuestion,
+    // logical assignment
+    AmpAmpEquals,
+    PipePipeEquals,
+    QuestionQuestionEquals,
     // bitwise
     BitAnd,
     BitOr,
@@ -366,24 +371,34 @@ impl<'a> Lexer<'a> {
     }
 
     fn number(&mut self, span: Span) -> Token {
-        // Hex literal: 0x or 0X
+        // Hex literal: 0x or 0X (may have BigInt suffix `n`)
         if self.current() == Some('0') && matches!(self.peek(), Some('x') | Some('X')) {
             self.bump(); // 0
             self.bump(); // x/X
             while matches!(self.current(), Some(ch) if ch.is_ascii_hexdigit()) {
                 self.bump();
             }
+            if self.current() == Some('n') {
+                self.bump();
+                let s = self.source[span.start..self.byte_position - 1].to_owned();
+                return Token { kind: TokenKind::BigInt(s), span: self.finish_span(span) };
+            }
             return Token {
                 kind: TokenKind::Number(self.source[span.start..self.byte_position].to_owned()),
                 span: self.finish_span(span),
             };
         }
-        // Binary literal: 0b or 0B
+        // Binary literal: 0b or 0B (may have BigInt suffix `n`)
         if self.current() == Some('0') && matches!(self.peek(), Some('b') | Some('B')) {
             self.bump();
             self.bump();
             while matches!(self.current(), Some('0') | Some('1')) {
                 self.bump();
+            }
+            if self.current() == Some('n') {
+                self.bump();
+                let s = self.source[span.start..self.byte_position - 1].to_owned();
+                return Token { kind: TokenKind::BigInt(s), span: self.finish_span(span) };
             }
             return Token {
                 kind: TokenKind::Number(self.source[span.start..self.byte_position].to_owned()),
@@ -393,6 +408,18 @@ impl<'a> Lexer<'a> {
         // Decimal (possibly with fractional part and exponent)
         while matches!(self.current(), Some(ch) if ch.is_ascii_digit() || ch == '_') {
             self.bump();
+        }
+        // BigInt suffix `n` — only on integers (no `.` or `e`)
+        if self.current() == Some('n')
+            && !matches!(self.peek(), Some(ch) if ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            // Check we haven't already consumed a `.` or `e` (i.e., this is an integer)
+            let digits = &self.source[span.start..self.byte_position];
+            if !digits.contains('.') && !digits.contains('e') && !digits.contains('E') {
+                self.bump(); // consume `n`
+                let s = self.source[span.start..self.byte_position - 1].to_owned();
+                return Token { kind: TokenKind::BigInt(s), span: self.finish_span(span) };
+            }
         }
         // Consume `.` as part of the number if followed by a digit OR another `.`
         // The second case handles `1..toString()` — `1.` is the float, `.toString` is member access.
@@ -742,9 +769,11 @@ impl Iterator for Lexer<'_> {
                 match self.current() {
                     Some('?') => {
                         self.bump();
-                        Token {
-                            kind: TokenKind::QuestionQuestion,
-                            span: self.finish_span(span),
+                        if self.current() == Some('=') {
+                            self.bump();
+                            Token { kind: TokenKind::QuestionQuestionEquals, span: self.finish_span(span) }
+                        } else {
+                            Token { kind: TokenKind::QuestionQuestion, span: self.finish_span(span) }
                         }
                     }
                     Some('.') => {
@@ -903,9 +932,11 @@ impl Iterator for Lexer<'_> {
                 match self.current() {
                     Some('&') => {
                         self.bump();
-                        Token {
-                            kind: TokenKind::AmpAmp,
-                            span: self.finish_span(span),
+                        if self.current() == Some('=') {
+                            self.bump();
+                            Token { kind: TokenKind::AmpAmpEquals, span: self.finish_span(span) }
+                        } else {
+                            Token { kind: TokenKind::AmpAmp, span: self.finish_span(span) }
                         }
                     }
                     Some('=') => {
@@ -926,9 +957,11 @@ impl Iterator for Lexer<'_> {
                 match self.current() {
                     Some('|') => {
                         self.bump();
-                        Token {
-                            kind: TokenKind::PipePipe,
-                            span: self.finish_span(span),
+                        if self.current() == Some('=') {
+                            self.bump();
+                            Token { kind: TokenKind::PipePipeEquals, span: self.finish_span(span) }
+                        } else {
+                            Token { kind: TokenKind::PipePipe, span: self.finish_span(span) }
                         }
                     }
                     Some('=') => {
