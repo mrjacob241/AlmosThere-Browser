@@ -1,6 +1,9 @@
 target/
 appdata/
 
+#source https://github.com/tc39/test262
+ECMAScript/
+
 # Downloaded/generated third-party page captures and assets.
 sample_pages/cache/
 sample_pages/temp_outputs/

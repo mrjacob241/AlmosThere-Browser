@@ -662,6 +662,50 @@ impl BrowserExecutionState {
         self.effects.drain(..).collect()
     }
 
+    pub fn take_uncaught_throw(&mut self) -> Option<String> {
+        match self.early_exit.take() {
+            Some(EarlyExit::Throw(val)) => Some(Self::format_thrown_value(&val)),
+            other => {
+                self.early_exit = other;
+                None
+            }
+        }
+    }
+
+    fn format_thrown_value(val: &JsValue) -> String {
+        match val {
+            JsValue::String(s) => s.clone(),
+            JsValue::Object(props) => {
+                let name = props
+                    .get("name")
+                    .and_then(|v| {
+                        if let JsValue::String(s) = v {
+                            Some(s.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or("Error");
+                let msg = props
+                    .get("message")
+                    .and_then(|v| {
+                        if let JsValue::String(s) = v {
+                            Some(s.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or("");
+                if msg.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{}: {}", name, msg)
+                }
+            }
+            other => format!("{:?}", other),
+        }
+    }
+
     fn trace_runtime(&mut self, kind: &str, detail: impl Into<String>) {
         self.effects.push(BrowserEffect::RuntimeTrace {
             kind: kind.to_owned(),
@@ -1911,14 +1955,14 @@ impl BrowserExecutionState {
                     "toFixed" => {
                         let digits = args_vals
                             .first()
-                            .map(|v| Self::value_to_number(v) as usize)
+                            .map(|v| (Self::value_to_number(v) as usize).min(100))
                             .unwrap_or(0);
                         JsValue::String(format!("{n:.digits$}"))
                     }
                     "toPrecision" => {
                         let p = args_vals
                             .first()
-                            .map(|v| Self::value_to_number(v) as usize)
+                            .map(|v| (Self::value_to_number(v) as usize).min(100).max(1))
                             .unwrap_or(1);
                         JsValue::String(format!("{n:.p$}"))
                     }
@@ -3593,14 +3637,14 @@ impl BrowserExecutionState {
             "repeat" => {
                 let n = arguments
                     .first()
-                    .map(|a| Self::value_to_number(&self.execute_expression(a)) as usize)
+                    .map(|a| (Self::value_to_number(&self.execute_expression(a)) as usize).min(65536))
                     .unwrap_or(0);
                 Some(JsValue::String(s.repeat(n)))
             }
             "padStart" => {
                 let target_len = arguments
                     .first()
-                    .map(|a| Self::value_to_number(&self.execute_expression(a)) as usize)
+                    .map(|a| (Self::value_to_number(&self.execute_expression(a)) as usize).min(65536))
                     .unwrap_or(0);
                 let fill = arguments
                     .get(1)
@@ -3618,7 +3662,7 @@ impl BrowserExecutionState {
             "padEnd" => {
                 let target_len = arguments
                     .first()
-                    .map(|a| Self::value_to_number(&self.execute_expression(a)) as usize)
+                    .map(|a| (Self::value_to_number(&self.execute_expression(a)) as usize).min(65536))
                     .unwrap_or(0);
                 let fill = arguments
                     .get(1)
@@ -3750,10 +3794,16 @@ impl BrowserExecutionState {
                 }
                 JsValue::Array(mut arr) => {
                     if let Ok(idx) = key.parse::<usize>() {
-                        if idx >= arr.len() {
-                            arr.resize(idx + 1, JsValue::Undefined);
+                        // Guard: skip sparse indices that would require a multi-GB allocation.
+                        // Real sparse arrays (e.g. x[4294967294] = 1) are treated as object
+                        // property assignments instead.
+                        const MAX_DENSE_INDEX: usize = 1 << 20; // 1 million elements
+                        if idx < MAX_DENSE_INDEX {
+                            if idx >= arr.len() {
+                                arr.resize(idx + 1, JsValue::Undefined);
+                            }
+                            arr[idx] = value;
                         }
-                        arr[idx] = value;
                         self.assign_target(object, JsValue::Array(arr));
                     }
                 }
