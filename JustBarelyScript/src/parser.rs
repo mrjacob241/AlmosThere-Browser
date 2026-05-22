@@ -1213,6 +1213,7 @@ impl Parser {
                 let value = self.parse_expression(2)?;
                 properties.push(ObjectProperty {
                     key: String::new(),
+                    computed_key: None,
                     value: Expression::Spread(Box::new(value)),
                     shorthand: false,
                 });
@@ -1222,23 +1223,39 @@ impl Parser {
                 continue;
             }
 
-            // Computed key: [expr]: value
+            // Computed key: [expr]: value  OR  [expr](params) { body }
             if self.eat(TokenKind::LeftBracket) {
                 let key_expr = self.parse_expression(0)?;
                 self.expect(TokenKind::RightBracket)?;
-                self.expect(TokenKind::Colon)?;
-                let value = self.parse_expression(0)?;
-                // Represent computed key as __computed__; executor ignores for now.
-                let key = match &key_expr {
-                    Expression::String(s) => s.clone(),
-                    Expression::Identifier(n) => n.clone(),
-                    _ => "__computed__".to_owned(),
-                };
-                properties.push(ObjectProperty {
-                    key,
-                    value,
-                    shorthand: false,
-                });
+                if self.at(TokenKind::LeftParen) {
+                    // Computed method shorthand: { [expr](params) { body } }
+                    let params = self.parse_parameter_list()?;
+                    let body = self.parse_block()?;
+                    properties.push(ObjectProperty {
+                        key: "__computed__".to_owned(),
+                        computed_key: Some(Box::new(key_expr)),
+                        value: Expression::Function(FunctionExpression {
+                            params,
+                            body,
+                            is_async: false,
+                        }),
+                        shorthand: false,
+                    });
+                } else {
+                    self.expect(TokenKind::Colon)?;
+                    let value = self.parse_expression(0)?;
+                    let key = match &key_expr {
+                        Expression::String(s) => s.clone(),
+                        Expression::Identifier(n) => n.clone(),
+                        _ => "__computed__".to_owned(),
+                    };
+                    properties.push(ObjectProperty {
+                        key,
+                        computed_key: Some(Box::new(key_expr)),
+                        value,
+                        shorthand: false,
+                    });
+                }
                 if !self.eat(TokenKind::Comma) {
                     break;
                 }
@@ -1267,18 +1284,37 @@ impl Parser {
                 && !self.at(TokenKind::Comma)
                 && !self.at(TokenKind::RightBrace)
             {
-                let actual_key = self.expect_identifier_or_keyword()?;
-                let params = self.parse_parameter_list()?;
-                let body = self.parse_block()?;
-                properties.push(ObjectProperty {
-                    key: actual_key,
-                    value: Expression::Function(FunctionExpression {
-                        params,
-                        body,
-                        is_async: false,
-                    }),
-                    shorthand: false,
-                });
+                // Computed accessor: get [expr]() {} or set [expr](v) {}
+                if self.eat(TokenKind::LeftBracket) {
+                    let key_expr = self.parse_expression(0)?;
+                    self.expect(TokenKind::RightBracket)?;
+                    let params = self.parse_parameter_list()?;
+                    let body = self.parse_block()?;
+                    properties.push(ObjectProperty {
+                        key: "__computed__".to_owned(),
+                        computed_key: Some(Box::new(key_expr)),
+                        value: Expression::Function(FunctionExpression {
+                            params,
+                            body,
+                            is_async: false,
+                        }),
+                        shorthand: false,
+                    });
+                } else {
+                    let actual_key = self.expect_identifier_or_keyword()?;
+                    let params = self.parse_parameter_list()?;
+                    let body = self.parse_block()?;
+                    properties.push(ObjectProperty {
+                        key: actual_key,
+                        computed_key: None,
+                        value: Expression::Function(FunctionExpression {
+                            params,
+                            body,
+                            is_async: false,
+                        }),
+                        shorthand: false,
+                    });
+                }
                 if !self.eat(TokenKind::Comma) {
                     break;
                 }
@@ -1291,6 +1327,7 @@ impl Parser {
                 let body = self.parse_block()?;
                 properties.push(ObjectProperty {
                     key: key.clone(),
+                    computed_key: None,
                     value: Expression::Function(FunctionExpression {
                         params,
                         body,
@@ -1302,6 +1339,7 @@ impl Parser {
                 let value = self.parse_expression(0)?;
                 properties.push(ObjectProperty {
                     key,
+                    computed_key: None,
                     value,
                     shorthand: false,
                 });
@@ -1310,6 +1348,7 @@ impl Parser {
                 properties.push(ObjectProperty {
                     value: Expression::Identifier(key.clone()),
                     key,
+                    computed_key: None,
                     shorthand: true,
                 });
             }

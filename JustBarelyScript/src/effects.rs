@@ -1385,6 +1385,7 @@ impl BrowserExecutionState {
                 {
                     JsValue::WeakMap(HashMap::new())
                 } else if let JsValue::Function(func) = self.execute_expression(callee) {
+                    let ctor_name = func.name.clone();
                     let this_obj = func
                         .properties
                         .get("prototype")
@@ -1392,11 +1393,18 @@ impl BrowserExecutionState {
                         .unwrap_or_else(|| JsValue::Object(HashMap::new()));
                     let args = self.eval_args(arguments);
                     let (result, this_after) = self.call_function_with_this(func, args, this_obj);
-                    if matches!(result, JsValue::Object(_)) {
+                    let mut instance = if matches!(result, JsValue::Object(_)) {
                         result
                     } else {
                         this_after
+                    };
+                    // Tag the object with the constructor name for instanceof checks.
+                    // Key uses a NUL prefix so it can never be set from JS source.
+                    if let (JsValue::Object(map), Some(name)) = (&mut instance, ctor_name) {
+                        map.entry("\x00class".to_owned())
+                            .or_insert_with(|| JsValue::String(name));
                     }
+                    instance
                 } else if let JsValue::HostFunction(name) = self.execute_expression(callee) {
                     JsValue::HostObject(name)
                 } else if let Some(name) = constructor_like_member_name(callee) {
@@ -3738,10 +3746,12 @@ impl BrowserExecutionState {
     ) -> HashMap<String, JsValue> {
         let mut object = HashMap::new();
         for property in properties {
-            object.insert(
-                property.key.clone(),
-                self.execute_expression(&property.value),
-            );
+            let key = if let Some(key_expr) = &property.computed_key {
+                Self::value_to_string(&self.execute_expression(key_expr))
+            } else {
+                property.key.clone()
+            };
+            object.insert(key, self.execute_expression(&property.value));
         }
         object
     }
@@ -4611,8 +4621,49 @@ impl BrowserExecutionState {
             "navigator" => JsValue::NavigatorRef,
             "globalThis" => JsValue::WindowRef,
             "ActiveXObject" => JsValue::HostFunction("ActiveXObject".into()),
-            "Function" => JsValue::HostFunction("Function".into()),
-            "Symbol" => JsValue::HostFunction("Symbol".into()),
+            // Built-in constructors exposed as HostFunctions so `instanceof` and
+            // `.prototype` access work correctly.
+            "Array"
+            | "Object"
+            | "String"
+            | "Number"
+            | "Boolean"
+            | "Function"
+            | "Symbol"
+            | "Error"
+            | "TypeError"
+            | "RangeError"
+            | "ReferenceError"
+            | "SyntaxError"
+            | "URIError"
+            | "EvalError"
+            | "RegExp"
+            | "Map"
+            | "Set"
+            | "WeakMap"
+            | "WeakSet"
+            | "Promise"
+            | "Proxy"
+            | "Reflect"
+            | "Date"
+            | "Math"
+            | "JSON"
+            | "Int8Array"
+            | "Uint8Array"
+            | "Uint8ClampedArray"
+            | "Int16Array"
+            | "Uint16Array"
+            | "Int32Array"
+            | "Uint32Array"
+            | "Float32Array"
+            | "Float64Array"
+            | "BigInt64Array"
+            | "BigUint64Array"
+            | "ArrayBuffer"
+            | "DataView"
+            | "SharedArrayBuffer"
+            | "Atomics"
+            | "WebAssembly" => JsValue::HostFunction(name.to_owned()),
             "AudioContext"
             | "webkitAudioContext"
             | "OfflineAudioContext"
@@ -4945,7 +4996,40 @@ impl BrowserExecutionState {
             BinaryOperator::Exponent => {
                 JsValue::Number(Self::value_to_number(&lv).powf(Self::value_to_number(&rv)))
             }
-            BinaryOperator::Instanceof => JsValue::Boolean(false),
+            BinaryOperator::Instanceof => {
+                let result = match &rv {
+                    // Built-in type checks by value variant
+                    JsValue::HostFunction(name) | JsValue::Function(JsFunction { name: Some(name), .. })
+                        if name == "Array" =>
+                    {
+                        matches!(lv, JsValue::Array(_))
+                    }
+                    JsValue::HostFunction(name) | JsValue::Function(JsFunction { name: Some(name), .. })
+                        if name == "Function" =>
+                    {
+                        matches!(lv, JsValue::Function(_) | JsValue::HostFunction(_))
+                    }
+                    JsValue::HostFunction(name) | JsValue::Function(JsFunction { name: Some(name), .. })
+                        if name == "Object" =>
+                    {
+                        matches!(lv, JsValue::Object(_) | JsValue::Array(_))
+                    }
+                    // User constructor: check __class__ tag set during new
+                    JsValue::Function(ctor) => {
+                        let ctor_name = ctor.name.as_deref().unwrap_or("");
+                        match &lv {
+                            JsValue::Object(map) => map
+                                .get("\x00class")
+                                .and_then(|v| if let JsValue::String(s) = v { Some(s.as_str()) } else { None })
+                                .map(|c| c == ctor_name)
+                                .unwrap_or(false),
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                };
+                JsValue::Boolean(result)
+            }
             BinaryOperator::In => match &rv {
                 JsValue::Object(map) => {
                     JsValue::Boolean(map.contains_key(&Self::value_to_string(&lv)))
@@ -5466,8 +5550,130 @@ impl BrowserExecutionState {
                 let s = args.first().map(Self::value_to_string).unwrap_or_default();
                 JsValue::String(js_unescape(&s))
             }
+            // Array methods called on array-like objects via .call(obj, cb).
+            // Iterates lazily so length:Infinity never causes a huge allocation.
+            "Array.prototype.every" => {
+                let cb = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                if let JsValue::Function(func) = cb {
+                    let (items_opt, len, map_opt) = Self::array_like_parts(this_arg);
+                    let iter_len = items_opt.as_ref().map(|v| v.len() as u32).unwrap_or(len);
+                    for i in 0..iter_len {
+                        if self.execution_budget_exhausted { break; }
+                        let item = items_opt.as_ref()
+                            .and_then(|v| v.get(i as usize).cloned())
+                            .or_else(|| map_opt.as_ref()?.get(&i.to_string()).cloned())
+                            .unwrap_or(JsValue::Undefined);
+                        let v = self.call_function(func.clone(), vec![item, JsValue::Number(i as f64)]);
+                        if self.early_exit.is_some() { break; }
+                        if !Self::is_truthy(&v) { return JsValue::Boolean(false); }
+                    }
+                }
+                JsValue::Boolean(true)
+            }
+            "Array.prototype.some" => {
+                let cb = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                if let JsValue::Function(func) = cb {
+                    let (items_opt, len, map_opt) = Self::array_like_parts(this_arg);
+                    let iter_len = items_opt.as_ref().map(|v| v.len() as u32).unwrap_or(len);
+                    for i in 0..iter_len {
+                        if self.execution_budget_exhausted { break; }
+                        let item = items_opt.as_ref()
+                            .and_then(|v| v.get(i as usize).cloned())
+                            .or_else(|| map_opt.as_ref()?.get(&i.to_string()).cloned())
+                            .unwrap_or(JsValue::Undefined);
+                        let v = self.call_function(func.clone(), vec![item, JsValue::Number(i as f64)]);
+                        if self.early_exit.is_some() { break; }
+                        if Self::is_truthy(&v) { return JsValue::Boolean(true); }
+                    }
+                }
+                JsValue::Boolean(false)
+            }
+            "Array.prototype.forEach" => {
+                let cb = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                if let JsValue::Function(func) = cb {
+                    let (items_opt, len, map_opt) = Self::array_like_parts(this_arg);
+                    let iter_len = items_opt.as_ref().map(|v| v.len() as u32).unwrap_or(len);
+                    for i in 0..iter_len {
+                        if self.execution_budget_exhausted { break; }
+                        let item = items_opt.as_ref()
+                            .and_then(|v| v.get(i as usize).cloned())
+                            .or_else(|| map_opt.as_ref()?.get(&i.to_string()).cloned())
+                            .unwrap_or(JsValue::Undefined);
+                        self.call_function(func.clone(), vec![item, JsValue::Number(i as f64)]);
+                        if self.early_exit.is_some() { break; }
+                    }
+                }
+                JsValue::Undefined
+            }
+            "Array.prototype.map" => {
+                let cb = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                if let JsValue::Function(func) = cb {
+                    let (items_opt, len, map_opt) = Self::array_like_parts(this_arg);
+                    let iter_len = items_opt.as_ref().map(|v| v.len() as u32).unwrap_or(len);
+                    let mut result = Vec::new();
+                    for i in 0..iter_len {
+                        if self.execution_budget_exhausted { break; }
+                        let item = items_opt.as_ref()
+                            .and_then(|v| v.get(i as usize).cloned())
+                            .or_else(|| map_opt.as_ref()?.get(&i.to_string()).cloned())
+                            .unwrap_or(JsValue::Undefined);
+                        let v = self.call_function(func.clone(), vec![item, JsValue::Number(i as f64)]);
+                        if self.early_exit.is_some() { break; }
+                        result.push(v);
+                    }
+                    JsValue::Array(result)
+                } else {
+                    JsValue::Array(vec![])
+                }
+            }
+            "Array.prototype.filter" => {
+                let cb = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                if let JsValue::Function(func) = cb {
+                    let (items_opt, len, map_opt) = Self::array_like_parts(this_arg);
+                    let iter_len = items_opt.as_ref().map(|v| v.len() as u32).unwrap_or(len);
+                    let mut result = Vec::new();
+                    for i in 0..iter_len {
+                        if self.execution_budget_exhausted { break; }
+                        let item = items_opt.as_ref()
+                            .and_then(|v| v.get(i as usize).cloned())
+                            .or_else(|| map_opt.as_ref()?.get(&i.to_string()).cloned())
+                            .unwrap_or(JsValue::Undefined);
+                        let v = self.call_function(func.clone(), vec![item.clone(), JsValue::Number(i as f64)]);
+                        if self.early_exit.is_some() { break; }
+                        if Self::is_truthy(&v) { result.push(item); }
+                    }
+                    JsValue::Array(result)
+                } else {
+                    JsValue::Array(vec![])
+                }
+            }
             _ => Self::host_function_default_return(name),
         }
+    }
+
+    // Returns (array_items, object_length, object_map) for array-like iteration.
+    // Never materializes a huge vec; the caller iterates lazily up to the length.
+    fn array_like_parts(val: JsValue) -> (Option<Vec<JsValue>>, u32, Option<HashMap<String, JsValue>>) {
+        match val {
+            JsValue::Array(items) => (Some(items), 0, None),
+            JsValue::Object(map) => {
+                let len = Self::to_length_from_map(&map);
+                (None, len, Some(map))
+            }
+            _ => (Some(vec![]), 0, None),
+        }
+    }
+
+    fn to_length_from_map(map: &HashMap<String, JsValue>) -> u32 {
+        let n = match map.get("length") {
+            Some(JsValue::Number(n)) => *n,
+            Some(other) => Self::value_to_number(other),
+            None => return 0,
+        };
+        if n.is_nan() || n <= 0.0 { return 0; }
+        // Clamp to a safe iteration cap. Real ToLength max is 2^53-1 but for
+        // execution purposes we cap at 2^32-1; the budget guard handles large loops.
+        n.min(u32::MAX as f64) as u32
     }
 
     fn native_prototype_object(owner: &str) -> JsValue {

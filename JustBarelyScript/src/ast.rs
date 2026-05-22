@@ -287,6 +287,7 @@ pub struct FunctionExpression {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ObjectProperty {
     pub key: String,
+    pub computed_key: Option<Box<Expression>>,
     pub value: Expression,
     pub shorthand: bool,
 }

@@ -8,6 +8,7 @@
 ///
 /// Options:
 ///   --ecma-script              Required gate flag
+///   --built-ins                Only run tests under built-ins/ (shorthand for --filter "built-ins")
 ///   --filter <substring>       Only run tests whose path contains <substring>
 ///   --limit <n>                Stop after <n> tests scanned
 ///   --verbose                  Print every PASS/FAIL result
@@ -324,7 +325,7 @@ fn run_test(path: &Path, harness_dir: &Path, filter: Option<&str>) -> TestOutcom
     }
 
     if path_str.contains("intl402") {
-        return TestOutcome::Skip("intl402".into());
+        return TestOutcome::Fail("not implemented: Intl/i18n (intl402) required".into());
     }
 
     let source = match fs::read_to_string(path) {
@@ -335,10 +336,10 @@ fn run_test(path: &Path, harness_dir: &Path, filter: Option<&str>) -> TestOutcom
     let fm = parse_frontmatter(&source);
 
     if fm.flags.iter().any(|f| f == "async") {
-        return TestOutcome::Skip("async".into());
+        return TestOutcome::Fail("not implemented: async/Promise support required".into());
     }
     if fm.flags.iter().any(|f| f == "module") {
-        return TestOutcome::Skip("module".into());
+        return TestOutcome::Fail("not implemented: ES module support required".into());
     }
 
     let is_raw = fm.flags.iter().any(|f| f == "raw");
@@ -391,7 +392,7 @@ fn run_test(path: &Path, harness_dir: &Path, filter: Option<&str>) -> TestOutcom
     state.execute_program(&program);
 
     if state.execution_budget_exhausted() {
-        return TestOutcome::Skip("budget exhausted".into());
+        return TestOutcome::Fail("execution budget exhausted (infinite loop or too complex)".into());
     }
 
     let thrown = state.take_uncaught_throw();
@@ -440,6 +441,7 @@ fn main() {
         eprintln!();
         eprintln!("Options:");
         eprintln!("  --ecma-script              Required — enables the runner");
+        eprintln!("  --built-ins                Only run tests under built-ins/");
         eprintln!("  --filter <substring>       Only run tests whose path contains <substring>");
         eprintln!("  --limit <n>                Stop after <n> tests scanned");
         eprintln!("  --verbose                  Print every result");
@@ -471,6 +473,7 @@ fn main() {
                 if args[idx] == "--verbose" { verbose = true; }
                 if args[idx] == "--show-failures" { show_failures = true; }
             }
+            "--built-ins" => { test_dir = default_test_dir.join("built-ins"); }
             "--filter" => { idx += 1; filter = args.get(idx).cloned(); }
             "--limit" => { idx += 1; limit = args.get(idx).and_then(|s| s.parse().ok()); }
             "--failures-log" => { idx += 1; failures_log = args.get(idx).cloned(); }
@@ -494,7 +497,9 @@ fn main() {
 
     let total_files = all_files.len();
     println!("ecma_test_runner: found {} test files", total_files);
-    if let Some(f) = &filter { println!("ecma_test_runner: filter = {:?}", f); }
+    if let Some(f) = &filter {
+        println!("ecma_test_runner: filter = {:?}", f);
+    }
     if let Some(l) = limit { println!("ecma_test_runner: limit = {}", l); }
     if let Some(log) = &failures_log { println!("ecma_test_runner: failures log = {}", log); }
     println!();
