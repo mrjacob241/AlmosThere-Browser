@@ -1405,8 +1405,16 @@ impl BrowserExecutionState {
                             .or_insert_with(|| JsValue::String(name));
                     }
                     instance
-                } else if let JsValue::HostFunction(name) = self.execute_expression(callee) {
-                    JsValue::HostObject(name)
+                } else if let JsValue::HostFunction(fn_name) = self.execute_expression(callee) {
+                    if matches!(fn_name.as_str(),
+                        "Error" | "TypeError" | "RangeError" | "ReferenceError"
+                        | "SyntaxError" | "URIError" | "EvalError" | "AggregateError"
+                    ) {
+                        let args = self.eval_args(arguments);
+                        self.call_host_function(&fn_name.clone(), JsValue::Undefined, args)
+                    } else {
+                        JsValue::HostObject(fn_name)
+                    }
                 } else if let Some(name) = constructor_like_member_name(callee) {
                     for argument in arguments {
                         self.execute_expression(argument);
@@ -2956,9 +2964,9 @@ impl BrowserExecutionState {
         if let (JsValue::Object(map), JsValue::Object(desc)) = (&mut target, descriptor) {
             if let Some(val) = desc.get("value") {
                 map.insert(key, val.clone());
-            } else if let Some(JsValue::Function(getter)) = desc.get("get").cloned() {
-                let value = self.call_function(getter, vec![]);
-                map.insert(key, value);
+            } else if let Some(getter) = desc.get("get").cloned() {
+                // Store getter lazily under "\x00get:key" so it's called on access.
+                map.insert(format!("\x00get:{key}"), getter);
             }
             self.assign_target(target_expr, target.clone());
             target
@@ -2971,8 +2979,11 @@ impl BrowserExecutionState {
         match name {
             "keys" => {
                 if let Some(JsValue::Object(map)) = args.into_iter().next() {
-                    let mut keys: Vec<JsValue> =
-                        map.keys().map(|k| JsValue::String(k.clone())).collect();
+                    let mut keys: Vec<JsValue> = map
+                        .keys()
+                        .filter(|k| !k.starts_with('\x00'))
+                        .map(|k| JsValue::String(k.clone()))
+                        .collect();
                     keys.sort_by(|a, b| Self::value_to_string(a).cmp(&Self::value_to_string(b)));
                     JsValue::Array(keys)
                 } else {
@@ -2981,7 +2992,10 @@ impl BrowserExecutionState {
             }
             "values" => {
                 if let Some(JsValue::Object(map)) = args.into_iter().next() {
-                    let mut pairs: Vec<(String, JsValue)> = map.into_iter().collect();
+                    let mut pairs: Vec<(String, JsValue)> = map
+                        .into_iter()
+                        .filter(|(k, _)| !k.starts_with('\x00'))
+                        .collect();
                     pairs.sort_by(|a, b| a.0.cmp(&b.0));
                     JsValue::Array(pairs.into_iter().map(|(_, v)| v).collect())
                 } else {
@@ -2990,7 +3004,10 @@ impl BrowserExecutionState {
             }
             "entries" => {
                 if let Some(JsValue::Object(map)) = args.into_iter().next() {
-                    let mut pairs: Vec<(String, JsValue)> = map.into_iter().collect();
+                    let mut pairs: Vec<(String, JsValue)> = map
+                        .into_iter()
+                        .filter(|(k, _)| !k.starts_with('\x00'))
+                        .collect();
                     pairs.sort_by(|a, b| a.0.cmp(&b.0));
                     JsValue::Array(
                         pairs
@@ -3032,7 +3049,6 @@ impl BrowserExecutionState {
                 JsValue::Object(map)
             }
             "defineProperty" => {
-                // Object.defineProperty(obj, key, descriptor) — apply value if present
                 let mut iter = args.into_iter();
                 let obj = iter.next().unwrap_or(JsValue::Undefined);
                 let key = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
@@ -3040,17 +3056,21 @@ impl BrowserExecutionState {
                 if let (JsValue::Object(mut map), JsValue::Object(desc)) = (obj, descriptor) {
                     if let Some(val) = desc.get("value") {
                         map.insert(key, val.clone());
-                    } else if let Some(JsValue::Function(getter)) = desc.get("get").cloned() {
-                        let v = self.call_function(getter, vec![]);
-                        map.insert(key, v);
+                    } else if let Some(getter) = desc.get("get").cloned() {
+                        map.insert(format!("\x00get:{key}"), getter);
                     }
                     JsValue::Object(map)
                 } else {
                     JsValue::Undefined
                 }
             }
+            "getOwnPropertyDescriptor" => {
+                let mut iter = args.into_iter();
+                let obj = iter.next().unwrap_or(JsValue::Undefined);
+                let prop = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
+                Self::static_get_own_property_descriptor(&obj, &prop)
+            }
             "defineProperties"
-            | "getOwnPropertyDescriptor"
             | "getOwnPropertyNames"
             | "getOwnPropertySymbols"
             | "getPrototypeOf"
@@ -3808,18 +3828,24 @@ impl BrowserExecutionState {
                 }
                 JsValue::Array(mut arr) => {
                     if let Ok(idx) = key.parse::<usize>() {
-                        // Guard: skip sparse indices that would require a multi-GB allocation.
-                        // Real sparse arrays (e.g. x[4294967294] = 1) are treated as object
-                        // property assignments instead.
                         const MAX_DENSE_INDEX: usize = 1 << 20; // 1 million elements
                         if idx < MAX_DENSE_INDEX {
                             if idx >= arr.len() {
                                 arr.resize(idx + 1, JsValue::Undefined);
                             }
                             arr[idx] = value;
+                            self.assign_target(object, JsValue::Array(arr));
+                        } else {
+                            // Sparse/large index: promote to Object so string-keyed access works.
+                            let mut map = HashMap::new();
+                            for (i, v) in arr.into_iter().enumerate() {
+                                map.insert(i.to_string(), v);
+                            }
+                            map.insert(key, value);
+                            self.assign_target(object, JsValue::Object(map));
                         }
-                        self.assign_target(object, JsValue::Array(arr));
                     }
+                    // Non-numeric key on bare Array: silently ignore.
                 }
                 JsValue::WindowRef => {
                     self.globals.insert(key, value);
@@ -4100,7 +4126,18 @@ impl BrowserExecutionState {
                     }
                     JsValue::Object(map) => {
                         let key = Self::value_to_string(&index);
-                        map.get(&key).cloned().unwrap_or(JsValue::Undefined)
+                        let getter_key = format!("\x00get:{key}");
+                        if let Some(getter) = map.get(&getter_key).cloned() {
+                            match getter {
+                                JsValue::Function(func) => self.call_function(func, vec![]),
+                                JsValue::HostFunction(fn_name) => {
+                                    self.call_host_function(&fn_name, JsValue::Undefined, vec![])
+                                }
+                                _ => JsValue::Undefined,
+                            }
+                        } else {
+                            map.get(&key).cloned().unwrap_or(JsValue::Undefined)
+                        }
                     }
                     JsValue::String(s) => {
                         let idx = Self::value_to_number(&index);
@@ -4139,17 +4176,14 @@ impl BrowserExecutionState {
                         "window" if property == "ActiveXObject" => {
                             return JsValue::HostFunction("ActiveXObject".into());
                         }
-                        "Object" if property == "prototype" => {
-                            return Self::native_prototype_object("Object");
-                        }
-                        "Array" if property == "prototype" => {
-                            return Self::native_prototype_object("Array");
-                        }
-                        "String" if property == "prototype" => {
-                            return Self::native_prototype_object("String");
-                        }
-                        "Function" if property == "prototype" => {
-                            return Self::native_prototype_object("Function");
+                        "Object" | "Array" | "String" | "Function" | "Boolean"
+                        | "Reflect" | "Atomics" => {
+                            return match property.as_str() {
+                                "prototype" => Self::constructor_prototype_object(obj_name)
+                                    .unwrap_or_else(|| Self::native_prototype_object("Object")),
+                                _ => Self::host_fn_static_member(obj_name, property)
+                                    .unwrap_or(JsValue::Undefined),
+                            };
                         }
                         "Symbol" => {
                             return match property.as_str() {
@@ -4167,6 +4201,17 @@ impl BrowserExecutionState {
                                 "asyncIterator" => {
                                     JsValue::String("Symbol(Symbol.asyncIterator)".into())
                                 }
+                                "unscopables" => {
+                                    JsValue::String("Symbol(Symbol.unscopables)".into())
+                                }
+                                "isConcatSpreadable" => {
+                                    JsValue::String("Symbol(Symbol.isConcatSpreadable)".into())
+                                }
+                                "match" => JsValue::String("Symbol(Symbol.match)".into()),
+                                "matchAll" => JsValue::String("Symbol(Symbol.matchAll)".into()),
+                                "replace" => JsValue::String("Symbol(Symbol.replace)".into()),
+                                "search" => JsValue::String("Symbol(Symbol.search)".into()),
+                                "split" => JsValue::String("Symbol(Symbol.split)".into()),
                                 "for" => JsValue::HostFunction("Symbol.for".into()),
                                 "keyFor" => JsValue::HostFunction("Symbol.keyFor".into()),
                                 _ => JsValue::Undefined,
@@ -4187,6 +4232,7 @@ impl BrowserExecutionState {
                         }
                         "Number" => {
                             return match property.as_str() {
+                                "prototype" => Self::native_prototype_object("Number"),
                                 "MAX_SAFE_INTEGER" => JsValue::Number(9007199254740991.0),
                                 "MIN_SAFE_INTEGER" => JsValue::Number(-9007199254740991.0),
                                 "MAX_VALUE" => JsValue::Number(f64::MAX),
@@ -4195,7 +4241,8 @@ impl BrowserExecutionState {
                                 "NEGATIVE_INFINITY" => JsValue::Number(f64::NEG_INFINITY),
                                 "NaN" => JsValue::Number(f64::NAN),
                                 "EPSILON" => JsValue::Number(f64::EPSILON),
-                                _ => JsValue::Undefined,
+                                _ => Self::host_fn_static_member("Number", property)
+                                    .unwrap_or(JsValue::Undefined),
                             };
                         }
                         _ => {}
@@ -4388,12 +4435,18 @@ impl BrowserExecutionState {
                             .native_prototype_property("Object", property)
                             .unwrap_or(JsValue::Undefined),
                     },
-                    JsValue::HostFunction(name) => match property.as_str() {
-                        "call" | "apply" | "bind" => JsValue::HostFunction(name.clone()),
-                        "prototype" => Self::constructor_prototype_object(&name)
-                            .unwrap_or_else(|| Self::host_function_prototype(&name)),
-                        _ => self
-                            .native_prototype_property("Function", property)
+                    JsValue::HostFunction(ref fn_name) => match property.as_str() {
+                        "call" | "apply" | "bind" => JsValue::HostFunction(fn_name.clone()),
+                        "prototype" => Self::constructor_prototype_object(fn_name)
+                            .unwrap_or_else(|| Self::host_function_prototype(fn_name)),
+                        "name" => JsValue::String(Self::host_fn_short_name(fn_name)),
+                        "length" => JsValue::Number(Self::host_fn_arity(fn_name) as f64),
+                        // Array[Symbol.species] is an accessor; calling it returns Array.
+                        "Symbol(Symbol.species)" if fn_name == "Array" => {
+                            JsValue::HostFunction("Array".into())
+                        }
+                        _ => Self::host_fn_static_member(fn_name, property)
+                            .or_else(|| self.native_prototype_property("Function", property))
                             .unwrap_or(JsValue::Undefined),
                     },
                     JsValue::BoundHostFunction { .. } => match property.as_str() {
@@ -4617,7 +4670,7 @@ impl BrowserExecutionState {
     fn get_identifier_value(&self, name: &str) -> JsValue {
         self.get_binding(name).unwrap_or_else(|| match name {
             "document" => JsValue::DocumentRef,
-            "window" => JsValue::WindowRef,
+            "window" | "this" => JsValue::WindowRef,
             "navigator" => JsValue::NavigatorRef,
             "globalThis" => JsValue::WindowRef,
             "ActiveXObject" => JsValue::HostFunction("ActiveXObject".into()),
@@ -4637,6 +4690,7 @@ impl BrowserExecutionState {
             | "SyntaxError"
             | "URIError"
             | "EvalError"
+            | "AggregateError"
             | "RegExp"
             | "Map"
             | "Set"
@@ -5014,6 +5068,16 @@ impl BrowserExecutionState {
                     {
                         matches!(lv, JsValue::Object(_) | JsValue::Array(_))
                     }
+                    // HostFunction constructor: check HostObject name or __class__ tag
+                    JsValue::HostFunction(ctor_name) => match &lv {
+                        JsValue::HostObject(name) => name == ctor_name,
+                        JsValue::Object(map) => map
+                            .get("\x00class")
+                            .and_then(|v| if let JsValue::String(s) = v { Some(s.as_str()) } else { None })
+                            .map(|c| c == ctor_name)
+                            .unwrap_or(false),
+                        _ => false,
+                    },
                     // User constructor: check __class__ tag set during new
                     JsValue::Function(ctor) => {
                         let ctor_name = ctor.name.as_deref().unwrap_or("");
@@ -5133,6 +5197,10 @@ impl BrowserExecutionState {
             (JsValue::Number(a), JsValue::Number(b)) => a == b,
             (JsValue::BigInt(a), JsValue::BigInt(b)) => a == b,
             (JsValue::String(a), JsValue::String(b)) => a == b,
+            // HostFunctions with the same name are the same function object.
+            (JsValue::HostFunction(a), JsValue::HostFunction(b)) => a == b,
+            // HostObjects with the same name are considered the same (best-effort).
+            (JsValue::HostObject(a), JsValue::HostObject(b)) => a == b,
             _ => false,
         }
     }
@@ -5241,14 +5309,240 @@ impl BrowserExecutionState {
 
     fn call_host_function(&mut self, name: &str, this_arg: JsValue, args: Vec<JsValue>) -> JsValue {
         match name {
+            "Array.isArray" => {
+                JsValue::Boolean(matches!(args.first(), Some(JsValue::Array(_))))
+            }
+            "Array.of" => {
+                match this_arg {
+                    JsValue::Function(ref ctor) => {
+                        // Array.of.call(Ctor, ...items) — construct via Ctor
+                        let len = args.len();
+                        let ctor_name = ctor.name.clone();
+                        let this_obj = ctor.properties.get("prototype")
+                            .cloned()
+                            .unwrap_or_else(|| JsValue::Object(HashMap::new()));
+                        let (_, this_after) = self.call_function_with_this(
+                            ctor.clone(),
+                            vec![JsValue::Number(len as f64)],
+                            this_obj,
+                        );
+                        let mut map = if let JsValue::Object(m) = this_after { m } else { HashMap::new() };
+                        for (i, val) in args.iter().enumerate() {
+                            map.insert(i.to_string(), val.clone());
+                        }
+                        map.insert("length".to_owned(), JsValue::Number(len as f64));
+                        if let Some(name) = ctor_name {
+                            map.entry("\x00class".to_owned())
+                                .or_insert_with(|| JsValue::String(name));
+                        }
+                        JsValue::Object(map)
+                    }
+                    _ => JsValue::Array(args),
+                }
+            }
+            "Array.from" => {
+                let mut args_iter = args.into_iter();
+                let items_val = args_iter.next().unwrap_or(JsValue::Undefined);
+                // Collect items into a Vec — try iterator protocol first for Objects.
+                let items: Vec<JsValue> = match items_val {
+                    JsValue::Array(v) => v,
+                    JsValue::Object(ref map) => {
+                        // Check for Symbol.iterator (including getters that may throw).
+                        let iter_key = "Symbol(Symbol.iterator)";
+                        let getter_key = format!("\x00get:{iter_key}");
+                        let iter_method: Option<JsValue> = if let Some(getter) = map.get(&getter_key).cloned() {
+                            let result = match getter {
+                                JsValue::Function(func) => self.call_function(func, vec![]),
+                                _ => JsValue::Undefined,
+                            };
+                            if self.early_exit.is_some() { return JsValue::Undefined; }
+                            Some(result)
+                        } else {
+                            map.get(iter_key).cloned()
+                        };
+                        if let Some(iter_fn) = iter_method.filter(|v| !matches!(v, JsValue::Undefined | JsValue::Null)) {
+                            // Has an iterator. Call it to get the iterator object.
+                            let mut iter_obj = match iter_fn {
+                                JsValue::Function(func) => {
+                                    let recv = items_val.clone();
+                                    self.call_function_with_this(func, vec![], recv).0
+                                }
+                                _ => JsValue::Undefined,
+                            };
+                            if self.early_exit.is_some() { return JsValue::Undefined; }
+                            // Consume the iterator, capping at MAX_ITER to avoid infinite loops.
+                            // If the cap is hit the iterator is considered non-terminating and we
+                            // fall through to the array-like path below.
+                            const MAX_ITER: usize = 10_000;
+                            let mut collected = vec![];
+                            let mut iter_done = false;
+                            for _ in 0..MAX_ITER {
+                                if self.execution_budget_exhausted { break; }
+                                let (next_result, new_obj) = if let JsValue::Object(ref m) = iter_obj {
+                                    if let Some(JsValue::Function(nf)) = m.get("next").cloned() {
+                                        self.call_function_with_this(nf, vec![], iter_obj.clone())
+                                    } else { (JsValue::Undefined, iter_obj) }
+                                } else { (JsValue::Undefined, iter_obj) };
+                                iter_obj = new_obj;
+                                if self.early_exit.is_some() { return JsValue::Undefined; }
+                                let done = if let JsValue::Object(ref rm) = next_result {
+                                    matches!(rm.get("done"), Some(JsValue::Boolean(true)))
+                                } else { true };
+                                if done { iter_done = true; break; }
+                                let value = if let JsValue::Object(ref rm) = next_result {
+                                    rm.get("value").cloned().unwrap_or(JsValue::Undefined)
+                                } else { JsValue::Undefined };
+                                collected.push(value);
+                            }
+                            if iter_done {
+                                collected
+                            } else {
+                                // Non-terminating iterator — fall back to array-like.
+                                let len = if let JsValue::Object(ref m) = items_val { self.to_length_from_map(m) } else { 0 };
+                                if let JsValue::Object(ref m) = items_val {
+                                    (0..len).map(|i| m.get(&i.to_string()).cloned().unwrap_or(JsValue::Undefined)).collect()
+                                } else { vec![] }
+                            }
+                        } else {
+                            // No iterator — fall back to array-like (length + numeric keys).
+                            let len = self.to_length_from_map(map);
+                            (0..len).map(|i| map.get(&i.to_string()).cloned()
+                                .unwrap_or(JsValue::Undefined)).collect()
+                        }
+                    }
+                    JsValue::String(ref s) => {
+                        s.chars().map(|c| JsValue::String(c.to_string())).collect()
+                    }
+                    _ => vec![],
+                };
+                // Apply mapfn if provided
+                let mapfn = args_iter.next().unwrap_or(JsValue::Undefined);
+                let mapped: Vec<JsValue> = if let JsValue::Function(func) = mapfn {
+                    items.into_iter().enumerate().map(|(i, v)| {
+                        self.call_function(func.clone(), vec![v, JsValue::Number(i as f64)])
+                    }).collect()
+                } else {
+                    items
+                };
+                // Use this_arg as constructor if it's a function
+                match this_arg {
+                    JsValue::Function(ref ctor) => {
+                        let len = mapped.len();
+                        let ctor_name = ctor.name.clone();
+                        let this_obj = ctor.properties.get("prototype")
+                            .cloned()
+                            .unwrap_or_else(|| JsValue::Object(HashMap::new()));
+                        let (_, this_after) = self.call_function_with_this(
+                            ctor.clone(),
+                            vec![JsValue::Number(len as f64)],
+                            this_obj,
+                        );
+                        let mut map = if let JsValue::Object(m) = this_after { m } else { HashMap::new() };
+                        for (i, val) in mapped.iter().enumerate() {
+                            map.insert(i.to_string(), val.clone());
+                        }
+                        map.insert("length".to_owned(), JsValue::Number(len as f64));
+                        if let Some(name) = ctor_name {
+                            map.entry("\x00class".to_owned())
+                                .or_insert_with(|| JsValue::String(name));
+                        }
+                        JsValue::Object(map)
+                    }
+                    _ => JsValue::Array(mapped),
+                }
+            }
+            // Array[@@species] getter — returns `this` (the constructor).
+            "Array.@@species.get" => this_arg,
+            "Error" | "TypeError" | "RangeError" | "ReferenceError"
+            | "SyntaxError" | "URIError" | "EvalError" => {
+                let message = args.first().map(Self::value_to_string).unwrap_or_default();
+                let options = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let mut obj = HashMap::new();
+                obj.insert("message".to_owned(), JsValue::String(message));
+                if let JsValue::Object(ref opts) = options {
+                    if let Some(cause) = opts.get("cause").cloned() {
+                        obj.insert("cause".to_owned(), cause);
+                    }
+                }
+                obj.insert("\x00class".to_owned(), JsValue::String(name.to_owned()));
+                obj.insert("\x00all_ne".to_owned(), JsValue::Boolean(true));
+                JsValue::Object(obj)
+            }
+            "AggregateError" => {
+                // AggregateError(errors, message[, options]) — callable as constructor
+                let errors = args.first().cloned().unwrap_or(JsValue::Undefined);
+                let message = args.get(1).map(Self::value_to_string).unwrap_or_default();
+                let options = args.get(2).cloned().unwrap_or(JsValue::Undefined);
+                let mut obj = HashMap::new();
+                obj.insert("message".to_owned(), JsValue::String(message));
+                obj.insert("errors".to_owned(), errors);
+                if let JsValue::Object(opts) = options {
+                    if let Some(cause) = opts.get("cause").cloned() {
+                        obj.insert("cause".to_owned(), cause);
+                    }
+                }
+                obj.insert("\x00class".to_owned(), JsValue::String("AggregateError".to_owned()));
+                obj.insert("\x00all_ne".to_owned(), JsValue::Boolean(true));
+                JsValue::Object(obj)
+            }
+            "Reflect.construct" => {
+                // Reflect.construct(target, args, newTarget)
+                // Throws TypeError if newTarget is not a callable/constructor value.
+                let new_target = args.get(2).cloned().unwrap_or(JsValue::Undefined);
+                let is_ctor = match &new_target {
+                    JsValue::Function(_) => true,
+                    // Objects and Proxies can represent cross-realm or wrapped constructors.
+                    JsValue::Object(_) | JsValue::Proxy { .. } => true,
+                    // HostObjects arise from `new other.SomeFunction()` in cross-realm tests.
+                    JsValue::HostObject(_) => true,
+                    JsValue::HostFunction(fn_name) => Self::host_fn_is_constructor(fn_name),
+                    _ => false,
+                };
+                if !is_ctor {
+                    let mut err = HashMap::new();
+                    err.insert("name".to_owned(), JsValue::String("TypeError".to_owned()));
+                    err.insert(
+                        "message".to_owned(),
+                        JsValue::String("Reflect.construct: newTarget is not a constructor".to_owned()),
+                    );
+                    self.early_exit = Some(EarlyExit::Throw(JsValue::Object(err)));
+                    return JsValue::Undefined;
+                }
+                JsValue::Object(HashMap::new())
+            }
             "Object.prototype.toString" => {
                 JsValue::String(format!("[object {}]", Self::object_tag(&this_arg)))
             }
             "Object.prototype.valueOf" => this_arg,
             "Object.prototype.hasOwnProperty" => {
                 let key = args.first().map(Self::value_to_string).unwrap_or_default();
-                match this_arg {
-                    JsValue::Object(map) => JsValue::Boolean(map.contains_key(&key)),
+                match &this_arg {
+                    JsValue::Object(map) => JsValue::Boolean(
+                        map.contains_key(&key)
+                            || map.contains_key(&format!("\x00get:{key}")),
+                    ),
+                    JsValue::Array(items) => JsValue::Boolean(
+                        key == "length"
+                            || key
+                                .parse::<usize>()
+                                .map_or(false, |i| i < items.len()),
+                    ),
+                    JsValue::String(s) => JsValue::Boolean(
+                        key == "length"
+                            || key
+                                .parse::<usize>()
+                                .map_or(false, |i| i < s.chars().count()),
+                    ),
+                    JsValue::HostFunction(fn_name) => {
+                        JsValue::Boolean(Self::host_fn_has_own_property(fn_name, &key))
+                    }
+                    JsValue::Function(func) => JsValue::Boolean(
+                        matches!(key.as_str(), "name" | "length" | "prototype")
+                            || func.properties.contains_key(&key),
+                    ),
+                    JsValue::WindowRef => {
+                        JsValue::Boolean(Self::window_has_own_property(&key))
+                    }
                     _ => JsValue::Boolean(false),
                 }
             }
@@ -5553,9 +5847,10 @@ impl BrowserExecutionState {
             // Array methods called on array-like objects via .call(obj, cb).
             // Iterates lazily so length:Infinity never causes a huge allocation.
             "Array.prototype.every" => {
-                let cb = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                let mut args_iter = args.into_iter();
+                let cb = args_iter.next().unwrap_or(JsValue::Undefined);
                 if let JsValue::Function(func) = cb {
-                    let (items_opt, len, map_opt) = Self::array_like_parts(this_arg);
+                    let (items_opt, len, map_opt) = self.array_like_parts(this_arg.clone());
                     let iter_len = items_opt.as_ref().map(|v| v.len() as u32).unwrap_or(len);
                     for i in 0..iter_len {
                         if self.execution_budget_exhausted { break; }
@@ -5563,7 +5858,7 @@ impl BrowserExecutionState {
                             .and_then(|v| v.get(i as usize).cloned())
                             .or_else(|| map_opt.as_ref()?.get(&i.to_string()).cloned())
                             .unwrap_or(JsValue::Undefined);
-                        let v = self.call_function(func.clone(), vec![item, JsValue::Number(i as f64)]);
+                        let v = self.call_function(func.clone(), vec![item, JsValue::Number(i as f64), this_arg.clone()]);
                         if self.early_exit.is_some() { break; }
                         if !Self::is_truthy(&v) { return JsValue::Boolean(false); }
                     }
@@ -5571,9 +5866,10 @@ impl BrowserExecutionState {
                 JsValue::Boolean(true)
             }
             "Array.prototype.some" => {
-                let cb = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                let mut args_iter = args.into_iter();
+                let cb = args_iter.next().unwrap_or(JsValue::Undefined);
                 if let JsValue::Function(func) = cb {
-                    let (items_opt, len, map_opt) = Self::array_like_parts(this_arg);
+                    let (items_opt, len, map_opt) = self.array_like_parts(this_arg.clone());
                     let iter_len = items_opt.as_ref().map(|v| v.len() as u32).unwrap_or(len);
                     for i in 0..iter_len {
                         if self.execution_budget_exhausted { break; }
@@ -5581,7 +5877,7 @@ impl BrowserExecutionState {
                             .and_then(|v| v.get(i as usize).cloned())
                             .or_else(|| map_opt.as_ref()?.get(&i.to_string()).cloned())
                             .unwrap_or(JsValue::Undefined);
-                        let v = self.call_function(func.clone(), vec![item, JsValue::Number(i as f64)]);
+                        let v = self.call_function(func.clone(), vec![item, JsValue::Number(i as f64), this_arg.clone()]);
                         if self.early_exit.is_some() { break; }
                         if Self::is_truthy(&v) { return JsValue::Boolean(true); }
                     }
@@ -5589,9 +5885,10 @@ impl BrowserExecutionState {
                 JsValue::Boolean(false)
             }
             "Array.prototype.forEach" => {
-                let cb = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                let mut args_iter = args.into_iter();
+                let cb = args_iter.next().unwrap_or(JsValue::Undefined);
                 if let JsValue::Function(func) = cb {
-                    let (items_opt, len, map_opt) = Self::array_like_parts(this_arg);
+                    let (items_opt, len, map_opt) = self.array_like_parts(this_arg.clone());
                     let iter_len = items_opt.as_ref().map(|v| v.len() as u32).unwrap_or(len);
                     for i in 0..iter_len {
                         if self.execution_budget_exhausted { break; }
@@ -5599,16 +5896,17 @@ impl BrowserExecutionState {
                             .and_then(|v| v.get(i as usize).cloned())
                             .or_else(|| map_opt.as_ref()?.get(&i.to_string()).cloned())
                             .unwrap_or(JsValue::Undefined);
-                        self.call_function(func.clone(), vec![item, JsValue::Number(i as f64)]);
+                        self.call_function(func.clone(), vec![item, JsValue::Number(i as f64), this_arg.clone()]);
                         if self.early_exit.is_some() { break; }
                     }
                 }
                 JsValue::Undefined
             }
             "Array.prototype.map" => {
-                let cb = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                let mut args_iter = args.into_iter();
+                let cb = args_iter.next().unwrap_or(JsValue::Undefined);
                 if let JsValue::Function(func) = cb {
-                    let (items_opt, len, map_opt) = Self::array_like_parts(this_arg);
+                    let (items_opt, len, map_opt) = self.array_like_parts(this_arg.clone());
                     let iter_len = items_opt.as_ref().map(|v| v.len() as u32).unwrap_or(len);
                     let mut result = Vec::new();
                     for i in 0..iter_len {
@@ -5617,7 +5915,7 @@ impl BrowserExecutionState {
                             .and_then(|v| v.get(i as usize).cloned())
                             .or_else(|| map_opt.as_ref()?.get(&i.to_string()).cloned())
                             .unwrap_or(JsValue::Undefined);
-                        let v = self.call_function(func.clone(), vec![item, JsValue::Number(i as f64)]);
+                        let v = self.call_function(func.clone(), vec![item, JsValue::Number(i as f64), this_arg.clone()]);
                         if self.early_exit.is_some() { break; }
                         result.push(v);
                     }
@@ -5627,9 +5925,10 @@ impl BrowserExecutionState {
                 }
             }
             "Array.prototype.filter" => {
-                let cb = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                let mut args_iter = args.into_iter();
+                let cb = args_iter.next().unwrap_or(JsValue::Undefined);
                 if let JsValue::Function(func) = cb {
-                    let (items_opt, len, map_opt) = Self::array_like_parts(this_arg);
+                    let (items_opt, len, map_opt) = self.array_like_parts(this_arg.clone());
                     let iter_len = items_opt.as_ref().map(|v| v.len() as u32).unwrap_or(len);
                     let mut result = Vec::new();
                     for i in 0..iter_len {
@@ -5638,7 +5937,7 @@ impl BrowserExecutionState {
                             .and_then(|v| v.get(i as usize).cloned())
                             .or_else(|| map_opt.as_ref()?.get(&i.to_string()).cloned())
                             .unwrap_or(JsValue::Undefined);
-                        let v = self.call_function(func.clone(), vec![item.clone(), JsValue::Number(i as f64)]);
+                        let v = self.call_function(func.clone(), vec![item.clone(), JsValue::Number(i as f64), this_arg.clone()]);
                         if self.early_exit.is_some() { break; }
                         if Self::is_truthy(&v) { result.push(item); }
                     }
@@ -5653,38 +5952,100 @@ impl BrowserExecutionState {
 
     // Returns (array_items, object_length, object_map) for array-like iteration.
     // Never materializes a huge vec; the caller iterates lazily up to the length.
-    fn array_like_parts(val: JsValue) -> (Option<Vec<JsValue>>, u32, Option<HashMap<String, JsValue>>) {
+    fn array_like_parts(&mut self, val: JsValue) -> (Option<Vec<JsValue>>, u32, Option<HashMap<String, JsValue>>) {
         match val {
             JsValue::Array(items) => (Some(items), 0, None),
             JsValue::Object(map) => {
-                let len = Self::to_length_from_map(&map);
+                let len = self.to_length_from_map(&map);
                 (None, len, Some(map))
             }
             _ => (Some(vec![]), 0, None),
         }
     }
 
-    fn to_length_from_map(map: &HashMap<String, JsValue>) -> u32 {
-        let n = match map.get("length") {
-            Some(JsValue::Number(n)) => *n,
-            Some(other) => Self::value_to_number(other),
+    fn to_length_from_map(&mut self, map: &HashMap<String, JsValue>) -> u32 {
+        let length_val = match map.get("length") {
+            Some(v) => v.clone(),
             None => return 0,
         };
+        let n = self.coerce_to_number(length_val);
         if n.is_nan() || n <= 0.0 { return 0; }
         // Clamp to a safe iteration cap. Real ToLength max is 2^53-1 but for
         // execution purposes we cap at 2^32-1; the budget guard handles large loops.
         n.min(u32::MAX as f64) as u32
     }
 
+    /// ToPrimitive/ToNumber for a value: for Objects calls valueOf() then toString().
+    fn coerce_to_number(&mut self, val: JsValue) -> f64 {
+        match val {
+            JsValue::Object(ref map) => {
+                // Try valueOf first.
+                if let Some(JsValue::Function(f)) = map.get("valueOf").cloned() {
+                    let result = self.call_function(f, vec![]);
+                    if !matches!(result, JsValue::Object(_)) {
+                        return Self::value_to_number(&result);
+                    }
+                }
+                // Try toString.
+                if let Some(JsValue::Function(f)) = map.get("toString").cloned() {
+                    let result = self.call_function(f, vec![]);
+                    if !matches!(result, JsValue::Object(_)) {
+                        return Self::value_to_number(&result);
+                    }
+                }
+                f64::NAN
+            }
+            other => Self::value_to_number(&other),
+        }
+    }
+
     fn native_prototype_object(owner: &str) -> JsValue {
         let mut map = HashMap::new();
         for method in Self::native_prototype_methods(owner) {
-            let value = if *method == "constructor" {
-                JsValue::HostFunction(owner.to_owned())
-            } else {
-                JsValue::HostFunction(format!("{owner}.prototype.{method}"))
+            let value = match *method {
+                "constructor" => JsValue::HostFunction(owner.to_owned()),
+                // Error-family prototypes carry data properties for name and message.
+                "name" if matches!(
+                    owner,
+                    "Error" | "TypeError" | "RangeError" | "ReferenceError"
+                        | "SyntaxError" | "URIError" | "EvalError" | "AggregateError"
+                ) => JsValue::String(owner.to_owned()),
+                "message" if matches!(
+                    owner,
+                    "Error" | "TypeError" | "RangeError" | "ReferenceError"
+                        | "SyntaxError" | "URIError" | "EvalError" | "AggregateError"
+                ) => JsValue::String(String::new()),
+                "stack" if matches!(
+                    owner,
+                    "Error" | "TypeError" | "RangeError" | "ReferenceError"
+                        | "SyntaxError" | "URIError" | "EvalError" | "AggregateError"
+                ) => JsValue::String(String::new()),
+                _ => JsValue::HostFunction(format!("{owner}.prototype.{method}")),
             };
             map.insert((*method).to_owned(), value);
+        }
+        // Mark as a built-in prototype so getOwnPropertyDescriptor returns enumerable:false.
+        map.insert("\x00builtin".to_owned(), JsValue::Boolean(true));
+        // Symbol-keyed well-known methods — stored under their JBS string representation.
+        if owner == "Array" {
+            // @@iterator is the same function as Array.prototype.values
+            map.insert(
+                "Symbol(Symbol.iterator)".to_owned(),
+                JsValue::HostFunction("Array.prototype.values".to_owned()),
+            );
+            // @@unscopables is an object listing array method names that are unscopable
+            let mut unscopables = HashMap::new();
+            for name in &[
+                "copyWithin", "entries", "fill", "find", "findIndex", "findLast",
+                "findLastIndex", "flat", "flatMap", "includes", "keys", "toReversed",
+                "toSorted", "toSpliced", "values",
+            ] {
+                unscopables.insert((*name).to_owned(), JsValue::Boolean(true));
+            }
+            map.insert(
+                "Symbol(Symbol.unscopables)".to_owned(),
+                JsValue::Object(unscopables),
+            );
         }
         JsValue::Object(map)
     }
@@ -5706,7 +6067,15 @@ impl BrowserExecutionState {
 
     fn native_prototype_methods(owner: &str) -> &'static [&'static str] {
         match owner {
-            "Object" => &["constructor", "toString", "valueOf", "hasOwnProperty"],
+            "Object" => &[
+                "constructor",
+                "toString",
+                "valueOf",
+                "hasOwnProperty",
+                "isPrototypeOf",
+                "propertyIsEnumerable",
+                "toLocaleString",
+            ],
             "Array" => &[
                 "constructor",
                 "push",
@@ -5723,25 +6092,119 @@ impl BrowserExecutionState {
                 "map",
                 "filter",
                 "reduce",
+                "reduceRight",
                 "some",
                 "every",
                 "find",
+                "findIndex",
+                "findLast",
+                "findLastIndex",
                 "flat",
+                "flatMap",
+                "fill",
+                "copyWithin",
+                "entries",
+                "keys",
+                "values",
                 "at",
+                "reverse",
+                "sort",
+                "splice",
+                "toReversed",
+                "toSorted",
+                "toSpliced",
+                "with",
                 "toString",
+                "toLocaleString",
             ],
             "String" => &[
                 "constructor",
                 "toString",
                 "replace",
+                "replaceAll",
                 "split",
                 "includes",
                 "indexOf",
+                "lastIndexOf",
+                "startsWith",
+                "endsWith",
                 "slice",
+                "substring",
+                "substr",
                 "trim",
+                "trimStart",
+                "trimEnd",
+                "padStart",
+                "padEnd",
+                "repeat",
                 "charAt",
+                "charCodeAt",
+                "codePointAt",
+                "at",
+                "normalize",
+                "match",
+                "matchAll",
+                "search",
+                "concat",
+                "toUpperCase",
+                "toLowerCase",
+                "toLocaleLowerCase",
+                "toLocaleUpperCase",
+                "localeCompare",
             ],
             "Function" => &["constructor", "call", "apply", "bind", "toString"],
+            "Number" => &[
+                "constructor",
+                "toString",
+                "toFixed",
+                "toPrecision",
+                "toExponential",
+                "valueOf",
+                "toLocaleString",
+            ],
+            "Boolean" => &["constructor", "toString", "valueOf"],
+            "RegExp" => &[
+                "constructor",
+                "exec",
+                "test",
+                "toString",
+                "compile",
+            ],
+            "Map" => &[
+                "constructor",
+                "get",
+                "set",
+                "has",
+                "delete",
+                "clear",
+                "forEach",
+                "keys",
+                "values",
+                "entries",
+                "size",
+            ],
+            "Set" => &[
+                "constructor",
+                "add",
+                "has",
+                "delete",
+                "clear",
+                "forEach",
+                "keys",
+                "values",
+                "entries",
+                "size",
+            ],
+            "Promise" => &[
+                "constructor",
+                "then",
+                "catch",
+                "finally",
+            ],
+            "Error" | "TypeError" | "RangeError" | "ReferenceError" | "SyntaxError"
+            | "URIError" | "EvalError" | "AggregateError" => {
+                &["constructor", "toString", "name", "message", "stack"]
+            }
             _ => &[],
         }
     }
@@ -5751,6 +6214,17 @@ impl BrowserExecutionState {
         map: &HashMap<String, JsValue>,
         property: &str,
     ) -> Option<JsValue> {
+        // Check for getter accessor first.
+        let getter_key = format!("\x00get:{property}");
+        if let Some(getter) = map.get(&getter_key).cloned() {
+            return Some(match getter {
+                JsValue::Function(func) => self.call_function(func, vec![]),
+                JsValue::HostFunction(fn_name) => {
+                    self.call_host_function(&fn_name, JsValue::Undefined, vec![])
+                }
+                _ => JsValue::Undefined,
+            });
+        }
         match map.get(property) {
             Some(JsValue::Undefined) if Self::soft_native_shadow_property(property) => self
                 .native_prototype_property("Object", property)
@@ -5857,9 +6331,299 @@ impl BrowserExecutionState {
 
     fn constructor_prototype_object(name: &str) -> Option<JsValue> {
         match name {
-            "Object" | "Array" | "String" | "Function" => Some(Self::native_prototype_object(name)),
+            "Object" | "Array" | "String" | "Function" | "Number" | "Boolean" | "RegExp"
+            | "Map" | "Set" | "Promise" | "Error" | "TypeError" | "RangeError"
+            | "ReferenceError" | "SyntaxError" | "URIError" | "EvalError" | "AggregateError" => {
+                Some(Self::native_prototype_object(name))
+            }
             _ => None,
         }
+    }
+
+    /// Returns a property descriptor Object for a known own property of `obj`.
+    /// Returns `JsValue::Undefined` when the property does not exist as an own property.
+    fn static_get_own_property_descriptor(obj: &JsValue, prop: &str) -> JsValue {
+        // Internal keys are never visible to getOwnPropertyDescriptor.
+        if prop.starts_with('\x00') {
+            return JsValue::Undefined;
+        }
+        match obj {
+            JsValue::Object(map) => {
+                // Accessor (getter) takes priority.
+                let getter_key = format!("\x00get:{prop}");
+                if let Some(getter) = map.get(&getter_key) {
+                    let mut desc = HashMap::new();
+                    desc.insert("get".into(), getter.clone());
+                    desc.insert("set".into(), JsValue::Undefined);
+                    let non_enum = map.contains_key("\x00builtin") || map.contains_key("\x00all_ne");
+                    desc.insert("enumerable".into(), JsValue::Boolean(!non_enum));
+                    desc.insert("configurable".into(), JsValue::Boolean(true));
+                    return JsValue::Object(desc);
+                }
+                if let Some(val) = map.get(prop) {
+                    let mut desc = HashMap::new();
+                    desc.insert("value".into(), val.clone());
+                    desc.insert("writable".into(), JsValue::Boolean(true));
+                    let non_enum = map.contains_key("\x00builtin") || map.contains_key("\x00all_ne");
+                    desc.insert("enumerable".into(), JsValue::Boolean(!non_enum));
+                    desc.insert("configurable".into(), JsValue::Boolean(true));
+                    JsValue::Object(desc)
+                } else {
+                    JsValue::Undefined
+                }
+            }
+            JsValue::HostFunction(fn_name) => {
+                // Special accessor: Array[Symbol.species]
+                if prop == "Symbol(Symbol.species)" && fn_name == "Array" {
+                    let getter = JsValue::HostFunction("Array.@@species.get".into());
+                    let mut desc = HashMap::new();
+                    desc.insert("get".into(), getter);
+                    desc.insert("set".into(), JsValue::Undefined);
+                    desc.insert("enumerable".into(), JsValue::Boolean(false));
+                    desc.insert("configurable".into(), JsValue::Boolean(true));
+                    return JsValue::Object(desc);
+                }
+                match prop {
+                    "name" => {
+                        let mut desc = HashMap::new();
+                        desc.insert("value".into(), JsValue::String(Self::host_fn_short_name(fn_name)));
+                        desc.insert("writable".into(), JsValue::Boolean(false));
+                        desc.insert("enumerable".into(), JsValue::Boolean(false));
+                        desc.insert("configurable".into(), JsValue::Boolean(true));
+                        JsValue::Object(desc)
+                    }
+                    "length" => {
+                        let mut desc = HashMap::new();
+                        desc.insert("value".into(), JsValue::Number(Self::host_fn_arity(fn_name) as f64));
+                        desc.insert("writable".into(), JsValue::Boolean(false));
+                        desc.insert("enumerable".into(), JsValue::Boolean(false));
+                        desc.insert("configurable".into(), JsValue::Boolean(true));
+                        JsValue::Object(desc)
+                    }
+                    "prototype" => {
+                        if let Some(proto) = Self::constructor_prototype_object(fn_name) {
+                            let writable = !matches!(fn_name.as_str(),
+                                "Error" | "TypeError" | "RangeError" | "ReferenceError"
+                                | "SyntaxError" | "URIError" | "EvalError" | "AggregateError");
+                            let mut desc = HashMap::new();
+                            desc.insert("value".into(), proto);
+                            desc.insert("writable".into(), JsValue::Boolean(writable));
+                            desc.insert("enumerable".into(), JsValue::Boolean(false));
+                            desc.insert("configurable".into(), JsValue::Boolean(false));
+                            JsValue::Object(desc)
+                        } else {
+                            JsValue::Undefined
+                        }
+                    }
+                    _ => {
+                        if let Some(val) = Self::host_fn_static_member(fn_name, prop) {
+                            let mut desc = HashMap::new();
+                            desc.insert("value".into(), val);
+                            desc.insert("writable".into(), JsValue::Boolean(true));
+                            desc.insert("enumerable".into(), JsValue::Boolean(false));
+                            desc.insert("configurable".into(), JsValue::Boolean(true));
+                            JsValue::Object(desc)
+                        } else {
+                            JsValue::Undefined
+                        }
+                    }
+                }
+            }
+            JsValue::Function(func) => {
+                match prop {
+                    "name" | "length" | "prototype" => {
+                        let val = match prop {
+                            "name" => func.name.as_deref().map(|n| JsValue::String(n.to_owned())).unwrap_or(JsValue::String(String::new())),
+                            "length" => JsValue::Number(0.0),
+                            "prototype" => func.properties.get("prototype").cloned().unwrap_or_else(|| JsValue::Object(HashMap::new())),
+                            _ => JsValue::Undefined,
+                        };
+                        let mut desc = HashMap::new();
+                        desc.insert("value".into(), val);
+                        desc.insert("writable".into(), JsValue::Boolean(prop == "prototype"));
+                        desc.insert("enumerable".into(), JsValue::Boolean(false));
+                        desc.insert("configurable".into(), JsValue::Boolean(prop != "prototype"));
+                        JsValue::Object(desc)
+                    }
+                    _ => {
+                        if let Some(val) = func.properties.get(prop) {
+                            let mut desc = HashMap::new();
+                            desc.insert("value".into(), val.clone());
+                            desc.insert("writable".into(), JsValue::Boolean(true));
+                            desc.insert("enumerable".into(), JsValue::Boolean(true));
+                            desc.insert("configurable".into(), JsValue::Boolean(true));
+                            JsValue::Object(desc)
+                        } else {
+                            JsValue::Undefined
+                        }
+                    }
+                }
+            }
+            JsValue::Array(items) => {
+                match prop {
+                    "length" => {
+                        let mut desc = HashMap::new();
+                        desc.insert("value".into(), JsValue::Number(items.len() as f64));
+                        desc.insert("writable".into(), JsValue::Boolean(true));
+                        desc.insert("enumerable".into(), JsValue::Boolean(false));
+                        desc.insert("configurable".into(), JsValue::Boolean(false));
+                        JsValue::Object(desc)
+                    }
+                    _ => {
+                        if let Ok(idx) = prop.parse::<usize>() {
+                            if let Some(val) = items.get(idx) {
+                                let mut desc = HashMap::new();
+                                desc.insert("value".into(), val.clone());
+                                desc.insert("writable".into(), JsValue::Boolean(true));
+                                desc.insert("enumerable".into(), JsValue::Boolean(true));
+                                desc.insert("configurable".into(), JsValue::Boolean(true));
+                                return JsValue::Object(desc);
+                            }
+                        }
+                        JsValue::Undefined
+                    }
+                }
+            }
+            _ => JsValue::Undefined,
+        }
+    }
+
+    /// Returns `Some(HostFunction(...))` for known static methods of built-in constructors/namespaces.
+    /// Used by both member-access resolution and `hasOwnProperty` checks.
+    fn host_fn_static_member(fn_name: &str, property: &str) -> Option<JsValue> {
+        let known = match fn_name {
+            "Array" => matches!(
+                property,
+                "isArray" | "from" | "of" | "fromAsync"
+            ),
+            "Object" => matches!(
+                property,
+                "assign" | "keys" | "values" | "entries" | "create" | "freeze" | "seal"
+                    | "defineProperty" | "defineProperties" | "getOwnPropertyNames"
+                    | "getOwnPropertySymbols" | "getOwnPropertyDescriptor"
+                    | "getOwnPropertyDescriptors" | "getPrototypeOf" | "setPrototypeOf"
+                    | "is" | "fromEntries" | "hasOwn"
+            ),
+            "Number" => matches!(
+                property,
+                "isFinite" | "isNaN" | "isInteger" | "isSafeInteger"
+                    | "parseInt" | "parseFloat"
+            ),
+            "String" => matches!(property, "fromCharCode" | "fromCodePoint" | "raw"),
+            "Math" => matches!(
+                property,
+                "abs" | "ceil" | "floor" | "round" | "max" | "min" | "pow" | "sqrt"
+                    | "cbrt" | "sign" | "trunc" | "exp" | "expm1" | "log" | "log2"
+                    | "log10" | "log1p" | "sin" | "cos" | "tan" | "asin" | "acos"
+                    | "atan" | "atan2" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh"
+                    | "atanh" | "hypot" | "imul" | "clz32" | "fround" | "random"
+            ),
+            "Reflect" => matches!(
+                property,
+                "construct" | "apply" | "defineProperty" | "deleteProperty" | "get"
+                    | "getOwnPropertyDescriptor" | "getPrototypeOf" | "has"
+                    | "isExtensible" | "ownKeys" | "preventExtensions" | "set"
+                    | "setPrototypeOf"
+            ),
+            "Promise" => matches!(property, "resolve" | "reject" | "all" | "allSettled" | "any" | "race"),
+            "Symbol" => matches!(property, "for" | "keyFor"),
+            _ => false,
+        };
+        if known {
+            Some(JsValue::HostFunction(format!("{fn_name}.{property}")))
+        } else {
+            None
+        }
+    }
+
+    /// Returns `true` when `key` is a known own property of `HostFunction(fn_name)`.
+    fn host_fn_has_own_property(fn_name: &str, key: &str) -> bool {
+        match key {
+            "name" | "length" => true,
+            "prototype" => Self::constructor_prototype_object(fn_name).is_some(),
+            // Array[Symbol.species] is a getter-only accessor property.
+            "Symbol(Symbol.species)" => fn_name == "Array",
+            _ => Self::host_fn_static_member(fn_name, key).is_some(),
+        }
+    }
+
+    /// Returns `true` when the HostFunction with this name can be used as a constructor (new target).
+    fn host_fn_is_constructor(fn_name: &str) -> bool {
+        matches!(
+            fn_name,
+            "Array" | "Object" | "Function" | "String" | "Number" | "Boolean"
+                | "RegExp" | "Error" | "TypeError" | "RangeError" | "ReferenceError"
+                | "SyntaxError" | "URIError" | "EvalError" | "Map" | "Set"
+                | "WeakMap" | "WeakSet" | "Promise" | "Proxy" | "Date"
+                | "Int8Array" | "Uint8Array" | "Uint8ClampedArray" | "Int16Array"
+                | "Uint16Array" | "Int32Array" | "Uint32Array" | "Float32Array"
+                | "Float64Array" | "BigInt64Array" | "BigUint64Array"
+                | "ArrayBuffer" | "DataView" | "SharedArrayBuffer"
+                | "AggregateError" | "Symbol"
+        )
+    }
+
+    /// Returns the short name of a host function (last segment after the final dot).
+    fn host_fn_short_name(fn_name: &str) -> String {
+        match fn_name {
+            "Array.@@species.get" => "get [Symbol.species]".to_owned(),
+            _ => fn_name.rsplit('.').next().unwrap_or(fn_name).to_owned(),
+        }
+    }
+
+    /// Returns the expected `length` (arity) for a known host function, or 0 as default.
+    fn host_fn_arity(fn_name: &str) -> u32 {
+        match fn_name {
+            "Array.from" | "Array.of" | "Object.create" | "Object.getPrototypeOf"
+            | "Object.getOwnPropertyDescriptor" | "Number.isFinite" | "Number.isNaN"
+            | "Number.isInteger" | "Number.isSafeInteger" | "Number.parseFloat"
+            | "Number.parseInt" | "String.fromCharCode" | "String.fromCodePoint"
+            | "Math.abs" | "Math.ceil" | "Math.floor" | "Math.round" | "Math.sqrt"
+            | "Math.cbrt" | "Math.sign" | "Math.trunc" | "Math.exp" | "Math.log"
+            | "Math.log2" | "Math.log10" | "Math.sin" | "Math.cos" | "Math.tan"
+            | "Math.asin" | "Math.acos" | "Math.atan" | "Math.sinh" | "Math.cosh"
+            | "Math.tanh" | "Math.asinh" | "Math.acosh" | "Math.atanh"
+            | "Reflect.construct" | "Reflect.deleteProperty" | "Reflect.get"
+            | "Reflect.getPrototypeOf" | "Reflect.isExtensible" | "Reflect.ownKeys"
+            | "Reflect.preventExtensions" | "Reflect.set" | "Reflect.setPrototypeOf"
+            | "Object.assign" | "Object.defineProperty" | "Object.defineProperties"
+            | "Object.setPrototypeOf" | "Object.is" => 2,
+            "Reflect.apply" | "Reflect.defineProperty" | "Reflect.getOwnPropertyDescriptor"
+            | "Reflect.has" | "Math.max" | "Math.min" | "Math.pow" | "Math.atan2"
+            | "Math.hypot" | "Math.imul" | "Object.entries" | "Object.keys"
+            | "Object.values" | "Object.getOwnPropertyNames" | "Object.getOwnPropertySymbols"
+            | "Object.getOwnPropertyDescriptors" | "Object.freeze" | "Object.seal"
+            | "Object.fromEntries" | "Object.hasOwn" | "Array.isArray"
+            | "Promise.resolve" | "Promise.reject" | "Promise.all" | "Promise.allSettled"
+            | "Promise.any" | "Promise.race" => 1,
+            "Array" | "Object" | "Function" | "String" | "Number" | "Boolean"
+            | "RegExp" | "Error" | "TypeError" | "RangeError" | "ReferenceError"
+            | "SyntaxError" | "URIError" | "EvalError" => 1,
+            "Math.random" | "Array.fromAsync" => 0,
+            _ => 0,
+        }
+    }
+
+    /// Returns `true` when `key` is a known own property of the `window`/`globalThis` object.
+    fn window_has_own_property(key: &str) -> bool {
+        matches!(
+            key,
+            "Array" | "Object" | "Function" | "String" | "Number" | "Boolean"
+                | "Symbol" | "BigInt" | "Math" | "JSON" | "Reflect" | "Proxy"
+                | "Date" | "RegExp" | "Map" | "Set" | "WeakMap" | "WeakSet"
+                | "Promise" | "Error" | "TypeError" | "RangeError" | "ReferenceError"
+                | "SyntaxError" | "URIError" | "EvalError" | "AggregateError"
+                | "Int8Array" | "Uint8Array" | "Uint8ClampedArray" | "Int16Array"
+                | "Uint16Array" | "Int32Array" | "Uint32Array" | "Float32Array"
+                | "Float64Array" | "BigInt64Array" | "BigUint64Array"
+                | "ArrayBuffer" | "SharedArrayBuffer" | "DataView" | "Atomics"
+                | "WebAssembly" | "parseInt" | "parseFloat" | "isNaN" | "isFinite"
+                | "decodeURI" | "decodeURIComponent" | "encodeURI"
+                | "encodeURIComponent" | "eval" | "escape" | "unescape"
+                | "undefined" | "NaN" | "Infinity" | "globalThis"
+                | "window" | "self" | "document" | "navigator" | "location"
+                | "console" | "performance" | "localStorage" | "sessionStorage"
+        )
     }
 
     fn navigator_soft_failure_property(property: &str) -> JsValue {
