@@ -117,9 +117,32 @@ pub struct BrowserExecutionState {
     symbol_counter: u32,
 }
 
+// ─── Environment Record Slot (Phase B: const / let mutability) ───────────────
+
+/// A single variable binding inside an environment record.
+/// `mutable: false` → `const` binding; reassignment throws TypeError.
+#[derive(Clone, Debug)]
+struct Slot {
+    value: JsValue,
+    mutable: bool,
+}
+
+impl Slot {
+    fn var(value: JsValue) -> Self { Slot { value, mutable: true } }
+    fn const_(value: JsValue) -> Self { Slot { value, mutable: false } }
+}
+
+impl PartialEq for Slot {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value && self.mutable == other.mutable
+    }
+}
+
+// ─── Stack Frame ──────────────────────────────────────────────────────────────
+
 #[derive(Clone, Debug)]
 struct StackFrame {
-    locals: Rc<RefCell<HashMap<String, JsValue>>>,
+    locals: Rc<RefCell<HashMap<String, Slot>>>,
     is_function_scope: bool,
 }
 
@@ -143,7 +166,7 @@ impl StackFrame {
 
 impl PartialEq for StackFrame {
     fn eq(&self, other: &Self) -> bool {
-        *self.locals.borrow() == *other.locals.borrow()
+        Rc::ptr_eq(&self.locals, &other.locals)
     }
 }
 
@@ -156,7 +179,138 @@ struct EventHandler {
     captured: Vec<StackFrame>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+// ─── ECMAScript Property Descriptor (ECMA-262 §6.2.6) ────────────────────────
+
+#[derive(Clone, Debug)]
+pub(crate) enum Property {
+    Data {
+        value: JsValue,
+        writable: bool,
+        enumerable: bool,
+        configurable: bool,
+    },
+    Accessor {
+        get: Option<JsValue>,
+        set: Option<JsValue>,
+        enumerable: bool,
+        configurable: bool,
+    },
+}
+
+impl Property {
+    /// Writable/enumerable/configurable = true (the common case).
+    fn data(value: JsValue) -> Self {
+        Property::Data { value, writable: true, enumerable: true, configurable: true }
+    }
+    /// Non-enumerable, non-configurable data property (for built-in prototype members).
+    fn non_enumerable(value: JsValue) -> Self {
+        Property::Data { value, writable: true, enumerable: false, configurable: true }
+    }
+    fn is_enumerable(&self) -> bool {
+        match self {
+            Property::Data { enumerable, .. } | Property::Accessor { enumerable, .. } => *enumerable,
+        }
+    }
+    fn is_writable(&self) -> bool {
+        matches!(self, Property::Data { writable: true, .. })
+    }
+    fn is_configurable(&self) -> bool {
+        match self {
+            Property::Data { configurable, .. } | Property::Accessor { configurable, .. } => *configurable,
+        }
+    }
+    /// Read the contained value if this is a Data property.
+    fn as_value(&self) -> Option<&JsValue> {
+        if let Property::Data { value, .. } = self { Some(value) } else { None }
+    }
+}
+
+// ─── Heap-Allocated ECMAScript Ordinary Object (ECMA-262 §10.1) ──────────────
+
+#[derive(Clone, Debug, Default)]
+pub struct JsObject {
+    pub properties: HashMap<String, Property>,
+    pub prototype: Option<Rc<RefCell<JsObject>>>,
+    pub extensible: bool,
+    /// Class tag used by `instanceof` and `Object.prototype.toString`.
+    pub class_name: Option<String>,
+    /// True for Error-like objects and built-in prototypes: own props are non-enumerable.
+    pub all_non_enumerable: bool,
+}
+
+impl JsObject {
+    pub fn new() -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(Self { extensible: true, ..Default::default() }))
+    }
+
+    pub fn with_proto(proto: Rc<RefCell<JsObject>>) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(Self { prototype: Some(proto), extensible: true, ..Default::default() }))
+    }
+
+    /// Set own enumerable data property (writable/enumerable/configurable = true).
+    pub fn set(&mut self, key: impl Into<String>, value: JsValue) {
+        self.properties.insert(key.into(), Property::data(value));
+    }
+
+    /// Set own non-enumerable data property (hidden from `Object.keys` / `for…in`).
+    pub fn set_ne(&mut self, key: impl Into<String>, value: JsValue) {
+        self.properties.insert(key.into(), Property::non_enumerable(value));
+    }
+
+    /// Install a full property descriptor.
+    pub fn define(&mut self, key: impl Into<String>, prop: Property) {
+        self.properties.insert(key.into(), prop);
+    }
+
+    /// Install a getter-only accessor (configurable, non-enumerable).
+    pub fn set_getter(&mut self, key: impl Into<String>, getter: JsValue) {
+        self.properties.insert(key.into(), Property::Accessor {
+            get: Some(getter),
+            set: None,
+            enumerable: false,
+            configurable: true,
+        });
+    }
+
+    /// Read own data value without invoking getters.
+    pub fn get_own_data(&self, key: &str) -> Option<JsValue> {
+        self.properties.get(key)?.as_value().cloned()
+    }
+
+    /// Read own property descriptor.
+    pub fn get_own(&self, key: &str) -> Option<&Property> {
+        self.properties.get(key)
+    }
+
+    pub fn has_own(&self, key: &str) -> bool {
+        self.properties.contains_key(key)
+    }
+
+    pub fn delete_own(&mut self, key: &str) -> bool {
+        self.properties.remove(key).is_some()
+    }
+
+    /// Own enumerable string keys, sorted (for `Object.keys`, `for…in`).
+    pub fn own_enumerable_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.properties.iter()
+            .filter(|(_, p)| !self.all_non_enumerable && p.is_enumerable())
+            .map(|(k, _)| k.clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// All own string keys, sorted (for `Object.getOwnPropertyNames`).
+    pub fn all_own_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.properties.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+}
+
+// ─── JsValue ──────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
 enum JsValue {
     Undefined,
     Null,
@@ -164,7 +318,8 @@ enum JsValue {
     Number(f64),
     BigInt(i64),
     String(String),
-    Object(HashMap<String, JsValue>),
+    /// Heap-allocated ordinary object with a prototype chain (reference semantics).
+    Object(Rc<RefCell<JsObject>>),
     Array(Vec<JsValue>),
     Function(JsFunction),
     ElementRef(String),
@@ -200,6 +355,51 @@ enum JsValue {
     WeakMap(HashMap<String, JsValue>),
 }
 
+impl PartialEq for JsValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (JsValue::Undefined, JsValue::Undefined) => true,
+            (JsValue::Null, JsValue::Null) => true,
+            (JsValue::Boolean(a), JsValue::Boolean(b)) => a == b,
+            (JsValue::Number(a), JsValue::Number(b)) => a == b,
+            (JsValue::BigInt(a), JsValue::BigInt(b)) => a == b,
+            (JsValue::String(a), JsValue::String(b)) => a == b,
+            // Objects use identity (reference) equality — same Rc pointer = same object.
+            (JsValue::Object(a), JsValue::Object(b)) => Rc::ptr_eq(a, b),
+            (JsValue::Array(a), JsValue::Array(b)) => a == b,
+            (JsValue::HostFunction(a), JsValue::HostFunction(b)) => a == b,
+            (JsValue::HostObject(a), JsValue::HostObject(b)) => a == b,
+            (JsValue::ElementRef(a), JsValue::ElementRef(b)) => a == b,
+            (JsValue::StorageRef(a), JsValue::StorageRef(b)) => a == b,
+            (JsValue::DocumentRef, JsValue::DocumentRef) => true,
+            (JsValue::WindowRef, JsValue::WindowRef) => true,
+            (JsValue::NavigatorRef, JsValue::NavigatorRef) => true,
+            (JsValue::DateInstance, JsValue::DateInstance) => true,
+            (JsValue::ResolvedPromise, JsValue::ResolvedPromise) => true,
+            _ => false,
+        }
+    }
+}
+
+impl JsValue {
+    /// Create a new empty ordinary object.
+    fn new_object() -> Self {
+        JsValue::Object(JsObject::new())
+    }
+
+    /// Create an object from a flat `key → JsValue` map (all props enumerable).
+    fn from_map(map: impl IntoIterator<Item = (String, JsValue)>) -> Self {
+        let rc = JsObject::new();
+        {
+            let mut obj = rc.borrow_mut();
+            for (k, v) in map {
+                obj.set(k, v);
+            }
+        }
+        JsValue::Object(rc)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum StorageKind {
     Local,
@@ -213,6 +413,88 @@ pub fn collect_browser_effects(program: &Program) -> Vec<BrowserEffect> {
 }
 
 impl BrowserExecutionState {
+    // ── Core object model helpers ─────────────────────────────────────────────
+
+    /// `[[Get]]` — walks the prototype chain and invokes accessor getters.
+    fn obj_get(&mut self, rc: &Rc<RefCell<JsObject>>, key: &str) -> JsValue {
+        // Own property lookup.
+        let own = rc.borrow().get_own(key).cloned();
+        match own {
+            Some(Property::Data { value, .. }) => return value,
+            Some(Property::Accessor { get: Some(getter), .. }) => {
+                return self.call_value(getter, JsValue::Object(rc.clone()), vec![]);
+            }
+            Some(Property::Accessor { get: None, .. }) => return JsValue::Undefined,
+            None => {}
+        }
+        // Walk prototype chain.
+        let proto = rc.borrow().prototype.clone();
+        if let Some(proto) = proto {
+            return self.obj_get(&proto, key);
+        }
+        JsValue::Undefined
+    }
+
+    /// `[[Set]]` — invokes accessor setters or writes a data property.
+    fn obj_set(&mut self, rc: &Rc<RefCell<JsObject>>, key: &str, value: JsValue) {
+        // Check own accessor setter.
+        let setter = rc.borrow().get_own(key)
+            .and_then(|p| if let Property::Accessor { set: Some(s), .. } = p { Some(s.clone()) } else { None });
+        if let Some(setter) = setter {
+            self.call_value(setter, JsValue::Object(rc.clone()), vec![value]);
+            return;
+        }
+        // Check prototype chain for inherited setter.
+        let proto = rc.borrow().prototype.clone();
+        if let Some(proto) = proto {
+            let proto_setter = proto.borrow().get_own(key)
+                .and_then(|p| if let Property::Accessor { set: Some(s), .. } = p { Some(s.clone()) } else { None });
+            if let Some(setter) = proto_setter {
+                self.call_value(setter, JsValue::Object(rc.clone()), vec![value]);
+                return;
+            }
+        }
+        rc.borrow_mut().set(key, value);
+    }
+
+    /// Dispatch a call to a JsValue that is either a Function or HostFunction.
+    fn call_value(&mut self, callee: JsValue, this: JsValue, args: Vec<JsValue>) -> JsValue {
+        match callee {
+            JsValue::Function(func) => self.call_function_with_this(func, args, this).0,
+            JsValue::HostFunction(name) => self.call_host_function(&name.clone(), this, args),
+            _ => JsValue::Undefined,
+        }
+    }
+
+    /// Create a new empty ordinary object (JsValue convenience).
+    fn new_obj() -> JsValue {
+        JsValue::new_object()
+    }
+
+    /// Create an Error-shaped object: non-enumerable `name`, `message`, `stack`;
+    /// `class_name` set for instanceof. This is spec-compliant for all Error subtypes.
+    fn make_error_obj(class: &str, message: String) -> JsValue {
+        let rc = JsObject::new();
+        {
+            let mut obj = rc.borrow_mut();
+            obj.class_name = Some(class.to_owned());
+            obj.all_non_enumerable = true;
+            obj.set_ne("name", JsValue::String(class.to_owned()));
+            obj.set_ne("message", JsValue::String(message));
+            obj.set_ne("stack", JsValue::String(String::new()));
+        }
+        JsValue::Object(rc)
+    }
+
+    /// Declare a variable binding in the top frame.
+    /// `mutable: false` = const; reassignment later throws TypeError.
+    fn declare_binding(&mut self, name: &str, value: JsValue, mutable: bool) {
+        self.ensure_global_frame();
+        if let Some(frame) = self.stack.last() {
+            let slot = if mutable { Slot::var(value) } else { Slot::const_(value) };
+            frame.locals.borrow_mut().insert(name.to_owned(), slot);
+        }
+    }
     pub fn set_execution_budget(&mut self, statement_budget: usize) {
         self.execution_budget_remaining = Some(statement_budget);
         self.execution_budget_exhausted = false;
@@ -268,137 +550,75 @@ impl BrowserExecutionState {
     /// Seed the global `navigator` object so that scripts can read
     /// `navigator.platform`, `navigator.languages`, etc.
     pub fn seed_navigator(&mut self, info: &crate::navigator::NavigatorInfo) {
-        let mut obj: HashMap<String, JsValue> = HashMap::new();
-
-        obj.insert("platform".into(), JsValue::String(info.platform.clone()));
-        obj.insert("userAgent".into(), JsValue::String(info.user_agent.clone()));
-        obj.insert(
-            "appVersion".into(),
-            JsValue::String(info.app_version.clone()),
-        );
-        obj.insert("appName".into(), JsValue::String(info.app_name.into()));
-        obj.insert(
-            "appCodeName".into(),
-            JsValue::String(info.app_code_name.into()),
-        );
-        obj.insert("product".into(), JsValue::String(info.product.into()));
-        obj.insert(
-            "productSub".into(),
-            JsValue::String(info.product_sub.into()),
-        );
-        obj.insert("vendor".into(), JsValue::String(info.vendor.into()));
-        obj.insert("vendorSub".into(), JsValue::String(info.vendor_sub.into()));
-        obj.insert(
-            "hardwareConcurrency".into(),
-            JsValue::Number(info.hardware_concurrency as f64),
-        );
-        obj.insert(
-            "maxTouchPoints".into(),
-            JsValue::Number(info.max_touch_points as f64),
-        );
-        obj.insert(
-            "cookieEnabled".into(),
-            JsValue::Boolean(info.cookie_enabled),
-        );
-        obj.insert(
-            "doNotTrack".into(),
-            match info.do_not_track {
+        let rc = JsObject::new();
+        {
+            let mut obj = rc.borrow_mut();
+            obj.set("platform", JsValue::String(info.platform.clone()));
+            obj.set("userAgent", JsValue::String(info.user_agent.clone()));
+            obj.set("appVersion", JsValue::String(info.app_version.clone()));
+            obj.set("appName", JsValue::String(info.app_name.into()));
+            obj.set("appCodeName", JsValue::String(info.app_code_name.into()));
+            obj.set("product", JsValue::String(info.product.into()));
+            obj.set("productSub", JsValue::String(info.product_sub.into()));
+            obj.set("vendor", JsValue::String(info.vendor.into()));
+            obj.set("vendorSub", JsValue::String(info.vendor_sub.into()));
+            obj.set("hardwareConcurrency", JsValue::Number(info.hardware_concurrency as f64));
+            obj.set("maxTouchPoints", JsValue::Number(info.max_touch_points as f64));
+            obj.set("cookieEnabled", JsValue::Boolean(info.cookie_enabled));
+            obj.set("doNotTrack", match info.do_not_track {
                 Some(true) => JsValue::String("1".into()),
                 Some(false) => JsValue::String("0".into()),
                 None => JsValue::String("unspecified".into()),
-            },
-        );
-
-        // languages array
-        let langs: Vec<JsValue> = info
-            .languages
-            .iter()
-            .map(|l| JsValue::String(l.clone()))
-            .collect();
-        obj.insert("languages".into(), JsValue::Array(langs));
-        // language (first entry, or empty string)
-        obj.insert(
-            "language".into(),
-            JsValue::String(info.languages.first().cloned().unwrap_or_default()),
-        );
-
-        // Firefox-only; undefined in Chrome — we expose as undefined when absent
-        if let Some(ref oscpu) = info.oscpu {
-            obj.insert("oscpu".into(), JsValue::String(oscpu.clone()));
+            });
+            let langs: Vec<JsValue> = info.languages.iter().map(|l| JsValue::String(l.clone())).collect();
+            obj.set("languages", JsValue::Array(langs));
+            obj.set("language", JsValue::String(info.languages.first().cloned().unwrap_or_default()));
+            if let Some(ref oscpu) = info.oscpu {
+                obj.set("oscpu", JsValue::String(oscpu.clone()));
+            }
+            if let Some(ref cpu) = info.cpu_class {
+                obj.set("cpuClass", JsValue::String(cpu.clone()));
+            }
+            if let Some(ref bid) = info.build_id {
+                obj.set("buildID", JsValue::String(bid.clone()));
+            }
+            obj.set("plugins", JsValue::Array(vec![]));
+            obj.set("mimeTypes", JsValue::Array(vec![]));
         }
-        // IE-only
-        if let Some(ref cpu) = info.cpu_class {
-            obj.insert("cpuClass".into(), JsValue::String(cpu.clone()));
-        }
-        // Firefox-only buildID
-        if let Some(ref bid) = info.build_id {
-            obj.insert("buildID".into(), JsValue::String(bid.clone()));
-        }
-
-        // Stub out plugin-related properties as empty arrays / zero
-        obj.insert("plugins".into(), JsValue::Array(vec![]));
-        obj.insert("mimeTypes".into(), JsValue::Array(vec![]));
-
-        self.globals
-            .insert("navigator".into(), JsValue::NavigatorRef);
-        self.globals
-            .insert("__navigatorData".into(), JsValue::Object(obj));
+        self.globals.insert("navigator".into(), JsValue::NavigatorRef);
+        self.globals.insert("__navigatorData".into(), JsValue::Object(rc));
     }
 
     /// Seed the global `screen` object so scripts can read
     /// `screen.width`, `screen.height`, `screen.colorDepth`, etc.
     pub fn seed_screen(&mut self, info: &crate::screen::ScreenInfo) {
-        let mut obj: HashMap<String, JsValue> = HashMap::new();
-        obj.insert("width".into(), JsValue::Number(info.width as f64));
-        obj.insert("height".into(), JsValue::Number(info.height as f64));
-        obj.insert(
-            "colorDepth".into(),
-            JsValue::Number(info.color_depth as f64),
-        );
-        obj.insert(
-            "pixelDepth".into(),
-            JsValue::Number(info.pixel_depth() as f64),
-        );
-        obj.insert(
-            "availWidth".into(),
-            JsValue::Number(info.avail_width as f64),
-        );
-        obj.insert(
-            "availHeight".into(),
-            JsValue::Number(info.avail_height as f64),
-        );
-        self.globals.insert("screen".into(), JsValue::Object(obj));
+        let rc = JsObject::new();
+        {
+            let mut obj = rc.borrow_mut();
+            obj.set("width", JsValue::Number(info.width as f64));
+            obj.set("height", JsValue::Number(info.height as f64));
+            obj.set("colorDepth", JsValue::Number(info.color_depth as f64));
+            obj.set("pixelDepth", JsValue::Number(info.pixel_depth() as f64));
+            obj.set("availWidth", JsValue::Number(info.avail_width as f64));
+            obj.set("availHeight", JsValue::Number(info.avail_height as f64));
+        }
+        self.globals.insert("screen".into(), JsValue::Object(rc));
     }
 
     /// Seed browser globals that are independent of OS detection.
     pub fn seed_browser_basics(&mut self) {
-        self.globals.insert(
-            "localStorage".into(),
-            JsValue::StorageRef(StorageKind::Local),
-        );
-        self.globals.insert(
-            "sessionStorage".into(),
-            JsValue::StorageRef(StorageKind::Session),
-        );
+        self.globals.insert("localStorage".into(), JsValue::StorageRef(StorageKind::Local));
+        self.globals.insert("sessionStorage".into(), JsValue::StorageRef(StorageKind::Session));
         self.globals.insert("document".into(), JsValue::DocumentRef);
         self.globals.insert("window".into(), JsValue::WindowRef);
         self.globals.insert("globalThis".into(), JsValue::WindowRef);
-        self.globals.insert(
-            "ActiveXObject".into(),
-            JsValue::HostFunction("ActiveXObject".into()),
-        );
-        self.globals.insert(
-            "Symbol".into(),
-            JsValue::HostFunction("Symbol".into()),
-        );
+        self.globals.insert("ActiveXObject".into(), JsValue::HostFunction("ActiveXObject".into()));
+        self.globals.insert("Symbol".into(), JsValue::HostFunction("Symbol".into()));
         self.globals.insert("escape".into(), JsValue::HostFunction("escape".into()));
         self.globals.insert("unescape".into(), JsValue::HostFunction("unescape".into()));
-        let mut perf = HashMap::new();
-        perf.insert(
-            "now".to_owned(),
-            JsValue::HostFunction("performance.now".into()),
-        );
-        self.globals.insert("performance".into(), JsValue::Object(perf));
+        let perf_rc = JsObject::new();
+        perf_rc.borrow_mut().set("now", JsValue::HostFunction("performance.now".into()));
+        self.globals.insert("performance".into(), JsValue::Object(perf_rc));
     }
 
     /// Seed the precomputed browser fingerprint suite into JS-facing APIs.
@@ -424,45 +644,24 @@ impl BrowserExecutionState {
     }
 
     fn fingerprint_suite_js_object(suite: &crate::specs_placeholder::FingerprintSuite) -> JsValue {
-        let mut obj = HashMap::new();
-        obj.insert(
-            "canvas".into(),
-            JsValue::String(suite.canvas.data_url.clone()),
-        );
-        obj.insert(
-            "webGLVendor".into(),
-            JsValue::String(suite.webgl.vendor.clone()),
-        );
-        obj.insert(
-            "webGLRenderer".into(),
-            JsValue::String(suite.webgl.renderer.clone()),
-        );
-        obj.insert(
-            "webGLData".into(),
+        let rc = JsObject::new();
+        let mut obj = rc.borrow_mut();
+        obj.set("canvas", JsValue::String(suite.canvas.data_url.clone()));
+        obj.set("webGLVendor", JsValue::String(suite.webgl.vendor.clone()));
+        obj.set("webGLRenderer", JsValue::String(suite.webgl.renderer.clone()));
+        obj.set(
+            "webGLData",
             JsValue::String(
-                suite
-                    .webgl
-                    .parameters
-                    .iter()
+                suite.webgl.parameters.iter()
                     .map(|(key, value)| format!("{key}:{value}"))
-                    .collect::<Vec<_>>()
-                    .join(";"),
+                    .collect::<Vec<_>>().join(";"),
             ),
         );
-        obj.insert(
-            "audio".into(),
-            JsValue::String(Self::audio_fingerprint_string(&suite.audio)),
-        );
-        obj.insert(
-            "fontsEnum".into(),
-            JsValue::String(suite.fonts.as_amiunique_string()),
-        );
-        obj.insert(
-            "touchSupport".into(),
-            JsValue::String(suite.touch.as_amiunique_string()),
-        );
-        obj.insert(
-            "overwrittenObjects".into(),
+        obj.set("audio", JsValue::String(Self::audio_fingerprint_string(&suite.audio)));
+        obj.set("fontsEnum", JsValue::String(suite.fonts.as_amiunique_string()));
+        obj.set("touchSupport", JsValue::String(suite.touch.as_amiunique_string()));
+        obj.set(
+            "overwrittenObjects",
             JsValue::String(format!(
                 "screen.width={};canvas.toDataURL={};Date.getTimezoneOffset={}",
                 suite.overwrite.screen_width_getter,
@@ -470,60 +669,38 @@ impl BrowserExecutionState {
                 suite.overwrite.date_get_timezone_offset
             )),
         );
-        obj.insert(
-            "navigatorPrototype".into(),
-            JsValue::String(suite.nav_prototype.properties.join(";")),
-        );
-        obj.insert(
-            "mathsConstants".into(),
+        obj.set("navigatorPrototype", JsValue::String(suite.nav_prototype.properties.join(";")));
+        obj.set(
+            "mathsConstants",
             JsValue::String(Self::math_constants_string(&suite.math)),
         );
-        obj.insert(
-            "errorsGenerated".into(),
+        obj.set(
+            "errorsGenerated",
             JsValue::String(Self::error_shape_string(&suite.errors)),
         );
-        obj.insert(
-            "resOverflow".into(),
+        obj.set(
+            "resOverflow",
             JsValue::String(format!(
                 "{};{};{}",
                 suite.stack.depth, suite.stack.error_name, suite.stack.error_message
             )),
         );
-        obj.insert(
-            "modernizr".into(),
+        obj.set(
+            "modernizr",
             JsValue::String(suite.modernizr.as_amiunique_string()),
         );
-        obj.insert(
-            "osMediaqueries".into(),
+        obj.set(
+            "osMediaqueries",
             JsValue::String(suite.os_queries.as_amiunique_string()),
         );
-        obj.insert(
-            "unknownImageError".into(),
-            JsValue::String(suite.unknown_image.as_amiunique_string()),
-        );
-        obj.insert(
-            "timezone".into(),
-            JsValue::Number(suite.timezone.offset_minutes as f64),
-        );
-        obj.insert(
-            "timezoneName".into(),
-            suite
-                .timezone
-                .iana_name
-                .clone()
-                .map(JsValue::String)
-                .unwrap_or(JsValue::Null),
-        );
-        obj.insert(
-            "localStorage".into(),
-            JsValue::Boolean(suite.storage.local_storage),
-        );
-        obj.insert(
-            "sessionStorage".into(),
-            JsValue::Boolean(suite.storage.session_storage),
-        );
-        obj.insert("adBlock".into(), JsValue::Boolean(suite.adblock));
-        JsValue::Object(obj)
+        obj.set("unknownImageError", JsValue::String(suite.unknown_image.as_amiunique_string()));
+        obj.set("timezone", JsValue::Number(suite.timezone.offset_minutes as f64));
+        obj.set("timezoneName", suite.timezone.iana_name.clone().map(JsValue::String).unwrap_or(JsValue::Null));
+        obj.set("localStorage", JsValue::Boolean(suite.storage.local_storage));
+        obj.set("sessionStorage", JsValue::Boolean(suite.storage.session_storage));
+        obj.set("adBlock", JsValue::Boolean(suite.adblock));
+        drop(obj);
+        JsValue::Object(rc)
     }
 
     fn audio_fingerprint_string(audio: &crate::specs_placeholder::AudioFingerprint) -> String {
@@ -574,69 +751,59 @@ impl BrowserExecutionState {
 
     /// Seed a minimal `location` object for scripts that inspect the current URL.
     pub fn seed_location(&mut self, href: &str) {
-        let mut obj: HashMap<String, JsValue> = HashMap::new();
-        obj.insert("href".into(), JsValue::String(href.to_owned()));
-
-        if let Some((protocol, rest)) = href.split_once("://") {
-            obj.insert("protocol".into(), JsValue::String(format!("{protocol}:")));
-            let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-            let host = &rest[..host_end];
-            obj.insert("host".into(), JsValue::String(host.to_owned()));
-            let hostname = host.split(':').next().unwrap_or("").to_owned();
-            let port = host
-                .split(':')
-                .nth(1)
-                .unwrap_or("")
-                .to_owned();
-            obj.insert("hostname".into(), JsValue::String(hostname.clone()));
-            obj.insert("port".into(), JsValue::String(port));
-            let after_host = &rest[host_end..];
-            let (path_part, rest_after_path) = after_host
-                .split_once('?')
-                .map(|(p, r)| (p, format!("?{r}")))
-                .unwrap_or_else(|| {
-                    after_host
+        let rc = JsObject::new();
+        {
+            let mut obj = rc.borrow_mut();
+            obj.set("href", JsValue::String(href.to_owned()));
+            if let Some((protocol, rest)) = href.split_once("://") {
+                obj.set("protocol", JsValue::String(format!("{protocol}:")));
+                let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+                let host = &rest[..host_end];
+                obj.set("host", JsValue::String(host.to_owned()));
+                let hostname = host.split(':').next().unwrap_or("").to_owned();
+                let port = host.split(':').nth(1).unwrap_or("").to_owned();
+                obj.set("hostname", JsValue::String(hostname.clone()));
+                obj.set("port", JsValue::String(port));
+                let after_host = &rest[host_end..];
+                let (path_part, rest_after_path) = after_host
+                    .split_once('?')
+                    .map(|(p, r)| (p, format!("?{r}")))
+                    .unwrap_or_else(|| {
+                        after_host
+                            .split_once('#')
+                            .map(|(p, r)| (p, format!("#{r}")))
+                            .unwrap_or((after_host, String::new()))
+                    });
+                let pathname = if path_part.is_empty() { "/".to_owned() } else { path_part.to_owned() };
+                obj.set("pathname", JsValue::String(pathname));
+                let (search_part, hash_part) = if let Some(q_rest) = rest_after_path.strip_prefix('?') {
+                    let (s, h) = q_rest
                         .split_once('#')
-                        .map(|(p, r)| (p, format!("#{r}")))
-                        .unwrap_or((after_host, String::new()))
-                });
-            let pathname = if path_part.is_empty() {
-                "/".to_owned()
+                        .map(|(s, h)| (format!("?{s}"), format!("#{h}")))
+                        .unwrap_or_else(|| (format!("?{q_rest}"), String::new()));
+                    (s, h)
+                } else if let Some(h_rest) = rest_after_path.strip_prefix('#') {
+                    (String::new(), format!("#{h_rest}"))
+                } else {
+                    (String::new(), String::new())
+                };
+                obj.set("search", JsValue::String(search_part));
+                obj.set("hash", JsValue::String(hash_part));
+                obj.set("origin", JsValue::String(format!("{protocol}://{hostname}")));
             } else {
-                path_part.to_owned()
-            };
-            obj.insert("pathname".into(), JsValue::String(pathname));
-            let (search_part, hash_part) = if let Some(q_rest) = rest_after_path.strip_prefix('?') {
-                let (s, h) = q_rest
-                    .split_once('#')
-                    .map(|(s, h)| (format!("?{s}"), format!("#{h}")))
-                    .unwrap_or_else(|| (format!("?{q_rest}"), String::new()));
-                (s, h)
-            } else if let Some(h_rest) = rest_after_path.strip_prefix('#') {
-                (String::new(), format!("#{h_rest}"))
-            } else {
-                (String::new(), String::new())
-            };
-            obj.insert("search".into(), JsValue::String(search_part));
-            obj.insert("hash".into(), JsValue::String(hash_part));
-            obj.insert(
-                "origin".into(),
-                JsValue::String(format!("{protocol}://{hostname}")),
-            );
-        } else {
-            obj.insert("protocol".into(), JsValue::String(String::new()));
-            obj.insert("host".into(), JsValue::String(String::new()));
-            obj.insert("hostname".into(), JsValue::String(String::new()));
-            obj.insert("pathname".into(), JsValue::String(href.to_owned()));
-            obj.insert("port".into(), JsValue::String(String::new()));
-            obj.insert("search".into(), JsValue::String(String::new()));
-            obj.insert("hash".into(), JsValue::String(String::new()));
-            obj.insert("origin".into(), JsValue::String("null".to_owned()));
+                obj.set("protocol", JsValue::String(String::new()));
+                obj.set("host", JsValue::String(String::new()));
+                obj.set("hostname", JsValue::String(String::new()));
+                obj.set("pathname", JsValue::String(href.to_owned()));
+                obj.set("port", JsValue::String(String::new()));
+                obj.set("search", JsValue::String(String::new()));
+                obj.set("hash", JsValue::String(String::new()));
+                obj.set("origin", JsValue::String("null".to_owned()));
+            }
         }
-
-        self.globals.insert("location".into(), JsValue::Object(obj.clone()));
-        // Mirror as window.location for scripts that read window.location.*
-        self.globals.insert("__location__".into(), JsValue::Object(obj));
+        // Both `location` and `__location__` share the same Rc — mutations propagate.
+        self.globals.insert("location".into(), JsValue::Object(rc.clone()));
+        self.globals.insert("__location__".into(), JsValue::Object(rc));
     }
 
     pub fn execute_program(&mut self, program: &Program) {
@@ -678,29 +845,18 @@ impl BrowserExecutionState {
     fn format_thrown_value(val: &JsValue) -> String {
         match val {
             JsValue::String(s) => s.clone(),
-            JsValue::Object(props) => {
-                let name = props
-                    .get("name")
-                    .and_then(|v| {
-                        if let JsValue::String(s) = v {
-                            Some(s.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or("Error");
-                let msg = props
-                    .get("message")
-                    .and_then(|v| {
-                        if let JsValue::String(s) = v {
-                            Some(s.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or("");
+            JsValue::Object(rc) => {
+                let obj = rc.borrow();
+                let name = obj
+                    .get_own_data("name")
+                    .and_then(|v| if let JsValue::String(s) = v { Some(s) } else { None })
+                    .unwrap_or_else(|| "Error".to_owned());
+                let msg = obj
+                    .get_own_data("message")
+                    .and_then(|v| if let JsValue::String(s) = v { Some(s) } else { None })
+                    .unwrap_or_default();
                 if msg.is_empty() {
-                    name.to_owned()
+                    name
                 } else {
                     format!("{}: {}", name, msg)
                 }
@@ -992,7 +1148,7 @@ impl BrowserExecutionState {
                 let stmt = stmt.clone();
                 let object = self.execute_expression(&stmt.object);
                 let keys: Vec<String> = match object {
-                    JsValue::Object(map) => map.keys().cloned().collect(),
+                    JsValue::Object(rc) => rc.borrow().own_enumerable_keys(),
                     _ => vec![],
                 };
                 let for_in_is_var = stmt.binding_kind == VarKind::Var;
@@ -1114,15 +1270,25 @@ impl BrowserExecutionState {
     }
 
     fn execute_variable_declaration(&mut self, declaration: &VariableDeclaration) {
+        let is_const = declaration.kind == VarKind::Const;
+        let is_var = declaration.kind == VarKind::Var;
         for declarator in &declaration.declarations {
             let value = declarator
                 .init
                 .as_ref()
                 .map(|expression| self.execute_expression(expression))
                 .unwrap_or(JsValue::Undefined);
+            if self.early_exit.is_some() { return; }
             let binding = declarator.id.clone();
-            if declaration.kind == VarKind::Var {
+            if is_var {
                 self.execute_var_binding(&binding, value);
+            } else if is_const {
+                // const: declare as immutable slot (Phase B).
+                if let Binding::Name(name) = &binding {
+                    self.declare_binding(name, value, false);
+                } else {
+                    self.execute_binding(&binding, value);
+                }
             } else {
                 self.execute_binding(&binding, value);
             }
@@ -1137,9 +1303,7 @@ impl BrowserExecutionState {
             Binding::Object(props) => {
                 for prop in props {
                     let extracted = match &value {
-                        JsValue::Object(map) => {
-                            map.get(&prop.key).cloned().unwrap_or(JsValue::Undefined)
-                        }
+                        JsValue::Object(rc) => self.obj_get(rc, &prop.key),
                         _ => JsValue::Undefined,
                     };
                     let extracted = if extracted == JsValue::Undefined {
@@ -1180,9 +1344,7 @@ impl BrowserExecutionState {
             Binding::Object(props) => {
                 for prop in props {
                     let extracted = match &value {
-                        JsValue::Object(map) => {
-                            map.get(&prop.key).cloned().unwrap_or(JsValue::Undefined)
-                        }
+                        JsValue::Object(rc) => self.obj_get(rc, &prop.key),
                         _ => JsValue::Undefined,
                     };
                     let extracted = if extracted == JsValue::Undefined {
@@ -1218,7 +1380,7 @@ impl BrowserExecutionState {
         match expression {
             Expression::Assignment { target, value } => {
                 let value = self.execute_expression(value);
-                self.assign_target(target, value.clone());
+                self.user_assign(target, value.clone());
                 value
             }
             Expression::Ternary {
@@ -1367,10 +1529,10 @@ impl BrowserExecutionState {
                 {
                     let mut args = self.eval_args(arguments);
                     let target = args.get(0).cloned().unwrap_or(JsValue::Undefined);
-                    let get = args.get_mut(1).and_then(|handler| {
-                        if let JsValue::Object(map) = handler {
-                            match map.get("get") {
-                                Some(JsValue::Function(func)) => Some(func.clone()),
+                    let get = args.get(1).and_then(|handler| {
+                        if let JsValue::Object(rc) = handler {
+                            match rc.borrow().get_own_data("get") {
+                                Some(JsValue::Function(func)) => Some(func),
                                 _ => None,
                             }
                         } else {
@@ -1390,19 +1552,20 @@ impl BrowserExecutionState {
                         .properties
                         .get("prototype")
                         .cloned()
-                        .unwrap_or_else(|| JsValue::Object(HashMap::new()));
+                        .unwrap_or_else(JsValue::new_object);
                     let args = self.eval_args(arguments);
                     let (result, this_after) = self.call_function_with_this(func, args, this_obj);
-                    let mut instance = if matches!(result, JsValue::Object(_)) {
+                    let instance = if matches!(result, JsValue::Object(_)) {
                         result
                     } else {
                         this_after
                     };
                     // Tag the object with the constructor name for instanceof checks.
-                    // Key uses a NUL prefix so it can never be set from JS source.
-                    if let (JsValue::Object(map), Some(name)) = (&mut instance, ctor_name) {
-                        map.entry("\x00class".to_owned())
-                            .or_insert_with(|| JsValue::String(name));
+                    if let (JsValue::Object(rc), Some(name)) = (&instance, ctor_name) {
+                        let mut obj = rc.borrow_mut();
+                        if obj.class_name.is_none() {
+                            obj.class_name = Some(name);
+                        }
                     }
                     instance
                 } else if let JsValue::HostFunction(fn_name) = self.execute_expression(callee) {
@@ -1505,7 +1668,7 @@ impl BrowserExecutionState {
                     let var_name = var_name.clone();
                     if let Some(JsValue::Array(mut arr)) = self.get_binding(&var_name) {
                         arr.push(val);
-                        self.set_binding(&var_name, JsValue::Array(arr));
+                        self.writeback_binding(&var_name, JsValue::Array(arr));
                     }
                     return JsValue::Undefined;
                 }
@@ -1524,12 +1687,12 @@ impl BrowserExecutionState {
                 .get(1)
                 .map(|argument| self.execute_expression(argument))
             {
-                if let JsValue::Object(map) = options {
-                    if let Some(value) = map.get("method") {
-                        method = Self::value_to_string(value).to_ascii_uppercase();
+                if let JsValue::Object(rc) = options {
+                    if let Some(value) = rc.borrow().get_own_data("method") {
+                        method = Self::value_to_string(&value).to_ascii_uppercase();
                     }
-                    if let Some(value) = map.get("body") {
-                        body = Self::value_to_string(value);
+                    if let Some(value) = rc.borrow().get_own_data("body") {
+                        body = Self::value_to_string(&value);
                     }
                 }
             }
@@ -1560,22 +1723,21 @@ impl BrowserExecutionState {
                 .unwrap_or(JsValue::Undefined);
             if let JsValue::ElementRef(element_ref) = element {
                 if let Some(element_id) = existing_id_from_ref(&element_ref) {
-                    let mut props: HashMap<String, JsValue> = self
-                        .dom
-                        .computed_styles_by_id
-                        .get(&element_id)
-                        .map(|m| {
-                            m.iter()
-                                .map(|(k, v)| (k.clone(), JsValue::String(v.clone())))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if let Some(inline) = self.get_element_attribute(&element_ref, "style") {
-                        for (prop, val) in parse_inline_style_map(&inline) {
-                            props.insert(prop, JsValue::String(val));
+                    let rc = JsObject::new();
+                    {
+                        let mut obj = rc.borrow_mut();
+                        if let Some(m) = self.dom.computed_styles_by_id.get(&element_id) {
+                            for (k, v) in m {
+                                obj.set(k.clone(), JsValue::String(v.clone()));
+                            }
+                        }
+                        if let Some(inline) = self.get_element_attribute(&element_ref, "style") {
+                            for (prop, val) in parse_inline_style_map(&inline) {
+                                obj.set(prop, JsValue::String(val));
+                            }
                         }
                     }
-                    return JsValue::Object(props);
+                    return JsValue::Object(rc);
                 }
             }
             return JsValue::Undefined;
@@ -2416,11 +2578,10 @@ impl BrowserExecutionState {
                     for arg in arguments {
                         self.execute_expression(arg);
                     }
-                    let mut rect = HashMap::new();
-                    for key in &["top", "left", "right", "bottom", "width", "height", "x", "y"] {
-                        rect.insert((*key).to_owned(), JsValue::Number(0.0));
-                    }
-                    return JsValue::Object(rect);
+                    return JsValue::from_map(
+                        ["top", "left", "right", "bottom", "width", "height", "x", "y"]
+                            .iter().map(|k| ((*k).to_owned(), JsValue::Number(0.0)))
+                    );
                 }
                 if matches!(
                     method_name.as_str(),
@@ -2701,17 +2862,15 @@ impl BrowserExecutionState {
                 }
             }
 
-            if let JsValue::Object(ref map) = receiver {
-                if let Some(JsValue::Function(func)) = map.get(&method_name).cloned() {
+            if let JsValue::Object(ref rc) = receiver {
+                let method_val = self.obj_get(rc, &method_name);
+                if let JsValue::Function(func) = method_val {
                     let args = self.eval_args(arguments);
-                    let (result, this_after) =
+                    let (result, _this_after) =
                         self.call_function_with_this(func, args, receiver.clone());
-                    if matches!(this_after, JsValue::Object(_) | JsValue::Array(_)) {
-                        self.assign_target(object, this_after);
-                    }
                     return result;
                 }
-                if let Some(JsValue::HostFunction(name)) = map.get(&method_name).cloned() {
+                if let JsValue::HostFunction(name) = self.obj_get(rc, &method_name) {
                     let args = self.eval_args(arguments);
                     return self.call_host_function(&name, receiver.clone(), args);
                 }
@@ -2721,7 +2880,7 @@ impl BrowserExecutionState {
                         .first()
                         .map(|a| Self::value_to_string(&self.execute_expression(a)))
                         .unwrap_or_default();
-                    return JsValue::Boolean(map.contains_key(&key));
+                    return JsValue::Boolean(rc.borrow().has_own(&key));
                 }
             }
             // Evaluated receiver but method not found; trace it and still evaluate args for side effects.
@@ -2961,14 +3120,13 @@ impl BrowserExecutionState {
             .map(|argument| self.execute_expression(argument))
             .unwrap_or(JsValue::Undefined);
 
-        if let (JsValue::Object(map), JsValue::Object(desc)) = (&mut target, descriptor) {
-            if let Some(val) = desc.get("value") {
-                map.insert(key, val.clone());
-            } else if let Some(getter) = desc.get("get").cloned() {
-                // Store getter lazily under "\x00get:key" so it's called on access.
-                map.insert(format!("\x00get:{key}"), getter);
+        if let (JsValue::Object(rc), JsValue::Object(desc)) = (&target, descriptor) {
+            let desc_borrow = desc.borrow();
+            if let Some(val) = desc_borrow.get_own_data("value") {
+                rc.borrow_mut().set(key.clone(), val);
+            } else if let Some(getter) = desc_borrow.get_own_data("get") {
+                rc.borrow_mut().set_getter(key.clone(), getter);
             }
-            self.assign_target(target_expr, target.clone());
             target
         } else {
             JsValue::Undefined
@@ -2978,12 +3136,9 @@ impl BrowserExecutionState {
     fn call_object_static(&mut self, name: &str, args: Vec<JsValue>) -> JsValue {
         match name {
             "keys" => {
-                if let Some(JsValue::Object(map)) = args.into_iter().next() {
-                    let mut keys: Vec<JsValue> = map
-                        .keys()
-                        .filter(|k| !k.starts_with('\x00'))
-                        .map(|k| JsValue::String(k.clone()))
-                        .collect();
+                if let Some(JsValue::Object(rc)) = args.into_iter().next() {
+                    let mut keys: Vec<JsValue> = rc.borrow().own_enumerable_keys()
+                        .into_iter().map(JsValue::String).collect();
                     keys.sort_by(|a, b| Self::value_to_string(a).cmp(&Self::value_to_string(b)));
                     JsValue::Array(keys)
                 } else {
@@ -2991,10 +3146,10 @@ impl BrowserExecutionState {
                 }
             }
             "values" => {
-                if let Some(JsValue::Object(map)) = args.into_iter().next() {
-                    let mut pairs: Vec<(String, JsValue)> = map
+                if let Some(JsValue::Object(rc)) = args.into_iter().next() {
+                    let mut pairs: Vec<(String, JsValue)> = rc.borrow().own_enumerable_keys()
                         .into_iter()
-                        .filter(|(k, _)| !k.starts_with('\x00'))
+                        .filter_map(|k| rc.borrow().get_own_data(&k).map(|v| (k, v)))
                         .collect();
                     pairs.sort_by(|a, b| a.0.cmp(&b.0));
                     JsValue::Array(pairs.into_iter().map(|(_, v)| v).collect())
@@ -3003,15 +3158,14 @@ impl BrowserExecutionState {
                 }
             }
             "entries" => {
-                if let Some(JsValue::Object(map)) = args.into_iter().next() {
-                    let mut pairs: Vec<(String, JsValue)> = map
+                if let Some(JsValue::Object(rc)) = args.into_iter().next() {
+                    let mut pairs: Vec<(String, JsValue)> = rc.borrow().own_enumerable_keys()
                         .into_iter()
-                        .filter(|(k, _)| !k.starts_with('\x00'))
+                        .filter_map(|k| rc.borrow().get_own_data(&k).map(|v| (k, v)))
                         .collect();
                     pairs.sort_by(|a, b| a.0.cmp(&b.0));
                     JsValue::Array(
-                        pairs
-                            .into_iter()
+                        pairs.into_iter()
                             .map(|(k, v)| JsValue::Array(vec![JsValue::String(k), v]))
                             .collect(),
                     )
@@ -3021,45 +3175,49 @@ impl BrowserExecutionState {
             }
             "assign" => {
                 let mut iter = args.into_iter();
-                let mut target = match iter.next() {
-                    Some(JsValue::Object(m)) => m,
+                let target_rc = match iter.next() {
+                    Some(JsValue::Object(rc)) => rc,
                     _ => return JsValue::Undefined,
                 };
                 for src in iter {
-                    if let JsValue::Object(m) = src {
-                        for (k, v) in m {
-                            target.insert(k, v);
+                    if let JsValue::Object(src_rc) = src {
+                        let pairs: Vec<(String, JsValue)> = src_rc.borrow().own_enumerable_keys()
+                            .into_iter()
+                            .filter_map(|k| src_rc.borrow().get_own_data(&k).map(|v| (k, v)))
+                            .collect();
+                        for (k, v) in pairs {
+                            target_rc.borrow_mut().set(k, v);
                         }
                     }
                 }
-                JsValue::Object(target)
+                JsValue::Object(target_rc)
             }
             "fromEntries" => {
-                let mut map = HashMap::new();
+                let rc = JsObject::new();
                 if let Some(JsValue::Array(entries)) = args.into_iter().next() {
                     for entry in entries {
                         if let JsValue::Array(pair) = entry {
-                            let k =
-                                Self::value_to_string(pair.first().unwrap_or(&JsValue::Undefined));
+                            let k = Self::value_to_string(pair.first().unwrap_or(&JsValue::Undefined));
                             let v = pair.get(1).cloned().unwrap_or(JsValue::Undefined);
-                            map.insert(k, v);
+                            rc.borrow_mut().set(k, v);
                         }
                     }
                 }
-                JsValue::Object(map)
+                JsValue::Object(rc)
             }
             "defineProperty" => {
                 let mut iter = args.into_iter();
                 let obj = iter.next().unwrap_or(JsValue::Undefined);
                 let key = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
                 let descriptor = iter.next().unwrap_or(JsValue::Undefined);
-                if let (JsValue::Object(mut map), JsValue::Object(desc)) = (obj, descriptor) {
-                    if let Some(val) = desc.get("value") {
-                        map.insert(key, val.clone());
-                    } else if let Some(getter) = desc.get("get").cloned() {
-                        map.insert(format!("\x00get:{key}"), getter);
+                if let (JsValue::Object(rc), JsValue::Object(desc)) = (obj, descriptor) {
+                    let desc_borrow = desc.borrow();
+                    if let Some(val) = desc_borrow.get_own_data("value") {
+                        rc.borrow_mut().set(key.clone(), val);
+                    } else if let Some(getter) = desc_borrow.get_own_data("get") {
+                        rc.borrow_mut().set_getter(key.clone(), getter);
                     }
-                    JsValue::Object(map)
+                    JsValue::Object(rc)
                 } else {
                     JsValue::Undefined
                 }
@@ -3075,14 +3233,14 @@ impl BrowserExecutionState {
             | "getOwnPropertySymbols"
             | "getPrototypeOf"
             | "setPrototypeOf" => args.into_iter().next().unwrap_or(JsValue::Undefined),
-            "create" => JsValue::Object(HashMap::new()), // ignore prototype arg
+            "create" => JsValue::new_object(), // ignore prototype arg
             "freeze" | "seal" | "preventExtensions" => {
                 args.into_iter().next().unwrap_or(JsValue::Undefined)
             }
             "isFrozen" | "isSealed" => JsValue::Boolean(false),
             "hasOwn" => {
-                if let (Some(JsValue::Object(m)), Some(k)) = (args.first(), args.get(1)) {
-                    JsValue::Boolean(m.contains_key(Self::value_to_string(k).as_str()))
+                if let (Some(JsValue::Object(rc)), Some(k)) = (args.first(), args.get(1)) {
+                    JsValue::Boolean(rc.borrow().has_own(Self::value_to_string(k).as_str()))
                 } else {
                     JsValue::Boolean(false)
                 }
@@ -3763,17 +3921,18 @@ impl BrowserExecutionState {
     fn object_from_properties(
         &mut self,
         properties: &[ObjectProperty],
-    ) -> HashMap<String, JsValue> {
-        let mut object = HashMap::new();
+    ) -> Rc<RefCell<JsObject>> {
+        let rc = JsObject::new();
         for property in properties {
             let key = if let Some(key_expr) = &property.computed_key {
                 Self::value_to_string(&self.execute_expression(key_expr))
             } else {
                 property.key.clone()
             };
-            object.insert(key, self.execute_expression(&property.value));
+            let val = self.execute_expression(&property.value);
+            rc.borrow_mut().set(key, val);
         }
-        object
+        rc
     }
 
     fn query_selector_first_id(&self, selector: &str) -> Option<String> {
@@ -3822,13 +3981,15 @@ impl BrowserExecutionState {
             let key = Self::value_to_string(&self.execute_expression(key_expr));
             let receiver = self.execute_expression(object);
             match receiver {
-                JsValue::Object(mut map) => {
-                    map.insert(key, value);
-                    self.assign_target(object, JsValue::Object(map));
+                JsValue::Object(rc) => {
+                    self.obj_set(&rc, &key, value);
+                    // Writeback so newly-created Rcs (e.g. uninitialized Function.prototype)
+                    // get stored in their parent expression.
+                    self.assign_target(object, JsValue::Object(rc));
                 }
                 JsValue::Array(mut arr) => {
                     if let Ok(idx) = key.parse::<usize>() {
-                        const MAX_DENSE_INDEX: usize = 1 << 20; // 1 million elements
+                        const MAX_DENSE_INDEX: usize = 1 << 20;
                         if idx < MAX_DENSE_INDEX {
                             if idx >= arr.len() {
                                 arr.resize(idx + 1, JsValue::Undefined);
@@ -3836,13 +3997,16 @@ impl BrowserExecutionState {
                             arr[idx] = value;
                             self.assign_target(object, JsValue::Array(arr));
                         } else {
-                            // Sparse/large index: promote to Object so string-keyed access works.
-                            let mut map = HashMap::new();
-                            for (i, v) in arr.into_iter().enumerate() {
-                                map.insert(i.to_string(), v);
+                            // Sparse/large index: promote to Object.
+                            let rc = JsObject::new();
+                            {
+                                let mut obj = rc.borrow_mut();
+                                for (i, v) in arr.into_iter().enumerate() {
+                                    obj.set(i.to_string(), v);
+                                }
+                                obj.set(key, value);
                             }
-                            map.insert(key, value);
-                            self.assign_target(object, JsValue::Object(map));
+                            self.assign_target(object, JsValue::Object(rc));
                         }
                     }
                     // Non-numeric key on bare Array: silently ignore.
@@ -3871,9 +4035,9 @@ impl BrowserExecutionState {
                     self.storage_map_mut(kind).insert(property, value);
                     return;
                 }
-                JsValue::Object(mut map) => {
-                    map.insert(property, value);
-                    self.assign_target(object, JsValue::Object(map));
+                JsValue::Object(rc) => {
+                    self.obj_set(&rc, &property, value);
+                    self.assign_target(object, JsValue::Object(rc));
                     return;
                 }
                 JsValue::Function(mut func) => {
@@ -3935,57 +4099,41 @@ impl BrowserExecutionState {
             // to any Object in scope that holds it as an entry (handles the Webpack pattern:
             // `var module = installedModules[id] = {...}` where both sides are aliases).
             let old_val = self.get_binding(name).unwrap_or(JsValue::Undefined);
-            self.set_binding(name, value.clone());
+            self.writeback_binding(name, value.clone());
             if matches!(&old_val, JsValue::Object(_)) {
                 self.propagate_object_alias_update(old_val, value);
             }
         } else if matches!(target, Expression::This) {
-            self.set_binding("this", value);
+            self.writeback_binding("this", value);
         }
     }
 
-    /// When an Object identifier is overwritten with a new value, scan all accessible
-    /// Object bindings for entries equal to the old value and update those entries to
-    /// the new value. This gives shallow alias semantics for the Webpack pattern:
-    ///   `var module = installedModules[id] = {exports:{}}` — both sides start equal;
-    /// when writeback updates `module`, `installedModules[id]` must reflect the change.
-    fn propagate_object_alias_update(&mut self, old_val: JsValue, new_val: JsValue) {
-        // Scan globals
-        let global_keys: Vec<String> = self.globals.keys().cloned().collect();
-        for key in global_keys {
-            if let Some(JsValue::Object(mut map)) = self.globals.get(&key).cloned() {
-                let mut changed = false;
-                for v in map.values_mut() {
-                    if Self::safe_objects_equal(v, &old_val) {
-                        *v = new_val.clone();
-                        changed = true;
-                    }
-                }
-                if changed {
-                    self.globals.insert(key, JsValue::Object(map));
-                }
+    /// User-visible assignment: enforces const, then delegates to assign_target.
+    /// All `x = value` expressions call this; array/object mutation write-backs call assign_target directly.
+    fn user_assign(&mut self, target: &Expression, value: JsValue) {
+        if let Expression::Identifier(name) = target {
+            let name = name.clone();
+            let is_const = self
+                .stack
+                .iter()
+                .rev()
+                .find_map(|f| f.locals.borrow().get(name.as_str()).map(|s| !s.mutable))
+                .unwrap_or(false);
+            if is_const {
+                self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                    "TypeError",
+                    "Assignment to constant variable.".to_owned(),
+                )));
+                return;
             }
         }
-        // Scan all stack frames (including captured closure frames)
-        for frame in &self.stack {
-            let frame_keys: Vec<String> = frame.locals.borrow().keys().cloned().collect();
-            for key in frame_keys {
-                let current = frame.locals.borrow().get(&key).cloned();
-                if let Some(JsValue::Object(mut map)) = current {
-                    let mut changed = false;
-                    for v in map.values_mut() {
-                        if Self::safe_objects_equal(v, &old_val) {
-                            *v = new_val.clone();
-                            changed = true;
-                        }
-                    }
-                    if changed {
-                        frame.locals.borrow_mut().insert(key, JsValue::Object(map));
-                    }
-                }
-            }
-        }
+        self.assign_target(target, value);
     }
+
+    /// With Rc<RefCell<JsObject>> (reference semantics), mutations to objects propagate
+    /// automatically through all aliases. This function is kept as a no-op for call-site
+    /// compatibility; the actual alias propagation happens implicitly via the Rc.
+    fn propagate_object_alias_update(&mut self, _old_val: JsValue, _new_val: JsValue) {}
 
     /// Structural equality check that never recurses into Function values.
     /// When a named function declaration runs in statement order, any method override
@@ -4002,29 +4150,10 @@ impl BrowserExecutionState {
         }
     }
 
-    /// Any comparison involving a Function (or other complex host type) returns false,
-    /// preventing the PartialEq stack overflow that occurs when closures contain
-    /// self-referential captured frames (e.g. a function stored in exports that
-    /// captures the same globals map containing it).
+    /// Value equality check used for alias detection and array-method override propagation.
+    /// Objects compare by Rc pointer identity (reference equality, matching JS semantics).
     fn safe_objects_equal(a: &JsValue, b: &JsValue) -> bool {
-        match (a, b) {
-            (JsValue::Undefined, JsValue::Undefined) | (JsValue::Null, JsValue::Null) => true,
-            (JsValue::Boolean(x), JsValue::Boolean(y)) => x == y,
-            (JsValue::Number(x), JsValue::Number(y)) => x == y,
-            (JsValue::String(x), JsValue::String(y)) => x == y,
-            (JsValue::Object(a), JsValue::Object(b)) => {
-                a.len() == b.len()
-                    && a.iter()
-                        .all(|(k, v)| b.get(k).is_some_and(|bv| Self::safe_objects_equal(v, bv)))
-            }
-            (JsValue::Array(a), JsValue::Array(b)) => {
-                a.len() == b.len()
-                    && a.iter()
-                        .zip(b.iter())
-                        .all(|(av, bv)| Self::safe_objects_equal(av, bv))
-            }
-            _ => false,
-        }
+        a == b
     }
 
     fn assign_element_property(&mut self, element_ref: &str, property: &str, value: JsValue) {
@@ -4058,14 +4187,10 @@ impl BrowserExecutionState {
             return self.globals.get(&global_name).cloned().unwrap_or_else(|| {
                 match global_name.as_str() {
                     "ActiveXObject" => JsValue::HostFunction("ActiveXObject".into()),
-                    "external" => {
-                        let mut map = HashMap::new();
-                        map.insert(
-                            "msActiveXFilteringEnabled".to_owned(),
-                            JsValue::HostFunction("msActiveXFilteringEnabled".into()),
-                        );
-                        JsValue::Object(map)
-                    }
+                    "external" => JsValue::from_map([(
+                        "msActiveXFilteringEnabled".to_owned(),
+                        JsValue::HostFunction("msActiveXFilteringEnabled".into()),
+                    )]),
                     _ => JsValue::Undefined,
                 }
             });
@@ -4124,20 +4249,9 @@ impl BrowserExecutionState {
                             JsValue::Undefined
                         }
                     }
-                    JsValue::Object(map) => {
+                    JsValue::Object(rc) => {
                         let key = Self::value_to_string(&index);
-                        let getter_key = format!("\x00get:{key}");
-                        if let Some(getter) = map.get(&getter_key).cloned() {
-                            match getter {
-                                JsValue::Function(func) => self.call_function(func, vec![]),
-                                JsValue::HostFunction(fn_name) => {
-                                    self.call_host_function(&fn_name, JsValue::Undefined, vec![])
-                                }
-                                _ => JsValue::Undefined,
-                            }
-                        } else {
-                            map.get(&key).cloned().unwrap_or(JsValue::Undefined)
-                        }
+                        self.obj_get(&rc, &key)
                     }
                     JsValue::String(s) => {
                         let idx = Self::value_to_number(&index);
@@ -4357,28 +4471,21 @@ impl BrowserExecutionState {
                             JsValue::Undefined
                         }
                     }
-                    JsValue::NavigatorRef => self
-                        .globals
-                        .get("__navigatorData")
-                        .and_then(|value| {
-                            if let JsValue::Object(map) = value {
-                                map.get(property).cloned()
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_else(|| Self::navigator_soft_failure_property(property)),
+                    JsValue::NavigatorRef => {
+                        let nav_val = self.globals.get("__navigatorData").cloned();
+                        if let Some(JsValue::Object(rc)) = nav_val {
+                            self.obj_get(&rc, property)
+                        } else {
+                            Self::navigator_soft_failure_property(property)
+                        }
+                    }
                     JsValue::WindowRef => {
                         self.globals.get(property).cloned().unwrap_or_else(|| {
                             match property.as_str() {
-                                "external" => {
-                                    let mut map = HashMap::new();
-                                    map.insert(
-                                        "msActiveXFilteringEnabled".to_owned(),
-                                        JsValue::HostFunction("msActiveXFilteringEnabled".into()),
-                                    );
-                                    JsValue::Object(map)
-                                }
+                                "external" => JsValue::from_map([(
+                                    "msActiveXFilteringEnabled".to_owned(),
+                                    JsValue::HostFunction("msActiveXFilteringEnabled".into()),
+                                )]),
                                 "msActiveXFilteringEnabled" => {
                                     JsValue::HostFunction("msActiveXFilteringEnabled".into())
                                 }
@@ -4389,14 +4496,10 @@ impl BrowserExecutionState {
                                     JsValue::HostFunction(property.clone())
                                 }
                                 "Symbol" => JsValue::HostFunction("Symbol".into()),
-                                "performance" => {
-                                    let mut map = HashMap::new();
-                                    map.insert(
-                                        "now".to_owned(),
-                                        JsValue::HostFunction("performance.now".into()),
-                                    );
-                                    JsValue::Object(map)
-                                }
+                                "performance" => JsValue::from_map([(
+                                    "now".to_owned(),
+                                    JsValue::HostFunction("performance.now".into()),
+                                )]),
                                 "globalThis" => JsValue::WindowRef,
                                 _ => JsValue::Undefined,
                             }
@@ -4466,15 +4569,15 @@ impl BrowserExecutionState {
                             value
                         }
                     }
-                    JsValue::Object(map) => self
-                        .object_property_or_native_fallback(&map, property)
+                    JsValue::Object(rc) => self
+                        .object_property_or_native_fallback(&rc, property)
                         .unwrap_or(JsValue::Undefined),
                     JsValue::Function(func) => {
                         if property == "prototype" {
                             func.properties
                                 .get(property.as_str())
                                 .cloned()
-                                .unwrap_or_else(|| JsValue::Object(HashMap::new()))
+                                .unwrap_or_else(JsValue::new_object)
                         } else if matches!(property.as_str(), "call" | "apply" | "bind") {
                             JsValue::HostFunction(format!("Function.prototype.{property}"))
                         } else {
@@ -4514,7 +4617,7 @@ impl BrowserExecutionState {
             return self.call_function(getter, vec![target, JsValue::String(property.to_owned())]);
         }
         match target {
-            JsValue::Object(map) => map.get(property).cloned().unwrap_or(JsValue::Undefined),
+            JsValue::Object(rc) => self.obj_get(&rc, property),
             JsValue::Array(items) if property == "length" => JsValue::Number(items.len() as f64),
             _ => JsValue::Undefined,
         }
@@ -4660,8 +4763,8 @@ impl BrowserExecutionState {
 
     fn get_binding(&self, name: &str) -> Option<JsValue> {
         for frame in self.stack.iter().rev() {
-            if let Some(value) = frame.locals.borrow().get(name).cloned() {
-                return Some(value);
+            if let Some(slot) = frame.locals.borrow().get(name) {
+                return Some(slot.value.clone());
             }
         }
         self.globals.get(name).cloned()
@@ -4729,8 +4832,32 @@ impl BrowserExecutionState {
 
     fn set_binding(&mut self, name: &str, value: JsValue) {
         for frame in self.stack.iter().rev() {
-            if frame.locals.borrow().contains_key(name) {
-                frame.locals.borrow_mut().insert(name.to_owned(), value);
+            // Extract mutable flag without keeping borrow alive.
+            let found = frame.locals.borrow().get(name).map(|s| s.mutable);
+            if let Some(mutable) = found {
+                if !mutable {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        "Assignment to constant variable.".to_owned(),
+                    )));
+                    return;
+                }
+                frame.locals.borrow_mut().insert(name.to_owned(), Slot::var(value));
+                return;
+            }
+        }
+        self.set_local(name, value);
+    }
+
+    /// Update a binding's value in-place, preserving its const/mutable flag.
+    /// Used for array/object write-backs where the binding itself is not being reassigned —
+    /// only its contents are being mutated (e.g. `const arr = []; arr.push(x)`).
+    fn writeback_binding(&mut self, name: &str, value: JsValue) {
+        for frame in self.stack.iter().rev() {
+            let found = frame.locals.borrow().get(name).map(|s| s.mutable);
+            if let Some(mutable) = found {
+                let new_slot = if mutable { Slot::var(value) } else { Slot::const_(value) };
+                frame.locals.borrow_mut().insert(name.to_owned(), new_slot);
                 return;
             }
         }
@@ -4740,7 +4867,7 @@ impl BrowserExecutionState {
     fn set_local(&mut self, name: &str, value: JsValue) {
         self.ensure_global_frame();
         if let Some(frame) = self.stack.last() {
-            frame.locals.borrow_mut().insert(name.to_owned(), value);
+            frame.locals.borrow_mut().insert(name.to_owned(), Slot::var(value));
         }
     }
 
@@ -4748,7 +4875,7 @@ impl BrowserExecutionState {
     fn set_var(&mut self, name: &str, value: JsValue) {
         for frame in self.stack.iter().rev() {
             if frame.is_function_scope {
-                frame.locals.borrow_mut().insert(name.to_owned(), value);
+                frame.locals.borrow_mut().insert(name.to_owned(), Slot::var(value));
                 return;
             }
         }
@@ -4779,12 +4906,15 @@ impl BrowserExecutionState {
     }
 
     fn build_arguments_object(args: &[JsValue]) -> JsValue {
-        let mut map = HashMap::new();
-        map.insert("length".to_owned(), JsValue::Number(args.len() as f64));
-        for (i, v) in args.iter().enumerate() {
-            map.insert(i.to_string(), v.clone());
+        let rc = JsObject::new();
+        {
+            let mut obj = rc.borrow_mut();
+            obj.set("length", JsValue::Number(args.len() as f64));
+            for (i, v) in args.iter().enumerate() {
+                obj.set(i.to_string(), v.clone());
+            }
         }
-        JsValue::Object(map)
+        JsValue::Object(rc)
     }
 
     fn bind_params(&mut self, params: &[Param], args: Vec<JsValue>) {
@@ -5068,25 +5198,17 @@ impl BrowserExecutionState {
                     {
                         matches!(lv, JsValue::Object(_) | JsValue::Array(_))
                     }
-                    // HostFunction constructor: check HostObject name or __class__ tag
+                    // HostFunction constructor: check HostObject name or class_name tag
                     JsValue::HostFunction(ctor_name) => match &lv {
                         JsValue::HostObject(name) => name == ctor_name,
-                        JsValue::Object(map) => map
-                            .get("\x00class")
-                            .and_then(|v| if let JsValue::String(s) = v { Some(s.as_str()) } else { None })
-                            .map(|c| c == ctor_name)
-                            .unwrap_or(false),
+                        JsValue::Object(rc) => rc.borrow().class_name.as_deref() == Some(ctor_name),
                         _ => false,
                     },
-                    // User constructor: check __class__ tag set during new
+                    // User constructor: check class_name tag set during new
                     JsValue::Function(ctor) => {
                         let ctor_name = ctor.name.as_deref().unwrap_or("");
                         match &lv {
-                            JsValue::Object(map) => map
-                                .get("\x00class")
-                                .and_then(|v| if let JsValue::String(s) = v { Some(s.as_str()) } else { None })
-                                .map(|c| c == ctor_name)
-                                .unwrap_or(false),
+                            JsValue::Object(rc) => rc.borrow().class_name.as_deref() == Some(ctor_name),
                             _ => false,
                         }
                     }
@@ -5095,8 +5217,8 @@ impl BrowserExecutionState {
                 JsValue::Boolean(result)
             }
             BinaryOperator::In => match &rv {
-                JsValue::Object(map) => {
-                    JsValue::Boolean(map.contains_key(&Self::value_to_string(&lv)))
+                JsValue::Object(rc) => {
+                    JsValue::Boolean(rc.borrow().has_own(&Self::value_to_string(&lv)))
                 }
                 _ => JsValue::Boolean(false),
             },
@@ -5173,16 +5295,7 @@ impl BrowserExecutionState {
 
     fn weak_map_key(value: &JsValue) -> String {
         match value {
-            JsValue::Object(map) => {
-                let mut pairs: Vec<_> = map.iter().collect();
-                pairs.sort_by(|a, b| a.0.cmp(b.0));
-                let body = pairs
-                    .into_iter()
-                    .map(|(key, value)| format!("{key}:{}", Self::value_to_string(value)))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                format!("object:{{{body}}}")
-            }
+            JsValue::Object(rc) => format!("ptr:{}", Rc::as_ptr(rc) as usize),
             _ => Self::value_to_string(value),
         }
     }
@@ -5320,22 +5433,26 @@ impl BrowserExecutionState {
                         let ctor_name = ctor.name.clone();
                         let this_obj = ctor.properties.get("prototype")
                             .cloned()
-                            .unwrap_or_else(|| JsValue::Object(HashMap::new()));
+                            .unwrap_or_else(JsValue::new_object);
                         let (_, this_after) = self.call_function_with_this(
                             ctor.clone(),
                             vec![JsValue::Number(len as f64)],
                             this_obj,
                         );
-                        let mut map = if let JsValue::Object(m) = this_after { m } else { HashMap::new() };
-                        for (i, val) in args.iter().enumerate() {
-                            map.insert(i.to_string(), val.clone());
+                        let rc = if let JsValue::Object(r) = this_after { r } else { JsObject::new() };
+                        {
+                            let mut obj = rc.borrow_mut();
+                            for (i, val) in args.iter().enumerate() {
+                                obj.set(i.to_string(), val.clone());
+                            }
+                            obj.set("length", JsValue::Number(len as f64));
+                            if let Some(name) = ctor_name {
+                                if obj.class_name.is_none() {
+                                    obj.class_name = Some(name);
+                                }
+                            }
                         }
-                        map.insert("length".to_owned(), JsValue::Number(len as f64));
-                        if let Some(name) = ctor_name {
-                            map.entry("\x00class".to_owned())
-                                .or_insert_with(|| JsValue::String(name));
-                        }
-                        JsValue::Object(map)
+                        JsValue::Object(rc)
                     }
                     _ => JsValue::Array(args),
                 }
@@ -5346,23 +5463,14 @@ impl BrowserExecutionState {
                 // Collect items into a Vec — try iterator protocol first for Objects.
                 let items: Vec<JsValue> = match items_val {
                     JsValue::Array(v) => v,
-                    JsValue::Object(ref map) => {
+                    JsValue::Object(ref rc) => {
                         // Check for Symbol.iterator (including getters that may throw).
                         let iter_key = "Symbol(Symbol.iterator)";
-                        let getter_key = format!("\x00get:{iter_key}");
-                        let iter_method: Option<JsValue> = if let Some(getter) = map.get(&getter_key).cloned() {
-                            let result = match getter {
-                                JsValue::Function(func) => self.call_function(func, vec![]),
-                                _ => JsValue::Undefined,
-                            };
-                            if self.early_exit.is_some() { return JsValue::Undefined; }
-                            Some(result)
-                        } else {
-                            map.get(iter_key).cloned()
-                        };
-                        if let Some(iter_fn) = iter_method.filter(|v| !matches!(v, JsValue::Undefined | JsValue::Null)) {
+                        let iter_method = self.obj_get(rc, iter_key);
+                        if self.early_exit.is_some() { return JsValue::Undefined; }
+                        if !matches!(iter_method, JsValue::Undefined | JsValue::Null) {
                             // Has an iterator. Call it to get the iterator object.
-                            let mut iter_obj = match iter_fn {
+                            let mut iter_obj = match iter_method {
                                 JsValue::Function(func) => {
                                     let recv = items_val.clone();
                                     self.call_function_with_this(func, vec![], recv).0
@@ -5371,26 +5479,25 @@ impl BrowserExecutionState {
                             };
                             if self.early_exit.is_some() { return JsValue::Undefined; }
                             // Consume the iterator, capping at MAX_ITER to avoid infinite loops.
-                            // If the cap is hit the iterator is considered non-terminating and we
-                            // fall through to the array-like path below.
                             const MAX_ITER: usize = 10_000;
                             let mut collected = vec![];
                             let mut iter_done = false;
                             for _ in 0..MAX_ITER {
                                 if self.execution_budget_exhausted { break; }
                                 let (next_result, new_obj) = if let JsValue::Object(ref m) = iter_obj {
-                                    if let Some(JsValue::Function(nf)) = m.get("next").cloned() {
+                                    let next_fn = self.obj_get(m, "next");
+                                    if let JsValue::Function(nf) = next_fn {
                                         self.call_function_with_this(nf, vec![], iter_obj.clone())
                                     } else { (JsValue::Undefined, iter_obj) }
                                 } else { (JsValue::Undefined, iter_obj) };
                                 iter_obj = new_obj;
                                 if self.early_exit.is_some() { return JsValue::Undefined; }
                                 let done = if let JsValue::Object(ref rm) = next_result {
-                                    matches!(rm.get("done"), Some(JsValue::Boolean(true)))
+                                    matches!(self.obj_get(rm, "done"), JsValue::Boolean(true))
                                 } else { true };
                                 if done { iter_done = true; break; }
                                 let value = if let JsValue::Object(ref rm) = next_result {
-                                    rm.get("value").cloned().unwrap_or(JsValue::Undefined)
+                                    self.obj_get(rm, "value")
                                 } else { JsValue::Undefined };
                                 collected.push(value);
                             }
@@ -5398,16 +5505,13 @@ impl BrowserExecutionState {
                                 collected
                             } else {
                                 // Non-terminating iterator — fall back to array-like.
-                                let len = if let JsValue::Object(ref m) = items_val { self.to_length_from_map(m) } else { 0 };
-                                if let JsValue::Object(ref m) = items_val {
-                                    (0..len).map(|i| m.get(&i.to_string()).cloned().unwrap_or(JsValue::Undefined)).collect()
-                                } else { vec![] }
+                                let len = self.to_length_from_obj(rc);
+                                (0..len).map(|i| rc.borrow().get_own_data(&i.to_string()).unwrap_or(JsValue::Undefined)).collect()
                             }
                         } else {
                             // No iterator — fall back to array-like (length + numeric keys).
-                            let len = self.to_length_from_map(map);
-                            (0..len).map(|i| map.get(&i.to_string()).cloned()
-                                .unwrap_or(JsValue::Undefined)).collect()
+                            let len = self.to_length_from_obj(rc);
+                            (0..len).map(|i| rc.borrow().get_own_data(&i.to_string()).unwrap_or(JsValue::Undefined)).collect()
                         }
                     }
                     JsValue::String(ref s) => {
@@ -5431,22 +5535,26 @@ impl BrowserExecutionState {
                         let ctor_name = ctor.name.clone();
                         let this_obj = ctor.properties.get("prototype")
                             .cloned()
-                            .unwrap_or_else(|| JsValue::Object(HashMap::new()));
+                            .unwrap_or_else(JsValue::new_object);
                         let (_, this_after) = self.call_function_with_this(
                             ctor.clone(),
                             vec![JsValue::Number(len as f64)],
                             this_obj,
                         );
-                        let mut map = if let JsValue::Object(m) = this_after { m } else { HashMap::new() };
-                        for (i, val) in mapped.iter().enumerate() {
-                            map.insert(i.to_string(), val.clone());
+                        let rc = if let JsValue::Object(r) = this_after { r } else { JsObject::new() };
+                        {
+                            let mut obj = rc.borrow_mut();
+                            for (i, val) in mapped.iter().enumerate() {
+                                obj.set(i.to_string(), val.clone());
+                            }
+                            obj.set("length", JsValue::Number(len as f64));
+                            if let Some(name) = ctor_name {
+                                if obj.class_name.is_none() {
+                                    obj.class_name = Some(name);
+                                }
+                            }
                         }
-                        map.insert("length".to_owned(), JsValue::Number(len as f64));
-                        if let Some(name) = ctor_name {
-                            map.entry("\x00class".to_owned())
-                                .or_insert_with(|| JsValue::String(name));
-                        }
-                        JsValue::Object(map)
+                        JsValue::Object(rc)
                     }
                     _ => JsValue::Array(mapped),
                 }
@@ -5457,33 +5565,29 @@ impl BrowserExecutionState {
             | "SyntaxError" | "URIError" | "EvalError" => {
                 let message = args.first().map(Self::value_to_string).unwrap_or_default();
                 let options = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let mut obj = HashMap::new();
-                obj.insert("message".to_owned(), JsValue::String(message));
-                if let JsValue::Object(ref opts) = options {
-                    if let Some(cause) = opts.get("cause").cloned() {
-                        obj.insert("cause".to_owned(), cause);
+                let mut err = Self::make_error_obj(name, message);
+                if let (JsValue::Object(rc), JsValue::Object(opts)) = (&err, options) {
+                    if let Some(cause) = opts.borrow().get_own_data("cause") {
+                        rc.borrow_mut().set_ne("cause", cause);
                     }
                 }
-                obj.insert("\x00class".to_owned(), JsValue::String(name.to_owned()));
-                obj.insert("\x00all_ne".to_owned(), JsValue::Boolean(true));
-                JsValue::Object(obj)
+                err
             }
             "AggregateError" => {
                 // AggregateError(errors, message[, options]) — callable as constructor
                 let errors = args.first().cloned().unwrap_or(JsValue::Undefined);
                 let message = args.get(1).map(Self::value_to_string).unwrap_or_default();
                 let options = args.get(2).cloned().unwrap_or(JsValue::Undefined);
-                let mut obj = HashMap::new();
-                obj.insert("message".to_owned(), JsValue::String(message));
-                obj.insert("errors".to_owned(), errors);
-                if let JsValue::Object(opts) = options {
-                    if let Some(cause) = opts.get("cause").cloned() {
-                        obj.insert("cause".to_owned(), cause);
+                let err = Self::make_error_obj("AggregateError", message);
+                if let JsValue::Object(ref rc) = err {
+                    rc.borrow_mut().set_ne("errors", errors);
+                    if let JsValue::Object(opts) = options {
+                        if let Some(cause) = opts.borrow().get_own_data("cause") {
+                            rc.borrow_mut().set_ne("cause", cause);
+                        }
                     }
                 }
-                obj.insert("\x00class".to_owned(), JsValue::String("AggregateError".to_owned()));
-                obj.insert("\x00all_ne".to_owned(), JsValue::Boolean(true));
-                JsValue::Object(obj)
+                err
             }
             "Reflect.construct" => {
                 // Reflect.construct(target, args, newTarget)
@@ -5499,16 +5603,13 @@ impl BrowserExecutionState {
                     _ => false,
                 };
                 if !is_ctor {
-                    let mut err = HashMap::new();
-                    err.insert("name".to_owned(), JsValue::String("TypeError".to_owned()));
-                    err.insert(
-                        "message".to_owned(),
-                        JsValue::String("Reflect.construct: newTarget is not a constructor".to_owned()),
-                    );
-                    self.early_exit = Some(EarlyExit::Throw(JsValue::Object(err)));
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        "Reflect.construct: newTarget is not a constructor".to_owned(),
+                    )));
                     return JsValue::Undefined;
                 }
-                JsValue::Object(HashMap::new())
+                JsValue::new_object()
             }
             "Object.prototype.toString" => {
                 JsValue::String(format!("[object {}]", Self::object_tag(&this_arg)))
@@ -5517,10 +5618,7 @@ impl BrowserExecutionState {
             "Object.prototype.hasOwnProperty" => {
                 let key = args.first().map(Self::value_to_string).unwrap_or_default();
                 match &this_arg {
-                    JsValue::Object(map) => JsValue::Boolean(
-                        map.contains_key(&key)
-                            || map.contains_key(&format!("\x00get:{key}")),
-                    ),
+                    JsValue::Object(rc) => JsValue::Boolean(rc.borrow().has_own(&key)),
                     JsValue::Array(items) => JsValue::Boolean(
                         key == "length"
                             || key
@@ -5856,7 +5954,7 @@ impl BrowserExecutionState {
                         if self.execution_budget_exhausted { break; }
                         let item = items_opt.as_ref()
                             .and_then(|v| v.get(i as usize).cloned())
-                            .or_else(|| map_opt.as_ref()?.get(&i.to_string()).cloned())
+                            .or_else(|| { let rc = map_opt.as_ref()?; rc.borrow().get_own_data(&i.to_string()) })
                             .unwrap_or(JsValue::Undefined);
                         let v = self.call_function(func.clone(), vec![item, JsValue::Number(i as f64), this_arg.clone()]);
                         if self.early_exit.is_some() { break; }
@@ -5875,7 +5973,7 @@ impl BrowserExecutionState {
                         if self.execution_budget_exhausted { break; }
                         let item = items_opt.as_ref()
                             .and_then(|v| v.get(i as usize).cloned())
-                            .or_else(|| map_opt.as_ref()?.get(&i.to_string()).cloned())
+                            .or_else(|| { let rc = map_opt.as_ref()?; rc.borrow().get_own_data(&i.to_string()) })
                             .unwrap_or(JsValue::Undefined);
                         let v = self.call_function(func.clone(), vec![item, JsValue::Number(i as f64), this_arg.clone()]);
                         if self.early_exit.is_some() { break; }
@@ -5894,7 +5992,7 @@ impl BrowserExecutionState {
                         if self.execution_budget_exhausted { break; }
                         let item = items_opt.as_ref()
                             .and_then(|v| v.get(i as usize).cloned())
-                            .or_else(|| map_opt.as_ref()?.get(&i.to_string()).cloned())
+                            .or_else(|| { let rc = map_opt.as_ref()?; rc.borrow().get_own_data(&i.to_string()) })
                             .unwrap_or(JsValue::Undefined);
                         self.call_function(func.clone(), vec![item, JsValue::Number(i as f64), this_arg.clone()]);
                         if self.early_exit.is_some() { break; }
@@ -5913,7 +6011,7 @@ impl BrowserExecutionState {
                         if self.execution_budget_exhausted { break; }
                         let item = items_opt.as_ref()
                             .and_then(|v| v.get(i as usize).cloned())
-                            .or_else(|| map_opt.as_ref()?.get(&i.to_string()).cloned())
+                            .or_else(|| { let rc = map_opt.as_ref()?; rc.borrow().get_own_data(&i.to_string()) })
                             .unwrap_or(JsValue::Undefined);
                         let v = self.call_function(func.clone(), vec![item, JsValue::Number(i as f64), this_arg.clone()]);
                         if self.early_exit.is_some() { break; }
@@ -5935,7 +6033,7 @@ impl BrowserExecutionState {
                         if self.execution_budget_exhausted { break; }
                         let item = items_opt.as_ref()
                             .and_then(|v| v.get(i as usize).cloned())
-                            .or_else(|| map_opt.as_ref()?.get(&i.to_string()).cloned())
+                            .or_else(|| { let rc = map_opt.as_ref()?; rc.borrow().get_own_data(&i.to_string()) })
                             .unwrap_or(JsValue::Undefined);
                         let v = self.call_function(func.clone(), vec![item.clone(), JsValue::Number(i as f64), this_arg.clone()]);
                         if self.early_exit.is_some() { break; }
@@ -5950,24 +6048,22 @@ impl BrowserExecutionState {
         }
     }
 
-    // Returns (array_items, object_length, object_map) for array-like iteration.
+    // Returns (array_items, object_length, object_rc) for array-like iteration.
     // Never materializes a huge vec; the caller iterates lazily up to the length.
-    fn array_like_parts(&mut self, val: JsValue) -> (Option<Vec<JsValue>>, u32, Option<HashMap<String, JsValue>>) {
+    fn array_like_parts(&mut self, val: JsValue) -> (Option<Vec<JsValue>>, u32, Option<Rc<RefCell<JsObject>>>) {
         match val {
             JsValue::Array(items) => (Some(items), 0, None),
-            JsValue::Object(map) => {
-                let len = self.to_length_from_map(&map);
-                (None, len, Some(map))
+            JsValue::Object(rc) => {
+                let len = self.to_length_from_obj(&rc);
+                (None, len, Some(rc))
             }
             _ => (Some(vec![]), 0, None),
         }
     }
 
-    fn to_length_from_map(&mut self, map: &HashMap<String, JsValue>) -> u32 {
-        let length_val = match map.get("length") {
-            Some(v) => v.clone(),
-            None => return 0,
-        };
+    fn to_length_from_obj(&mut self, rc: &Rc<RefCell<JsObject>>) -> u32 {
+        let length_val = self.obj_get(rc, "length");
+        if matches!(length_val, JsValue::Undefined) { return 0; }
         let n = self.coerce_to_number(length_val);
         if n.is_nan() || n <= 0.0 { return 0; }
         // Clamp to a safe iteration cap. Real ToLength max is 2^53-1 but for
@@ -5978,16 +6074,18 @@ impl BrowserExecutionState {
     /// ToPrimitive/ToNumber for a value: for Objects calls valueOf() then toString().
     fn coerce_to_number(&mut self, val: JsValue) -> f64 {
         match val {
-            JsValue::Object(ref map) => {
+            JsValue::Object(ref rc) => {
                 // Try valueOf first.
-                if let Some(JsValue::Function(f)) = map.get("valueOf").cloned() {
+                let value_of = self.obj_get(rc, "valueOf");
+                if let JsValue::Function(f) = value_of {
                     let result = self.call_function(f, vec![]);
                     if !matches!(result, JsValue::Object(_)) {
                         return Self::value_to_number(&result);
                     }
                 }
                 // Try toString.
-                if let Some(JsValue::Function(f)) = map.get("toString").cloned() {
+                let to_string = self.obj_get(rc, "toString");
+                if let JsValue::Function(f) = to_string {
                     let result = self.call_function(f, vec![]);
                     if !matches!(result, JsValue::Object(_)) {
                         return Self::value_to_number(&result);
@@ -6000,54 +6098,52 @@ impl BrowserExecutionState {
     }
 
     fn native_prototype_object(owner: &str) -> JsValue {
-        let mut map = HashMap::new();
-        for method in Self::native_prototype_methods(owner) {
-            let value = match *method {
-                "constructor" => JsValue::HostFunction(owner.to_owned()),
-                // Error-family prototypes carry data properties for name and message.
-                "name" if matches!(
-                    owner,
-                    "Error" | "TypeError" | "RangeError" | "ReferenceError"
-                        | "SyntaxError" | "URIError" | "EvalError" | "AggregateError"
-                ) => JsValue::String(owner.to_owned()),
-                "message" if matches!(
-                    owner,
-                    "Error" | "TypeError" | "RangeError" | "ReferenceError"
-                        | "SyntaxError" | "URIError" | "EvalError" | "AggregateError"
-                ) => JsValue::String(String::new()),
-                "stack" if matches!(
-                    owner,
-                    "Error" | "TypeError" | "RangeError" | "ReferenceError"
-                        | "SyntaxError" | "URIError" | "EvalError" | "AggregateError"
-                ) => JsValue::String(String::new()),
-                _ => JsValue::HostFunction(format!("{owner}.prototype.{method}")),
-            };
-            map.insert((*method).to_owned(), value);
-        }
-        // Mark as a built-in prototype so getOwnPropertyDescriptor returns enumerable:false.
-        map.insert("\x00builtin".to_owned(), JsValue::Boolean(true));
-        // Symbol-keyed well-known methods — stored under their JBS string representation.
-        if owner == "Array" {
-            // @@iterator is the same function as Array.prototype.values
-            map.insert(
-                "Symbol(Symbol.iterator)".to_owned(),
-                JsValue::HostFunction("Array.prototype.values".to_owned()),
-            );
-            // @@unscopables is an object listing array method names that are unscopable
-            let mut unscopables = HashMap::new();
-            for name in &[
-                "copyWithin", "entries", "fill", "find", "findIndex", "findLast",
-                "findLastIndex", "flat", "flatMap", "includes", "keys", "toReversed",
-                "toSorted", "toSpliced", "values",
-            ] {
-                unscopables.insert((*name).to_owned(), JsValue::Boolean(true));
+        let rc = JsObject::new();
+        {
+            let mut obj = rc.borrow_mut();
+            obj.all_non_enumerable = true;
+            for method in Self::native_prototype_methods(owner) {
+                let value = match *method {
+                    "constructor" => JsValue::HostFunction(owner.to_owned()),
+                    "name" if matches!(
+                        owner,
+                        "Error" | "TypeError" | "RangeError" | "ReferenceError"
+                            | "SyntaxError" | "URIError" | "EvalError" | "AggregateError"
+                    ) => JsValue::String(owner.to_owned()),
+                    "message" if matches!(
+                        owner,
+                        "Error" | "TypeError" | "RangeError" | "ReferenceError"
+                            | "SyntaxError" | "URIError" | "EvalError" | "AggregateError"
+                    ) => JsValue::String(String::new()),
+                    "stack" if matches!(
+                        owner,
+                        "Error" | "TypeError" | "RangeError" | "ReferenceError"
+                            | "SyntaxError" | "URIError" | "EvalError" | "AggregateError"
+                    ) => JsValue::String(String::new()),
+                    _ => JsValue::HostFunction(format!("{owner}.prototype.{method}")),
+                };
+                obj.set_ne((*method).to_owned(), value);
             }
-            map.insert(
-                "Symbol(Symbol.unscopables)".to_owned(),
-                JsValue::Object(unscopables),
-            );
+            if owner == "Array" {
+                obj.set_ne(
+                    "Symbol(Symbol.iterator)",
+                    JsValue::HostFunction("Array.prototype.values".to_owned()),
+                );
+                let unscopables_rc = JsObject::new();
+                {
+                    let mut u = unscopables_rc.borrow_mut();
+                    for name in &[
+                        "copyWithin", "entries", "fill", "find", "findIndex", "findLast",
+                        "findLastIndex", "flat", "flatMap", "includes", "keys", "toReversed",
+                        "toSorted", "toSpliced", "values",
+                    ] {
+                        u.set(*name, JsValue::Boolean(true));
+                    }
+                }
+                obj.set_ne("Symbol(Symbol.unscopables)", JsValue::Object(unscopables_rc));
+            }
         }
-        JsValue::Object(map)
+        JsValue::Object(rc)
     }
 
     fn native_prototype_property(&mut self, owner: &str, property: &str) -> Option<JsValue> {
@@ -6211,31 +6307,26 @@ impl BrowserExecutionState {
 
     fn object_property_or_native_fallback(
         &mut self,
-        map: &HashMap<String, JsValue>,
+        rc: &Rc<RefCell<JsObject>>,
         property: &str,
     ) -> Option<JsValue> {
-        // Check for getter accessor first.
-        let getter_key = format!("\x00get:{property}");
-        if let Some(getter) = map.get(&getter_key).cloned() {
-            return Some(match getter {
-                JsValue::Function(func) => self.call_function(func, vec![]),
-                JsValue::HostFunction(fn_name) => {
-                    self.call_host_function(&fn_name, JsValue::Undefined, vec![])
-                }
-                _ => JsValue::Undefined,
-            });
-        }
-        match map.get(property) {
-            Some(JsValue::Undefined) if Self::soft_native_shadow_property(property) => self
-                .native_prototype_property("Object", property)
-                .inspect(|_| {
+        let val = self.obj_get(rc, property);
+        match val {
+            // Soft-shadow: if an own property is explicitly `undefined` for a known
+            // Object.prototype method (toString, valueOf, etc.), prefer the native.
+            JsValue::Undefined if Self::soft_native_shadow_property(property) => {
+                self.native_prototype_property("Object", property).inspect(|_| {
                     self.trace_runtime(
                         "prototype.shadowed_undefined",
                         format!("Object.prototype.{property}"),
                     );
-                }),
-            Some(value) => Some(value.clone()),
-            None => self.native_prototype_property("Object", property),
+                })
+            }
+            JsValue::Undefined => {
+                // Property missing on object AND prototype chain → native fallback.
+                self.native_prototype_property("Object", property)
+            }
+            other => Some(other),
         }
     }
 
@@ -6319,14 +6410,9 @@ impl BrowserExecutionState {
     }
 
     fn host_function_prototype(name: &str) -> JsValue {
-        let mut map = HashMap::new();
-        for method in ["call", "apply", "bind"] {
-            map.insert(
-                method.to_owned(),
-                JsValue::HostFunction(format!("{name}.prototype.{method}")),
-            );
-        }
-        JsValue::Object(map)
+        JsValue::from_map(["call", "apply", "bind"].iter().map(|method| {
+            (method.to_owned().to_owned(), JsValue::HostFunction(format!("{name}.prototype.{method}")))
+        }))
     }
 
     fn constructor_prototype_object(name: &str) -> Option<JsValue> {
@@ -6343,86 +6429,60 @@ impl BrowserExecutionState {
     /// Returns a property descriptor Object for a known own property of `obj`.
     /// Returns `JsValue::Undefined` when the property does not exist as an own property.
     fn static_get_own_property_descriptor(obj: &JsValue, prop: &str) -> JsValue {
-        // Internal keys are never visible to getOwnPropertyDescriptor.
-        if prop.starts_with('\x00') {
-            return JsValue::Undefined;
+        fn make_data(value: JsValue, writable: bool, enumerable: bool, configurable: bool) -> JsValue {
+            JsValue::from_map([
+                ("value".to_owned(), value),
+                ("writable".to_owned(), JsValue::Boolean(writable)),
+                ("enumerable".to_owned(), JsValue::Boolean(enumerable)),
+                ("configurable".to_owned(), JsValue::Boolean(configurable)),
+            ])
+        }
+        fn make_accessor(getter: JsValue, enumerable: bool, configurable: bool) -> JsValue {
+            JsValue::from_map([
+                ("get".to_owned(), getter),
+                ("set".to_owned(), JsValue::Undefined),
+                ("enumerable".to_owned(), JsValue::Boolean(enumerable)),
+                ("configurable".to_owned(), JsValue::Boolean(configurable)),
+            ])
         }
         match obj {
-            JsValue::Object(map) => {
-                // Accessor (getter) takes priority.
-                let getter_key = format!("\x00get:{prop}");
-                if let Some(getter) = map.get(&getter_key) {
-                    let mut desc = HashMap::new();
-                    desc.insert("get".into(), getter.clone());
-                    desc.insert("set".into(), JsValue::Undefined);
-                    let non_enum = map.contains_key("\x00builtin") || map.contains_key("\x00all_ne");
-                    desc.insert("enumerable".into(), JsValue::Boolean(!non_enum));
-                    desc.insert("configurable".into(), JsValue::Boolean(true));
-                    return JsValue::Object(desc);
-                }
-                if let Some(val) = map.get(prop) {
-                    let mut desc = HashMap::new();
-                    desc.insert("value".into(), val.clone());
-                    desc.insert("writable".into(), JsValue::Boolean(true));
-                    let non_enum = map.contains_key("\x00builtin") || map.contains_key("\x00all_ne");
-                    desc.insert("enumerable".into(), JsValue::Boolean(!non_enum));
-                    desc.insert("configurable".into(), JsValue::Boolean(true));
-                    JsValue::Object(desc)
-                } else {
-                    JsValue::Undefined
+            JsValue::Object(rc) => {
+                let obj_borrow = rc.borrow();
+                let non_enum = obj_borrow.all_non_enumerable;
+                match obj_borrow.get_own(prop) {
+                    Some(Property::Accessor { get, enumerable, configurable, .. }) => {
+                        make_accessor(
+                            get.clone().unwrap_or(JsValue::Undefined),
+                            *enumerable && !non_enum,
+                            *configurable,
+                        )
+                    }
+                    Some(Property::Data { value, writable, enumerable, configurable }) => {
+                        make_data(value.clone(), *writable, *enumerable && !non_enum, *configurable)
+                    }
+                    None => JsValue::Undefined,
                 }
             }
             JsValue::HostFunction(fn_name) => {
-                // Special accessor: Array[Symbol.species]
                 if prop == "Symbol(Symbol.species)" && fn_name == "Array" {
-                    let getter = JsValue::HostFunction("Array.@@species.get".into());
-                    let mut desc = HashMap::new();
-                    desc.insert("get".into(), getter);
-                    desc.insert("set".into(), JsValue::Undefined);
-                    desc.insert("enumerable".into(), JsValue::Boolean(false));
-                    desc.insert("configurable".into(), JsValue::Boolean(true));
-                    return JsValue::Object(desc);
+                    return make_accessor(JsValue::HostFunction("Array.@@species.get".into()), false, true);
                 }
                 match prop {
-                    "name" => {
-                        let mut desc = HashMap::new();
-                        desc.insert("value".into(), JsValue::String(Self::host_fn_short_name(fn_name)));
-                        desc.insert("writable".into(), JsValue::Boolean(false));
-                        desc.insert("enumerable".into(), JsValue::Boolean(false));
-                        desc.insert("configurable".into(), JsValue::Boolean(true));
-                        JsValue::Object(desc)
-                    }
-                    "length" => {
-                        let mut desc = HashMap::new();
-                        desc.insert("value".into(), JsValue::Number(Self::host_fn_arity(fn_name) as f64));
-                        desc.insert("writable".into(), JsValue::Boolean(false));
-                        desc.insert("enumerable".into(), JsValue::Boolean(false));
-                        desc.insert("configurable".into(), JsValue::Boolean(true));
-                        JsValue::Object(desc)
-                    }
+                    "name" => make_data(JsValue::String(Self::host_fn_short_name(fn_name)), false, false, true),
+                    "length" => make_data(JsValue::Number(Self::host_fn_arity(fn_name) as f64), false, false, true),
                     "prototype" => {
                         if let Some(proto) = Self::constructor_prototype_object(fn_name) {
                             let writable = !matches!(fn_name.as_str(),
                                 "Error" | "TypeError" | "RangeError" | "ReferenceError"
                                 | "SyntaxError" | "URIError" | "EvalError" | "AggregateError");
-                            let mut desc = HashMap::new();
-                            desc.insert("value".into(), proto);
-                            desc.insert("writable".into(), JsValue::Boolean(writable));
-                            desc.insert("enumerable".into(), JsValue::Boolean(false));
-                            desc.insert("configurable".into(), JsValue::Boolean(false));
-                            JsValue::Object(desc)
+                            make_data(proto, writable, false, false)
                         } else {
                             JsValue::Undefined
                         }
                     }
                     _ => {
                         if let Some(val) = Self::host_fn_static_member(fn_name, prop) {
-                            let mut desc = HashMap::new();
-                            desc.insert("value".into(), val);
-                            desc.insert("writable".into(), JsValue::Boolean(true));
-                            desc.insert("enumerable".into(), JsValue::Boolean(false));
-                            desc.insert("configurable".into(), JsValue::Boolean(true));
-                            JsValue::Object(desc)
+                            make_data(val, true, false, true)
                         } else {
                             JsValue::Undefined
                         }
@@ -6435,24 +6495,14 @@ impl BrowserExecutionState {
                         let val = match prop {
                             "name" => func.name.as_deref().map(|n| JsValue::String(n.to_owned())).unwrap_or(JsValue::String(String::new())),
                             "length" => JsValue::Number(0.0),
-                            "prototype" => func.properties.get("prototype").cloned().unwrap_or_else(|| JsValue::Object(HashMap::new())),
+                            "prototype" => func.properties.get("prototype").cloned().unwrap_or_else(JsValue::new_object),
                             _ => JsValue::Undefined,
                         };
-                        let mut desc = HashMap::new();
-                        desc.insert("value".into(), val);
-                        desc.insert("writable".into(), JsValue::Boolean(prop == "prototype"));
-                        desc.insert("enumerable".into(), JsValue::Boolean(false));
-                        desc.insert("configurable".into(), JsValue::Boolean(prop != "prototype"));
-                        JsValue::Object(desc)
+                        make_data(val, prop == "prototype", false, prop != "prototype")
                     }
                     _ => {
                         if let Some(val) = func.properties.get(prop) {
-                            let mut desc = HashMap::new();
-                            desc.insert("value".into(), val.clone());
-                            desc.insert("writable".into(), JsValue::Boolean(true));
-                            desc.insert("enumerable".into(), JsValue::Boolean(true));
-                            desc.insert("configurable".into(), JsValue::Boolean(true));
-                            JsValue::Object(desc)
+                            make_data(val.clone(), true, true, true)
                         } else {
                             JsValue::Undefined
                         }
@@ -6461,23 +6511,11 @@ impl BrowserExecutionState {
             }
             JsValue::Array(items) => {
                 match prop {
-                    "length" => {
-                        let mut desc = HashMap::new();
-                        desc.insert("value".into(), JsValue::Number(items.len() as f64));
-                        desc.insert("writable".into(), JsValue::Boolean(true));
-                        desc.insert("enumerable".into(), JsValue::Boolean(false));
-                        desc.insert("configurable".into(), JsValue::Boolean(false));
-                        JsValue::Object(desc)
-                    }
+                    "length" => make_data(JsValue::Number(items.len() as f64), true, false, false),
                     _ => {
                         if let Ok(idx) = prop.parse::<usize>() {
                             if let Some(val) = items.get(idx) {
-                                let mut desc = HashMap::new();
-                                desc.insert("value".into(), val.clone());
-                                desc.insert("writable".into(), JsValue::Boolean(true));
-                                desc.insert("enumerable".into(), JsValue::Boolean(true));
-                                desc.insert("configurable".into(), JsValue::Boolean(true));
-                                return JsValue::Object(desc);
+                                return make_data(val.clone(), true, true, true);
                             }
                         }
                         JsValue::Undefined
@@ -6629,24 +6667,13 @@ impl BrowserExecutionState {
     fn navigator_soft_failure_property(property: &str) -> JsValue {
         match property {
             "permissions" => {
-                let mut map = HashMap::new();
-                map.insert(
-                    "query".to_owned(),
-                    JsValue::HostFunction("permissions.query".to_owned()),
-                );
-                JsValue::Object(map)
+                JsValue::from_map([("query".to_owned(), JsValue::HostFunction("permissions.query".to_owned()))])
             }
             "mediaDevices" => {
-                let mut map = HashMap::new();
-                map.insert(
-                    "enumerateDevices".to_owned(),
-                    JsValue::HostFunction("mediaDevices.enumerateDevices".to_owned()),
-                );
-                map.insert(
-                    "getUserMedia".to_owned(),
-                    JsValue::HostFunction("mediaDevices.getUserMedia".to_owned()),
-                );
-                JsValue::Object(map)
+                JsValue::from_map([
+                    ("enumerateDevices".to_owned(), JsValue::HostFunction("mediaDevices.enumerateDevices".to_owned())),
+                    ("getUserMedia".to_owned(), JsValue::HostFunction("mediaDevices.getUserMedia".to_owned())),
+                ])
             }
             "getBattery" => JsValue::HostFunction("navigator.getBattery".to_owned()),
             _ => JsValue::Undefined,
@@ -6827,20 +6854,20 @@ impl BrowserExecutionState {
             // Push an invocation frame for parameters.
             self.stack.push(StackFrame::function_scope());
             if let Some(param_name) = handler.params.first() {
-                let mut event_obj = HashMap::new();
-                event_obj.insert("type".to_owned(), JsValue::String(event_type.to_owned()));
-                event_obj.insert(
-                    "target".to_owned(),
-                    JsValue::ElementRef(existing_element_ref(element_id)),
-                );
-                if let Some(k) = key {
-                    event_obj.insert("key".to_owned(), JsValue::String(k.to_owned()));
+                let event_rc = JsObject::new();
+                {
+                    let mut event_obj = event_rc.borrow_mut();
+                    event_obj.set("type", JsValue::String(event_type.to_owned()));
+                    event_obj.set("target", JsValue::ElementRef(existing_element_ref(element_id)));
+                    if let Some(k) = key {
+                        event_obj.set("key", JsValue::String(k.to_owned()));
+                    }
                 }
                 if let Some(frame) = self.stack.last() {
-                    frame
-                        .locals
-                        .borrow_mut()
-                        .insert(param_name.clone(), JsValue::Object(event_obj));
+                    frame.locals.borrow_mut().insert(
+                        param_name.clone(),
+                        Slot::var(JsValue::Object(event_rc)),
+                    );
                 }
             }
 
@@ -7166,11 +7193,11 @@ fn json_parse_string(bytes: &[u8], pos: &mut usize) -> JsValue {
 
 fn json_parse_object(bytes: &[u8], pos: &mut usize) -> JsValue {
     *pos += 1; // skip {
-    let mut map = HashMap::new();
+    let rc = JsObject::new();
     json_skip_ws(bytes, pos);
     if bytes.get(*pos) == Some(&b'}') {
         *pos += 1;
-        return JsValue::Object(map);
+        return JsValue::Object(rc);
     }
     loop {
         json_skip_ws(bytes, pos);
@@ -7183,7 +7210,7 @@ fn json_parse_object(bytes: &[u8], pos: &mut usize) -> JsValue {
             *pos += 1;
         }
         let value = json_parse_value(bytes, pos);
-        map.insert(key, value);
+        rc.borrow_mut().set(key, value);
         json_skip_ws(bytes, pos);
         match bytes.get(*pos) {
             Some(b',') => {
@@ -7196,7 +7223,7 @@ fn json_parse_object(bytes: &[u8], pos: &mut usize) -> JsValue {
             _ => break,
         }
     }
-    JsValue::Object(map)
+    JsValue::Object(rc)
 }
 
 fn json_parse_array(bytes: &[u8], pos: &mut usize) -> JsValue {
@@ -7259,12 +7286,13 @@ fn json_stringify(value: &JsValue) -> String {
             let parts: Vec<String> = items.iter().map(json_stringify).collect();
             format!("[{}]", parts.join(","))
         }
-        JsValue::Object(map) => {
-            let mut pairs: Vec<String> = map
-                .iter()
-                .map(|(k, v)| {
-                    let key = json_stringify(&JsValue::String(k.clone()));
-                    format!("{key}:{}", json_stringify(v))
+        JsValue::Object(rc) => {
+            let mut pairs: Vec<String> = rc.borrow().own_enumerable_keys()
+                .into_iter()
+                .filter_map(|k| {
+                    let v = rc.borrow().get_own_data(&k)?;
+                    let key = json_stringify(&JsValue::String(k));
+                    Some(format!("{key}:{}", json_stringify(&v)))
                 })
                 .collect();
             pairs.sort(); // stable key order for deterministic output
