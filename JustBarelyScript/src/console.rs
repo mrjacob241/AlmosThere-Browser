@@ -198,7 +198,8 @@ fn collect_expression_console_messages(expression: &Expression, out: &mut Vec<Co
         | Expression::Null
         | Expression::Undefined
         | Expression::This
-        | Expression::Sequence(_) => {}
+        | Expression::Sequence(_)
+        | Expression::Class(_) => {}
     }
 }
 

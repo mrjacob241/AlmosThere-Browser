@@ -114,6 +114,7 @@ pub struct ClassDeclaration {
     pub name: String,
     pub superclass: Option<String>,
     pub methods: Vec<ClassMethod>,
+    pub fields: Vec<ClassField>,
     pub span: Span,
 }
 
@@ -122,8 +123,23 @@ pub struct ClassMethod {
     pub name: String,
     pub is_static: bool,
     pub is_constructor: bool,
+    pub kind: MethodKind,
     pub params: Vec<Param>,
     pub body: BlockStatement,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MethodKind {
+    Method,
+    Get,
+    Set,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClassField {
+    pub name: String,
+    pub init: Option<Expression>,
+    pub is_static: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -268,6 +284,8 @@ pub enum Expression {
     },
     // Comma-sequence operator: evaluate all expressions, return the last value.
     Sequence(Vec<Expression>),
+    // Class expression: `class Foo { ... }` or `class { ... }` used as a value.
+    Class(Box<ClassDeclaration>),
 }
 
 /// One segment of a template literal: either literal text or an interpolated expression.

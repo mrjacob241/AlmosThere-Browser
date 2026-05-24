@@ -1,12 +1,12 @@
 use crate::{
     Program,
     ast::{
-        BinaryOperator, Binding, BlockStatement, ClassDeclaration, ClassMethod, DoWhileStatement,
-        Expression, ForInStatement, ForOfStatement, ForStatement, FunctionBody,
-        FunctionDeclaration, FunctionExpression, IfStatement, MemberProperty, ObjectBindingProp,
-        ObjectProperty, Param, ReturnStatement, Statement, SwitchCase, SwitchStatement,
-        TemplateElement, ThrowStatement, TryCatchStatement, UnaryOperator, VarKind,
-        VariableDeclaration, VariableDeclarator, WhileStatement,
+        BinaryOperator, Binding, BlockStatement, ClassDeclaration, ClassField, ClassMethod,
+        DoWhileStatement, Expression, ForInStatement, ForOfStatement, ForStatement, FunctionBody,
+        FunctionDeclaration, FunctionExpression, IfStatement, MemberProperty, MethodKind,
+        ObjectBindingProp, ObjectProperty, Param, ReturnStatement, Statement, SwitchCase,
+        SwitchStatement, TemplateElement, ThrowStatement, TryCatchStatement, UnaryOperator,
+        VarKind, VariableDeclaration, VariableDeclarator, WhileStatement,
     },
     error::JsError,
     lexer::{TemplatePart, Token, TokenKind, lex},
@@ -537,20 +537,28 @@ impl Parser {
         let span = self.expect(TokenKind::Class)?.span;
         let name = self.expect_identifier()?;
         let superclass = if self.eat(TokenKind::Extends) {
-            Some(self.expect_identifier()?)
+            // Accept a dotted chain (e.g. `extends Foo.Bar`) but not a call.
+            let base = self.expect_identifier()?;
+            let mut chain = base;
+            while self.eat(TokenKind::Dot) {
+                let part = self.expect_identifier_or_keyword()?;
+                chain = format!("{chain}.{part}");
+            }
+            Some(chain)
         } else {
             None
         };
         self.expect(TokenKind::LeftBrace)?;
         let mut methods = Vec::new();
+        let mut fields = Vec::new();
         while !self.at(TokenKind::RightBrace) && !self.at_eof() {
-            // Skip semicolons between class members.
             if self.eat(TokenKind::Semicolon) {
                 continue;
             }
             let is_static = self.eat(TokenKind::Static);
-            // Parse method name: identifier, keyword-as-identifier, private, or string.
-            let method_name = match self.current_kind() {
+            // Parse member name.
+            let mut kind = MethodKind::Method;
+            let member_name = match self.current_kind() {
                 TokenKind::PrivateIdentifier(n) => {
                     let n = format!("#{}", n.clone());
                     self.advance();
@@ -562,46 +570,43 @@ impl Parser {
                     s
                 }
                 _ => {
-                    // Identifier or keyword used as method name.
                     let n = self.expect_identifier_or_keyword()?;
-                    // 'get'/'set' accessor — we flatten these as normal methods.
+                    // get / set accessor — parse the actual name next.
                     if (n == "get" || n == "set") && !self.at(TokenKind::LeftParen) {
-                        // Skip get/set keyword, parse the actual name.
-                        let actual = self.expect_identifier_or_keyword()?;
-                        let params = self.parse_parameter_list()?;
-                        let body = self.parse_block()?;
-                        let is_constructor = actual == "constructor";
-                        methods.push(ClassMethod {
-                            name: actual,
-                            is_static,
-                            is_constructor,
-                            params,
-                            body,
-                        });
-                        continue;
+                        kind = if n == "get" { MethodKind::Get } else { MethodKind::Set };
+                        // actual member name
+                        match self.current_kind() {
+                            TokenKind::PrivateIdentifier(pn) => {
+                                let pn = format!("#{}", pn.clone());
+                                self.advance();
+                                pn
+                            }
+                            _ => self.expect_identifier_or_keyword()?,
+                        }
+                    } else {
+                        n
                     }
-                    n
                 }
             };
-            let is_constructor = method_name == "constructor";
-            // Method shorthand or computed — parse parameters and body.
+            // Field declaration: `name = expr ;` or `name ;`  (no leading `(`).
+            if kind == MethodKind::Method && !self.at(TokenKind::LeftParen) {
+                let init = if self.eat(TokenKind::Equals) {
+                    Some(self.parse_expression(0)?)
+                } else {
+                    None
+                };
+                self.eat(TokenKind::Semicolon);
+                fields.push(ClassField { name: member_name, init, is_static });
+                continue;
+            }
+            // Method: parse params + body.
+            let is_constructor = member_name == "constructor" && !is_static;
             let params = self.parse_parameter_list()?;
             let body = self.parse_block()?;
-            methods.push(ClassMethod {
-                name: method_name,
-                is_static,
-                is_constructor,
-                params,
-                body,
-            });
+            methods.push(ClassMethod { name: member_name, is_static, is_constructor, kind, params, body });
         }
         self.expect(TokenKind::RightBrace)?;
-        Ok(ClassDeclaration {
-            name,
-            superclass,
-            methods,
-            span,
-        })
+        Ok(ClassDeclaration { name, superclass, methods, fields, span })
     }
 
     fn parse_block(&mut self) -> Result<BlockStatement, JsError> {
@@ -675,9 +680,15 @@ impl Parser {
                 continue;
             }
 
-            // Member access: obj.prop
+            // Member access: obj.prop  or  obj.#privateField
             if self.eat(TokenKind::Dot) {
-                let property = self.expect_identifier_or_keyword()?;
+                let property = if let TokenKind::PrivateIdentifier(n) = self.current_kind() {
+                    let n = format!("#{}", n.clone());
+                    self.advance();
+                    n
+                } else {
+                    self.expect_identifier_or_keyword()?
+                };
                 left = Expression::Member {
                     object: Box::new(left),
                     property: MemberProperty::Named(property),
@@ -1019,39 +1030,71 @@ impl Parser {
         }
     }
 
-    /// Parse a class expression (anonymous or named). Returns `Expression::Null` because JBS
-    /// does not execute class bodies; the body tokens are consumed so the parser stays in sync.
+    /// Parse a class expression (anonymous or named) and emit `Expression::Class`.
     fn parse_class_expression(&mut self) -> Result<Expression, JsError> {
-        self.expect(TokenKind::Class)?;
+        let span = self.expect(TokenKind::Class)?.span;
         // optional class name
-        if let TokenKind::Identifier(_) = self.current_kind() {
+        let name = if let TokenKind::Identifier(n) = self.current_kind() {
+            let n = n.clone();
             self.advance();
-        }
-        // optional `extends <superclass-expr>`
-        if self.eat(TokenKind::Extends) {
-            // Parse the superclass expression. It stops naturally before `{` because `{` is
-            // not an infix operator.
-            self.parse_expression(0)?;
-        }
-        // consume the class body with a brace counter (tokens correctly tokenise strings/regexes)
-        self.expect(TokenKind::LeftBrace)?;
-        let mut depth = 1usize;
-        while depth > 0 && !self.at_eof() {
-            match self.current_kind() {
-                TokenKind::LeftBrace => {
-                    depth += 1;
-                    self.advance();
-                }
-                TokenKind::RightBrace => {
-                    depth -= 1;
-                    self.advance();
-                }
-                _ => {
-                    self.advance();
-                }
+            n
+        } else {
+            String::new()
+        };
+        // Reuse parse_class_declaration body (skip the `class NAME` prefix already consumed).
+        let superclass = if self.eat(TokenKind::Extends) {
+            let base = self.expect_identifier()?;
+            let mut chain = base;
+            while self.eat(TokenKind::Dot) {
+                let part = self.expect_identifier_or_keyword()?;
+                chain = format!("{chain}.{part}");
             }
+            Some(chain)
+        } else {
+            None
+        };
+        self.expect(TokenKind::LeftBrace)?;
+        let mut methods = Vec::new();
+        let mut fields = Vec::new();
+        while !self.at(TokenKind::RightBrace) && !self.at_eof() {
+            if self.eat(TokenKind::Semicolon) { continue; }
+            let is_static = self.eat(TokenKind::Static);
+            let mut kind = MethodKind::Method;
+            let member_name = match self.current_kind() {
+                TokenKind::PrivateIdentifier(n) => {
+                    let n = format!("#{}", n.clone());
+                    self.advance();
+                    n
+                }
+                TokenKind::String(s) => { let s = s.clone(); self.advance(); s }
+                _ => {
+                    let n = self.expect_identifier_or_keyword()?;
+                    if (n == "get" || n == "set") && !self.at(TokenKind::LeftParen) {
+                        kind = if n == "get" { MethodKind::Get } else { MethodKind::Set };
+                        match self.current_kind() {
+                            TokenKind::PrivateIdentifier(pn) => {
+                                let pn = format!("#{}", pn.clone());
+                                self.advance();
+                                pn
+                            }
+                            _ => self.expect_identifier_or_keyword()?,
+                        }
+                    } else { n }
+                }
+            };
+            if kind == MethodKind::Method && !self.at(TokenKind::LeftParen) {
+                let init = if self.eat(TokenKind::Equals) { Some(self.parse_expression(0)?) } else { None };
+                self.eat(TokenKind::Semicolon);
+                fields.push(ClassField { name: member_name, init, is_static });
+                continue;
+            }
+            let is_constructor = member_name == "constructor" && !is_static;
+            let params = self.parse_parameter_list()?;
+            let body = self.parse_block()?;
+            methods.push(ClassMethod { name: member_name, is_static, is_constructor, kind, params, body });
         }
-        Ok(Expression::Null)
+        self.expect(TokenKind::RightBrace)?;
+        Ok(Expression::Class(Box::new(ClassDeclaration { name, superclass, methods, fields, span })))
     }
 
     /// Parse the callee for `new` (identifiers, member access, or parenthesised expression).

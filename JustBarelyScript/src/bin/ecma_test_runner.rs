@@ -20,6 +20,7 @@ use std::fs;
 use std::io::{Write as IoWrite, stderr};
 use std::panic;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
@@ -516,31 +517,102 @@ fn main() {
     let mut failures: Vec<(String, String)> = Vec::new();
 
     let scan_total = limit.map(|l| l.min(total_files)).unwrap_or(total_files);
+
+    // Collect the batch of paths to run.
+    let batch: Vec<PathBuf> = all_files.into_iter().take(scan_total).collect();
+
+    // Parallel worker pool: use N threads = logical CPU count.
+    let nthreads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(16)  // cap at 16 — leaves headroom on 24-core machines
+        .max(1);
+
+    // Shared work queue: (original_index, path)
+    let queue: Arc<Mutex<std::collections::VecDeque<(usize, PathBuf)>>> =
+        Arc::new(Mutex::new(batch.iter().cloned().enumerate().collect()));
+
+    // Result channel: (original_index, rel_path, outcome)
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, String, TestOutcome)>();
+
+    let harness_arc = Arc::new(harness_dir.clone());
+    let test_dir_arc = Arc::new(test_dir.clone());
+    let filter_arc: Arc<Option<String>> = Arc::new(filter.clone());
+
+    let workers: Vec<_> = (0..nthreads).map(|_| {
+        let queue = Arc::clone(&queue);
+        let tx = tx.clone();
+        let harness = Arc::clone(&harness_arc);
+        let tdir = Arc::clone(&test_dir_arc);
+        let flt = Arc::clone(&filter_arc);
+        std::thread::spawn(move || {
+            loop {
+                let (idx, path) = {
+                    let mut q = queue.lock().unwrap();
+                    match q.pop_front() {
+                        Some(item) => item,
+                        None => break,
+                    }
+                };
+                let outcome = run_test_safe(&path, &harness, flt.as_deref());
+                let rel = path.strip_prefix(tdir.as_ref())
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                let _ = tx.send((idx, rel, outcome));
+            }
+        })
+    }).collect();
+    drop(tx); // close sender so rx knows when all workers are done
+
+    // Collect results in order using a reorder buffer.
     let mut bar = ProgressBar::new(scan_total);
     bar.render(0, 0, 0);
 
-    for (i, path) in all_files.iter().enumerate() {
-        if let Some(l) = limit {
-            if i >= l { break; }
-        }
+    let mut next_idx = 0usize;
+    let mut pending: std::collections::BTreeMap<usize, (String, TestOutcome)> = std::collections::BTreeMap::new();
+    let mut done = 0usize;
 
-        let outcome = run_test_safe(path, &harness_dir, filter.as_deref());
+    for (idx, rel, outcome) in rx {
+        pending.insert(idx, (rel, outcome));
 
-        let rel = path
-            .strip_prefix(&test_dir)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .into_owned();
+        // Drain any in-order results.
+        while let Some((rel, outcome)) = pending.remove(&next_idx) {
+            next_idx += 1;
+            done += 1;
 
-        match &outcome {
-            TestOutcome::Pass => {
-                passed += 1;
-                if verbose {
-                    // Clear the bar line before printing, then redraw
-                    let _ = write!(stderr(), "\r{:80}\r", "");
-                    println!("PASS  {}", rel);
+            match &outcome {
+                TestOutcome::Pass => {
+                    passed += 1;
+                    if verbose {
+                        let _ = write!(stderr(), "\r{:80}\r", "");
+                        println!("PASS  {}", rel);
+                    }
                 }
+                TestOutcome::Fail(reason) => {
+                    let is_panic = reason.starts_with("panic");
+                    if is_panic { panicked += 1; }
+                    failed += 1;
+                    failures.push((rel.clone(), reason.clone()));
+                    if let Some(ref mut lf) = log_file {
+                        let _ = writeln!(lf, "FAIL  {}  — {}", rel, reason);
+                    }
+                    if verbose {
+                        let _ = write!(stderr(), "\r{:80}\r", "");
+                        println!("FAIL  {}  — {}", rel, reason);
+                    }
+                }
+                TestOutcome::Skip(_) => { skipped += 1; }
             }
+            bar.render(done, passed, failed);
+        }
+    }
+
+    // Drain any remaining out-of-order results.
+    for (_, (rel, outcome)) in pending {
+        done += 1;
+        match &outcome {
+            TestOutcome::Pass => { passed += 1; }
             TestOutcome::Fail(reason) => {
                 let is_panic = reason.starts_with("panic");
                 if is_panic { panicked += 1; }
@@ -549,22 +621,17 @@ fn main() {
                 if let Some(ref mut lf) = log_file {
                     let _ = writeln!(lf, "FAIL  {}  — {}", rel, reason);
                 }
-                if verbose {
-                    let _ = write!(stderr(), "\r{:80}\r", "");
-                    println!("FAIL  {}  — {}", rel, reason);
-                }
             }
-            TestOutcome::Skip(reason) => {
-                skipped += 1;
-                if verbose {
-                    let _ = write!(stderr(), "\r{:80}\r", "");
-                    println!("SKIP  {}  — {}", rel, reason);
-                }
-            }
+            TestOutcome::Skip(_) => { skipped += 1; }
         }
-
-        bar.render(i + 1, passed, failed);
+        bar.render(done, passed, failed);
     }
+
+    // Wait for all workers to finish (they already have — rx closed when all senders dropped).
+    for w in workers { let _ = w.join(); }
+
+    // Sort failures by path so output is deterministic regardless of thread interleaving.
+    failures.sort_by(|a, b| a.0.cmp(&b.0));
 
     bar.finish();
     println!();
