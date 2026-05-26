@@ -16,12 +16,15 @@
 ///   --failures-log <path>      Write every failure line to <path>
 ///   --test-dir <path>          Override default test directory
 ///   --harness-dir <path>       Override default harness directory
+use std::collections::HashMap;
 use std::fs;
-use std::io::{Write as IoWrite, stderr};
+use std::io::{BufRead, Write as IoWrite, stderr};
 use std::panic;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use std::time::Instant;
+use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Progress bar (written to stderr so it doesn't mix with --verbose stdout)
@@ -185,7 +188,61 @@ struct Frontmatter {
     negative_type: Option<String>,
     includes: Vec<String>,
     flags: Vec<String>,
+    features: Vec<String>,
 }
+
+/// Features that JBS does not implement; tests requiring any of these are
+/// skipped instead of timing out burning through the step budget.
+static UNSUPPORTED_FEATURES: &[&str] = &[
+    // TypedArrays / binary data
+    "ArrayBuffer",
+    "DataView",
+    "SharedArrayBuffer",
+    "TypedArray",
+    "Float16Array",
+    "Float32Array",
+    "Float64Array",
+    "Int8Array",
+    "Int16Array",
+    "Int32Array",
+    "Uint8Array",
+    "Uint8ClampedArray",
+    "Uint16Array",
+    "Uint32Array",
+    "BigInt64Array",
+    "BigUint64Array",
+    "immutable-arraybuffer",
+    "resizable-arraybuffer",
+    // Async / generators
+    "async-functions",
+    "async-iteration",
+    "generators",
+    // Reflection / meta
+    "Proxy",
+    "Reflect",
+    "Reflect.construct",
+    "WeakRef",
+    "FinalizationRegistry",
+    // Other unsupported built-ins
+    "Atomics",
+    "Atomics.waitAsync",
+    "import-assertions",
+    "import-attributes",
+    "dynamic-import",
+    "top-level-await",
+    "json-modules",
+    "decorators",
+    "source-phase-imports",
+    "regexp-v-flag",
+    "regexp-modifiers",
+    "iterator-helpers",
+    "explicit-resource-management",
+    "Temporal",
+    "ShadowRealm",
+    "import.meta",
+    "module-blocks",
+    "AbstractModuleSource",
+];
 
 fn parse_frontmatter(source: &str) -> Frontmatter {
     let mut fm = Frontmatter::default();
@@ -202,6 +259,7 @@ fn parse_frontmatter(source: &str) -> Frontmatter {
     let mut in_negative = false;
     let mut in_includes = false;
     let mut in_flags = false;
+    let mut in_features = false;
 
     for raw_line in yaml.lines() {
         let line = raw_line.trim_end();
@@ -210,6 +268,7 @@ fn parse_frontmatter(source: &str) -> Frontmatter {
             in_negative = false;
             in_includes = false;
             in_flags = false;
+            in_features = false;
         }
 
         let trimmed = line.trim();
@@ -280,6 +339,33 @@ fn parse_frontmatter(source: &str) -> Frontmatter {
                 in_flags = false;
             }
         }
+
+        if trimmed.starts_with("features:") {
+            let rest = trimmed["features:".len()..].trim();
+            if rest.starts_with('[') {
+                let inner = rest.trim_start_matches('[').trim_end_matches(']');
+                for item in inner.split(',') {
+                    let s = item.trim().trim_matches('"').trim_matches('\'').to_owned();
+                    if !s.is_empty() {
+                        fm.features.push(s);
+                    }
+                }
+            } else {
+                in_features = true;
+            }
+            continue;
+        }
+        if in_features {
+            if trimmed.starts_with('-') {
+                let item = trimmed.trim_start_matches('-').trim().trim_matches('"').trim_matches('\'').to_owned();
+                if !item.is_empty() {
+                    fm.features.push(item);
+                }
+                continue;
+            } else {
+                in_features = false;
+            }
+        }
     }
 
     fm
@@ -315,8 +401,10 @@ enum TestOutcome {
 
 // ---------------------------------------------------------------------------
 // Run one test (may panic — call via run_test_safe)
+// harness_cache: pre-loaded map of include filename → source, shared across threads
+// timeout_secs: per-test wall-clock cap; None = no deadline
 // ---------------------------------------------------------------------------
-fn run_test(path: &Path, harness_dir: &Path, filter: Option<&str>) -> TestOutcome {
+fn run_test(path: &Path, harness_cache: &Arc<HashMap<String, String>>, filter: Option<&str>, timeout_secs: Option<f64>) -> TestOutcome {
     let path_str = path.to_string_lossy();
 
     if let Some(f) = filter {
@@ -327,6 +415,42 @@ fn run_test(path: &Path, harness_dir: &Path, filter: Option<&str>) -> TestOutcom
 
     if path_str.contains("intl402") {
         return TestOutcome::Fail("not implemented: Intl/i18n (intl402) required".into());
+    }
+
+    // Fast-fail entire built-in directories for features we don't implement.
+    // Many tests in these dirs have no `features:` tag, so path-based detection
+    // avoids burning the step budget on them.
+    const UNSUPPORTED_DIRS: &[&str] = &[
+        "/built-ins/ArrayBuffer/",
+        "/built-ins/SharedArrayBuffer/",
+        "/built-ins/DataView/",
+        "/built-ins/TypedArray/",
+        "/built-ins/Float16Array/",
+        "/built-ins/Float32Array/",
+        "/built-ins/Float64Array/",
+        "/built-ins/Int8Array/",
+        "/built-ins/Int16Array/",
+        "/built-ins/Int32Array/",
+        "/built-ins/Uint8Array/",
+        "/built-ins/Uint16Array/",
+        "/built-ins/Uint32Array/",
+        "/built-ins/Uint8ClampedArray/",
+        "/built-ins/BigInt64Array/",
+        "/built-ins/BigUint64Array/",
+        "/built-ins/Atomics/",
+        "/built-ins/AsyncGeneratorPrototype/",
+        "/built-ins/AsyncFromSyncIteratorPrototype/",
+        "/built-ins/AsyncDisposableStack/",
+        "/built-ins/DisposableStack/",
+        "/built-ins/FinalizationRegistry/",
+        "/built-ins/WeakRef/",
+        "/built-ins/GeneratorFunction/",
+        "/built-ins/GeneratorPrototype/",
+        "/built-ins/AsyncGeneratorFunction/",
+        "/built-ins/ShadowRealm/",
+    ];
+    if let Some(dir) = UNSUPPORTED_DIRS.iter().find(|&&d| path_str.contains(d)) {
+        return TestOutcome::Fail(format!("not implemented: {}", dir.trim_matches('/').rsplit('/').next().unwrap_or(dir)));
     }
 
     let source = match fs::read_to_string(path) {
@@ -343,6 +467,10 @@ fn run_test(path: &Path, harness_dir: &Path, filter: Option<&str>) -> TestOutcom
         return TestOutcome::Fail("not implemented: ES module support required".into());
     }
 
+    if let Some(feat) = fm.features.iter().find(|f| UNSUPPORTED_FEATURES.contains(&f.as_str())) {
+        return TestOutcome::Fail(format!("not implemented: {}", feat));
+    }
+
     let is_raw = fm.flags.iter().any(|f| f == "raw");
     let only_strict = fm.flags.iter().any(|f| f == "onlyStrict");
 
@@ -353,9 +481,8 @@ fn run_test(path: &Path, harness_dir: &Path, filter: Option<&str>) -> TestOutcom
         full.push('\n');
 
         for include in &fm.includes {
-            let inc_path = harness_dir.join(include);
-            if let Ok(inc_src) = fs::read_to_string(&inc_path) {
-                full.push_str(&inc_src);
+            if let Some(src) = harness_cache.get(include) {
+                full.push_str(src);
                 full.push('\n');
             }
         }
@@ -386,10 +513,15 @@ fn run_test(path: &Path, harness_dir: &Path, filter: Option<&str>) -> TestOutcom
         }
     };
 
-    // execute
+    // execute — hard wall-clock cap per test (catches loops the step budget misses)
     const BUDGET: usize = 100_000;
     let mut state = BrowserExecutionState::default();
     state.set_execution_budget(BUDGET);
+    if let Some(secs) = timeout_secs {
+        if secs > 0.0 {
+            state.set_execution_deadline(std::time::Instant::now() + std::time::Duration::from_secs_f64(secs));
+        }
+    }
     state.execute_program(&program);
 
     if state.execution_budget_exhausted() {
@@ -411,20 +543,42 @@ fn run_test(path: &Path, harness_dir: &Path, filter: Option<&str>) -> TestOutcom
 }
 
 // ---------------------------------------------------------------------------
-// Panic-safe wrapper
+// Panic-safe wrapper with hard external timeout.
+//
+// The interpreter's internal deadline (checked every 256 budget steps) is the
+// first line of defence. The outer `recv_timeout` here is the hard kill: it
+// fires even when the interpreter is stuck inside a Rust-level loop that never
+// reaches a budget-check point.  The abandoned thread continues in the
+// background but the caller moves on immediately.
 // ---------------------------------------------------------------------------
-fn run_test_safe(path: &Path, harness_dir: &Path, filter: Option<&str>) -> TestOutcome {
-    let path_owned = path.to_path_buf();
-    let harness_owned = harness_dir.to_path_buf();
+fn run_test_safe(path: &Path, harness_cache: Arc<HashMap<String, String>>, filter: Option<&str>, timeout_secs: Option<f64>) -> TestOutcome {
+    let path_owned   = path.to_path_buf();
     let filter_owned = filter.map(str::to_owned);
+    // Use a sync_channel(1) so the sender never blocks even if we've already
+    // returned due to timeout.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<TestOutcome>(1);
+    let cache = Arc::clone(&harness_cache);
 
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(move || {
-        run_test(&path_owned, &harness_owned, filter_owned.as_deref())
-    }));
+    std::thread::spawn(move || {
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            run_test(&path_owned, &cache, filter_owned.as_deref(), timeout_secs)
+        }));
+        let outcome = match result {
+            Ok(o)  => o,
+            Err(_) => TestOutcome::Fail("panic/crash during execution".into()),
+        };
+        let _ = tx.send(outcome); // ignored if receiver already timed out
+    });
 
-    match result {
-        Ok(outcome) => outcome,
-        Err(_) => TestOutcome::Fail("panic/crash during execution".into()),
+    match timeout_secs.filter(|&s| s > 0.0) {
+        Some(secs) => {
+            // Give 150 ms extra margin so the internal deadline fires first
+            // and provides a cleaner failure message when possible.
+            let wall = std::time::Duration::from_secs_f64(secs + 0.15);
+            rx.recv_timeout(wall)
+                .unwrap_or_else(|_| TestOutcome::Fail("timeout: test exceeded wall-clock limit".into()))
+        }
+        None => rx.recv().unwrap_or(TestOutcome::Fail("thread error".into())),
     }
 }
 
@@ -445,11 +599,14 @@ fn main() {
         eprintln!("  --built-ins                Only run tests under built-ins/");
         eprintln!("  --filter <substring>       Only run tests whose path contains <substring>");
         eprintln!("  --limit <n>                Stop after <n> tests scanned");
+        eprintln!("  --nproc <n>                Worker threads (default: min(cpus,16))");
         eprintln!("  --verbose                  Print every result");
         eprintln!("  --show-failures            Print failure details in summary");
         eprintln!("  --failures-log <path>      Write failures to a log file");
         eprintln!("  --test-dir <path>          Override test directory");
         eprintln!("  --harness-dir <path>       Override harness directory");
+        eprintln!("  --slow-ms <n>              (nproc=1 only) Print tests taking >= n ms");
+        eprintln!("  --timeout-sec <n>          Per-test wall-clock cap in seconds, fractions ok (default: 0.25, 0 = off)");
         std::process::exit(0);
     }
 
@@ -461,11 +618,18 @@ fn main() {
 
     let mut filter: Option<String> = None;
     let mut limit: Option<usize> = None;
+    let mut nproc: Option<usize> = None;
     let mut verbose = false;
     let mut show_failures = false;
     let mut failures_log: Option<String> = None;
     let mut test_dir = default_test_dir.clone();
     let mut harness_dir = default_harness_dir.clone();
+    // Print tests that take longer than this many milliseconds. Disabled when None.
+    let mut slow_ms: Option<u64> = None;
+    // Per-test wall-clock timeout in seconds (fractional ok): Some(n>0) = n seconds, Some(0) / None = no deadline.
+    let mut timeout_secs: Option<f64> = Some(0.25);
+    // Internal flag set by master on child processes: "start:count" slice into the sorted file list.
+    let mut worker_shard: Option<(usize, usize)> = None;
 
     let mut idx = 1usize;
     while idx < args.len() {
@@ -477,163 +641,295 @@ fn main() {
             "--built-ins" => { test_dir = default_test_dir.join("built-ins"); }
             "--filter" => { idx += 1; filter = args.get(idx).cloned(); }
             "--limit" => { idx += 1; limit = args.get(idx).and_then(|s| s.parse().ok()); }
+            "--nproc" => { idx += 1; nproc = args.get(idx).and_then(|s| s.parse().ok()); }
             "--failures-log" => { idx += 1; failures_log = args.get(idx).cloned(); }
             "--test-dir" => { idx += 1; if let Some(p) = args.get(idx) { test_dir = PathBuf::from(p); } }
             "--harness-dir" => { idx += 1; if let Some(p) = args.get(idx) { harness_dir = PathBuf::from(p); } }
+            "--slow-ms" => { idx += 1; slow_ms = args.get(idx).and_then(|s| s.parse().ok()); }
+            "--timeout-sec" => { idx += 1; timeout_secs = args.get(idx).and_then(|s| s.parse::<f64>().ok()); }
+            "--worker-shard" => {
+                idx += 1;
+                if let Some(s) = args.get(idx) {
+                    let mut parts = s.splitn(2, ':');
+                    if let (Some(a), Some(b)) = (parts.next(), parts.next()) {
+                        if let (Ok(start), Ok(count)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                            worker_shard = Some((start, count));
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         idx += 1;
     }
 
+    // ── WORKER FAST PATH ─────────────────────────────────────────────────────
+    // Child processes: skip all scanning/banners — load harness, read paths from stdin, run tests.
+    if let Some((_shard_start, _shard_count)) = worker_shard {
+        let harness_cache: Arc<HashMap<String, String>> = Arc::new({
+            let mut map = HashMap::new();
+            if let Ok(entries) = fs::read_dir(&harness_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("js") {
+                        if let (Some(name), Ok(src)) = (
+                            p.file_name().and_then(|n| n.to_str()).map(str::to_owned),
+                            fs::read_to_string(&p),
+                        ) { map.insert(name, src); }
+                    }
+                }
+            }
+            map
+        });
+        let batch: Vec<PathBuf> = std::io::stdin()
+            .lock()
+            .lines()
+            .flatten()
+            .filter(|l| !l.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        for path in &batch {
+            let rel = path.strip_prefix(&test_dir).unwrap_or(path).to_string_lossy();
+            let outcome = run_test_safe(path, Arc::clone(&harness_cache), filter.as_deref(), timeout_secs);
+            match outcome {
+                TestOutcome::Pass        => { let _ = writeln!(out, "P\t{}", rel); }
+                TestOutcome::Fail(r)     => { let _ = writeln!(out, "F\t{}\t{}", rel, r.replace('\n', " ")); }
+                TestOutcome::Skip(r)     => { let _ = writeln!(out, "S\t{}\t{}", rel, r); }
+            }
+        }
+        return;
+    }
+
+    // ── MASTER MODE ──────────────────────────────────────────────────────────
     if !test_dir.exists() {
         eprintln!("error: test directory not found: {}", test_dir.display());
-        eprintln!("  ECMAScript/test262-main/ must be present at the workspace root.");
         std::process::exit(1);
     }
+
+    // Determine process count — respects RAYON_NUM_THREADS env var as an alternative to --nproc.
+    let env_nproc: Option<usize> = std::env::var("RAYON_NUM_THREADS").ok()
+        .and_then(|s| s.parse().ok());
+    let nprocs = nproc.or(env_nproc).unwrap_or_else(|| {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16)
+    }).max(1);
 
     println!("ecma_test_runner: collecting tests from {}", test_dir.display());
     let mut all_files: Vec<PathBuf> = Vec::new();
     collect_js_files(&test_dir, &mut all_files);
     all_files.sort();
-
     let total_files = all_files.len();
     println!("ecma_test_runner: found {} test files", total_files);
-    if let Some(f) = &filter {
-        println!("ecma_test_runner: filter = {:?}", f);
-    }
+    if let Some(f) = &filter { println!("ecma_test_runner: filter = {:?}", f); }
     if let Some(l) = limit { println!("ecma_test_runner: limit = {}", l); }
     if let Some(log) = &failures_log { println!("ecma_test_runner: failures log = {}", log); }
+    println!("ecma_test_runner: nproc = {}", nprocs);
+    println!("ecma_test_runner: available CPUs = {}", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0));
     println!();
+
+    let scan_total = limit.map(|l| l.min(total_files)).unwrap_or(total_files);
+
+    // Harness cache — only needed for single-process path.
+    let harness_cache: Arc<HashMap<String, String>> = Arc::new({
+        let mut map = HashMap::new();
+        if let Ok(entries) = fs::read_dir(&harness_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("js") {
+                    if let (Some(name), Ok(src)) = (
+                        p.file_name().and_then(|n| n.to_str()).map(str::to_owned),
+                        fs::read_to_string(&p),
+                    ) { map.insert(name, src); }
+                }
+            }
+        }
+        map
+    });
 
     // open failures log if requested
     let mut log_file: Option<fs::File> = failures_log.as_ref().and_then(|p| {
         fs::File::create(p).map_err(|e| eprintln!("warn: cannot open failures log {}: {}", p, e)).ok()
     });
 
-    let mut passed = 0usize;
-    let mut failed = 0usize;
+    let mut passed  = 0usize;
+    let mut failed  = 0usize;
     let mut skipped = 0usize;
     let mut panicked = 0usize;
     let mut failures: Vec<(String, String)> = Vec::new();
 
-    let scan_total = limit.map(|l| l.min(total_files)).unwrap_or(total_files);
+    if nprocs == 1 {
+        // ── SINGLE-PROCESS PATH (rayon within one process) ───────────────────
+        let batch: Vec<PathBuf> = all_files.into_iter().take(scan_total).collect();
 
-    // Collect the batch of paths to run.
-    let batch: Vec<PathBuf> = all_files.into_iter().take(scan_total).collect();
+        rayon::ThreadPoolBuilder::new().num_threads(1).build_global().unwrap_or(());
+        println!("ecma_test_runner: rayon threads = {}", rayon::current_num_threads());
 
-    // Parallel worker pool: use N threads = logical CPU count.
-    let nthreads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(16)  // cap at 16 — leaves headroom on 24-core machines
-        .max(1);
-
-    // Shared work queue: (original_index, path)
-    let queue: Arc<Mutex<std::collections::VecDeque<(usize, PathBuf)>>> =
-        Arc::new(Mutex::new(batch.iter().cloned().enumerate().collect()));
-
-    // Result channel: (original_index, rel_path, outcome)
-    let (tx, rx) = std::sync::mpsc::channel::<(usize, String, TestOutcome)>();
-
-    let harness_arc = Arc::new(harness_dir.clone());
-    let test_dir_arc = Arc::new(test_dir.clone());
-    let filter_arc: Arc<Option<String>> = Arc::new(filter.clone());
-
-    let workers: Vec<_> = (0..nthreads).map(|_| {
-        let queue = Arc::clone(&queue);
-        let tx = tx.clone();
-        let harness = Arc::clone(&harness_arc);
-        let tdir = Arc::clone(&test_dir_arc);
-        let flt = Arc::clone(&filter_arc);
-        std::thread::spawn(move || {
-            loop {
-                let (idx, path) = {
-                    let mut q = queue.lock().unwrap();
-                    match q.pop_front() {
-                        Some(item) => item,
-                        None => break,
-                    }
-                };
-                let outcome = run_test_safe(&path, &harness, flt.as_deref());
-                let rel = path.strip_prefix(tdir.as_ref())
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .into_owned();
-                let _ = tx.send((idx, rel, outcome));
-            }
-        })
-    }).collect();
-    drop(tx); // close sender so rx knows when all workers are done
-
-    // Collect results in order using a reorder buffer.
-    let mut bar = ProgressBar::new(scan_total);
-    bar.render(0, 0, 0);
-
-    let mut next_idx = 0usize;
-    let mut pending: std::collections::BTreeMap<usize, (String, TestOutcome)> = std::collections::BTreeMap::new();
-    let mut done = 0usize;
-
-    for (idx, rel, outcome) in rx {
-        pending.insert(idx, (rel, outcome));
-
-        // Drain any in-order results.
-        while let Some((rel, outcome)) = pending.remove(&next_idx) {
-            next_idx += 1;
-            done += 1;
-
+        let a_passed = Arc::new(AtomicUsize::new(0));
+        let a_failed = Arc::new(AtomicUsize::new(0));
+        let a_done   = Arc::new(AtomicUsize::new(0));
+        let (bp, bf, bd) = (Arc::clone(&a_passed), Arc::clone(&a_failed), Arc::clone(&a_done));
+        let bar_handle = {
+            let total = scan_total;
+            std::thread::spawn(move || {
+                let mut bar = ProgressBar::new(total);
+                bar.render(0, 0, 0);
+                loop {
+                    bar.render(bd.load(Ordering::Relaxed), bp.load(Ordering::Relaxed), bf.load(Ordering::Relaxed));
+                    if bd.load(Ordering::Relaxed) >= total { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            })
+        };
+        let filter_ref: Option<&str> = filter.as_deref();
+        let results: Vec<(String, TestOutcome, u64)> = batch.par_iter().map(|path| {
+            let rel = path.strip_prefix(&test_dir).unwrap_or(path).to_string_lossy().into_owned();
+            let t0 = std::time::Instant::now();
+            let outcome = run_test_safe(path, Arc::clone(&harness_cache), filter_ref, timeout_secs);
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
             match &outcome {
+                TestOutcome::Pass    => { a_passed.fetch_add(1, Ordering::Relaxed); }
+                TestOutcome::Fail(_) => { a_failed.fetch_add(1, Ordering::Relaxed); }
+                TestOutcome::Skip(_) => {}
+            }
+            a_done.fetch_add(1, Ordering::Relaxed);
+            (rel, outcome, elapsed_ms)
+        }).collect();
+        let _ = bar_handle.join();
+
+        let mut slow_log: Vec<(u64, String)> = Vec::new();
+        for (rel, outcome, elapsed_ms) in results {
+            if let Some(thresh) = slow_ms {
+                if elapsed_ms >= thresh {
+                    slow_log.push((elapsed_ms, rel.clone()));
+                }
+            }
+            match outcome {
+                TestOutcome::Pass => { passed += 1; }
+                TestOutcome::Fail(r) => {
+                    if r.starts_with("panic") { panicked += 1; }
+                    failed += 1;
+                    failures.push((rel, r));
+                }
+                TestOutcome::Skip(_) => { skipped += 1; }
+            }
+        }
+        if !slow_log.is_empty() {
+            slow_log.sort_by(|a, b| b.0.cmp(&a.0));
+            println!("\nSlow tests (>= {}ms):", slow_ms.unwrap_or(0));
+            for (ms, path) in &slow_log {
+                println!("  {:>6}ms  {}", ms, path);
+            }
+        }
+    } else {
+        // ── MULTI-PROCESS PATH ───────────────────────────────────────────────
+        // Split the sorted file list into nprocs shards.
+        let exe = std::env::current_exe().expect("cannot resolve executable path");
+
+        // Build the arg list to forward to children (drop --nproc and its value).
+        let forward_args: Vec<String> = {
+            let mut out: Vec<String> = Vec::new();
+            let mut skip_next = false;
+            for arg in &args[1..] {
+                if skip_next { skip_next = false; continue; }
+                if arg == "--nproc" { skip_next = true; continue; }
+                out.push(arg.clone());
+            }
+            out
+        };
+
+        // Result channel: (rel_path, outcome) from all child stdout readers.
+        let (tx, rx) = std::sync::mpsc::channel::<(String, TestOutcome)>();
+
+        // Master pre-computes the full path list — children receive their slice via stdin.
+        // Round-robin interleaving: process i gets indices i, i+nprocs, i+2*nprocs, ...
+        // This spreads slow tests evenly instead of concentrating them in one shard.
+        let all_paths: Vec<PathBuf> = all_files.into_iter().take(scan_total).collect();
+
+        // Spawn one child process per shard + one reader thread per child.
+        // Paths are fed to each child via stdin (one absolute path per line).
+        let reader_handles: Vec<_> = (0..nprocs).filter_map(|i| {
+            let shard_paths: Vec<PathBuf> = all_paths.iter()
+                .skip(i)
+                .step_by(nprocs)
+                .cloned()
+                .collect();
+            if shard_paths.is_empty() { return None; }
+            let count = shard_paths.len();
+
+            let mut child = match Command::new(&exe)
+                .args(&forward_args)
+                .arg("--worker-shard")
+                .arg(format!("{}:{}", i, count))
+                .stdin(Stdio::piped())   // paths fed via stdin
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())  // suppress child banners
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => { eprintln!("warn: failed to spawn worker: {}", e); return None; }
+            };
+
+            // Write this shard's absolute paths to child stdin, then close it.
+            if let Some(mut stdin_pipe) = child.stdin.take() {
+                use std::io::Write;
+                for p in &shard_paths {
+                    let _ = writeln!(stdin_pipe, "{}", p.display());
+                }
+                // stdin_pipe dropped here → EOF → child stops reading
+            }
+
+            let stdout = child.stdout.take().unwrap();
+            let tx = tx.clone();
+            Some(std::thread::spawn(move || {
+                let reader = std::io::BufReader::new(stdout);
+                for line in reader.lines().flatten() {
+                    let mut parts = line.splitn(3, '\t');
+                    let tag = parts.next().unwrap_or("");
+                    let rel = parts.next().unwrap_or("").to_owned();
+                    let detail = parts.next().unwrap_or("").to_owned();
+                    let outcome = match tag {
+                        "P" => TestOutcome::Pass,
+                        "F" => TestOutcome::Fail(detail),
+                        "S" => TestOutcome::Skip(detail),
+                        _   => continue,
+                    };
+                    let _ = tx.send((rel, outcome));
+                }
+                let _ = child.wait();
+            }))
+        }).collect();
+        drop(tx); // close original sender so rx closes when all readers finish
+
+        // Render progress bar on main thread while collecting results.
+        let mut bar = ProgressBar::new(scan_total);
+        bar.render(0, 0, 0);
+        let mut done = 0usize;
+
+        for (rel, outcome) in rx {
+            done += 1;
+            match outcome {
                 TestOutcome::Pass => {
                     passed += 1;
-                    if verbose {
-                        let _ = write!(stderr(), "\r{:80}\r", "");
-                        println!("PASS  {}", rel);
-                    }
+                    if verbose { let _ = write!(stderr(), "\r{:80}\r", ""); println!("PASS  {}", rel); }
                 }
-                TestOutcome::Fail(reason) => {
-                    let is_panic = reason.starts_with("panic");
-                    if is_panic { panicked += 1; }
+                TestOutcome::Fail(r) => {
+                    if r.starts_with("panic") { panicked += 1; }
                     failed += 1;
-                    failures.push((rel.clone(), reason.clone()));
-                    if let Some(ref mut lf) = log_file {
-                        let _ = writeln!(lf, "FAIL  {}  — {}", rel, reason);
-                    }
-                    if verbose {
-                        let _ = write!(stderr(), "\r{:80}\r", "");
-                        println!("FAIL  {}  — {}", rel, reason);
-                    }
+                    failures.push((rel.clone(), r.clone()));
+                    if let Some(ref mut lf) = log_file { let _ = writeln!(lf, "FAIL  {}  — {}", rel, r); }
+                    if verbose { let _ = write!(stderr(), "\r{:80}\r", ""); println!("FAIL  {}  — {}", rel, r); }
                 }
                 TestOutcome::Skip(_) => { skipped += 1; }
             }
             bar.render(done, passed, failed);
         }
+
+        for h in reader_handles { let _ = h.join(); }
     }
 
-    // Drain any remaining out-of-order results.
-    for (_, (rel, outcome)) in pending {
-        done += 1;
-        match &outcome {
-            TestOutcome::Pass => { passed += 1; }
-            TestOutcome::Fail(reason) => {
-                let is_panic = reason.starts_with("panic");
-                if is_panic { panicked += 1; }
-                failed += 1;
-                failures.push((rel.clone(), reason.clone()));
-                if let Some(ref mut lf) = log_file {
-                    let _ = writeln!(lf, "FAIL  {}  — {}", rel, reason);
-                }
-            }
-            TestOutcome::Skip(_) => { skipped += 1; }
-        }
-        bar.render(done, passed, failed);
-    }
-
-    // Wait for all workers to finish (they already have — rx closed when all senders dropped).
-    for w in workers { let _ = w.join(); }
-
-    // Sort failures by path so output is deterministic regardless of thread interleaving.
+    // ── SUMMARY ──────────────────────────────────────────────────────────────
     failures.sort_by(|a, b| a.0.cmp(&b.0));
-
-    bar.finish();
     println!();
 
     if show_failures && !failures.is_empty() {
@@ -646,27 +942,16 @@ fn main() {
     }
 
     let ran = passed + failed;
-    let pct = if ran > 0 {
-        (passed as f64 / ran as f64) * 100.0
-    } else {
-        0.0
-    };
-
+    let pct = if ran > 0 { (passed as f64 / ran as f64) * 100.0 } else { 0.0 };
     println!("Results:");
     println!("  passed  : {} / {} ran  ({:.1}%)", passed, ran, pct);
     println!("  failed  : {}", failed);
-    if panicked > 0 {
-        println!("  panicked: {} (caught and recorded as failures)", panicked);
-    }
+    if panicked > 0 { println!("  panicked: {} (caught and recorded as failures)", panicked); }
     println!("  skipped : {}", skipped);
-    if let Some(log) = &failures_log {
-        println!("  failures log: {}", log);
-    }
+    if let Some(log) = &failures_log { println!("  failures log: {}", log); }
     if failed > 0 && !show_failures {
         println!();
         println!("  run with --show-failures to see details, --failures-log <path> to save them");
     }
-    if failed > 0 {
-        std::process::exit(1);
-    }
+    if failed > 0 { std::process::exit(1); }
 }

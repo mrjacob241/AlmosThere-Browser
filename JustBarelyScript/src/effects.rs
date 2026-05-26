@@ -140,6 +140,7 @@ pub struct BrowserExecutionState {
     early_exit: Option<EarlyExit>,
     execution_budget_remaining: Option<usize>,
     execution_budget_exhausted: bool,
+    execution_deadline: Option<std::time::Instant>,
     array_method_overrides: HashMap<String, JsValue>,
     symbol_counter: u32,
 }
@@ -539,6 +540,10 @@ impl BrowserExecutionState {
     pub fn set_execution_budget(&mut self, statement_budget: usize) {
         self.execution_budget_remaining = Some(statement_budget);
         self.execution_budget_exhausted = false;
+    }
+
+    pub fn set_execution_deadline(&mut self, deadline: std::time::Instant) {
+        self.execution_deadline = Some(deadline);
     }
 
     pub fn execution_budget_exhausted(&self) -> bool {
@@ -1234,6 +1239,16 @@ impl BrowserExecutionState {
         if self.execution_budget_exhausted {
             return false;
         }
+        // Wall-clock deadline check (catches tight loops the step counter misses).
+        // Only sample Instant::now() every 256 steps to avoid overhead.
+        if let Some(deadline) = self.execution_deadline {
+            if let Some(remaining) = self.execution_budget_remaining {
+                if remaining % 256 == 0 && std::time::Instant::now() >= deadline {
+                    self.execution_budget_exhausted = true;
+                    return false;
+                }
+            }
+        }
         let Some(remaining) = self.execution_budget_remaining.as_mut() else {
             return true;
         };
@@ -1655,7 +1670,24 @@ impl BrowserExecutionState {
                         JsValue::HostObject(name)
                     }
                 } else {
-                    self.trace_runtime("unsupported.constructor", format!("{:?}", callee.as_ref()));
+                    // Per spec: `new <non-constructor>` throws TypeError.
+                    // This also prevents burning through the step budget when unknown
+                    // built-ins (e.g. TypedArray constructors) evaluate to Undefined.
+                    let callee_val = self.execute_expression(callee);
+                    let callee_name = match &callee_val {
+                        JsValue::Undefined => {
+                            if let Expression::Identifier(n) = callee.as_ref() {
+                                n.clone()
+                            } else {
+                                "unknown".to_owned()
+                            }
+                        }
+                        _ => format!("{:?}", callee_val),
+                    };
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        format!("{} is not a constructor", callee_name),
+                    )));
                     JsValue::Undefined
                 }
             }
@@ -4097,7 +4129,7 @@ impl BrowserExecutionState {
                 }
                 JsValue::Array(mut arr) => {
                     if let Ok(idx) = key.parse::<usize>() {
-                        const MAX_DENSE_INDEX: usize = 1 << 20;
+                        const MAX_DENSE_INDEX: usize = 100_000;
                         if idx < MAX_DENSE_INDEX {
                             if idx >= arr.len() {
                                 arr.resize(idx + 1, JsValue::Undefined);
@@ -4106,11 +4138,15 @@ impl BrowserExecutionState {
                             self.assign_target(object, JsValue::Array(arr));
                         } else {
                             // Sparse/large index: promote to Object.
+                            // Only copy non-hole elements to avoid O(capacity) cost on
+                            // sparse arrays that were built with a large dense Vec.
                             let rc = JsObject::new();
                             {
                                 let mut obj = rc.borrow_mut();
                                 for (i, v) in arr.into_iter().enumerate() {
-                                    obj.set(i.to_string(), v);
+                                    if !matches!(v, JsValue::Undefined) {
+                                        obj.set(i.to_string(), v);
+                                    }
                                 }
                                 obj.set(key, value);
                             }
