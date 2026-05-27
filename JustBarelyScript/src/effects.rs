@@ -408,7 +408,10 @@ impl PartialEq for JsValue {
             (JsValue::String(a), JsValue::String(b)) => a == b,
             // Objects use identity (reference) equality — same Rc pointer = same object.
             (JsValue::Object(a), JsValue::Object(b)) => Rc::ptr_eq(a, b),
-            (JsValue::Array(a), JsValue::Array(b)) => a == b,
+            // Arrays are value-semantics Vecs in JBS — two separate instances are never
+            // the same reference, and deep comparison recurses infinitely on self-referential
+            // arrays. JS semantics: different array refs are never ===, so always false.
+            (JsValue::Array(_), JsValue::Array(_)) => false,
             (JsValue::HostFunction(a), JsValue::HostFunction(b)) => a == b,
             (JsValue::HostObject(a), JsValue::HostObject(b)) => a == b,
             (JsValue::ElementRef(a), JsValue::ElementRef(b)) => a == b,
@@ -1657,6 +1660,23 @@ impl BrowserExecutionState {
                         } else {
                             JsValue::Array(args)
                         }
+                    } else if matches!(fn_name.as_str(), "Boolean" | "Number" | "String" | "Object") {
+                        // new Boolean(x) / new Number(x) / new String(x) — primitive wrapper objects
+                        let args = self.eval_args(arguments);
+                        let prim = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                        let prim_val = match fn_name.as_str() {
+                            "Boolean" => JsValue::Boolean(Self::is_truthy(&prim)),
+                            "Number" => JsValue::Number(Self::value_to_number(&prim)),
+                            "String" => JsValue::String(Self::value_to_string(&prim)),
+                            _ => prim,
+                        };
+                        let rc = JsObject::new();
+                        {
+                            let mut obj = rc.borrow_mut();
+                            obj.class_name = Some(fn_name.clone());
+                            obj.set("[[PrimitiveValue]]", prim_val);
+                        }
+                        JsValue::Object(rc)
                     } else {
                         JsValue::HostObject(fn_name)
                     }
@@ -3212,8 +3232,22 @@ impl BrowserExecutionState {
             "sin" => JsValue::Number(a0().sin()),
             "cos" => JsValue::Number(a0().cos()),
             "tan" => JsValue::Number(a0().tan()),
+            "asin" => JsValue::Number(a0().asin()),
+            "acos" => JsValue::Number(a0().acos()),
             "atan" => JsValue::Number(a0().atan()),
             "atan2" => JsValue::Number(a0().atan2(a1())),
+            "sinh" => JsValue::Number(a0().sinh()),
+            "cosh" => JsValue::Number(a0().cosh()),
+            "tanh" => JsValue::Number(a0().tanh()),
+            "asinh" => JsValue::Number(a0().asinh()),
+            "acosh" => JsValue::Number(a0().acosh()),
+            "atanh" => JsValue::Number(a0().atanh()),
+            "cbrt" => JsValue::Number(a0().cbrt()),
+            "expm1" => JsValue::Number(a0().exp_m1()),
+            "log1p" => JsValue::Number(a0().ln_1p()),
+            "clz32" => JsValue::Number((a0() as u32).leading_zeros() as f64),
+            "fround" => JsValue::Number((a0() as f32) as f64),
+            "imul" => JsValue::Number(((a0() as i32).wrapping_mul(a1() as i32)) as f64),
             "min" => {
                 let v = args
                     .iter()
@@ -3265,6 +3299,104 @@ impl BrowserExecutionState {
             target
         } else {
             JsValue::Undefined
+        }
+    }
+
+    fn js_same_value(a: &JsValue, b: &JsValue) -> bool {
+        match (a, b) {
+            (JsValue::Number(x), JsValue::Number(y)) => {
+                if x.is_nan() && y.is_nan() { true }
+                else { x.to_bits() == y.to_bits() }
+            }
+            // Arrays have value semantics in JBS (bare Vecs), so two separate
+            // arrays are never the same reference. Avoid deep Vec comparison
+            // which would recurse infinitely for self-referential arrays.
+            (JsValue::Array(_), JsValue::Array(_)) => false,
+            (JsValue::Undefined, JsValue::Undefined) => true,
+            (JsValue::Null, JsValue::Null) => true,
+            (JsValue::Boolean(a), JsValue::Boolean(b)) => a == b,
+            (JsValue::BigInt(a), JsValue::BigInt(b)) => a == b,
+            (JsValue::String(a), JsValue::String(b)) => a == b,
+            (JsValue::Object(a), JsValue::Object(b)) => Rc::ptr_eq(a, b),
+            (JsValue::HostFunction(a), JsValue::HostFunction(b)) => a == b,
+            // Functions: avoid structural equality (can overflow via captures).
+            _ => false,
+        }
+    }
+
+    /// Apply a single property descriptor object to a target object under `key`.
+    /// Returns true on success, false if a TypeError should be thrown.
+    fn apply_property_descriptor(target: &Rc<RefCell<JsObject>>, key: String, desc: &Rc<RefCell<JsObject>>) -> bool {
+        let desc_ref = desc.borrow();
+        let has_get = desc_ref.has_own("get");
+        let has_set = desc_ref.has_own("set");
+        if has_get || has_set {
+            let getter = desc_ref.get_own_data("get");
+            let setter = desc_ref.get_own_data("set");
+            let new_enumerable = desc_ref.get_own_data("enumerable");
+            let new_configurable = desc_ref.get_own_data("configurable");
+            drop(desc_ref);
+            let existing = target.borrow().get_own(key.as_str()).cloned();
+            let (def_enumerable, def_configurable) = match &existing {
+                Some(Property::Data { enumerable, configurable, .. }) => (*enumerable, *configurable),
+                Some(Property::Accessor { enumerable, configurable, .. }) => (*enumerable, *configurable),
+                None => (false, true),
+            };
+            if !def_configurable {
+                // non-configurable: can't change to accessor or change enumerable/get/set
+                let new_enum = new_enumerable.as_ref().map(|v| matches!(v, JsValue::Boolean(true)));
+                if new_enum.is_some() && new_enum != Some(def_enumerable) { return false; }
+                if let Some(Property::Accessor { get: old_get, set: old_set, .. }) = &existing {
+                    if getter.as_ref().map(|g| !Self::js_same_value(g, old_get.as_ref().unwrap_or(&JsValue::Undefined))).unwrap_or(false) { return false; }
+                    if setter.as_ref().map(|s| !Self::js_same_value(s, old_set.as_ref().unwrap_or(&JsValue::Undefined))).unwrap_or(false) { return false; }
+                } else if existing.is_some() {
+                    // Was data, can't convert to accessor if non-configurable
+                    return false;
+                }
+            }
+            let enumerable = new_enumerable.map(|v| matches!(v, JsValue::Boolean(true))).unwrap_or(def_enumerable);
+            let configurable = new_configurable.map(|v| matches!(v, JsValue::Boolean(true))).unwrap_or(def_configurable);
+            target.borrow_mut().define(key, Property::Accessor { get: getter, set: setter, enumerable, configurable });
+            true
+        } else {
+            let new_value = desc_ref.get_own_data("value");
+            let new_writable = desc_ref.get_own_data("writable");
+            let new_enumerable = desc_ref.get_own_data("enumerable");
+            let new_configurable = desc_ref.get_own_data("configurable");
+            drop(desc_ref);
+            let existing = target.borrow().get_own(key.as_str()).cloned();
+            let (def_value, def_writable, def_enumerable, def_configurable) = match existing {
+                Some(Property::Data { value, writable, enumerable, configurable }) => {
+                    (value, writable, enumerable, configurable)
+                }
+                Some(Property::Accessor { enumerable, configurable, .. }) => {
+                    // Converting accessor to data: only allowed if configurable
+                    if !configurable { return false; }
+                    (JsValue::Undefined, false, enumerable, configurable)
+                }
+                None => (JsValue::Undefined, false, false, true),
+            };
+            // Enforce non-configurable constraints
+            if !def_configurable {
+                let new_cfg = new_configurable.as_ref().map(|v| matches!(v, JsValue::Boolean(true)));
+                if new_cfg == Some(true) { return false; }
+                let new_enum = new_enumerable.as_ref().map(|v| matches!(v, JsValue::Boolean(true)));
+                if new_enum.is_some() && new_enum != Some(def_enumerable) { return false; }
+                // non-configurable, non-writable: can't change value or make writable
+                if !def_writable {
+                    let new_writ = new_writable.as_ref().map(|v| matches!(v, JsValue::Boolean(true)));
+                    if new_writ == Some(true) { return false; }
+                    if let Some(v) = &new_value {
+                        if !Self::js_same_value(v, &def_value) { return false; }
+                    }
+                }
+            }
+            let value = new_value.unwrap_or(def_value);
+            let writable = new_writable.map(|v| matches!(v, JsValue::Boolean(true))).unwrap_or(def_writable);
+            let enumerable = new_enumerable.map(|v| matches!(v, JsValue::Boolean(true))).unwrap_or(def_enumerable);
+            let configurable = new_configurable.map(|v| matches!(v, JsValue::Boolean(true))).unwrap_or(def_configurable);
+            target.borrow_mut().define(key, Property::Data { value, writable, enumerable, configurable });
+            true
         }
     }
 
@@ -3346,11 +3478,10 @@ impl BrowserExecutionState {
                 let key = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
                 let descriptor = iter.next().unwrap_or(JsValue::Undefined);
                 if let (JsValue::Object(rc), JsValue::Object(desc)) = (obj, descriptor) {
-                    let desc_borrow = desc.borrow();
-                    if let Some(val) = desc_borrow.get_own_data("value") {
-                        rc.borrow_mut().set(key.clone(), val);
-                    } else if let Some(getter) = desc_borrow.get_own_data("get") {
-                        rc.borrow_mut().set_getter(key.clone(), getter);
+                    if !Self::apply_property_descriptor(&rc, key.clone(), &desc) {
+                        self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                            "TypeError", format!("Cannot redefine property: {key}"))));
+                        return JsValue::Undefined;
                     }
                     JsValue::Object(rc)
                 } else {
@@ -3363,12 +3494,78 @@ impl BrowserExecutionState {
                 let prop = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
                 Self::static_get_own_property_descriptor(&obj, &prop)
             }
-            "defineProperties"
-            | "getOwnPropertyNames"
-            | "getOwnPropertySymbols"
-            | "getPrototypeOf"
-            | "setPrototypeOf" => args.into_iter().next().unwrap_or(JsValue::Undefined),
-            "create" => JsValue::new_object(), // ignore prototype arg
+            "defineProperties" => {
+                let mut iter = args.into_iter();
+                let obj = iter.next().unwrap_or(JsValue::Undefined);
+                let props_val = iter.next().unwrap_or(JsValue::Undefined);
+                if let (JsValue::Object(obj_rc), JsValue::Object(props_rc)) = (&obj, props_val) {
+                    let keys: Vec<String> = props_rc.borrow().own_enumerable_keys();
+                    for key in keys {
+                        if let Some(JsValue::Object(desc)) = props_rc.borrow().get_own_data(key.as_str()) {
+                            if !Self::apply_property_descriptor(obj_rc, key.clone(), &desc) {
+                                self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                                    "TypeError", format!("Cannot redefine property: {key}"))));
+                                return JsValue::Undefined;
+                            }
+                        }
+                    }
+                }
+                obj
+            }
+            "getOwnPropertyNames" => {
+                match args.into_iter().next().unwrap_or(JsValue::Undefined) {
+                    JsValue::Object(rc) => JsValue::Array(rc.borrow().all_own_keys().into_iter().map(JsValue::String).collect()),
+                    JsValue::Array(arr) => {
+                        let mut keys: Vec<JsValue> = (0..arr.len()).map(|i| JsValue::String(i.to_string())).collect();
+                        keys.push(JsValue::String("length".to_string()));
+                        JsValue::Array(keys)
+                    }
+                    _ => JsValue::Array(vec![]),
+                }
+            }
+            "getOwnPropertySymbols" => JsValue::Array(vec![]),
+            "getPrototypeOf" => {
+                match args.into_iter().next().unwrap_or(JsValue::Undefined) {
+                    JsValue::Object(rc) => {
+                        rc.borrow().prototype.as_ref()
+                            .map(|p| JsValue::Object(Rc::clone(p)))
+                            .unwrap_or(JsValue::Null)
+                    }
+                    _ => JsValue::Null,
+                }
+            }
+            "setPrototypeOf" => {
+                let mut iter = args.into_iter();
+                let obj = iter.next().unwrap_or(JsValue::Undefined);
+                let proto = iter.next().unwrap_or(JsValue::Undefined);
+                if let JsValue::Object(rc) = &obj {
+                    match proto {
+                        JsValue::Object(proto_rc) => rc.borrow_mut().prototype = Some(proto_rc),
+                        JsValue::Null => rc.borrow_mut().prototype = None,
+                        _ => {}
+                    }
+                }
+                obj
+            }
+            "create" => {
+                let mut iter = args.into_iter();
+                let proto = iter.next().unwrap_or(JsValue::Undefined);
+                let props_val = iter.next().unwrap_or(JsValue::Undefined);
+                let new_obj_rc = match proto {
+                    JsValue::Object(proto_rc) => JsObject::with_proto(proto_rc),
+                    _ => JsObject::new(),
+                };
+                if let JsValue::Object(props_rc) = props_val {
+                    let keys: Vec<String> = props_rc.borrow().own_enumerable_keys();
+                    for key in keys {
+                        let desc_val = props_rc.borrow().get_own_data(key.as_str()).unwrap_or(JsValue::Undefined);
+                        if let JsValue::Object(desc) = desc_val {
+                            Self::apply_property_descriptor(&new_obj_rc, key, &desc);
+                        }
+                    }
+                }
+                JsValue::Object(new_obj_rc)
+            }
             "freeze" | "seal" | "preventExtensions" => {
                 args.into_iter().next().unwrap_or(JsValue::Undefined)
             }
@@ -4054,6 +4251,40 @@ impl BrowserExecutionState {
             }
             "search" => Some(JsValue::Number(-1.0)),
             "normalize" => Some(JsValue::String(s.to_owned())),
+            // annexB HTML wrapper methods
+            "fixed"   => Some(JsValue::String(format!("<tt>{s}</tt>"))),
+            "bold"    => Some(JsValue::String(format!("<b>{s}</b>"))),
+            "italics" => Some(JsValue::String(format!("<i>{s}</i>"))),
+            "small"   => Some(JsValue::String(format!("<small>{s}</small>"))),
+            "big"     => Some(JsValue::String(format!("<big>{s}</big>"))),
+            "strike"  => Some(JsValue::String(format!("<strike>{s}</strike>"))),
+            "sup"     => Some(JsValue::String(format!("<sup>{s}</sup>"))),
+            "sub"     => Some(JsValue::String(format!("<sub>{s}</sub>"))),
+            "blink"   => Some(JsValue::String(format!("<blink>{s}</blink>"))),
+            "link" => {
+                let url = arguments.first()
+                    .map(|a| Self::value_to_string(&self.execute_expression(a)))
+                    .unwrap_or_default();
+                Some(JsValue::String(format!("<a href=\"{url}\">{s}</a>")))
+            }
+            "anchor" => {
+                let name = arguments.first()
+                    .map(|a| Self::value_to_string(&self.execute_expression(a)))
+                    .unwrap_or_default();
+                Some(JsValue::String(format!("<a name=\"{name}\">{s}</a>")))
+            }
+            "fontcolor" => {
+                let color = arguments.first()
+                    .map(|a| Self::value_to_string(&self.execute_expression(a)))
+                    .unwrap_or_default();
+                Some(JsValue::String(format!("<font color=\"{color}\">{s}</font>")))
+            }
+            "fontsize" => {
+                let size = arguments.first()
+                    .map(|a| Self::value_to_string(&self.execute_expression(a)))
+                    .unwrap_or_default();
+                Some(JsValue::String(format!("<font size=\"{size}\">{s}</font>")))
+            }
             _ => None,
         }
     }
@@ -4632,7 +4863,8 @@ impl BrowserExecutionState {
                                 "LOG10E" => JsValue::Number(std::f64::consts::LOG10_E),
                                 "SQRT2" => JsValue::Number(std::f64::consts::SQRT_2),
                                 "SQRT1_2" => JsValue::Number(1.0 / std::f64::consts::SQRT_2),
-                                _ => JsValue::Undefined,
+                                m => Self::host_fn_static_member("Math", m)
+                                    .unwrap_or(JsValue::Undefined),
                             };
                         }
                         "Number" => {
@@ -4841,6 +5073,7 @@ impl BrowserExecutionState {
                         }
                         _ => Self::host_fn_static_member(fn_name, property)
                             .or_else(|| self.native_prototype_property("Function", property))
+                            .or_else(|| self.native_prototype_property("Object", property))
                             .unwrap_or(JsValue::Undefined),
                     },
                     JsValue::BoundHostFunction { .. } => match property.as_str() {
@@ -4849,6 +5082,7 @@ impl BrowserExecutionState {
                         }
                         _ => self
                             .native_prototype_property("Function", property)
+                            .or_else(|| self.native_prototype_property("Object", property))
                             .unwrap_or(JsValue::Undefined),
                     },
                     JsValue::HostObject(name) => {
@@ -4864,19 +5098,27 @@ impl BrowserExecutionState {
                         .object_property_or_native_fallback(&rc, property)
                         .unwrap_or(JsValue::Undefined),
                     JsValue::Function(func) => {
-                        if property == "prototype" {
-                            func.properties
-                                .get(property.as_str())
+                        match property.as_str() {
+                            "name" => func.name.as_deref()
+                                .map(|n| JsValue::String(n.to_owned()))
+                                .unwrap_or(JsValue::String(String::new())),
+                            "length" => {
+                                let arity = func.params.iter()
+                                    .take_while(|p| !p.rest && p.default.is_none())
+                                    .count();
+                                JsValue::Number(arity as f64)
+                            }
+                            "prototype" => func.properties
+                                .get("prototype")
                                 .cloned()
-                                .unwrap_or_else(JsValue::new_object)
-                        } else if matches!(property.as_str(), "call" | "apply" | "bind") {
-                            JsValue::HostFunction(format!("Function.prototype.{property}"))
-                        } else {
-                            func.properties
+                                .unwrap_or_else(JsValue::new_object),
+                            "call" | "apply" | "bind" =>
+                                JsValue::HostFunction(format!("Function.prototype.{property}")),
+                            _ => func.properties
                                 .get(property.as_str())
                                 .cloned()
                                 .or_else(|| self.native_prototype_property("Function", property))
-                                .unwrap_or(JsValue::Undefined)
+                                .unwrap_or(JsValue::Undefined),
                         }
                     }
                     JsValue::NodeList(items) if property == "length" => {
@@ -5648,7 +5890,13 @@ impl BrowserExecutionState {
             JsValue::Boolean(value) => value.to_string(),
             JsValue::BigInt(n) => n.to_string(),
             JsValue::Number(value) => {
-                if value.fract() == 0.0 && value.is_finite() {
+                if value.is_nan() {
+                    "NaN".to_owned()
+                } else if *value == f64::INFINITY {
+                    "Infinity".to_owned()
+                } else if *value == f64::NEG_INFINITY {
+                    "-Infinity".to_owned()
+                } else if value.fract() == 0.0 && value.abs() < 1e21 {
                     (*value as i64).to_string()
                 } else {
                     value.to_string()
@@ -5720,8 +5968,15 @@ impl BrowserExecutionState {
             JsValue::ResolvedPromise
         } else if name.ends_with("Enabled") || name.starts_with("ms") {
             JsValue::Boolean(false)
-        } else if name.starts_with("Function.prototype.") {
-            JsValue::HostFunction(name.to_owned())
+        } else if let Some(suffix) = name.strip_prefix("Function.prototype.") {
+            // Only valid if suffix is a known Function.prototype method (no further dots).
+            if !suffix.contains('.') && matches!(suffix,
+                "call" | "apply" | "bind" | "toString" | "toLocaleString" | "constructor"
+            ) {
+                JsValue::HostFunction(name.to_owned())
+            } else {
+                JsValue::Undefined
+            }
         } else {
             JsValue::Undefined
         }
@@ -5951,6 +6206,24 @@ impl BrowserExecutionState {
                     _ => JsValue::Boolean(false),
                 }
             }
+            "Object.prototype.isPrototypeOf" => {
+                let v = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                JsValue::Boolean(Self::js_is_prototype_of(&this_arg, &v))
+            }
+            "Object.prototype.propertyIsEnumerable" => {
+                let key = args.first().map(Self::value_to_string).unwrap_or_default();
+                match &this_arg {
+                    JsValue::Object(rc) => JsValue::Boolean(
+                        rc.borrow().get_own(key.as_str())
+                            .map(|p| p.is_enumerable())
+                            .unwrap_or(false)
+                    ),
+                    JsValue::Array(items) => JsValue::Boolean(
+                        key.parse::<usize>().map_or(false, |i| i < items.len())
+                    ),
+                    _ => JsValue::Boolean(false),
+                }
+            }
             "Array.prototype.push" => {
                 if let JsValue::Array(mut items) = this_arg {
                     items.extend(args);
@@ -6033,10 +6306,7 @@ impl BrowserExecutionState {
                 let total = items_opt.as_ref().map(|v| v.len() as u64).unwrap_or(len as u64);
                 let start = if from_index < 0 { (total as i64 + from_index).max(0) as u64 } else { from_index as u64 };
                 for i in start..total {
-                    let item = items_opt.as_ref()
-                        .and_then(|v| v.get(i as usize).cloned())
-                        .or_else(|| { let rc = map_opt.as_ref()?; rc.borrow().get_own_data(&i.to_string()) })
-                        .unwrap_or(JsValue::Undefined);
+                    let item = self.array_like_get(&items_opt, &map_opt, i as u32);
                     if Self::js_equal(&item, &needle) { return JsValue::Number(i as f64); }
                 }
                 JsValue::Number(-1.0)
@@ -6046,10 +6316,7 @@ impl BrowserExecutionState {
                 let (items_opt, len, map_opt) = self.array_like_parts(this_arg);
                 let total = items_opt.as_ref().map(|v| v.len() as u32).unwrap_or(len);
                 for i in 0..total {
-                    let item = items_opt.as_ref()
-                        .and_then(|v| v.get(i as usize).cloned())
-                        .or_else(|| { let rc = map_opt.as_ref()?; rc.borrow().get_own_data(&i.to_string()) })
-                        .unwrap_or(JsValue::Undefined);
+                    let item = self.array_like_get(&items_opt, &map_opt, i as u32);
                     if Self::js_equal(&item, &needle) { return JsValue::Boolean(true); }
                 }
                 JsValue::Boolean(false)
@@ -6060,10 +6327,7 @@ impl BrowserExecutionState {
                 let total = items_opt.as_ref().map(|v| v.len() as u32).unwrap_or(len);
                 if total == 0 { return JsValue::Number(-1.0); }
                 for i in (0..total).rev() {
-                    let item = items_opt.as_ref()
-                        .and_then(|v| v.get(i as usize).cloned())
-                        .or_else(|| { let rc = map_opt.as_ref()?; rc.borrow().get_own_data(&i.to_string()) })
-                        .unwrap_or(JsValue::Undefined);
+                    let item = self.array_like_get(&items_opt, &map_opt, i as u32);
                     if Self::js_equal(&item, &needle) { return JsValue::Number(i as f64); }
                 }
                 JsValue::Number(-1.0)
@@ -6081,6 +6345,37 @@ impl BrowserExecutionState {
                     JsValue::String(String::new())
                 }
             }
+            "String.prototype.fixed"   => { let s = Self::value_to_string(&this_arg); JsValue::String(format!("<tt>{s}</tt>")) }
+            "String.prototype.bold"    => { let s = Self::value_to_string(&this_arg); JsValue::String(format!("<b>{s}</b>")) }
+            "String.prototype.italics" => { let s = Self::value_to_string(&this_arg); JsValue::String(format!("<i>{s}</i>")) }
+            "String.prototype.small"   => { let s = Self::value_to_string(&this_arg); JsValue::String(format!("<small>{s}</small>")) }
+            "String.prototype.big"     => { let s = Self::value_to_string(&this_arg); JsValue::String(format!("<big>{s}</big>")) }
+            "String.prototype.strike"  => { let s = Self::value_to_string(&this_arg); JsValue::String(format!("<strike>{s}</strike>")) }
+            "String.prototype.sup"     => { let s = Self::value_to_string(&this_arg); JsValue::String(format!("<sup>{s}</sup>")) }
+            "String.prototype.sub"     => { let s = Self::value_to_string(&this_arg); JsValue::String(format!("<sub>{s}</sub>")) }
+            "String.prototype.blink"   => { let s = Self::value_to_string(&this_arg); JsValue::String(format!("<blink>{s}</blink>")) }
+            "String.prototype.link" => {
+                let s = Self::value_to_string(&this_arg);
+                let url = args.first().map(Self::value_to_string).unwrap_or_default();
+                JsValue::String(format!("<a href=\"{url}\">{s}</a>"))
+            }
+            "String.prototype.anchor" => {
+                let s = Self::value_to_string(&this_arg);
+                let name = args.first().map(Self::value_to_string).unwrap_or_default();
+                JsValue::String(format!("<a name=\"{name}\">{s}</a>"))
+            }
+            "String.prototype.fontcolor" => {
+                let s = Self::value_to_string(&this_arg);
+                let color = args.first().map(Self::value_to_string).unwrap_or_default();
+                JsValue::String(format!("<font color=\"{color}\">{s}</font>"))
+            }
+            "String.prototype.fontsize" => {
+                let s = Self::value_to_string(&this_arg);
+                let size = args.first().map(Self::value_to_string).unwrap_or_default();
+                JsValue::String(format!("<font size=\"{size}\">{s}</font>"))
+            }
+            "String.prototype.trimLeft" => JsValue::String(Self::value_to_string(&this_arg).trim_start().to_owned()),
+            "String.prototype.trimRight" => JsValue::String(Self::value_to_string(&this_arg).trim_end().to_owned()),
             "String.prototype.toString" => JsValue::String(Self::value_to_string(&this_arg)),
             "String.prototype.replace" => {
                 let source = Self::value_to_string(&this_arg);
@@ -6267,10 +6562,7 @@ impl BrowserExecutionState {
                     let iter_len = items_opt.as_ref().map(|v| v.len() as u32).unwrap_or(len);
                     for i in 0..iter_len {
                         if self.execution_budget_exhausted { break; }
-                        let item = items_opt.as_ref()
-                            .and_then(|v| v.get(i as usize).cloned())
-                            .or_else(|| { let rc = map_opt.as_ref()?; rc.borrow().get_own_data(&i.to_string()) })
-                            .unwrap_or(JsValue::Undefined);
+                        let item = self.array_like_get(&items_opt, &map_opt, i);
                         let v = self.call_function(func.clone(), vec![item, JsValue::Number(i as f64), this_arg.clone()]);
                         if self.early_exit.is_some() { break; }
                         if !Self::is_truthy(&v) { return JsValue::Boolean(false); }
@@ -6290,10 +6582,7 @@ impl BrowserExecutionState {
                     let iter_len = items_opt.as_ref().map(|v| v.len() as u32).unwrap_or(len);
                     for i in 0..iter_len {
                         if self.execution_budget_exhausted { break; }
-                        let item = items_opt.as_ref()
-                            .and_then(|v| v.get(i as usize).cloned())
-                            .or_else(|| { let rc = map_opt.as_ref()?; rc.borrow().get_own_data(&i.to_string()) })
-                            .unwrap_or(JsValue::Undefined);
+                        let item = self.array_like_get(&items_opt, &map_opt, i);
                         let v = self.call_function(func.clone(), vec![item, JsValue::Number(i as f64), this_arg.clone()]);
                         if self.early_exit.is_some() { break; }
                         if Self::is_truthy(&v) { return JsValue::Boolean(true); }
@@ -6313,10 +6602,7 @@ impl BrowserExecutionState {
                     let iter_len = items_opt.as_ref().map(|v| v.len() as u32).unwrap_or(len);
                     for i in 0..iter_len {
                         if self.execution_budget_exhausted { break; }
-                        let item = items_opt.as_ref()
-                            .and_then(|v| v.get(i as usize).cloned())
-                            .or_else(|| { let rc = map_opt.as_ref()?; rc.borrow().get_own_data(&i.to_string()) })
-                            .unwrap_or(JsValue::Undefined);
+                        let item = self.array_like_get(&items_opt, &map_opt, i);
                         self.call_function(func.clone(), vec![item, JsValue::Number(i as f64), this_arg.clone()]);
                         if self.early_exit.is_some() { break; }
                     }
@@ -6335,10 +6621,7 @@ impl BrowserExecutionState {
                     let mut result = Vec::new();
                     for i in 0..iter_len {
                         if self.execution_budget_exhausted { break; }
-                        let item = items_opt.as_ref()
-                            .and_then(|v| v.get(i as usize).cloned())
-                            .or_else(|| { let rc = map_opt.as_ref()?; rc.borrow().get_own_data(&i.to_string()) })
-                            .unwrap_or(JsValue::Undefined);
+                        let item = self.array_like_get(&items_opt, &map_opt, i);
                         let v = self.call_function(func.clone(), vec![item, JsValue::Number(i as f64), this_arg.clone()]);
                         if self.early_exit.is_some() { break; }
                         result.push(v);
@@ -6359,10 +6642,7 @@ impl BrowserExecutionState {
                     let mut result = Vec::new();
                     for i in 0..iter_len {
                         if self.execution_budget_exhausted { break; }
-                        let item = items_opt.as_ref()
-                            .and_then(|v| v.get(i as usize).cloned())
-                            .or_else(|| { let rc = map_opt.as_ref()?; rc.borrow().get_own_data(&i.to_string()) })
-                            .unwrap_or(JsValue::Undefined);
+                        let item = self.array_like_get(&items_opt, &map_opt, i);
                         let v = self.call_function(func.clone(), vec![item.clone(), JsValue::Number(i as f64), this_arg.clone()]);
                         if self.early_exit.is_some() { break; }
                         if Self::is_truthy(&v) { result.push(item); }
@@ -6373,6 +6653,17 @@ impl BrowserExecutionState {
                         "TypeError", format!("{} is not a function", Self::value_to_string(&cb)))));
                     JsValue::Undefined
                 }
+            }
+            n if n.starts_with("Math.") => {
+                self.call_math_method(&n["Math.".len()..], &args)
+            }
+            "JSON.parse" => {
+                let s = args.first().map(Self::value_to_string).unwrap_or_default();
+                json_parse_str(&s)
+            }
+            "JSON.stringify" => {
+                let arg = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                JsValue::String(json_stringify(&arg))
             }
             _ => Self::host_function_default_return(name),
         }
@@ -6403,6 +6694,17 @@ impl BrowserExecutionState {
                 (Some(items), 0, None)
             }
             _ => (Some(vec![]), 0, None),
+        }
+    }
+
+    /// Get index `i` from array-like parts, invoking getters for object slots.
+    fn array_like_get(&mut self, items_opt: &Option<Vec<JsValue>>, map_opt: &Option<Rc<RefCell<JsObject>>>, i: u32) -> JsValue {
+        if let Some(items) = items_opt {
+            items.get(i as usize).cloned().unwrap_or(JsValue::Undefined)
+        } else if let Some(rc) = map_opt {
+            self.obj_get(rc, &i.to_string())
+        } else {
+            JsValue::Undefined
         }
     }
 
@@ -6592,6 +6894,30 @@ impl BrowserExecutionState {
                 "toLocaleLowerCase",
                 "toLocaleUpperCase",
                 "localeCompare",
+                // annexB HTML wrapper methods
+                "fixed", "bold", "italics", "small", "big", "strike",
+                "sup", "sub", "blink", "link", "anchor", "fontcolor", "fontsize",
+                "trimLeft", "trimRight",
+            ],
+            "Date" => &[
+                "constructor",
+                "toString", "toDateString", "toTimeString", "toISOString", "toJSON",
+                "toLocaleDateString", "toLocaleString", "toLocaleTimeString",
+                "toUTCString",
+                "valueOf", "getTime",
+                "getFullYear", "getUTCFullYear", "getMonth", "getUTCMonth",
+                "getDate", "getUTCDate", "getDay", "getUTCDay",
+                "getHours", "getUTCHours", "getMinutes", "getUTCMinutes",
+                "getSeconds", "getUTCSeconds", "getMilliseconds", "getUTCMilliseconds",
+                "getTimezoneOffset",
+                "setTime",
+                "setFullYear", "setUTCFullYear", "setMonth", "setUTCMonth",
+                "setDate", "setUTCDate", "setHours", "setUTCHours",
+                "setMinutes", "setUTCMinutes", "setSeconds", "setUTCSeconds",
+                "setMilliseconds", "setUTCMilliseconds",
+                "Symbol(Symbol.toPrimitive)",
+                // annexB
+                "getYear", "setYear", "toGMTString",
             ],
             "Function" => &["constructor", "call", "apply", "bind", "toString"],
             "Number" => &[
@@ -6763,7 +7089,8 @@ impl BrowserExecutionState {
     fn constructor_prototype_object(name: &str) -> Option<JsValue> {
         match name {
             "Object" | "Array" | "String" | "Function" | "Number" | "Boolean" | "RegExp"
-            | "Map" | "Set" | "Promise" | "Error" | "TypeError" | "RangeError"
+            | "Map" | "Set" | "Promise" | "Date"
+            | "Error" | "TypeError" | "RangeError"
             | "ReferenceError" | "SyntaxError" | "URIError" | "EvalError" | "AggregateError" => {
                 Some(Self::native_prototype_object(name))
             }
@@ -6839,7 +7166,12 @@ impl BrowserExecutionState {
                     "name" | "length" | "prototype" => {
                         let val = match prop {
                             "name" => func.name.as_deref().map(|n| JsValue::String(n.to_owned())).unwrap_or(JsValue::String(String::new())),
-                            "length" => JsValue::Number(0.0),
+                            "length" => {
+                                let arity = func.params.iter()
+                                    .take_while(|p| !p.rest && p.default.is_none())
+                                    .count();
+                                JsValue::Number(arity as f64)
+                            }
                             "prototype" => func.properties.get("prototype").cloned().unwrap_or_else(JsValue::new_object),
                             _ => JsValue::Undefined,
                         };
@@ -6868,6 +7200,71 @@ impl BrowserExecutionState {
                 }
             }
             _ => JsValue::Undefined,
+        }
+    }
+
+    /// Implements `proto.isPrototypeOf(obj)` — true if `proto` appears in `obj`'s prototype chain.
+    fn js_is_prototype_of(proto: &JsValue, obj: &JsValue) -> bool {
+        // Non-object V always returns false.
+        if matches!(obj, JsValue::Undefined | JsValue::Null | JsValue::Boolean(_)
+            | JsValue::Number(_) | JsValue::String(_) | JsValue::BigInt(_)) {
+            return false;
+        }
+        match proto {
+            JsValue::Object(proto_rc) => {
+                let is_native_proto = proto_rc.borrow().all_non_enumerable;
+                if is_native_proto {
+                    // Native prototype: determine its type from constructor property.
+                    let ctor_name = proto_rc.borrow().get_own_data("constructor")
+                        .and_then(|v| if let JsValue::HostFunction(n) = v { Some(n) } else { None })
+                        .unwrap_or_default();
+                    Self::native_proto_covers(ctor_name.as_str(), obj)
+                } else {
+                    // User-defined prototype: walk obj's prototype chain by Rc pointer.
+                    let mut current = match obj {
+                        JsValue::Object(rc) => rc.borrow().prototype.clone(),
+                        _ => return false,
+                    };
+                    while let Some(p) = current {
+                        if Rc::ptr_eq(&p, proto_rc) {
+                            return true;
+                        }
+                        current = p.borrow().prototype.clone();
+                    }
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns true if the native prototype named `proto_type` covers `obj` in the type hierarchy.
+    fn native_proto_covers(proto_type: &str, obj: &JsValue) -> bool {
+        match proto_type {
+            "Object" => matches!(obj,
+                JsValue::Object(_) | JsValue::Array(_) | JsValue::Function(_)
+                | JsValue::HostFunction(_) | JsValue::HostObject(_) | JsValue::DateInstance
+                | JsValue::RegExp { .. } | JsValue::ResolvedPromise | JsValue::WeakMap(_)
+            ),
+            "Function" => matches!(obj, JsValue::Function(_) | JsValue::HostFunction(_)),
+            "Array" => matches!(obj, JsValue::Array(_)),
+            "Date" => matches!(obj, JsValue::DateInstance),
+            "RegExp" => matches!(obj, JsValue::RegExp { .. }),
+            "Promise" => matches!(obj, JsValue::ResolvedPromise),
+            "Boolean" => matches!(obj, JsValue::HostObject(n) if n == "Boolean")
+                || matches!(obj, JsValue::Object(rc) if rc.borrow().class_name.as_deref() == Some("Boolean")),
+            "Number" => matches!(obj, JsValue::HostObject(n) if n == "Number")
+                || matches!(obj, JsValue::Object(rc) if rc.borrow().class_name.as_deref() == Some("Number")),
+            "String" => matches!(obj, JsValue::HostObject(n) if n == "String")
+                || matches!(obj, JsValue::Object(rc) if rc.borrow().class_name.as_deref() == Some("String")),
+            "Error" => matches!(obj, JsValue::Object(rc)
+                if matches!(rc.borrow().class_name.as_deref(),
+                    Some("Error" | "TypeError" | "RangeError" | "ReferenceError" | "SyntaxError" | "URIError" | "EvalError")
+                )),
+            "TypeError" | "RangeError" | "ReferenceError" | "SyntaxError" | "URIError" | "EvalError" => {
+                matches!(obj, JsValue::Object(rc) if rc.borrow().class_name.as_deref() == Some(proto_type))
+            }
+            _ => false,
         }
     }
 
@@ -6910,6 +7307,7 @@ impl BrowserExecutionState {
             ),
             "Promise" => matches!(property, "resolve" | "reject" | "all" | "allSettled" | "any" | "race"),
             "Symbol" => matches!(property, "for" | "keyFor"),
+            "JSON" => matches!(property, "parse" | "stringify" | "rawJSON" | "isRawJSON"),
             _ => false,
         };
         if known {
@@ -6962,9 +7360,10 @@ impl BrowserExecutionState {
             | "Number.isInteger" | "Number.isSafeInteger" | "Number.parseFloat"
             | "Number.parseInt" | "String.fromCharCode" | "String.fromCodePoint"
             | "Math.abs" | "Math.ceil" | "Math.floor" | "Math.round" | "Math.sqrt"
-            | "Math.cbrt" | "Math.sign" | "Math.trunc" | "Math.exp" | "Math.log"
-            | "Math.log2" | "Math.log10" | "Math.sin" | "Math.cos" | "Math.tan"
-            | "Math.asin" | "Math.acos" | "Math.atan" | "Math.sinh" | "Math.cosh"
+            | "Math.cbrt" | "Math.sign" | "Math.trunc" | "Math.exp" | "Math.expm1"
+            | "Math.log" | "Math.log2" | "Math.log10" | "Math.log1p" | "Math.clz32"
+            | "Math.fround" | "Math.sin" | "Math.cos" | "Math.tan" | "Math.asin"
+            | "Math.acos" | "Math.atan" | "Math.sinh" | "Math.cosh"
             | "Math.tanh" | "Math.asinh" | "Math.acosh" | "Math.atanh"
             | "Reflect.construct" | "Reflect.deleteProperty" | "Reflect.get"
             | "Reflect.getPrototypeOf" | "Reflect.isExtensible" | "Reflect.ownKeys"
@@ -6978,11 +7377,22 @@ impl BrowserExecutionState {
             | "Object.getOwnPropertyDescriptors" | "Object.freeze" | "Object.seal"
             | "Object.fromEntries" | "Object.hasOwn" | "Array.isArray"
             | "Promise.resolve" | "Promise.reject" | "Promise.all" | "Promise.allSettled"
-            | "Promise.any" | "Promise.race" => 1,
+            | "Promise.any" | "Promise.race"
+            | "JSON.parse" => 1,
             "Array" | "Object" | "Function" | "String" | "Number" | "Boolean"
             | "RegExp" | "Error" | "TypeError" | "RangeError" | "ReferenceError"
             | "SyntaxError" | "URIError" | "EvalError" => 1,
             "Math.random" | "Array.fromAsync" => 0,
+            "String.prototype.link" | "String.prototype.anchor"
+            | "String.prototype.fontcolor" | "String.prototype.fontsize" => 1,
+            "Date.prototype.setYear" | "Date.prototype.setTime"
+            | "Date.prototype.setFullYear" | "Date.prototype.setUTCFullYear"
+            | "Date.prototype.setMonth" | "Date.prototype.setUTCMonth"
+            | "Date.prototype.setDate" | "Date.prototype.setUTCDate"
+            | "Date.prototype.setHours" | "Date.prototype.setUTCHours"
+            | "Date.prototype.setMinutes" | "Date.prototype.setUTCMinutes"
+            | "Date.prototype.setSeconds" | "Date.prototype.setUTCSeconds"
+            | "Date.prototype.setMilliseconds" | "Date.prototype.setUTCMilliseconds" => 1,
             _ => 0,
         }
     }

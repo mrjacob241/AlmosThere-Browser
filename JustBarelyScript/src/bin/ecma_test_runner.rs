@@ -559,16 +559,20 @@ fn run_test_safe(path: &Path, harness_cache: Arc<HashMap<String, String>>, filte
     let (tx, rx) = std::sync::mpsc::sync_channel::<TestOutcome>(1);
     let cache = Arc::clone(&harness_cache);
 
-    std::thread::spawn(move || {
-        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            run_test(&path_owned, &cache, filter_owned.as_deref(), timeout_secs)
-        }));
-        let outcome = match result {
-            Ok(o)  => o,
-            Err(_) => TestOutcome::Fail("panic/crash during execution".into()),
-        };
-        let _ = tx.send(outcome); // ignored if receiver already timed out
-    });
+    // 128 MB stack — some tests recurse deeply (deeply-nested ASTs, RegExp
+    // property-escape chains, etc.) and overflow the default 8 MB OS thread stack.
+    let _ = std::thread::Builder::new()
+        .stack_size(128 * 1024 * 1024)
+        .spawn(move || {
+            let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                run_test(&path_owned, &cache, filter_owned.as_deref(), timeout_secs)
+            }));
+            let outcome = match result {
+                Ok(o)  => o,
+                Err(_) => TestOutcome::Fail("panic/crash during execution".into()),
+            };
+            let _ = tx.send(outcome); // ignored if receiver already timed out
+        });
 
     match timeout_secs.filter(|&s| s > 0.0) {
         Some(secs) => {
@@ -857,6 +861,11 @@ fn main() {
             if shard_paths.is_empty() { return None; }
             let count = shard_paths.len();
 
+            // Pre-compute relative paths so we can detect unaccounted tests if the worker crashes.
+            let shard_rel_paths: Vec<String> = shard_paths.iter()
+                .map(|p| p.strip_prefix(&test_dir).unwrap_or(p).to_string_lossy().into_owned())
+                .collect();
+
             let mut child = match Command::new(&exe)
                 .args(&forward_args)
                 .arg("--worker-shard")
@@ -882,6 +891,7 @@ fn main() {
             let stdout = child.stdout.take().unwrap();
             let tx = tx.clone();
             Some(std::thread::spawn(move || {
+                let mut reported = std::collections::HashSet::new();
                 let reader = std::io::BufReader::new(stdout);
                 for line in reader.lines().flatten() {
                     let mut parts = line.splitn(3, '\t');
@@ -894,9 +904,17 @@ fn main() {
                         "S" => TestOutcome::Skip(detail),
                         _   => continue,
                     };
+                    reported.insert(rel.clone());
                     let _ = tx.send((rel, outcome));
                 }
                 let _ = child.wait();
+                // If the worker crashed mid-run, some tests were never reported.
+                // Count them as failures so the total always equals scan_total.
+                for rel in shard_rel_paths {
+                    if !reported.contains(&rel) {
+                        let _ = tx.send((rel, TestOutcome::Fail("worker crash: process terminated early".into())));
+                    }
+                }
             }))
         }).collect();
         drop(tx); // close original sender so rx closes when all readers finish
