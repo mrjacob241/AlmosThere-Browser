@@ -107,6 +107,7 @@ pub struct FunctionDeclaration {
     pub body: BlockStatement,
     pub span: Span,
     pub is_async: bool,
+    pub is_generator: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -250,6 +251,10 @@ pub enum Expression {
         callee: Box<Expression>,
         arguments: Vec<Expression>,
     },
+    /// `yield expr` / `yield` — only valid inside a generator body.
+    Yield(Option<Box<Expression>>),
+    /// `yield* expr` — delegate to another iterable.
+    YieldStar(Box<Expression>),
     Await(Box<Expression>),
     Typeof(Box<Expression>),
     Void(Box<Expression>),
@@ -300,6 +305,7 @@ pub struct FunctionExpression {
     pub params: Vec<Param>,
     pub body: BlockStatement,
     pub is_async: bool,
+    pub is_generator: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -188,6 +188,8 @@ impl Parser {
         is_async: bool,
     ) -> Result<FunctionDeclaration, JsError> {
         let span = self.expect(TokenKind::Function)?.span;
+        // `function*` generator declaration
+        let is_generator = self.eat(TokenKind::Star);
         let name = self.expect_identifier()?;
         let params = self.parse_parameter_list()?;
         let body = self.parse_block()?;
@@ -197,11 +199,14 @@ impl Parser {
             body,
             span,
             is_async,
+            is_generator,
         })
     }
 
     fn parse_function_expression_inner(&mut self) -> Result<FunctionExpression, JsError> {
         self.expect(TokenKind::Function)?;
+        // `function*` generator expression
+        let is_generator = self.eat(TokenKind::Star);
         // Optional function name (named function expression)
         if matches!(self.current_kind(), TokenKind::Identifier(_)) {
             self.advance();
@@ -212,6 +217,7 @@ impl Parser {
             params,
             body,
             is_async: false,
+            is_generator,
         })
     }
 
@@ -963,6 +969,48 @@ impl Parser {
                 Ok(Expression::Await(Box::new(expr)))
             }
 
+            TokenKind::Yield => {
+                // `yield` is contextual: if the next token is `:` or `(` (as in
+                // `{yield: v}` or `yield()`) treat it as a plain identifier.
+                let next_is_colon_or_assign = matches!(
+                    self.peek_kind(),
+                    Some(TokenKind::Colon)
+                    | Some(TokenKind::LeftParen)
+                    | Some(TokenKind::Comma)
+                    | Some(TokenKind::RightBrace)
+                    | Some(TokenKind::RightParen)
+                    | Some(TokenKind::RightBracket)
+                    | Some(TokenKind::Semicolon)
+                    | Some(TokenKind::Dot)
+                    | Some(TokenKind::LeftBracket)
+                    | Some(TokenKind::Equals)
+                    | Some(TokenKind::Eof)
+                );
+                if next_is_colon_or_assign {
+                    self.advance();
+                    return Ok(Expression::Identifier("yield".to_owned()));
+                }
+                self.advance();
+                // `yield*` delegates to an iterable
+                if self.eat(TokenKind::Star) {
+                    let expr = self.parse_expression(2)?;
+                    return Ok(Expression::YieldStar(Box::new(expr)));
+                }
+                // `yield expr` or bare `yield`
+                let expr = if !self.at(TokenKind::Semicolon)
+                    && !self.at(TokenKind::RightBrace)
+                    && !self.at(TokenKind::RightParen)
+                    && !self.at(TokenKind::RightBracket)
+                    && !self.at(TokenKind::Comma)
+                    && !self.at_eof()
+                {
+                    Some(Box::new(self.parse_expression(2)?))
+                } else {
+                    None
+                };
+                Ok(Expression::Yield(expr))
+            }
+
             TokenKind::DotDotDot => {
                 self.advance();
                 let expr = self.parse_expression(2)?;
@@ -1281,6 +1329,7 @@ impl Parser {
                             params,
                             body,
                             is_async: false,
+                            is_generator: false,
                         }),
                         shorthand: false,
                     });
@@ -1340,11 +1389,17 @@ impl Parser {
                             params,
                             body,
                             is_async: false,
+                            is_generator: false,
                         }),
                         shorthand: false,
                     });
                 } else {
-                    let actual_key = self.expect_identifier_or_keyword()?;
+                    // Allow numeric or string keys: `get 0()`, `get "foo"()`.
+                    let actual_key = match self.current_kind() {
+                        TokenKind::Number(n) => { let k = n.clone(); self.advance(); k }
+                        TokenKind::String(s) => { let k = s.clone(); self.advance(); k }
+                        _ => self.expect_identifier_or_keyword()?,
+                    };
                     let params = self.parse_parameter_list()?;
                     let body = self.parse_block()?;
                     properties.push(ObjectProperty {
@@ -1354,6 +1409,7 @@ impl Parser {
                             params,
                             body,
                             is_async: false,
+                            is_generator: false,
                         }),
                         shorthand: false,
                     });
@@ -1375,6 +1431,7 @@ impl Parser {
                         params,
                         body,
                         is_async: false,
+                            is_generator: false,
                     }),
                     shorthand: false,
                 });
@@ -1632,6 +1689,10 @@ impl Parser {
         &self.tokens[self.position]
     }
 
+    fn peek_kind(&self) -> Option<&TokenKind> {
+        self.tokens.get(self.position + 1).map(|t| &t.kind)
+    }
+
     fn current_kind(&self) -> &TokenKind {
         &self.current().kind
     }
@@ -1681,6 +1742,7 @@ fn keyword_as_identifier(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::True => Some("true"),
         TokenKind::False => Some("false"),
         TokenKind::Await => Some("await"),
+        TokenKind::Yield => Some("yield"),
         TokenKind::Throw => Some("throw"),
         TokenKind::Try => Some("try"),
         TokenKind::Catch => Some("catch"),

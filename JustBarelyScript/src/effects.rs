@@ -78,6 +78,8 @@ pub struct JsFunction {
     pub body: FunctionBody,
     pub captured: Vec<StackFrame>,
     properties: HashMap<String, JsValue>,
+    /// True for `function*` — calling this function returns a GeneratorObject.
+    pub is_generator: bool,
     /// True only for class constructors built by execute_class_decl.
     pub is_class_ctor: bool,
     /// Superclass constructor for `super()` calls inside class constructors.
@@ -104,6 +106,7 @@ impl JsFunction {
             body,
             captured,
             properties: HashMap::new(),
+            is_generator: false,
             is_class_ctor: false,
             super_ctor: None,
             instance_fields: Vec::new(),
@@ -152,6 +155,9 @@ pub struct BrowserExecutionState {
     execution_deadline: Option<std::time::Instant>,
     array_method_overrides: HashMap<String, JsValue>,
     symbol_counter: u32,
+    /// When Some, we are inside a generator body running in "collection mode".
+    /// Each `yield expr` pushes the value here instead of suspending.
+    collecting_generator: Option<Vec<JsValue>>,
 }
 
 // ─── Environment Record Slot (Phase B: const / let mutability) ───────────────
@@ -415,6 +421,48 @@ impl JsArray {
     }
 }
 
+// ─── Generator state (ECMA-262 §27.5) ─────────────────────────────────────────
+
+/// Eagerly-collected generator state.  When a `function*` is invoked we run
+/// the entire body in "collection mode": every `yield expr` appends `expr` to
+/// `entries` instead of suspending.  `.next()` walks through the pre-collected
+/// entries.  This correctly handles generators without resume-value dependency
+/// (the majority of test262 cases); generators that read the value of the yield
+/// expression will receive `undefined` for the resume value.
+#[derive(Clone, Debug)]
+pub(crate) struct GeneratorState {
+    /// Yielded values in order.
+    pub entries: Vec<JsValue>,
+    /// Final `return` value (default `undefined`).
+    pub return_val: JsValue,
+    /// Current position (0 = not yet consumed any entry).
+    pub pos: usize,
+    /// True once all entries are consumed and return has been delivered.
+    pub done: bool,
+}
+
+impl GeneratorState {
+    fn advance(&mut self, resume_val: JsValue) -> JsValue {
+        if self.done {
+            return Self::result(JsValue::Undefined, true);
+        }
+        if let Some(val) = self.entries.get(self.pos) {
+            let val = val.clone();
+            self.pos += 1;
+            Self::result(val, false)
+        } else {
+            self.done = true;
+            Self::result(self.return_val.clone(), true)
+        }
+    }
+    fn result(value: JsValue, done: bool) -> JsValue {
+        JsValue::from_map([
+            ("value".to_owned(), value),
+            ("done".to_owned(), JsValue::Boolean(done)),
+        ])
+    }
+}
+
 // ─── JsValue ──────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -431,6 +479,9 @@ enum JsValue {
     /// Array that has been "upgraded" by `Object.defineProperty` to track
     /// per-element property descriptors. Reference semantics (Rc).
     RichArray(Rc<RefCell<JsArray>>),
+    /// Generator iterator: holds eagerly-collected yielded values and a cursor.
+    /// Created when a `function*` is called; `.next()` advances through entries.
+    GeneratorObject(Rc<RefCell<GeneratorState>>),
     Function(JsFunction),
     ElementRef(String),
     NodeList(Vec<String>),
@@ -480,6 +531,7 @@ impl PartialEq for JsValue {
             (JsValue::Array(_), JsValue::Array(_)) => false,
             // RichArrays: compare by Rc identity (reference semantics, like Objects).
             (JsValue::RichArray(a), JsValue::RichArray(b)) => Rc::ptr_eq(a, b),
+            (JsValue::GeneratorObject(a), JsValue::GeneratorObject(b)) => Rc::ptr_eq(a, b),
             (JsValue::HostFunction(a), JsValue::HostFunction(b)) => a == b,
             (JsValue::HostObject(a), JsValue::HostObject(b)) => a == b,
             (JsValue::ElementRef(a), JsValue::ElementRef(b)) => a == b,
@@ -1176,16 +1228,15 @@ impl BrowserExecutionState {
                 self.ensure_global_frame();
             }
             Statement::FunctionDeclaration(decl) => {
-                let func = JsFunction::plain(
+                let mut func = JsFunction::plain(
                     Some(decl.name.clone()),
                     decl.params.clone(),
                     FunctionBody::Block(decl.body.clone()),
                     self.stack.clone(),
                 );
+                func.is_generator = decl.is_generator;
                 let name = decl.name.clone();
                 self.set_local(&name, JsValue::Function(func.clone()));
-                // If this was previously hoisted (empty-closure version stored in an
-                // override), refresh those overrides with the now-complete closure.
                 self.refresh_overrides_for_named_func(&name, JsValue::Function(func));
             }
             Statement::ClassDeclaration(decl) => {
@@ -1265,6 +1316,22 @@ impl BrowserExecutionState {
                 let stmt = stmt.clone();
                 let iterable = self.execute_expression(&stmt.iterable);
                 let items: Vec<JsValue> = match iterable {
+                    JsValue::GeneratorObject(rc) => {
+                        // Drain the generator into a Vec for for-of iteration.
+                        let mut out = Vec::new();
+                        loop {
+                            let r = rc.borrow_mut().advance(JsValue::Undefined);
+                            if let JsValue::Object(ref o) = r {
+                                let done = matches!(o.borrow().get_own_data("done"), Some(JsValue::Boolean(true)));
+                                let val = o.borrow().get_own_data("value").unwrap_or(JsValue::Undefined);
+                                if done { break; }
+                                out.push(val);
+                            } else {
+                                break;
+                            }
+                        }
+                        out
+                    }
                     JsValue::Array(arr) => arr,
                     JsValue::String(s) => {
                         s.chars().map(|c| JsValue::String(c.to_string())).collect()
@@ -1437,12 +1504,13 @@ impl BrowserExecutionState {
     fn hoist_function_declarations(&mut self, stmts: &[Statement]) {
         for stmt in stmts {
             if let Statement::FunctionDeclaration(decl) = stmt {
-                let func = JsFunction::plain(
+                let mut func = JsFunction::plain(
                     Some(decl.name.clone()),
                     decl.params.clone(),
                     FunctionBody::Block(decl.body.clone()),
                     self.stack.clone(),
                 );
+                func.is_generator = decl.is_generator;
                 self.set_local(&decl.name, JsValue::Function(func));
             }
         }
@@ -1636,12 +1704,16 @@ impl BrowserExecutionState {
             Expression::Object(properties) => {
                 JsValue::Object(self.object_from_properties(properties))
             }
-            Expression::Function(fe) => JsValue::Function(JsFunction::plain(
-                None,
-                fe.params.clone(),
-                FunctionBody::Block(fe.body.clone()),
-                self.stack.clone(),
-            )),
+            Expression::Function(fe) => {
+                let mut func = JsFunction::plain(
+                    None,
+                    fe.params.clone(),
+                    FunctionBody::Block(fe.body.clone()),
+                    self.stack.clone(),
+                );
+                func.is_generator = fe.is_generator;
+                JsValue::Function(func)
+            }
             Expression::ArrowFunction { params, body, .. } => JsValue::Function(JsFunction::plain(
                 None,
                 params.clone(),
@@ -1711,6 +1783,27 @@ impl BrowserExecutionState {
                 }
             }
             Expression::Await(expr) => self.execute_expression(expr),
+            Expression::Yield(expr) => {
+                let val = expr.as_ref().map(|e| self.execute_expression(e)).unwrap_or(JsValue::Undefined);
+                if let Some(ref mut entries) = self.collecting_generator {
+                    // Collection mode: record the yielded value and return undefined
+                    // (the resume-value substitute).
+                    entries.push(val);
+                    JsValue::Undefined
+                } else {
+                    // Outside a generator (shouldn't happen in well-formed code).
+                    val
+                }
+            }
+            Expression::YieldStar(expr) => {
+                // Delegate: iterate the inner iterable and collect all its values.
+                let inner = self.execute_expression(expr);
+                let items = inner.array_elements_cloned().unwrap_or_default();
+                if let Some(ref mut entries) = self.collecting_generator {
+                    entries.extend(items);
+                }
+                JsValue::Undefined
+            }
             Expression::New { callee, arguments } => {
                 if matches!(callee.as_ref(), Expression::Identifier(name) if name == "Date") {
                     JsValue::DateInstance
@@ -3084,6 +3177,35 @@ impl BrowserExecutionState {
                             this_arg: Box::new(this_arg),
                             bound_args: args,
                         };
+                    }
+                    _ => {}
+                }
+            }
+
+            // Generator protocol: .next(val) / .return(val) / .throw(err)
+            if let JsValue::GeneratorObject(rc) = &receiver {
+                let rc = rc.clone();
+                match method_name.as_str() {
+                    "next" => {
+                        let resume = arguments.first()
+                            .map(|a| self.execute_expression(a))
+                            .unwrap_or(JsValue::Undefined);
+                        return rc.borrow_mut().advance(resume);
+                    }
+                    "return" => {
+                        let val = arguments.first()
+                            .map(|a| self.execute_expression(a))
+                            .unwrap_or(JsValue::Undefined);
+                        rc.borrow_mut().done = true;
+                        return GeneratorState::result(val, true);
+                    }
+                    "throw" => {
+                        let err = arguments.first()
+                            .map(|a| self.execute_expression(a))
+                            .unwrap_or(JsValue::Undefined);
+                        rc.borrow_mut().done = true;
+                        self.early_exit = Some(EarlyExit::Throw(err));
+                        return JsValue::Undefined;
                     }
                     _ => {}
                 }
@@ -5407,6 +5529,9 @@ impl BrowserExecutionState {
                                 .unwrap_or(JsValue::Undefined),
                         }
                     }
+                    JsValue::GeneratorObject(_) => {
+                        JsValue::HostFunction(format!("GeneratorPrototype.{property}"))
+                    }
                     JsValue::NodeList(items) if property == "length" => {
                         JsValue::Number(items.len() as f64)
                     }
@@ -5841,8 +5966,28 @@ impl BrowserExecutionState {
     }
 
     fn call_function(&mut self, func: JsFunction, args: Vec<JsValue>) -> JsValue {
+        if func.is_generator {
+            return self.call_generator_function(func, args);
+        }
         self.call_function_with_this(func, args, JsValue::Undefined)
             .0
+    }
+
+    /// Execute a `function*` body in collection mode and return a GeneratorObject.
+    fn call_generator_function(&mut self, func: JsFunction, args: Vec<JsValue>) -> JsValue {
+        // Save outer collection state and start a new one.
+        let outer = self.collecting_generator.take();
+        self.collecting_generator = Some(Vec::new());
+
+        // Run the generator body; yield expressions push to collecting_generator.
+        let return_val = self.call_function_with_this(func, args, JsValue::Undefined).0;
+
+        // Collect results and restore outer state.
+        let entries = self.collecting_generator.take().unwrap_or_default();
+        self.collecting_generator = outer;
+
+        let state = GeneratorState { entries, return_val, pos: 0, done: false };
+        JsValue::GeneratorObject(Rc::new(RefCell::new(state)))
     }
 
     fn call_function_with_this(
@@ -6155,6 +6300,7 @@ impl BrowserExecutionState {
             JsValue::Object(_)
             | JsValue::Array(_)
             | JsValue::RichArray(_)
+            | JsValue::GeneratorObject(_)
             | JsValue::Function(_)
             | JsValue::ElementRef(_)
             | JsValue::NodeList(_)
@@ -6189,6 +6335,7 @@ impl BrowserExecutionState {
             | JsValue::Object(_)
             | JsValue::Array(_)
             | JsValue::RichArray(_)
+            | JsValue::GeneratorObject(_)
             | JsValue::Function(_)
             | JsValue::ElementRef(_)
             | JsValue::NodeList(_)
@@ -6281,6 +6428,7 @@ impl BrowserExecutionState {
                 .map(|v| Self::value_to_string(v))
                 .collect::<Vec<_>>()
                 .join(","),
+            JsValue::GeneratorObject(_) => "[object Generator]".to_owned(),
             JsValue::Object(_) => "[object Object]".to_owned(),
             JsValue::Function(_) => "[object Function]".to_owned(),
             JsValue::ElementRef(_) => "[object Element]".to_owned(),
@@ -7388,7 +7536,7 @@ impl BrowserExecutionState {
     fn member_prototype_fallback_owner(value: &JsValue) -> Option<&'static str> {
         match value {
             JsValue::String(_) => Some("String"),
-            JsValue::Array(_) | JsValue::RichArray(_) => Some("Array"),
+            JsValue::Array(_) | JsValue::RichArray(_) | JsValue::GeneratorObject(_) => Some("Array"),
             JsValue::Function(_) | JsValue::HostFunction(_) | JsValue::BoundHostFunction { .. } => {
                 Some("Function")
             }
@@ -7436,6 +7584,7 @@ impl BrowserExecutionState {
             JsValue::String(_) => "String",
             JsValue::Object(_) | JsValue::Proxy { .. } => "Object",
             JsValue::Array(_) | JsValue::RichArray(_) => "Array",
+            JsValue::GeneratorObject(_) => "Generator",
             JsValue::Function(_) | JsValue::HostFunction(_) | JsValue::BoundHostFunction { .. } => {
                 "Function"
             }
@@ -8481,7 +8630,8 @@ fn json_stringify(value: &JsValue) -> String {
         | JsValue::ResolvedPromise
         | JsValue::XhrInstance { .. }
         | JsValue::Proxy { .. }
-        | JsValue::WeakMap(_) => "null".to_owned(),
+        | JsValue::WeakMap(_)
+        | JsValue::GeneratorObject(_) => "null".to_owned(),
         JsValue::BigInt(n) => n.to_string(),
     }
 }

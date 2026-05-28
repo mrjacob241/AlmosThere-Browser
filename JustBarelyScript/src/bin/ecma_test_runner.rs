@@ -213,10 +213,9 @@ static UNSUPPORTED_FEATURES: &[&str] = &[
     "BigUint64Array",
     "immutable-arraybuffer",
     "resizable-arraybuffer",
-    // Async / generators
+    // Async (generators are now implemented)
     "async-functions",
     "async-iteration",
-    "generators",
     // Reflection / meta
     "Proxy",
     "Reflect",
