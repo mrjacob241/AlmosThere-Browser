@@ -68,6 +68,26 @@ fn collect_statement_console_messages(statement: &Statement, out: &mut Vec<Conso
                 }
             }
         }
+        Statement::ImportDeclaration(_) => {}
+        Statement::ExportDeclaration(declaration) => {
+            use crate::ast::{ExportDeclaration, ExportDefaultDeclaration};
+
+            match declaration {
+                ExportDeclaration::Declaration { declaration, .. } => {
+                    collect_statement_console_messages(declaration, out);
+                }
+                ExportDeclaration::Default { declaration, .. } => match declaration {
+                    ExportDefaultDeclaration::Expression(expression) => {
+                        collect_expression_console_messages(expression, out);
+                    }
+                    ExportDefaultDeclaration::Function(function) => {
+                        collect_block_console_messages(&function.body, out);
+                    }
+                    ExportDefaultDeclaration::Class(_) => {}
+                },
+                ExportDeclaration::Named { .. } | ExportDeclaration::All { .. } => {}
+            }
+        }
         Statement::FunctionDeclaration(declaration) => {
             collect_block_console_messages(&declaration.body, out);
         }

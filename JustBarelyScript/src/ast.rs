@@ -7,6 +7,8 @@ pub struct Program {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Statement {
+    ImportDeclaration(ImportDeclaration),
+    ExportDeclaration(ExportDeclaration),
     VariableDeclaration(VariableDeclaration),
     FunctionDeclaration(FunctionDeclaration),
     ClassDeclaration(ClassDeclaration),
@@ -25,6 +27,55 @@ pub enum Statement {
     Block(BlockStatement),
     Expression(Expression),
     Empty,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImportDeclaration {
+    pub specifiers: Vec<ImportSpecifier>,
+    pub source: String,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ImportSpecifier {
+    Default { local: String },
+    Namespace { local: String },
+    Named { imported: String, local: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExportDeclaration {
+    Named {
+        specifiers: Vec<ExportSpecifier>,
+        source: Option<String>,
+        span: Span,
+    },
+    All {
+        source: String,
+        exported: Option<String>,
+        span: Span,
+    },
+    Default {
+        declaration: ExportDefaultDeclaration,
+        span: Span,
+    },
+    Declaration {
+        declaration: Box<Statement>,
+        span: Span,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportSpecifier {
+    pub local: String,
+    pub exported: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExportDefaultDeclaration {
+    Expression(Expression),
+    Function(FunctionDeclaration),
+    Class(ClassDeclaration),
 }
 
 #[derive(Clone, Debug, PartialEq)]

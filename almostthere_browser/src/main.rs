@@ -1896,6 +1896,7 @@ fn script_test_bookmarks() -> Vec<Bookmark> {
 struct PageScript {
     label: String,
     kind: PageScriptKind,
+    is_module: bool,
     source_url: Option<String>,
     byte_len: usize,
     deferred: bool,
@@ -1941,7 +1942,7 @@ fn script_console_messages_from_html_with_source(
     });
 
     for script in scripts {
-        match script.program {
+        match &script.program {
             Ok(program) => {
                 messages.extend(justbarelyscript::collect_static_console_messages(&program));
                 let mut state = justbarelyscript::BrowserExecutionState::default();
@@ -1952,7 +1953,7 @@ fn script_console_messages_from_html_with_source(
                     &[("phase", "console"), ("label", &script.label)],
                 );
                 let start = std::time::Instant::now();
-                state.execute_program(&program);
+                execute_collected_page_script(&mut state, &script, &program, source, None);
                 let elapsed = start.elapsed().as_millis().to_string();
                 let budget_exhausted = if state.execution_budget_exhausted() {
                     "true"
@@ -2020,6 +2021,7 @@ fn live_js_debug_report(html: &str, source: Option<&str>) -> String {
     seed_script_browser_globals(&mut state, source);
     seed_script_dom_state_from_html(&html, &mut state);
     seed_script_computed_styles_from_html(&html, &mut state);
+    let mut module_cache = justbarelyscript::ModuleExecutionCache::default();
 
     let mut parsed = 0usize;
     let mut skipped_or_failed = 0usize;
@@ -2057,7 +2059,13 @@ fn live_js_debug_report(html: &str, source: Option<&str>) -> String {
                     &[("phase", "live_js_debug"), ("label", &script.label)],
                 );
                 let start = std::time::Instant::now();
-                state.execute_program(program);
+                execute_collected_page_script(
+                    &mut state,
+                    script,
+                    program,
+                    source,
+                    Some(&mut module_cache),
+                );
                 let elapsed = start.elapsed();
                 let effects = state.drain_effects();
                 let effect_count = effects.len();
@@ -2201,8 +2209,9 @@ fn build_script_state_with_source(
     seed_script_browser_globals(&mut state, source);
     seed_script_dom_state_from_html(&html, &mut state);
     seed_script_computed_styles_from_html(&html, &mut state);
+    let mut module_cache = justbarelyscript::ModuleExecutionCache::default();
     for script in scripts {
-        let Ok(program) = script.program else {
+        let Ok(program) = &script.program else {
             continue;
         };
         state.set_execution_budget(LIVE_JS_DEBUG_STATEMENT_BUDGET);
@@ -2211,7 +2220,13 @@ fn build_script_state_with_source(
             &[("phase", "script_state"), ("label", &script.label)],
         );
         let start = std::time::Instant::now();
-        state.execute_program(&program);
+        execute_collected_page_script(
+            &mut state,
+            &script,
+            &program,
+            source,
+            Some(&mut module_cache),
+        );
         let elapsed = start.elapsed().as_millis().to_string();
         let budget_exhausted = if state.execution_budget_exhausted() {
             "true"
@@ -2367,10 +2382,11 @@ fn apply_safe_script_browser_effects_detailed(
     seed_script_dom_state_from_html(html, &mut state);
     seed_script_computed_styles_from_html(html, &mut state);
     let mut hydration_failed = false;
+    let mut module_cache = justbarelyscript::ModuleExecutionCache::default();
 
     for script in scripts {
         let script_hydration_candidate = page_script_is_hydration_candidate(&script);
-        let Ok(program) = script.program else {
+        let Ok(program) = &script.program else {
             if script_hydration_candidate {
                 hydration_failed = true;
             }
@@ -2382,7 +2398,13 @@ fn apply_safe_script_browser_effects_detailed(
             &[("phase", "dom_effects"), ("label", &script.label)],
         );
         let start = std::time::Instant::now();
-        state.execute_program(&program);
+        execute_collected_page_script(
+            &mut state,
+            &script,
+            &program,
+            source,
+            Some(&mut module_cache),
+        );
         let elapsed = start.elapsed().as_millis().to_string();
         let budget_exhausted = if state.execution_budget_exhausted() {
             "true"
@@ -2490,6 +2512,54 @@ fn seed_script_browser_globals(
     }
 }
 
+fn execute_collected_page_script(
+    state: &mut justbarelyscript::BrowserExecutionState,
+    script: &PageScript,
+    program: &justbarelyscript::Program,
+    document_source: Option<&str>,
+    module_cache: Option<&mut justbarelyscript::ModuleExecutionCache>,
+) {
+    if !script.is_module {
+        state.execute_program(program);
+        return;
+    }
+
+    let module_base = script
+        .source_url
+        .as_deref()
+        .or(document_source)
+        .unwrap_or(script.label.as_str());
+    let module_key = script.source_url.clone().unwrap_or_else(|| {
+        document_source
+            .map(|source| format!("{source}#{}", script.label))
+            .unwrap_or_else(|| script.label.clone())
+    });
+    let loader = |base: &str, specifier: &str| {
+        let resolution_base = if base == module_key {
+            module_base
+        } else {
+            base
+        };
+        let resolved = resolve_resource_url(resolution_base, specifier);
+        if let Some(document_source) = document_source {
+            if !script_allowed_for_document(document_source, &resolved) {
+                return None;
+            }
+        }
+        let source = read_script_resource(&resolved).ok()?;
+        if source.len() > MAX_EXTERNAL_SCRIPT_PARSE_BYTES {
+            return None;
+        }
+        let program = justbarelyscript::parse_script(&source).ok()?;
+        Some((resolved, program))
+    };
+    if let Some(cache) = module_cache {
+        state.execute_module_program_with_cache(program, &module_key, cache, loader);
+    } else {
+        state.execute_module_program_with_loader(program, &module_key, loader);
+    }
+}
+
 fn collect_page_scripts(html: &str, source: Option<&str>) -> Vec<PageScript> {
     let mut normal = Vec::new();
     let mut deferred = Vec::new();
@@ -2520,9 +2590,10 @@ fn collect_page_scripts(html: &str, source: Option<&str>) -> Vec<PageScript> {
             continue;
         }
 
-        let defer = tag_has_bool_attr(open_tag, "defer");
+        let is_module = script_type_is_module(open_tag);
+        let defer = tag_has_bool_attr(open_tag, "defer") || is_module;
         let script = if let Some(src) = extract_attr(open_tag, "src") {
-            load_external_page_script(source, &src, index, defer)
+            load_external_page_script(source, &src, index, defer, is_module)
         } else {
             let label = format!("Inline script {index}");
             if inline_source.len() > MAX_EXTERNAL_SCRIPT_PARSE_BYTES {
@@ -2530,6 +2601,7 @@ fn collect_page_scripts(html: &str, source: Option<&str>) -> Vec<PageScript> {
                 PageScript {
                     label,
                     kind: PageScriptKind::Inline,
+                    is_module,
                     source_url: None,
                     byte_len: inline_source.len(),
                     deferred: defer,
@@ -2545,6 +2617,7 @@ fn collect_page_scripts(html: &str, source: Option<&str>) -> Vec<PageScript> {
                 PageScript {
                     label,
                     kind: PageScriptKind::Inline,
+                    is_module,
                     source_url: None,
                     byte_len: inline_source.len(),
                     deferred: defer,
@@ -2590,6 +2663,19 @@ fn script_type_is_executable(open_tag: &str) -> bool {
             | "text/jscript"
             | "text/livescript"
     )
+}
+
+fn script_type_is_module(open_tag: &str) -> bool {
+    extract_attr(open_tag, "type")
+        .map(|script_type| {
+            script_type
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("module")
+        })
+        .unwrap_or(false)
 }
 
 fn emit_script_parse_telemetry(index: usize, script: &PageScript) {
@@ -2646,12 +2732,14 @@ fn load_external_page_script(
     src: &str,
     index: usize,
     deferred: bool,
+    is_module: bool,
 ) -> PageScript {
     let Some(document_source) = document_source else {
         let label = format!("External script {index} ({src})");
         return PageScript {
             label,
             kind: PageScriptKind::External,
+            is_module,
             source_url: Some(src.to_owned()),
             byte_len: 0,
             deferred,
@@ -2668,6 +2756,7 @@ fn load_external_page_script(
         return PageScript {
             label,
             kind: PageScriptKind::External,
+            is_module,
             source_url: Some(resolved),
             byte_len: 0,
             deferred,
@@ -2685,6 +2774,7 @@ fn load_external_page_script(
                 return PageScript {
                     label,
                     kind: PageScriptKind::External,
+                    is_module,
                     source_url: Some(resolved),
                     byte_len: source.len(),
                     deferred,
@@ -2701,6 +2791,7 @@ fn load_external_page_script(
             PageScript {
                 label,
                 kind: PageScriptKind::External,
+                is_module,
                 source_url: Some(resolved),
                 byte_len: source.len(),
                 deferred,
@@ -2711,6 +2802,7 @@ fn load_external_page_script(
         Err(error) => PageScript {
             label,
             kind: PageScriptKind::External,
+            is_module,
             source_url: Some(resolved),
             byte_len: 0,
             deferred,
@@ -12747,6 +12839,121 @@ mod tests {
 
         assert!(find_canvas_text(&document.canvas_graph, "AB").is_some());
         assert!(find_canvas_text(&document.canvas_graph, "Before").is_none());
+    }
+
+    #[test]
+    fn inline_module_script_imports_sibling_module() {
+        let dir = std::env::temp_dir().join(format!(
+            "almostthere-module-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp module dir");
+        fs::write(
+            dir.join("module.js"),
+            r#"
+            export const GREETING = "Hello from module";
+            export function add(a, b) { return a + b; }
+            export default function defaultFn() { return "default export"; }
+            "#,
+        )
+        .expect("write module script");
+
+        let html = r#"
+            <div id="result">Before</div>
+            <script type="module">
+                import defaultFn from "./module.js";
+                import { GREETING, add } from "./module.js";
+                document.getElementById("result").textContent =
+                    GREETING + "/" + String(add(1, 2)) + "/" + defaultFn();
+            </script>
+        "#;
+        let source = path_to_file_url(&dir.join("index.html"));
+        let document = parse_html_document(html, &source);
+
+        assert!(
+            find_canvas_text(&document.canvas_graph, "Hello from module/3/default export")
+                .is_some()
+        );
+        assert!(find_canvas_text(&document.canvas_graph, "Before").is_none());
+    }
+
+    #[test]
+    fn module_scripts_are_deferred_by_default() {
+        let html = r#"
+            <div id="result">Before</div>
+            <script type="module">
+                document.getElementById("result").textContent = window.order;
+            </script>
+            <script>
+                window.order = "classic ran first";
+            </script>
+        "#;
+        let document = parse_html_document(html, "file:///tmp/module-defer.html");
+
+        assert!(
+            find_canvas_text(&document.canvas_graph, "classic ran first").is_some(),
+            "expected module script to execute after the following classic script"
+        );
+        assert!(find_canvas_text(&document.canvas_graph, "Before").is_none());
+    }
+
+    #[test]
+    fn module_scripts_share_dependency_execution_cache() {
+        let dir = std::env::temp_dir().join(format!(
+            "almostthere-module-cache-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp module dir");
+        fs::write(
+            dir.join("dep.js"),
+            r#"
+            window.sharedModuleRuns = (window.sharedModuleRuns || 0) + 1;
+            export const value = window.sharedModuleRuns;
+            "#,
+        )
+        .expect("write dependency module");
+
+        let html = r#"
+            <div id="a">Before A</div>
+            <div id="b">Before B</div>
+            <script type="module">
+                import { value } from "./dep.js";
+                document.getElementById("a").textContent = String(value);
+            </script>
+            <script type="module">
+                import { value } from "./dep.js";
+                document.getElementById("b").textContent = String(value);
+            </script>
+        "#;
+        let source = path_to_file_url(&dir.join("index.html"));
+        let rendered_html = apply_safe_script_browser_effects_with_source(html, Some(&source));
+        let rendered_ones = rendered_html.matches(">1</div>").count();
+        assert_eq!(
+            rendered_ones, 2,
+            "expected both module scripts to observe the same cached dependency export: {rendered_html}"
+        );
+        assert!(!rendered_html.contains(">2</div>"));
+    }
+
+    #[test]
+    fn es_module_unit_fixture_executes_import_graph() {
+        let index_path =
+            workspace_root_path().join("JustBarelyScript/UnitTest/039-es-modules/index.html");
+        let html = fs::read_to_string(&index_path).expect("read 039 module fixture");
+        let source = path_to_file_url(&index_path);
+        let document = parse_html_document(&html, &source);
+
+        assert!(
+            find_canvas_text(&document.canvas_graph, "Hello from module/3/(1,2)").is_some(),
+            "expected module fixture result text in rendered document"
+        );
+        assert!(find_canvas_text(&document.canvas_graph, "fail").is_none());
     }
 
     #[test]

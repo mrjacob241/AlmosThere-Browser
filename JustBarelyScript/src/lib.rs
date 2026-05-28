@@ -16,7 +16,7 @@ pub use console::{
 };
 pub use effects::{
     BrowserEffect, BrowserExecutionState, DomElementSnapshot, DomExecutionState,
-    collect_browser_effects,
+    ModuleExecutionCache, collect_browser_effects,
 };
 pub use error::{JsError, JsErrorKind};
 pub use html::{InlineScript, ScriptParseReport, parse_inline_scripts_from_html};

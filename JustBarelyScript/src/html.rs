@@ -31,6 +31,10 @@ pub fn parse_inline_scripts_from_html(html: &str) -> ScriptParseReport {
     let mut index = 0;
 
     while let Some(open_index) = find_ascii_case_insensitive(remaining, "<script") {
+        if is_inside_html_comment(remaining, open_index) {
+            remaining = &remaining[open_index + "<script".len()..];
+            continue;
+        }
         let after_open = &remaining[open_index..];
         let Some(open_end) = after_open.find('>') else {
             break;
@@ -53,6 +57,14 @@ pub fn parse_inline_scripts_from_html(html: &str) -> ScriptParseReport {
     }
 
     ScriptParseReport { scripts }
+}
+
+fn is_inside_html_comment(haystack: &str, pos: usize) -> bool {
+    let before = &haystack[..pos];
+    let last_open = before.rfind("<!--");
+    let last_close = before.rfind("-->");
+    matches!((last_open, last_close), (Some(open), Some(close)) if open > close)
+        || matches!((last_open, last_close), (Some(_), None))
 }
 
 fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {

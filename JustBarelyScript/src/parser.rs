@@ -2,11 +2,12 @@ use crate::{
     Program,
     ast::{
         BinaryOperator, Binding, BlockStatement, ClassDeclaration, ClassField, ClassMethod,
-        DoWhileStatement, Expression, ForInStatement, ForOfStatement, ForStatement, FunctionBody,
-        FunctionDeclaration, FunctionExpression, IfStatement, MemberProperty, MethodKind,
-        ObjectBindingProp, ObjectProperty, Param, ReturnStatement, Statement, SwitchCase,
-        SwitchStatement, TemplateElement, ThrowStatement, TryCatchStatement, UnaryOperator,
-        VarKind, VariableDeclaration, VariableDeclarator, WhileStatement,
+        DoWhileStatement, ExportDeclaration, ExportDefaultDeclaration, ExportSpecifier, Expression,
+        ForInStatement, ForOfStatement, ForStatement, FunctionBody, FunctionDeclaration,
+        FunctionExpression, IfStatement, ImportDeclaration, ImportSpecifier, MemberProperty,
+        MethodKind, ObjectBindingProp, ObjectProperty, Param, ReturnStatement, Statement,
+        SwitchCase, SwitchStatement, TemplateElement, ThrowStatement, TryCatchStatement,
+        UnaryOperator, VarKind, VariableDeclaration, VariableDeclarator, WhileStatement,
     },
     error::JsError,
     lexer::{TemplatePart, Token, TokenKind, lex},
@@ -99,26 +100,12 @@ impl Parser {
                 self.advance();
                 Ok(Statement::Empty)
             }
-            // Skip export/import declarations gracefully.
-            TokenKind::Export => {
-                self.advance();
-                // export default expr
-                if matches!(self.current_kind(), TokenKind::Identifier(n) if n == "default") {
-                    self.advance();
-                    let expr = self.parse_expression(0)?;
-                    self.consume_semicolon();
-                    return Ok(Statement::Expression(expr));
-                }
-                self.parse_statement()
-            }
-            TokenKind::Import => {
-                // Skip the entire import statement.
-                while !matches!(self.current_kind(), TokenKind::Semicolon | TokenKind::Eof) {
-                    self.advance();
-                }
-                self.consume_semicolon();
-                Ok(Statement::Empty)
-            }
+            TokenKind::Export => self
+                .parse_export_declaration()
+                .map(Statement::ExportDeclaration),
+            TokenKind::Import => self
+                .parse_import_declaration()
+                .map(Statement::ImportDeclaration),
             _ => {
                 let first = self.parse_expression(0)?;
                 // Labeled statement: `label: statement` — discard label, parse body
@@ -181,6 +168,187 @@ impl Parser {
             declarations,
             span: start,
         }))
+    }
+
+    fn parse_import_declaration(&mut self) -> Result<ImportDeclaration, JsError> {
+        let span = self.expect(TokenKind::Import)?.span;
+        let mut specifiers = Vec::new();
+
+        if let TokenKind::String(source) = self.current_kind() {
+            let source = source.clone();
+            self.advance();
+            self.consume_semicolon();
+            return Ok(ImportDeclaration {
+                specifiers,
+                source,
+                span,
+            });
+        }
+
+        if self.at(TokenKind::LeftBrace) {
+            specifiers.extend(self.parse_named_import_specifiers()?);
+        } else if self.eat(TokenKind::Star) {
+            self.expect_identifier_name("as")?;
+            let local = self.expect_identifier()?;
+            specifiers.push(ImportSpecifier::Namespace { local });
+        } else {
+            let local = self.expect_identifier()?;
+            specifiers.push(ImportSpecifier::Default { local });
+
+            if self.eat(TokenKind::Comma) {
+                if self.at(TokenKind::LeftBrace) {
+                    specifiers.extend(self.parse_named_import_specifiers()?);
+                } else {
+                    self.expect(TokenKind::Star)?;
+                    self.expect_identifier_name("as")?;
+                    let local = self.expect_identifier()?;
+                    specifiers.push(ImportSpecifier::Namespace { local });
+                }
+            }
+        }
+
+        self.expect_identifier_name("from")?;
+        let source = self.expect_string_literal()?;
+        self.consume_semicolon();
+        Ok(ImportDeclaration {
+            specifiers,
+            source,
+            span,
+        })
+    }
+
+    fn parse_named_import_specifiers(&mut self) -> Result<Vec<ImportSpecifier>, JsError> {
+        self.expect(TokenKind::LeftBrace)?;
+        let mut specifiers = Vec::new();
+        while !self.at(TokenKind::RightBrace) && !self.at_eof() {
+            let imported = self.expect_module_export_name()?;
+            let local = if self.eat_identifier_name("as") {
+                self.expect_identifier()?
+            } else {
+                imported.clone()
+            };
+            specifiers.push(ImportSpecifier::Named { imported, local });
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RightBrace)?;
+        Ok(specifiers)
+    }
+
+    fn parse_export_declaration(&mut self) -> Result<ExportDeclaration, JsError> {
+        let span = self.expect(TokenKind::Export)?.span;
+
+        if self.eat(TokenKind::Default) {
+            if self.at(TokenKind::Function) && self.peek_kind_is_function_name() {
+                let declaration = self.parse_function_declaration(false)?;
+                return Ok(ExportDeclaration::Default {
+                    declaration: ExportDefaultDeclaration::Function(declaration),
+                    span,
+                });
+            }
+            if self.at(TokenKind::Async)
+                && matches!(self.peek_kind(), Some(TokenKind::Function))
+                && self.peek_n_kind_is_function_name(2)
+            {
+                self.advance();
+                let declaration = self.parse_function_declaration(true)?;
+                return Ok(ExportDeclaration::Default {
+                    declaration: ExportDefaultDeclaration::Function(declaration),
+                    span,
+                });
+            }
+            if self.at(TokenKind::Class)
+                && matches!(self.peek_kind(), Some(TokenKind::Identifier(_)))
+            {
+                let declaration = self.parse_class_declaration()?;
+                return Ok(ExportDeclaration::Default {
+                    declaration: ExportDefaultDeclaration::Class(declaration),
+                    span,
+                });
+            }
+
+            let declaration = if self.at(TokenKind::Function)
+                || self.at(TokenKind::Async)
+                || self.at(TokenKind::Class)
+            {
+                ExportDefaultDeclaration::Expression(self.parse_expression(0)?)
+            } else {
+                ExportDefaultDeclaration::Expression(self.parse_expression(0)?)
+            };
+            self.consume_semicolon();
+            return Ok(ExportDeclaration::Default { declaration, span });
+        }
+
+        if self.eat(TokenKind::Star) {
+            let exported = if self.eat_identifier_name("as") {
+                Some(self.expect_module_export_name()?)
+            } else {
+                None
+            };
+            self.expect_identifier_name("from")?;
+            let source = self.expect_string_literal()?;
+            self.consume_semicolon();
+            return Ok(ExportDeclaration::All {
+                source,
+                exported,
+                span,
+            });
+        }
+
+        if self.at(TokenKind::LeftBrace) {
+            let specifiers = self.parse_named_export_specifiers()?;
+            let source = if self.eat_identifier_name("from") {
+                Some(self.expect_string_literal()?)
+            } else {
+                None
+            };
+            self.consume_semicolon();
+            return Ok(ExportDeclaration::Named {
+                specifiers,
+                source,
+                span,
+            });
+        }
+
+        let declaration = match self.current_kind() {
+            TokenKind::Let | TokenKind::Const | TokenKind::Var => {
+                self.parse_variable_statement(true)?
+            }
+            TokenKind::Function => {
+                Statement::FunctionDeclaration(self.parse_function_declaration(false)?)
+            }
+            TokenKind::Async if matches!(self.peek_kind(), Some(TokenKind::Function)) => {
+                self.advance();
+                Statement::FunctionDeclaration(self.parse_function_declaration(true)?)
+            }
+            TokenKind::Class => Statement::ClassDeclaration(self.parse_class_declaration()?),
+            _ => return self.error("expected export declaration"),
+        };
+
+        Ok(ExportDeclaration::Declaration {
+            declaration: Box::new(declaration),
+            span,
+        })
+    }
+
+    fn parse_named_export_specifiers(&mut self) -> Result<Vec<ExportSpecifier>, JsError> {
+        self.expect(TokenKind::LeftBrace)?;
+        let mut specifiers = Vec::new();
+        while !self.at(TokenKind::RightBrace) && !self.at_eof() {
+            let local = self.expect_module_export_name()?;
+            let exported = if self.eat_identifier_name("as") {
+                self.expect_module_export_name()?
+            } else {
+                local.clone()
+            };
+            specifiers.push(ExportSpecifier { local, exported });
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RightBrace)?;
+        Ok(specifiers)
     }
 
     fn parse_function_declaration(
@@ -508,7 +676,10 @@ impl Parser {
 
         let catch = if self.eat(TokenKind::Catch) {
             let catch_param = if self.eat(TokenKind::LeftParen) {
-                let binding = if matches!(self.current_kind(), TokenKind::LeftBrace | TokenKind::LeftBracket) {
+                let binding = if matches!(
+                    self.current_kind(),
+                    TokenKind::LeftBrace | TokenKind::LeftBracket
+                ) {
                     self.parse_binding()?
                 } else {
                     Binding::Name(self.expect_identifier()?)
@@ -579,7 +750,11 @@ impl Parser {
                     let n = self.expect_identifier_or_keyword()?;
                     // get / set accessor — parse the actual name next.
                     if (n == "get" || n == "set") && !self.at(TokenKind::LeftParen) {
-                        kind = if n == "get" { MethodKind::Get } else { MethodKind::Set };
+                        kind = if n == "get" {
+                            MethodKind::Get
+                        } else {
+                            MethodKind::Set
+                        };
                         // actual member name
                         match self.current_kind() {
                             TokenKind::PrivateIdentifier(pn) => {
@@ -602,17 +777,34 @@ impl Parser {
                     None
                 };
                 self.eat(TokenKind::Semicolon);
-                fields.push(ClassField { name: member_name, init, is_static });
+                fields.push(ClassField {
+                    name: member_name,
+                    init,
+                    is_static,
+                });
                 continue;
             }
             // Method: parse params + body.
             let is_constructor = member_name == "constructor" && !is_static;
             let params = self.parse_parameter_list()?;
             let body = self.parse_block()?;
-            methods.push(ClassMethod { name: member_name, is_static, is_constructor, kind, params, body });
+            methods.push(ClassMethod {
+                name: member_name,
+                is_static,
+                is_constructor,
+                kind,
+                params,
+                body,
+            });
         }
         self.expect(TokenKind::RightBrace)?;
-        Ok(ClassDeclaration { name, superclass, methods, fields, span })
+        Ok(ClassDeclaration {
+            name,
+            superclass,
+            methods,
+            fields,
+            span,
+        })
     }
 
     fn parse_block(&mut self) -> Result<BlockStatement, JsError> {
@@ -975,16 +1167,13 @@ impl Parser {
                 let next_is_colon_or_assign = matches!(
                     self.peek_kind(),
                     Some(TokenKind::Colon)
-                    | Some(TokenKind::LeftParen)
-                    | Some(TokenKind::Comma)
-                    | Some(TokenKind::RightBrace)
-                    | Some(TokenKind::RightParen)
-                    | Some(TokenKind::RightBracket)
-                    | Some(TokenKind::Semicolon)
-                    | Some(TokenKind::Dot)
-                    | Some(TokenKind::LeftBracket)
-                    | Some(TokenKind::Equals)
-                    | Some(TokenKind::Eof)
+                        | Some(TokenKind::LeftParen)
+                        | Some(TokenKind::Comma)
+                        | Some(TokenKind::RightParen)
+                        | Some(TokenKind::RightBracket)
+                        | Some(TokenKind::Dot)
+                        | Some(TokenKind::LeftBracket)
+                        | Some(TokenKind::Equals)
                 );
                 if next_is_colon_or_assign {
                     self.advance();
@@ -1105,7 +1294,9 @@ impl Parser {
         let mut methods = Vec::new();
         let mut fields = Vec::new();
         while !self.at(TokenKind::RightBrace) && !self.at_eof() {
-            if self.eat(TokenKind::Semicolon) { continue; }
+            if self.eat(TokenKind::Semicolon) {
+                continue;
+            }
             let is_static = self.eat(TokenKind::Static);
             let mut kind = MethodKind::Method;
             let member_name = match self.current_kind() {
@@ -1114,11 +1305,19 @@ impl Parser {
                     self.advance();
                     n
                 }
-                TokenKind::String(s) => { let s = s.clone(); self.advance(); s }
+                TokenKind::String(s) => {
+                    let s = s.clone();
+                    self.advance();
+                    s
+                }
                 _ => {
                     let n = self.expect_identifier_or_keyword()?;
                     if (n == "get" || n == "set") && !self.at(TokenKind::LeftParen) {
-                        kind = if n == "get" { MethodKind::Get } else { MethodKind::Set };
+                        kind = if n == "get" {
+                            MethodKind::Get
+                        } else {
+                            MethodKind::Set
+                        };
                         match self.current_kind() {
                             TokenKind::PrivateIdentifier(pn) => {
                                 let pn = format!("#{}", pn.clone());
@@ -1127,22 +1326,45 @@ impl Parser {
                             }
                             _ => self.expect_identifier_or_keyword()?,
                         }
-                    } else { n }
+                    } else {
+                        n
+                    }
                 }
             };
             if kind == MethodKind::Method && !self.at(TokenKind::LeftParen) {
-                let init = if self.eat(TokenKind::Equals) { Some(self.parse_expression(0)?) } else { None };
+                let init = if self.eat(TokenKind::Equals) {
+                    Some(self.parse_expression(0)?)
+                } else {
+                    None
+                };
                 self.eat(TokenKind::Semicolon);
-                fields.push(ClassField { name: member_name, init, is_static });
+                fields.push(ClassField {
+                    name: member_name,
+                    init,
+                    is_static,
+                });
                 continue;
             }
             let is_constructor = member_name == "constructor" && !is_static;
             let params = self.parse_parameter_list()?;
             let body = self.parse_block()?;
-            methods.push(ClassMethod { name: member_name, is_static, is_constructor, kind, params, body });
+            methods.push(ClassMethod {
+                name: member_name,
+                is_static,
+                is_constructor,
+                kind,
+                params,
+                body,
+            });
         }
         self.expect(TokenKind::RightBrace)?;
-        Ok(Expression::Class(Box::new(ClassDeclaration { name, superclass, methods, fields, span })))
+        Ok(Expression::Class(Box::new(ClassDeclaration {
+            name,
+            superclass,
+            methods,
+            fields,
+            span,
+        })))
     }
 
     /// Parse the callee for `new` (identifiers, member access, or parenthesised expression).
@@ -1396,8 +1618,16 @@ impl Parser {
                 } else {
                     // Allow numeric or string keys: `get 0()`, `get "foo"()`.
                     let actual_key = match self.current_kind() {
-                        TokenKind::Number(n) => { let k = n.clone(); self.advance(); k }
-                        TokenKind::String(s) => { let k = s.clone(); self.advance(); k }
+                        TokenKind::Number(n) => {
+                            let k = n.clone();
+                            self.advance();
+                            k
+                        }
+                        TokenKind::String(s) => {
+                            let k = s.clone();
+                            self.advance();
+                            k
+                        }
                         _ => self.expect_identifier_or_keyword()?,
                     };
                     let params = self.parse_parameter_list()?;
@@ -1431,7 +1661,7 @@ impl Parser {
                         params,
                         body,
                         is_async: false,
-                            is_generator: false,
+                        is_generator: false,
                     }),
                     shorthand: false,
                 });
@@ -1637,6 +1867,72 @@ impl Parser {
         }
     }
 
+    fn expect_identifier_name(&mut self, expected: &str) -> Result<(), JsError> {
+        match self.current_kind() {
+            TokenKind::Identifier(name) if name == expected => {
+                self.advance();
+                Ok(())
+            }
+            _ => self.error("unexpected token"),
+        }
+    }
+
+    fn eat_identifier_name(&mut self, expected: &str) -> bool {
+        match self.current_kind() {
+            TokenKind::Identifier(name) if name == expected => {
+                self.advance();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn expect_string_literal(&mut self) -> Result<String, JsError> {
+        match self.current_kind() {
+            TokenKind::String(value) => {
+                let value = value.clone();
+                self.advance();
+                Ok(value)
+            }
+            _ => self.error("expected string literal"),
+        }
+    }
+
+    fn expect_module_export_name(&mut self) -> Result<String, JsError> {
+        match self.current_kind() {
+            TokenKind::String(value) => {
+                let value = value.clone();
+                self.advance();
+                Ok(value)
+            }
+            TokenKind::Identifier(name) => {
+                let name = name.clone();
+                self.advance();
+                Ok(name)
+            }
+            kind => {
+                if let Some(text) = keyword_as_identifier(kind) {
+                    self.advance();
+                    Ok(text.to_owned())
+                } else {
+                    self.error("expected module export name")
+                }
+            }
+        }
+    }
+
+    fn peek_kind_is_function_name(&self) -> bool {
+        matches!(self.peek_kind(), Some(TokenKind::Identifier(_)))
+            || (matches!(self.peek_kind(), Some(TokenKind::Star))
+                && matches!(self.peek_n_kind(2), Some(TokenKind::Identifier(_))))
+    }
+
+    fn peek_n_kind_is_function_name(&self, offset: usize) -> bool {
+        matches!(self.peek_n_kind(offset), Some(TokenKind::Identifier(_)))
+            || (matches!(self.peek_n_kind(offset), Some(TokenKind::Star))
+                && matches!(self.peek_n_kind(offset + 1), Some(TokenKind::Identifier(_))))
+    }
+
     /// Accept identifiers AND keywords that commonly appear as property names.
     fn expect_identifier_or_keyword(&mut self) -> Result<String, JsError> {
         match self.current_kind() {
@@ -1691,6 +1987,10 @@ impl Parser {
 
     fn peek_kind(&self) -> Option<&TokenKind> {
         self.tokens.get(self.position + 1).map(|t| &t.kind)
+    }
+
+    fn peek_n_kind(&self, offset: usize) -> Option<&TokenKind> {
+        self.tokens.get(self.position + offset).map(|t| &t.kind)
     }
 
     fn current_kind(&self) -> &TokenKind {
@@ -1778,6 +2078,19 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_bare_yield_as_generator_yield() {
+        let program = parse_script("function* gen() { yield; }").unwrap();
+        let Statement::FunctionDeclaration(decl) = &program.body[0] else {
+            panic!("expected function declaration");
+        };
+        assert!(decl.is_generator);
+        let Statement::Expression(expr) = &decl.body.body[0] else {
+            panic!("expected expression statement");
+        };
+        assert!(matches!(expr, Expression::Yield(None)));
     }
 
     #[test]
@@ -1872,6 +2185,165 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn parses_es_module_fixture_imports_as_ast_nodes() {
+        let html = include_str!("../UnitTest/039-es-modules/index.html");
+        let report = parse_inline_scripts_from_html(html);
+        assert_eq!(report.error_count(), 0);
+        assert_eq!(report.scripts.len(), 1);
+
+        let program = report.scripts[0].program.as_ref().unwrap();
+        let Statement::ImportDeclaration(default_import) = &program.body[0] else {
+            panic!("expected default import declaration");
+        };
+        assert_eq!(default_import.source, "./module.js");
+        assert_eq!(
+            default_import.specifiers,
+            vec![ImportSpecifier::Default {
+                local: "defaultFn".to_owned()
+            }]
+        );
+
+        let Statement::ImportDeclaration(named_imports) = &program.body[1] else {
+            panic!("expected named import declaration");
+        };
+        assert_eq!(named_imports.source, "./module.js");
+        assert_eq!(
+            named_imports.specifiers,
+            vec![
+                ImportSpecifier::Named {
+                    imported: "GREETING".to_owned(),
+                    local: "GREETING".to_owned()
+                },
+                ImportSpecifier::Named {
+                    imported: "add".to_owned(),
+                    local: "add".to_owned()
+                },
+                ImportSpecifier::Named {
+                    imported: "Point".to_owned(),
+                    local: "Point".to_owned()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_es_module_fixture_exports_as_ast_nodes() {
+        let module = include_str!("../UnitTest/039-es-modules/module.js");
+        let program = parse_script(module).unwrap();
+        assert_eq!(program.body.len(), 4);
+
+        match &program.body[0] {
+            Statement::ExportDeclaration(ExportDeclaration::Declaration {
+                declaration, ..
+            }) => {
+                assert!(matches!(
+                    declaration.as_ref(),
+                    Statement::VariableDeclaration(_)
+                ));
+            }
+            _ => panic!("expected exported const declaration"),
+        }
+        match &program.body[1] {
+            Statement::ExportDeclaration(ExportDeclaration::Declaration {
+                declaration, ..
+            }) => {
+                assert!(matches!(
+                    declaration.as_ref(),
+                    Statement::FunctionDeclaration(_)
+                ));
+            }
+            _ => panic!("expected exported function declaration"),
+        }
+        match &program.body[2] {
+            Statement::ExportDeclaration(ExportDeclaration::Declaration {
+                declaration, ..
+            }) => {
+                assert!(matches!(
+                    declaration.as_ref(),
+                    Statement::ClassDeclaration(_)
+                ));
+            }
+            _ => panic!("expected exported class declaration"),
+        }
+        match &program.body[3] {
+            Statement::ExportDeclaration(ExportDeclaration::Default {
+                declaration: ExportDefaultDeclaration::Function(function),
+                ..
+            }) => {
+                assert_eq!(function.name, "defaultFn");
+            }
+            _ => panic!("expected default exported function declaration"),
+        }
+    }
+
+    #[test]
+    fn parses_es_module_static_import_export_forms() {
+        let program = parse_script(
+            r#"
+                import "./setup.js";
+                import name, * as ns from "./both.js";
+                import { default as renamedDefault, "strange-name" as strange } from "./named.js";
+                export { name as renamed, strange };
+                export { renamedDefault as default } from "./named.js";
+                export * from "./all.js";
+                export * as everything from "./all.js";
+                export default class {}
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &program.body[0],
+            Statement::ImportDeclaration(ImportDeclaration {
+                specifiers,
+                source,
+                ..
+            }) if specifiers.is_empty() && source == "./setup.js"
+        ));
+        assert!(matches!(
+            &program.body[1],
+            Statement::ImportDeclaration(ImportDeclaration {
+                specifiers,
+                source,
+                ..
+            }) if specifiers == &vec![
+                ImportSpecifier::Default { local: "name".to_owned() },
+                ImportSpecifier::Namespace { local: "ns".to_owned() },
+            ] && source == "./both.js"
+        ));
+        assert!(matches!(
+            &program.body[4],
+            Statement::ExportDeclaration(ExportDeclaration::Named {
+                source: Some(source),
+                ..
+            }) if source == "./named.js"
+        ));
+        assert!(matches!(
+            &program.body[5],
+            Statement::ExportDeclaration(ExportDeclaration::All {
+                exported: None,
+                source,
+                ..
+            }) if source == "./all.js"
+        ));
+        assert!(matches!(
+            &program.body[6],
+            Statement::ExportDeclaration(ExportDeclaration::All {
+                exported: Some(exported),
+                source,
+                ..
+            }) if exported == "everything" && source == "./all.js"
+        ));
+        assert!(matches!(
+            &program.body[7],
+            Statement::ExportDeclaration(ExportDeclaration::Default {
+                declaration: ExportDefaultDeclaration::Expression(Expression::Class(_)),
+                ..
+            })
+        ));
     }
 
     #[test]

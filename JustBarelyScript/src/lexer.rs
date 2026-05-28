@@ -383,7 +383,10 @@ impl<'a> Lexer<'a> {
             if self.current() == Some('n') {
                 self.bump();
                 let s = self.source[span.start..self.byte_position - 1].to_owned();
-                return Token { kind: TokenKind::BigInt(s), span: self.finish_span(span) };
+                return Token {
+                    kind: TokenKind::BigInt(s),
+                    span: self.finish_span(span),
+                };
             }
             return Token {
                 kind: TokenKind::Number(self.source[span.start..self.byte_position].to_owned()),
@@ -400,7 +403,10 @@ impl<'a> Lexer<'a> {
             if self.current() == Some('n') {
                 self.bump();
                 let s = self.source[span.start..self.byte_position - 1].to_owned();
-                return Token { kind: TokenKind::BigInt(s), span: self.finish_span(span) };
+                return Token {
+                    kind: TokenKind::BigInt(s),
+                    span: self.finish_span(span),
+                };
             }
             return Token {
                 kind: TokenKind::Number(self.source[span.start..self.byte_position].to_owned()),
@@ -420,7 +426,10 @@ impl<'a> Lexer<'a> {
             if !digits.contains('.') && !digits.contains('e') && !digits.contains('E') {
                 self.bump(); // consume `n`
                 let s = self.source[span.start..self.byte_position - 1].to_owned();
-                return Token { kind: TokenKind::BigInt(s), span: self.finish_span(span) };
+                return Token {
+                    kind: TokenKind::BigInt(s),
+                    span: self.finish_span(span),
+                };
             }
         }
         // Consume `.` as part of the number if followed by a digit OR another `.`
@@ -773,9 +782,15 @@ impl Iterator for Lexer<'_> {
                         self.bump();
                         if self.current() == Some('=') {
                             self.bump();
-                            Token { kind: TokenKind::QuestionQuestionEquals, span: self.finish_span(span) }
+                            Token {
+                                kind: TokenKind::QuestionQuestionEquals,
+                                span: self.finish_span(span),
+                            }
                         } else {
-                            Token { kind: TokenKind::QuestionQuestion, span: self.finish_span(span) }
+                            Token {
+                                kind: TokenKind::QuestionQuestion,
+                                span: self.finish_span(span),
+                            }
                         }
                     }
                     Some('.') => {
@@ -936,9 +951,15 @@ impl Iterator for Lexer<'_> {
                         self.bump();
                         if self.current() == Some('=') {
                             self.bump();
-                            Token { kind: TokenKind::AmpAmpEquals, span: self.finish_span(span) }
+                            Token {
+                                kind: TokenKind::AmpAmpEquals,
+                                span: self.finish_span(span),
+                            }
                         } else {
-                            Token { kind: TokenKind::AmpAmp, span: self.finish_span(span) }
+                            Token {
+                                kind: TokenKind::AmpAmp,
+                                span: self.finish_span(span),
+                            }
                         }
                     }
                     Some('=') => {
@@ -961,9 +982,15 @@ impl Iterator for Lexer<'_> {
                         self.bump();
                         if self.current() == Some('=') {
                             self.bump();
-                            Token { kind: TokenKind::PipePipeEquals, span: self.finish_span(span) }
+                            Token {
+                                kind: TokenKind::PipePipeEquals,
+                                span: self.finish_span(span),
+                            }
                         } else {
-                            Token { kind: TokenKind::PipePipe, span: self.finish_span(span) }
+                            Token {
+                                kind: TokenKind::PipePipe,
+                                span: self.finish_span(span),
+                            }
                         }
                     }
                     Some('=') => {
