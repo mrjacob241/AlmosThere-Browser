@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     Program,
@@ -69,18 +70,25 @@ pub struct DomExecutionState {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct JsFunction {
+    /// Stable identity: set once at creation, preserved through clone. Used by
+    /// SameValue to detect "same function object" without Rc indirection.
+    pub id: u64,
     pub name: Option<String>,
     pub params: Vec<Param>,
     pub body: FunctionBody,
     pub captured: Vec<StackFrame>,
     properties: HashMap<String, JsValue>,
     /// True only for class constructors built by execute_class_decl.
-    /// Limits static method dispatch to intentional class statics, not ad-hoc function properties.
     pub is_class_ctor: bool,
     /// Superclass constructor for `super()` calls inside class constructors.
     pub super_ctor: Option<Box<JsValue>>,
     /// Instance field initializers run on `this` before the constructor body.
     pub instance_fields: Vec<ClassField>,
+}
+
+fn next_fn_id() -> u64 {
+    static CTR: AtomicU64 = AtomicU64::new(1);
+    CTR.fetch_add(1, Ordering::Relaxed)
 }
 
 impl JsFunction {
@@ -99,6 +107,7 @@ impl JsFunction {
             is_class_ctor: false,
             super_ctor: None,
             instance_fields: Vec::new(),
+            id: next_fn_id(),
         }
     }
 }
@@ -149,46 +158,66 @@ pub struct BrowserExecutionState {
 
 /// A single variable binding inside an environment record.
 /// `mutable: false` → `const` binding; reassignment throws TypeError.
+/// `initialized: false` → Temporal Dead Zone; access before the declaration throws ReferenceError.
 #[derive(Clone, Debug)]
 struct Slot {
     value: JsValue,
     mutable: bool,
+    initialized: bool,
 }
 
 impl Slot {
-    fn var(value: JsValue) -> Self { Slot { value, mutable: true } }
-    fn const_(value: JsValue) -> Self { Slot { value, mutable: false } }
+    fn var(value: JsValue) -> Self { Slot { value, mutable: true, initialized: true } }
+    fn const_(value: JsValue) -> Self { Slot { value, mutable: false, initialized: true } }
+    /// Temporal Dead Zone placeholder — inserted at block entry for `let`/`const` bindings.
+    fn tdz(mutable: bool) -> Self { Slot { value: JsValue::Undefined, mutable, initialized: false } }
 }
 
 impl PartialEq for Slot {
     fn eq(&self, other: &Self) -> bool {
-        self.value == other.value && self.mutable == other.mutable
+        self.value == other.value && self.mutable == other.mutable && self.initialized == other.initialized
     }
+}
+
+// ─── Environment Record Kind (ECMA-262 §9.1) ─────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+enum EnvKind {
+    /// Top-level script environment — `var` declarations live here.
+    Global,
+    /// Function body environment — `var` declarations land here.
+    Function,
+    /// Block `{ }` environment — `let`/`const` only, TDZ hoisting applies.
+    Block,
 }
 
 // ─── Stack Frame ──────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 struct StackFrame {
+    kind: EnvKind,
     locals: Rc<RefCell<HashMap<String, Slot>>>,
-    is_function_scope: bool,
 }
 
 impl Default for StackFrame {
     fn default() -> Self {
-        StackFrame {
-            locals: Rc::new(RefCell::new(HashMap::new())),
-            is_function_scope: false,
-        }
+        StackFrame { kind: EnvKind::Block, locals: Rc::new(RefCell::new(HashMap::new())) }
     }
 }
 
 impl StackFrame {
     fn function_scope() -> Self {
-        StackFrame {
-            locals: Rc::new(RefCell::new(HashMap::new())),
-            is_function_scope: true,
-        }
+        StackFrame { kind: EnvKind::Function, locals: Rc::new(RefCell::new(HashMap::new())) }
+    }
+    fn global_scope() -> Self {
+        StackFrame { kind: EnvKind::Global, locals: Rc::new(RefCell::new(HashMap::new())) }
+    }
+    fn block_scope() -> Self {
+        StackFrame { kind: EnvKind::Block, locals: Rc::new(RefCell::new(HashMap::new())) }
+    }
+    /// True for environments where `var` declarations land (function and global).
+    fn is_function_scope(&self) -> bool {
+        matches!(self.kind, EnvKind::Function | EnvKind::Global)
     }
 }
 
@@ -328,8 +357,13 @@ impl JsObject {
         self.properties.contains_key(key)
     }
 
+    /// Returns true if deleted, false if the property is non-configurable (ECMA-262 §10.1.10).
     pub fn delete_own(&mut self, key: &str) -> bool {
-        self.properties.remove(key).is_some()
+        match self.properties.get(key) {
+            Some(p) if !p.is_configurable() => false,
+            Some(_) => { self.properties.remove(key); true }
+            None => true,
+        }
     }
 
     /// Own enumerable string keys, sorted (for `Object.keys`, `for…in`).
@@ -350,6 +384,37 @@ impl JsObject {
     }
 }
 
+// ─── Array with per-element Property descriptors (ECMA-262 §10.4.2) ─────────
+
+/// Plain array that also tracks per-element `Property` overrides.
+/// Created lazily (from a bare `Vec`) only when `Object.defineProperty` is called
+/// on an array with non-default `writable`/`enumerable`/`configurable` flags.
+#[derive(Clone, Debug)]
+pub(crate) struct JsArray {
+    pub elements: Vec<JsValue>,
+    /// Per-index property overrides; only populated for indices that differ from
+    /// the default (writable=true, enumerable=true, configurable=true).
+    pub overrides: HashMap<usize, Property>,
+    /// False only after `Object.defineProperty(arr,"length",{writable:false})`.
+    pub length_writable: bool,
+}
+
+impl JsArray {
+    fn from_vec(elements: Vec<JsValue>) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(JsArray {
+            elements,
+            overrides: HashMap::new(),
+            length_writable: true,
+        }))
+    }
+    fn is_index_writable(&self, idx: usize) -> bool {
+        self.overrides.get(&idx).map(|p| p.is_writable()).unwrap_or(true)
+    }
+    fn is_index_configurable(&self, idx: usize) -> bool {
+        self.overrides.get(&idx).map(|p| p.is_configurable()).unwrap_or(true)
+    }
+}
+
 // ─── JsValue ──────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -363,6 +428,9 @@ enum JsValue {
     /// Heap-allocated ordinary object with a prototype chain (reference semantics).
     Object(Rc<RefCell<JsObject>>),
     Array(Vec<JsValue>),
+    /// Array that has been "upgraded" by `Object.defineProperty` to track
+    /// per-element property descriptors. Reference semantics (Rc).
+    RichArray(Rc<RefCell<JsArray>>),
     Function(JsFunction),
     ElementRef(String),
     NodeList(Vec<String>),
@@ -408,10 +476,10 @@ impl PartialEq for JsValue {
             (JsValue::String(a), JsValue::String(b)) => a == b,
             // Objects use identity (reference) equality — same Rc pointer = same object.
             (JsValue::Object(a), JsValue::Object(b)) => Rc::ptr_eq(a, b),
-            // Arrays are value-semantics Vecs in JBS — two separate instances are never
-            // the same reference, and deep comparison recurses infinitely on self-referential
-            // arrays. JS semantics: different array refs are never ===, so always false.
+            // Plain arrays: two separate Vec instances are never ===.
             (JsValue::Array(_), JsValue::Array(_)) => false,
+            // RichArrays: compare by Rc identity (reference semantics, like Objects).
+            (JsValue::RichArray(a), JsValue::RichArray(b)) => Rc::ptr_eq(a, b),
             (JsValue::HostFunction(a), JsValue::HostFunction(b)) => a == b,
             (JsValue::HostObject(a), JsValue::HostObject(b)) => a == b,
             (JsValue::ElementRef(a), JsValue::ElementRef(b)) => a == b,
@@ -442,6 +510,30 @@ impl JsValue {
             }
         }
         JsValue::Object(rc)
+    }
+
+    /// True if this value is any kind of array (plain Vec or RichArray).
+    fn is_array_like(&self) -> bool {
+        matches!(self, JsValue::Array(_) | JsValue::RichArray(_))
+    }
+
+    /// Clone the elements Vec from either Array variant (cheap for plain Array,
+    /// borrows for RichArray).
+    fn array_elements_cloned(&self) -> Option<Vec<JsValue>> {
+        match self {
+            JsValue::Array(v) => Some(v.clone()),
+            JsValue::RichArray(rc) => Some(rc.borrow().elements.clone()),
+            _ => None,
+        }
+    }
+
+    /// Length of the array, handling both variants.
+    fn array_len(&self) -> Option<usize> {
+        match self {
+            JsValue::Array(v) => Some(v.len()),
+            JsValue::RichArray(rc) => Some(rc.borrow().elements.len()),
+            _ => None,
+        }
     }
 }
 
@@ -482,12 +574,22 @@ impl BrowserExecutionState {
 
     /// `[[Set]]` — invokes accessor setters or writes a data property.
     fn obj_set(&mut self, rc: &Rc<RefCell<JsObject>>, key: &str, value: JsValue) {
-        // Check own accessor setter.
-        let setter = rc.borrow().get_own(key)
-            .and_then(|p| if let Property::Accessor { set: Some(s), .. } = p { Some(s.clone()) } else { None });
-        if let Some(setter) = setter {
-            self.call_value(setter, JsValue::Object(rc.clone()), vec![value]);
-            return;
+        // Check own property first.
+        let own = rc.borrow().get_own(key).cloned();
+        match own {
+            Some(Property::Accessor { set: Some(setter), .. }) => {
+                self.call_value(setter, JsValue::Object(rc.clone()), vec![value]);
+                return;
+            }
+            Some(Property::Accessor { set: None, .. }) => {
+                // No setter — silently fail in sloppy mode (ECMA-262 §10.1.9).
+                return;
+            }
+            Some(Property::Data { writable: false, .. }) => {
+                // Non-writable data property — silently fail in sloppy mode.
+                return;
+            }
+            Some(Property::Data { .. }) | None => {}
         }
         // Check prototype chain for inherited setter.
         let proto = rc.borrow().prototype.clone();
@@ -1113,7 +1215,8 @@ impl BrowserExecutionState {
             Statement::TryCatch(tc) => {
                 let tc = tc.clone();
                 // try body
-                self.stack.push(StackFrame::default());
+                self.stack.push(StackFrame::block_scope());
+                self.hoist_tdz_bindings(&tc.body.body);
                 for stmt in &tc.body.body {
                     self.execute_statement(stmt);
                     if self.early_exit.is_some() {
@@ -1125,10 +1228,11 @@ impl BrowserExecutionState {
                 // catch
                 if let Some(EarlyExit::Throw(err_val)) = self.early_exit.take() {
                     if let Some(catch_body) = &tc.catch_body.clone() {
-                        self.stack.push(StackFrame::default());
+                        self.stack.push(StackFrame::block_scope());
                         if let Some(param) = tc.catch_param.clone() {
                             self.execute_binding(&param, err_val);
                         }
+                        self.hoist_tdz_bindings(&catch_body.body);
                         for stmt in &catch_body.body {
                             self.execute_statement(stmt);
                             if self.early_exit.is_some() {
@@ -1142,7 +1246,8 @@ impl BrowserExecutionState {
                 // finally — always runs; preserves outer early_exit if finally doesn't set one
                 if let Some(finally_body) = tc.finally_body.clone() {
                     let saved = self.early_exit.take();
-                    self.stack.push(StackFrame::default());
+                    self.stack.push(StackFrame::block_scope());
+                    self.hoist_tdz_bindings(&finally_body.body);
                     for stmt in &finally_body.body {
                         self.execute_statement(stmt);
                         if self.early_exit.is_some() {
@@ -1170,16 +1275,28 @@ impl BrowserExecutionState {
                         .collect(),
                     _ => vec![],
                 };
-                let for_of_is_var = stmt.binding_kind == VarKind::Var;
+                let for_of_kind = stmt.binding_kind;
                 for item in items {
                     if self.execution_budget_exhausted {
                         break;
                     }
-                    self.stack.push(StackFrame::default());
-                    if for_of_is_var {
-                        self.execute_var_binding(&stmt.binding, item);
-                    } else {
-                        self.execute_binding(&stmt.binding, item);
+                    self.stack.push(StackFrame::block_scope());
+                    match for_of_kind {
+                        VarKind::Var => self.execute_var_binding(&stmt.binding, item),
+                        VarKind::Const => {
+                            if let Binding::Name(name) = &stmt.binding {
+                                self.initialize_binding(name, item, false);
+                            } else {
+                                self.execute_binding(&stmt.binding, item);
+                            }
+                        }
+                        VarKind::Let => {
+                            if let Binding::Name(name) = &stmt.binding {
+                                self.initialize_binding(name, item, true);
+                            } else {
+                                self.execute_binding(&stmt.binding, item);
+                            }
+                        }
                     }
                     self.execute_statement(&stmt.body);
                     self.stack.pop();
@@ -1204,16 +1321,29 @@ impl BrowserExecutionState {
                     JsValue::Object(rc) => rc.borrow().own_enumerable_keys(),
                     _ => vec![],
                 };
-                let for_in_is_var = stmt.binding_kind == VarKind::Var;
+                let for_in_kind = stmt.binding_kind;
                 for key in keys {
                     if self.execution_budget_exhausted {
                         break;
                     }
-                    self.stack.push(StackFrame::default());
-                    if for_in_is_var {
-                        self.execute_var_binding(&stmt.binding, JsValue::String(key));
-                    } else {
-                        self.execute_binding(&stmt.binding, JsValue::String(key));
+                    self.stack.push(StackFrame::block_scope());
+                    let key_val = JsValue::String(key);
+                    match for_in_kind {
+                        VarKind::Var => self.execute_var_binding(&stmt.binding, key_val),
+                        VarKind::Const => {
+                            if let Binding::Name(name) = &stmt.binding {
+                                self.initialize_binding(name, key_val, false);
+                            } else {
+                                self.execute_binding(&stmt.binding, key_val);
+                            }
+                        }
+                        VarKind::Let => {
+                            if let Binding::Name(name) = &stmt.binding {
+                                self.initialize_binding(name, key_val, true);
+                            } else {
+                                self.execute_binding(&stmt.binding, key_val);
+                            }
+                        }
                     }
                     self.execute_statement(&stmt.body);
                     self.stack.pop();
@@ -1319,8 +1449,9 @@ impl BrowserExecutionState {
     }
 
     fn execute_block(&mut self, block: &BlockStatement) {
-        self.stack.push(StackFrame::default());
+        self.stack.push(StackFrame::block_scope());
         self.hoist_function_declarations(&block.body);
+        self.hoist_tdz_bindings(&block.body);
         for statement in &block.body {
             self.execute_statement(statement);
             if self.early_exit.is_some() {
@@ -1345,14 +1476,18 @@ impl BrowserExecutionState {
             if is_var {
                 self.execute_var_binding(&binding, value);
             } else if is_const {
-                // const: declare as immutable slot (Phase B).
                 if let Binding::Name(name) = &binding {
-                    self.declare_binding(name, value, false);
+                    self.initialize_binding(name, value, false);
                 } else {
                     self.execute_binding(&binding, value);
                 }
             } else {
-                self.execute_binding(&binding, value);
+                // let
+                if let Binding::Name(name) = &binding {
+                    self.initialize_binding(name, value, true);
+                } else {
+                    self.execute_binding(&binding, value);
+                }
             }
         }
     }
@@ -1539,7 +1674,42 @@ impl BrowserExecutionState {
                 self.execute_expression(expr);
                 JsValue::Undefined
             }
-            Expression::Delete(_) => JsValue::Boolean(true),
+            Expression::Delete(inner) => {
+                let inner = inner.clone();
+                match inner.as_ref() {
+                    Expression::Member { object, property, .. } => {
+                        let obj_val = self.execute_expression(object);
+                        let key = match property {
+                            crate::ast::MemberProperty::Named(name) => name.clone(),
+                            crate::ast::MemberProperty::Computed(expr) => {
+                                Self::value_to_string(&self.execute_expression(expr))
+                            }
+                        };
+                        match obj_val {
+                            JsValue::Object(rc) => {
+                                // Non-configurable → return false in sloppy mode (ECMA-262 §13.5.1).
+                                JsValue::Boolean(rc.borrow_mut().delete_own(&key))
+                            }
+                            JsValue::Array(mut arr) => {
+                                if let Ok(idx) = key.parse::<usize>() {
+                                    if idx < arr.len() {
+                                        arr[idx] = JsValue::Undefined;
+                                        self.assign_target(object, JsValue::Array(arr));
+                                    }
+                                }
+                                JsValue::Boolean(true)
+                            }
+                            _ => JsValue::Boolean(true),
+                        }
+                    }
+                    // Declared identifiers are non-deletable (ECMA-262 §13.5.1.2).
+                    Expression::Identifier(_) => JsValue::Boolean(false),
+                    _ => {
+                        self.execute_expression(&inner);
+                        JsValue::Boolean(true)
+                    }
+                }
+            }
             Expression::Await(expr) => self.execute_expression(expr),
             Expression::New { callee, arguments } => {
                 if matches!(callee.as_ref(), Expression::Identifier(name) if name == "Date") {
@@ -1713,7 +1883,20 @@ impl BrowserExecutionState {
             }
             Expression::Spread(_) | Expression::Super => JsValue::Undefined,
             Expression::Class(decl) => self.execute_class_decl(decl),
-            Expression::Identifier(name) => self.get_identifier_value(name),
+            Expression::Identifier(name) => {
+                // TDZ: if the name is bound in scope but the slot is uninitialized,
+                // throw ReferenceError per ECMA-262 §9.1.1.1 GetBindingValue.
+                let tdz_hit = self.stack.iter().rev().find_map(|frame| {
+                    frame.locals.borrow().get(name).map(|s| !s.initialized)
+                });
+                if tdz_hit == Some(true) {
+                    let msg = format!("Cannot access '{}' before initialization", name);
+                    let err = Self::make_error_obj("ReferenceError", msg);
+                    self.early_exit = Some(EarlyExit::Throw(err));
+                    return JsValue::Undefined;
+                }
+                self.get_identifier_value(name)
+            }
             Expression::Number(value) => JsValue::Number(*value),
             Expression::BigInt(s) => JsValue::BigInt(s.parse().unwrap_or(0)),
             Expression::String(value) => JsValue::String(value.clone()),
@@ -3278,7 +3461,7 @@ impl BrowserExecutionState {
         let Some(target_expr) = arguments.first() else {
             return JsValue::Undefined;
         };
-        let mut target = self.execute_expression(target_expr);
+        let target = self.execute_expression(target_expr);
         let key = arguments
             .get(1)
             .map(|argument| self.execute_expression(argument))
@@ -3289,16 +3472,88 @@ impl BrowserExecutionState {
             .map(|argument| self.execute_expression(argument))
             .unwrap_or(JsValue::Undefined);
 
-        if let (JsValue::Object(rc), JsValue::Object(desc)) = (&target, descriptor) {
-            let desc_borrow = desc.borrow();
-            if let Some(val) = desc_borrow.get_own_data("value") {
-                rc.borrow_mut().set(key.clone(), val);
-            } else if let Some(getter) = desc_borrow.get_own_data("get") {
-                rc.borrow_mut().set_getter(key.clone(), getter);
+        match (&target, descriptor) {
+            (JsValue::Object(rc), JsValue::Object(desc)) => {
+                let rc = rc.clone();
+                if !Self::apply_property_descriptor(&rc, key.clone(), &desc) {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError", format!("Cannot redefine property: {key}"))));
+                    return JsValue::Undefined;
+                }
+                target
             }
-            target
+            (JsValue::Array(_), JsValue::Object(desc)) | (JsValue::RichArray(_), JsValue::Object(desc)) => {
+                let new_target = Self::array_apply_define_property(target, &key, &desc);
+                self.assign_target(target_expr, new_target.clone());
+                new_target
+            }
+            _ => JsValue::Undefined,
+        }
+    }
+
+    /// Apply a property descriptor to an Array or RichArray, upgrading to RichArray
+    /// when non-default flags (writable/enumerable/configurable) are present.
+    /// Returns the (possibly upgraded) array value.
+    fn array_apply_define_property(target: JsValue, key: &str, desc: &Rc<RefCell<JsObject>>) -> JsValue {
+        let (mut elements, mut overrides, mut length_writable) = match &target {
+            JsValue::Array(v) => (v.clone(), HashMap::new(), true),
+            JsValue::RichArray(rc) => {
+                let a = rc.borrow();
+                (a.elements.clone(), a.overrides.clone(), a.length_writable)
+            }
+            _ => return target,
+        };
+        let desc_ref = desc.borrow();
+        let new_value = desc_ref.get_own_data("value");
+        let new_writable = desc_ref.get_own_data("writable");
+        let new_enumerable = desc_ref.get_own_data("enumerable");
+        let new_configurable = desc_ref.get_own_data("configurable");
+        let has_get = desc_ref.has_own("get");
+        let has_set = desc_ref.has_own("set");
+        drop(desc_ref);
+
+        const MAX_DENSE: usize = 100_000;
+        let mut needs_rich = !overrides.is_empty() || !length_writable;
+
+        if key == "length" {
+            if let Some(v) = &new_value {
+                let new_len = Self::value_to_number(v) as usize;
+                if new_len < elements.len() { elements.truncate(new_len); }
+                else if new_len <= MAX_DENSE { elements.resize(new_len, JsValue::Undefined); }
+            }
+            if new_writable.as_ref().map(|v| matches!(v, JsValue::Boolean(false))).unwrap_or(false) {
+                length_writable = false;
+                needs_rich = true;
+            }
+        } else if let Ok(idx) = key.parse::<usize>() {
+            let writable = new_writable.as_ref().map(|v| matches!(v, JsValue::Boolean(true))).unwrap_or(true);
+            let enumerable = new_enumerable.as_ref().map(|v| matches!(v, JsValue::Boolean(true))).unwrap_or(true);
+            let configurable = new_configurable.as_ref().map(|v| matches!(v, JsValue::Boolean(true))).unwrap_or(true);
+            if let Some(val) = new_value.clone() {
+                if idx < MAX_DENSE {
+                    if idx >= elements.len() { elements.resize(idx + 1, JsValue::Undefined); }
+                    elements[idx] = val.clone();
+                }
+            }
+            if !writable || !enumerable || !configurable || has_get || has_set {
+                needs_rich = true;
+                let val = new_value.unwrap_or_else(|| elements.get(idx).cloned().unwrap_or(JsValue::Undefined));
+                overrides.insert(idx, Property::Data { value: val, writable, enumerable, configurable });
+            } else {
+                overrides.remove(&idx);
+            }
+        }
+
+        if needs_rich {
+            let ja = JsArray { elements, overrides, length_writable };
+            if let JsValue::RichArray(rc) = &target {
+                *rc.borrow_mut() = ja;
+                target
+            } else {
+                JsValue::RichArray(Rc::new(RefCell::new(ja)))
+            }
         } else {
-            JsValue::Undefined
+            JsValue::Array(elements)
         }
     }
 
@@ -3312,6 +3567,7 @@ impl BrowserExecutionState {
             // arrays are never the same reference. Avoid deep Vec comparison
             // which would recurse infinitely for self-referential arrays.
             (JsValue::Array(_), JsValue::Array(_)) => false,
+            (JsValue::RichArray(a), JsValue::RichArray(b)) => Rc::ptr_eq(a, b),
             (JsValue::Undefined, JsValue::Undefined) => true,
             (JsValue::Null, JsValue::Null) => true,
             (JsValue::Boolean(a), JsValue::Boolean(b)) => a == b,
@@ -3319,7 +3575,9 @@ impl BrowserExecutionState {
             (JsValue::String(a), JsValue::String(b)) => a == b,
             (JsValue::Object(a), JsValue::Object(b)) => Rc::ptr_eq(a, b),
             (JsValue::HostFunction(a), JsValue::HostFunction(b)) => a == b,
-            // Functions: avoid structural equality (can overflow via captures).
+            // Functions compare by stable ID (assigned at creation, preserved through Clone).
+            // This mirrors JS object-identity semantics without requiring Rc.
+            (JsValue::Function(a), JsValue::Function(b)) => a.id == b.id,
             _ => false,
         }
     }
@@ -3354,9 +3612,16 @@ impl BrowserExecutionState {
                     return false;
                 }
             }
+            // Merge with existing get/set — only overwrite if explicitly specified in desc.
+            let (existing_get, existing_set) = match &existing {
+                Some(Property::Accessor { get, set, .. }) => (get.clone(), set.clone()),
+                _ => (None, None),
+            };
+            let merged_get = if has_get { getter } else { existing_get };
+            let merged_set = if has_set { setter } else { existing_set };
             let enumerable = new_enumerable.map(|v| matches!(v, JsValue::Boolean(true))).unwrap_or(def_enumerable);
             let configurable = new_configurable.map(|v| matches!(v, JsValue::Boolean(true))).unwrap_or(def_configurable);
-            target.borrow_mut().define(key, Property::Accessor { get: getter, set: setter, enumerable, configurable });
+            target.borrow_mut().define(key, Property::Accessor { get: merged_get, set: merged_set, enumerable, configurable });
             true
         } else {
             let new_value = desc_ref.get_own_data("value");
@@ -3477,15 +3742,20 @@ impl BrowserExecutionState {
                 let obj = iter.next().unwrap_or(JsValue::Undefined);
                 let key = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
                 let descriptor = iter.next().unwrap_or(JsValue::Undefined);
-                if let (JsValue::Object(rc), JsValue::Object(desc)) = (obj, descriptor) {
-                    if !Self::apply_property_descriptor(&rc, key.clone(), &desc) {
-                        self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
-                            "TypeError", format!("Cannot redefine property: {key}"))));
-                        return JsValue::Undefined;
+                match (obj, descriptor) {
+                    (JsValue::Object(rc), JsValue::Object(desc)) => {
+                        if !Self::apply_property_descriptor(&rc, key.clone(), &desc) {
+                            self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                                "TypeError", format!("Cannot redefine property: {key}"))));
+                            return JsValue::Undefined;
+                        }
+                        JsValue::Object(rc)
                     }
-                    JsValue::Object(rc)
-                } else {
-                    JsValue::Undefined
+                    (arr_val @ JsValue::Array(_), JsValue::Object(desc)) |
+                    (arr_val @ JsValue::RichArray(_), JsValue::Object(desc)) => {
+                        Self::array_apply_define_property(arr_val, &key, &desc)
+                    }
+                    _ => JsValue::Undefined,
                 }
             }
             "getOwnPropertyDescriptor" => {
@@ -3583,7 +3853,7 @@ impl BrowserExecutionState {
 
     fn call_array_static(&self, name: &str, args: Vec<JsValue>) -> JsValue {
         match name {
-            "isArray" => JsValue::Boolean(matches!(args.first(), Some(JsValue::Array(_)))),
+            "isArray" => JsValue::Boolean(matches!(args.first(), Some(JsValue::Array(_) | JsValue::RichArray(_)))),
             "from" => match args.into_iter().next() {
                 Some(JsValue::Array(a)) => JsValue::Array(a),
                 Some(JsValue::String(s)) => {
@@ -4358,6 +4628,22 @@ impl BrowserExecutionState {
                     // get stored in their parent expression.
                     self.assign_target(object, JsValue::Object(rc));
                 }
+                JsValue::RichArray(rc) => {
+                    if let Ok(idx) = key.parse::<usize>() {
+                        let mut arr = rc.borrow_mut();
+                        if arr.is_index_writable(idx) {
+                            const MAX_DENSE: usize = 100_000;
+                            if idx < MAX_DENSE {
+                                if idx >= arr.elements.len() {
+                                    arr.elements.resize(idx + 1, JsValue::Undefined);
+                                }
+                                arr.elements[idx] = value;
+                            }
+                        }
+                        // else: non-writable — silently ignore in sloppy mode
+                    }
+                    // No writeback needed: Rc mutation is visible to all holders.
+                }
                 JsValue::Array(mut arr) => {
                     if let Ok(idx) = key.parse::<usize>() {
                         const MAX_DENSE_INDEX: usize = 100_000;
@@ -5130,6 +5416,28 @@ impl BrowserExecutionState {
                     JsValue::Array(_) => self
                         .native_prototype_property("Array", property)
                         .unwrap_or(JsValue::Undefined),
+                    JsValue::RichArray(rc) if property == "length" => {
+                        JsValue::Number(rc.borrow().elements.len() as f64)
+                    }
+                    JsValue::RichArray(rc) => {
+                        // Numeric index read — check per-element overrides then elements Vec.
+                        if let Ok(idx) = property.parse::<usize>() {
+                            let arr = rc.borrow();
+                            if let Some(Property::Accessor { get: Some(getter), .. }) = arr.overrides.get(&idx) {
+                                let getter = getter.clone();
+                                drop(arr);
+                                if let JsValue::Function(f) = getter {
+                                    return self.call_function(f, vec![]);
+                                }
+                            } else {
+                                let val = arr.elements.get(idx).cloned().unwrap_or(JsValue::Undefined);
+                                drop(arr);
+                                return val;
+                            }
+                        }
+                        self.native_prototype_property("Array", property)
+                            .unwrap_or(JsValue::Undefined)
+                    }
                     _ => JsValue::Undefined,
                 };
                 let prototype_attempted =
@@ -5407,7 +5715,7 @@ impl BrowserExecutionState {
     // `var` is function-scoped: skip block frames and land in the nearest function frame.
     fn set_var(&mut self, name: &str, value: JsValue) {
         for frame in self.stack.iter().rev() {
-            if frame.is_function_scope {
+            if frame.is_function_scope() {
                 frame.locals.borrow_mut().insert(name.to_owned(), Slot::var(value));
                 return;
             }
@@ -5417,7 +5725,63 @@ impl BrowserExecutionState {
 
     fn ensure_global_frame(&mut self) {
         if self.stack.is_empty() {
-            self.stack.push(StackFrame::function_scope());
+            self.stack.push(StackFrame::global_scope());
+        }
+    }
+
+    /// Initialize a `let`/`const` binding in the topmost frame.
+    /// If a TDZ placeholder already exists (inserted by `hoist_tdz_bindings`), marks it
+    /// initialized. Otherwise creates a new slot (handles scopes entered without hoisting).
+    fn initialize_binding(&mut self, name: &str, value: JsValue, mutable: bool) {
+        self.ensure_global_frame();
+        if let Some(frame) = self.stack.last() {
+            let mut locals = frame.locals.borrow_mut();
+            if let Some(slot) = locals.get_mut(name) {
+                slot.value = value;
+                slot.initialized = true;
+                return;
+            }
+            let slot = if mutable { Slot::var(value) } else { Slot::const_(value) };
+            locals.insert(name.to_owned(), slot);
+        }
+    }
+
+    /// Scan direct-child statements for `let`/`const` declarations and insert TDZ
+    /// (uninitialized) slots in the current frame. Called at block entry before any
+    /// statements execute so that accesses before the declaration line throw ReferenceError.
+    fn hoist_tdz_bindings(&mut self, stmts: &[Statement]) {
+        let mut tdz: Vec<(String, bool)> = Vec::new();
+        for stmt in stmts {
+            if let Statement::VariableDeclaration(decl) = stmt {
+                if decl.kind == VarKind::Let || decl.kind == VarKind::Const {
+                    let mutable = decl.kind == VarKind::Let;
+                    for declarator in &decl.declarations {
+                        Self::collect_binding_names_for_tdz(&declarator.id, mutable, &mut tdz);
+                    }
+                }
+            }
+        }
+        if let Some(frame) = self.stack.last() {
+            let mut locals = frame.locals.borrow_mut();
+            for (name, mutable) in tdz {
+                locals.entry(name).or_insert_with(|| Slot::tdz(mutable));
+            }
+        }
+    }
+
+    fn collect_binding_names_for_tdz(binding: &Binding, mutable: bool, out: &mut Vec<(String, bool)>) {
+        match binding {
+            Binding::Name(name) => out.push((name.clone(), mutable)),
+            Binding::Object(props) => {
+                for prop in props {
+                    Self::collect_binding_names_for_tdz(&prop.binding, mutable, out);
+                }
+            }
+            Binding::Array(items) => {
+                for item in items.iter().flatten() {
+                    Self::collect_binding_names_for_tdz(item, mutable, out);
+                }
+            }
         }
     }
 
@@ -5514,6 +5878,7 @@ impl BrowserExecutionState {
         let result = match func.body {
             FunctionBody::Block(block) => {
                 self.hoist_function_declarations(&block.body);
+                self.hoist_tdz_bindings(&block.body);
                 for stmt in &block.body {
                     self.execute_statement(stmt);
                     if self.early_exit.is_some() {
@@ -5577,6 +5942,7 @@ impl BrowserExecutionState {
         let result = match func.body {
             FunctionBody::Block(block) => {
                 self.hoist_function_declarations(&block.body);
+                self.hoist_tdz_bindings(&block.body);
                 for stmt in &block.body {
                     self.execute_statement(stmt);
                     if self.early_exit.is_some() {
@@ -5788,6 +6154,7 @@ impl BrowserExecutionState {
             JsValue::String(s) => !s.is_empty(),
             JsValue::Object(_)
             | JsValue::Array(_)
+            | JsValue::RichArray(_)
             | JsValue::Function(_)
             | JsValue::ElementRef(_)
             | JsValue::NodeList(_)
@@ -5821,6 +6188,7 @@ impl BrowserExecutionState {
             JsValue::Undefined
             | JsValue::Object(_)
             | JsValue::Array(_)
+            | JsValue::RichArray(_)
             | JsValue::Function(_)
             | JsValue::ElementRef(_)
             | JsValue::NodeList(_)
@@ -5904,6 +6272,11 @@ impl BrowserExecutionState {
             }
             JsValue::String(value) => value.clone(),
             JsValue::Array(items) => items
+                .iter()
+                .map(|v| Self::value_to_string(v))
+                .collect::<Vec<_>>()
+                .join(","),
+            JsValue::RichArray(rc) => rc.borrow().elements
                 .iter()
                 .map(|v| Self::value_to_string(v))
                 .collect::<Vec<_>>()
@@ -6183,15 +6556,19 @@ impl BrowserExecutionState {
                     JsValue::Object(rc) => JsValue::Boolean(rc.borrow().has_own(&key)),
                     JsValue::Array(items) => JsValue::Boolean(
                         key == "length"
-                            || key
-                                .parse::<usize>()
-                                .map_or(false, |i| i < items.len()),
+                            || key.parse::<usize>().map_or(false, |i| i < items.len()),
                     ),
+                    JsValue::RichArray(rc) => {
+                        let arr = rc.borrow();
+                        JsValue::Boolean(
+                            key == "length"
+                                || arr.overrides.contains_key(&key.parse::<usize>().unwrap_or(usize::MAX))
+                                || key.parse::<usize>().map_or(false, |i| i < arr.elements.len()),
+                        )
+                    }
                     JsValue::String(s) => JsValue::Boolean(
                         key == "length"
-                            || key
-                                .parse::<usize>()
-                                .map_or(false, |i| i < s.chars().count()),
+                            || key.parse::<usize>().map_or(false, |i| i < s.chars().count()),
                     ),
                     JsValue::HostFunction(fn_name) => {
                         JsValue::Boolean(Self::host_fn_has_own_property(fn_name, &key))
@@ -7011,7 +7388,7 @@ impl BrowserExecutionState {
     fn member_prototype_fallback_owner(value: &JsValue) -> Option<&'static str> {
         match value {
             JsValue::String(_) => Some("String"),
-            JsValue::Array(_) => Some("Array"),
+            JsValue::Array(_) | JsValue::RichArray(_) => Some("Array"),
             JsValue::Function(_) | JsValue::HostFunction(_) | JsValue::BoundHostFunction { .. } => {
                 Some("Function")
             }
@@ -7058,7 +7435,7 @@ impl BrowserExecutionState {
             JsValue::Number(_) => "Number",
             JsValue::String(_) => "String",
             JsValue::Object(_) | JsValue::Proxy { .. } => "Object",
-            JsValue::Array(_) => "Array",
+            JsValue::Array(_) | JsValue::RichArray(_) => "Array",
             JsValue::Function(_) | JsValue::HostFunction(_) | JsValue::BoundHostFunction { .. } => {
                 "Function"
             }
@@ -7199,6 +7576,29 @@ impl BrowserExecutionState {
                     }
                 }
             }
+            JsValue::RichArray(rc) => {
+                let arr = rc.borrow();
+                match prop {
+                    "length" => make_data(JsValue::Number(arr.elements.len() as f64), arr.length_writable, false, false),
+                    _ => {
+                        if let Ok(idx) = prop.parse::<usize>() {
+                            // Return the override descriptor if present, otherwise default data.
+                            if let Some(override_prop) = arr.overrides.get(&idx) {
+                                return match override_prop {
+                                    Property::Data { value, writable, enumerable, configurable } =>
+                                        make_data(value.clone(), *writable, *enumerable, *configurable),
+                                    Property::Accessor { get, set, enumerable, configurable } =>
+                                        make_accessor(get.clone().unwrap_or(JsValue::Undefined), *enumerable, *configurable),
+                                };
+                            }
+                            if let Some(val) = arr.elements.get(idx) {
+                                return make_data(val.clone(), true, true, true);
+                            }
+                        }
+                        JsValue::Undefined
+                    }
+                }
+            }
             _ => JsValue::Undefined,
         }
     }
@@ -7282,7 +7682,7 @@ impl BrowserExecutionState {
                     | "defineProperty" | "defineProperties" | "getOwnPropertyNames"
                     | "getOwnPropertySymbols" | "getOwnPropertyDescriptor"
                     | "getOwnPropertyDescriptors" | "getPrototypeOf" | "setPrototypeOf"
-                    | "is" | "fromEntries" | "hasOwn"
+                    | "is" | "fromEntries" | "hasOwn" | "groupBy"
             ),
             "Number" => matches!(
                 property,
@@ -7305,6 +7705,10 @@ impl BrowserExecutionState {
                     | "isExtensible" | "ownKeys" | "preventExtensions" | "set"
                     | "setPrototypeOf"
             ),
+            "BigInt" => matches!(property, "asIntN" | "asUintN"),
+            "Date"   => matches!(property, "parse" | "UTC" | "now"),
+            "Map"    => matches!(property, "groupBy"),
+            "RegExp" => matches!(property, "escape"),
             "Promise" => matches!(property, "resolve" | "reject" | "all" | "allSettled" | "any" | "race"),
             "Symbol" => matches!(property, "for" | "keyFor"),
             "JSON" => matches!(property, "parse" | "stringify" | "rawJSON" | "isRawJSON"),
@@ -7382,6 +7786,9 @@ impl BrowserExecutionState {
             "Array" | "Object" | "Function" | "String" | "Number" | "Boolean"
             | "RegExp" | "Error" | "TypeError" | "RangeError" | "ReferenceError"
             | "SyntaxError" | "URIError" | "EvalError" => 1,
+            "BigInt.asIntN" | "BigInt.asUintN" | "Object.groupBy" => 2,
+            "Date.parse" | "Date.UTC" | "Date.now" | "Map.groupBy" | "RegExp.escape" => 1,
+            "BigInt" => 1,
             "Math.random" | "Array.fromAsync" => 0,
             "String.prototype.link" | "String.prototype.anchor"
             | "String.prototype.fontcolor" | "String.prototype.fontsize" => 1,
@@ -8039,6 +8446,10 @@ fn json_stringify(value: &JsValue) -> String {
         }
         JsValue::Array(items) => {
             let parts: Vec<String> = items.iter().map(json_stringify).collect();
+            format!("[{}]", parts.join(","))
+        }
+        JsValue::RichArray(rc) => {
+            let parts: Vec<String> = rc.borrow().elements.iter().map(json_stringify).collect();
             format!("[{}]", parts.join(","))
         }
         JsValue::Object(rc) => {
