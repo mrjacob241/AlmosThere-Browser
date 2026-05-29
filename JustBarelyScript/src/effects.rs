@@ -7,10 +7,10 @@ use crate::{
     Program,
     ast::{
         BinaryOperator, Binding, BlockStatement, ClassDeclaration, ClassField, DoWhileStatement,
-        ExportDeclaration, ExportDefaultDeclaration, Expression, ForInStatement, ForStatement,
-        FunctionBody, IfStatement, ImportSpecifier, MemberProperty, MethodKind, ObjectProperty,
-        Param, Statement, SwitchStatement, UnaryOperator, VarKind, VariableDeclaration,
-        WhileStatement,
+        ExportDeclaration, ExportDefaultDeclaration, Expression, ForInStatement, ForOfStatement,
+        ForStatement, FunctionBody, IfStatement, ImportSpecifier, MemberProperty, MethodKind,
+        ObjectProperty, Param, Statement, SwitchStatement, TemplateElement, UnaryOperator, VarKind,
+        VariableDeclaration, WhileStatement,
     },
 };
 
@@ -140,6 +140,14 @@ enum PromiseReaction {
         on_rejected: Option<JsFunction>,
         chained: Rc<RefCell<PromiseState>>,
     },
+    Finally {
+        on_finally: Option<JsFunction>,
+        chained: Rc<RefCell<PromiseState>>,
+    },
+    FinallyContinuation {
+        original: PromiseStatus,
+        chained: Rc<RefCell<PromiseState>>,
+    },
     AllElement {
         index: usize,
         values: Rc<RefCell<Vec<JsValue>>>,
@@ -225,6 +233,10 @@ enum LoopCursor {
         keys: Vec<String>,
         next_index: usize,
     },
+    ForOf {
+        statement: ForOfStatement,
+        iterator: IteratorRecord,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -251,10 +263,68 @@ struct AsyncContinuation {
 
 #[derive(Clone, Debug)]
 enum ExpressionContinuation {
+    Then {
+        first: Box<ExpressionContinuation>,
+        next: Box<ExpressionContinuation>,
+    },
     Call {
         callee: JsValue,
         prefix: Vec<JsValue>,
         remaining: Vec<Expression>,
+    },
+    CallCallee {
+        arguments: Vec<Expression>,
+    },
+    ReevaluateCall {
+        callee: Expression,
+        arguments: Vec<Expression>,
+    },
+    MethodCall {
+        receiver: JsValue,
+        method_name: String,
+        arguments: Vec<Expression>,
+    },
+    MemberObject {
+        property: MemberProperty,
+        optional: bool,
+    },
+    MemberComputedKey {
+        receiver: JsValue,
+    },
+    BinaryLeft {
+        op: BinaryOperator,
+        right: Expression,
+    },
+    BinaryRight {
+        op: BinaryOperator,
+        left: JsValue,
+    },
+    TernaryTest {
+        consequent: Expression,
+        alternate: Expression,
+    },
+    TernaryBranch,
+    YieldStar {
+        iterator: IteratorRecord,
+    },
+    ArrayLiteral {
+        values: Vec<JsValue>,
+        remaining: Vec<Expression>,
+        resume_spread: bool,
+    },
+    ObjectLiteralKey {
+        object: Rc<RefCell<JsObject>>,
+        property: ObjectProperty,
+        remaining: Vec<ObjectProperty>,
+    },
+    ObjectLiteralValue {
+        object: Rc<RefCell<JsObject>>,
+        key: String,
+        remaining: Vec<ObjectProperty>,
+    },
+    TemplateLiteral {
+        text: String,
+        remaining: Vec<TemplateElement>,
     },
 }
 
@@ -741,6 +811,13 @@ enum JsValue {
         get: Option<JsFunction>,
     },
     WeakMap(HashMap<String, JsValue>),
+}
+
+#[derive(Clone, Debug)]
+enum IteratorRecord {
+    Indexed { items: Vec<JsValue>, index: usize },
+    Object { iterator: JsValue },
+    Generator { state: Rc<RefCell<GeneratorState>> },
 }
 
 impl PartialEq for JsValue {
@@ -1859,6 +1936,39 @@ impl BrowserExecutionState {
                     self.promise_resolve_to(&chained, value);
                 }
             }
+            PromiseReaction::Finally {
+                on_finally,
+                chained,
+            } => match status {
+                PromiseStatus::Fulfilled(value) => {
+                    self.run_promise_finally_reaction(
+                        on_finally,
+                        PromiseStatus::Fulfilled(value),
+                        chained,
+                    );
+                }
+                PromiseStatus::Rejected(reason) => {
+                    self.run_promise_finally_reaction(
+                        on_finally,
+                        PromiseStatus::Rejected(reason),
+                        chained,
+                    );
+                }
+                PromiseStatus::Pending => {}
+            },
+            PromiseReaction::FinallyContinuation { original, chained } => match status {
+                PromiseStatus::Fulfilled(_) => match original {
+                    PromiseStatus::Fulfilled(value) => self.promise_resolve_to(&chained, value),
+                    PromiseStatus::Rejected(reason) => {
+                        self.settle_promise(&chained, PromiseStatus::Rejected(reason));
+                    }
+                    PromiseStatus::Pending => {}
+                },
+                PromiseStatus::Rejected(reason) => {
+                    self.settle_promise(&chained, PromiseStatus::Rejected(reason));
+                }
+                PromiseStatus::Pending => {}
+            },
             PromiseReaction::AllElement {
                 index,
                 values,
@@ -1950,6 +2060,37 @@ impl BrowserExecutionState {
         }
     }
 
+    fn run_promise_finally_reaction(
+        &mut self,
+        on_finally: Option<JsFunction>,
+        original: PromiseStatus,
+        chained: Rc<RefCell<PromiseState>>,
+    ) {
+        let Some(func) = on_finally else {
+            match original {
+                PromiseStatus::Fulfilled(value) => self.promise_resolve_to(&chained, value),
+                PromiseStatus::Rejected(reason) => {
+                    self.settle_promise(&chained, PromiseStatus::Rejected(reason));
+                }
+                PromiseStatus::Pending => {}
+            }
+            return;
+        };
+
+        let cleanup_result = self.call_function(func, vec![]);
+        if let Some(EarlyExit::Throw(error)) = self.early_exit.take() {
+            self.settle_promise(&chained, PromiseStatus::Rejected(error));
+            return;
+        }
+
+        if let JsValue::Promise(cleanup) = self.promise_resolve_input(cleanup_result) {
+            self.attach_promise_reaction(
+                &cleanup,
+                PromiseReaction::FinallyContinuation { original, chained },
+            );
+        }
+    }
+
     fn promise_iterable_argument(&mut self, arguments: &[Expression]) -> Vec<JsValue> {
         arguments
             .first()
@@ -1958,66 +2099,244 @@ impl BrowserExecutionState {
             .unwrap_or_default()
     }
 
+    fn get_iterator_record(&mut self, value: JsValue) -> Option<IteratorRecord> {
+        match value {
+            JsValue::Array(items) => Some(IteratorRecord::Indexed { items, index: 0 }),
+            JsValue::RichArray(rc) => Some(IteratorRecord::Indexed {
+                items: rc.borrow().elements.clone(),
+                index: 0,
+            }),
+            JsValue::String(s) => Some(IteratorRecord::Indexed {
+                items: s.chars().map(|c| JsValue::String(c.to_string())).collect(),
+                index: 0,
+            }),
+            JsValue::NodeList(ids) => Some(IteratorRecord::Indexed {
+                items: ids
+                    .into_iter()
+                    .map(|id| JsValue::ElementRef(existing_element_ref(&id)))
+                    .collect(),
+                index: 0,
+            }),
+            JsValue::GeneratorObject(state) => Some(IteratorRecord::Generator { state }),
+            JsValue::Object(ref rc) => {
+                let iter_method = self.obj_get(rc, "Symbol(Symbol.iterator)");
+                if self.early_exit.is_some()
+                    || matches!(iter_method, JsValue::Undefined | JsValue::Null)
+                {
+                    return None;
+                }
+                match iter_method {
+                    JsValue::Function(func) => {
+                        let iterator = self.call_function_with_this(func, vec![], value).0;
+                        if self.early_exit.is_some() {
+                            None
+                        } else {
+                            Some(IteratorRecord::Object { iterator })
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn iterator_next_value(&mut self, record: &mut IteratorRecord) -> Option<JsValue> {
+        match record {
+            IteratorRecord::Indexed { items, index } => {
+                let item = items.get(*index).cloned();
+                *index += usize::from(item.is_some());
+                item
+            }
+            IteratorRecord::Generator { state } => {
+                let result = self.resume_generator_body(state, JsValue::Undefined);
+                let JsValue::Object(ref obj) = result else {
+                    return None;
+                };
+                if matches!(
+                    obj.borrow().get_own_data("done"),
+                    Some(JsValue::Boolean(true))
+                ) {
+                    return None;
+                }
+                Some(
+                    obj.borrow()
+                        .get_own_data("value")
+                        .unwrap_or(JsValue::Undefined),
+                )
+            }
+            IteratorRecord::Object { iterator } => {
+                let (next_result, new_iterator) = if let JsValue::Object(rc) = iterator {
+                    match self.obj_get(rc, "next") {
+                        JsValue::Function(next) => {
+                            self.call_function_with_this(next, vec![], iterator.clone())
+                        }
+                        _ => (JsValue::Undefined, iterator.clone()),
+                    }
+                } else {
+                    (JsValue::Undefined, iterator.clone())
+                };
+                *iterator = new_iterator;
+                if self.early_exit.is_some() {
+                    return None;
+                }
+                let JsValue::Object(ref result_obj) = next_result else {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        "Iterator next result is not an object".to_owned(),
+                    )));
+                    return None;
+                };
+                let done = self.obj_get(result_obj, "done");
+                if self.early_exit.is_some() {
+                    return None;
+                }
+                if matches!(done, JsValue::Boolean(true)) {
+                    return None;
+                }
+                let value = self.obj_get(result_obj, "value");
+                if self.early_exit.is_some() {
+                    return None;
+                }
+                Some(value)
+            }
+        }
+    }
+
+    fn iterator_close(&mut self, record: &mut IteratorRecord) {
+        match record {
+            IteratorRecord::Object { iterator } => {
+                let JsValue::Object(rc) = iterator else {
+                    return;
+                };
+                if let JsValue::Function(return_fn) = self.obj_get(rc, "return") {
+                    self.call_function_with_this(return_fn, vec![], iterator.clone());
+                }
+            }
+            IteratorRecord::Generator { state } => {
+                self.early_exit = Some(EarlyExit::Return(JsValue::Undefined));
+                self.resume_generator_body(state, JsValue::Undefined);
+            }
+            IteratorRecord::Indexed { .. } => {}
+        }
+    }
+
+    fn iterator_return(&mut self, record: &mut IteratorRecord, value: JsValue) {
+        match record {
+            IteratorRecord::Object { iterator } => {
+                let JsValue::Object(rc) = iterator else {
+                    return;
+                };
+                if let JsValue::Function(return_fn) = self.obj_get(rc, "return") {
+                    self.call_function_with_this(return_fn, vec![value], iterator.clone());
+                }
+            }
+            IteratorRecord::Generator { state } => {
+                self.early_exit = Some(EarlyExit::Return(value));
+                self.resume_generator_body(state, JsValue::Undefined);
+            }
+            IteratorRecord::Indexed { .. } => {}
+        }
+    }
+
+    fn iterator_throw(
+        &mut self,
+        record: &mut IteratorRecord,
+        reason: JsValue,
+    ) -> Option<(JsValue, bool)> {
+        match record {
+            IteratorRecord::Object { iterator } => {
+                let JsValue::Object(rc) = iterator else {
+                    self.early_exit = Some(EarlyExit::Throw(reason));
+                    return None;
+                };
+                let throw_fn = self.obj_get(rc, "throw");
+                if let JsValue::Function(throw_fn) = throw_fn {
+                    let (result, new_iterator) =
+                        self.call_function_with_this(throw_fn, vec![reason], iterator.clone());
+                    *iterator = new_iterator;
+                    let JsValue::Object(result_obj) = result else {
+                        self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                            "TypeError",
+                            "Iterator throw result is not an object".to_owned(),
+                        )));
+                        return None;
+                    };
+                    let done = matches!(self.obj_get(&result_obj, "done"), JsValue::Boolean(true));
+                    let value = self.obj_get(&result_obj, "value");
+                    Some((value, done))
+                } else {
+                    self.iterator_close(record);
+                    self.early_exit = Some(EarlyExit::Throw(reason));
+                    None
+                }
+            }
+            IteratorRecord::Generator { state } => {
+                self.early_exit = Some(EarlyExit::Throw(reason));
+                let result = self.resume_generator_body(state, JsValue::Undefined);
+                let JsValue::Object(result_obj) = result else {
+                    return None;
+                };
+                let done = matches!(self.obj_get(&result_obj, "done"), JsValue::Boolean(true));
+                let value = self.obj_get(&result_obj, "value");
+                Some((value, done))
+            }
+            IteratorRecord::Indexed { .. } => {
+                self.early_exit = Some(EarlyExit::Throw(reason));
+                None
+            }
+        }
+    }
+
+    fn collect_iterator_record_values(
+        &mut self,
+        record: &mut IteratorRecord,
+    ) -> Option<Vec<JsValue>> {
+        const MAX_ITER: usize = 10_000;
+        let mut collected = Vec::new();
+        for _ in 0..MAX_ITER {
+            if self.execution_budget_exhausted {
+                return None;
+            }
+            match self.iterator_next_value(record) {
+                Some(value) => {
+                    if self.early_exit.is_some() {
+                        return None;
+                    }
+                    collected.push(value);
+                }
+                None if self.early_exit.is_some() => {
+                    let saved = self.early_exit.take();
+                    self.iterator_close(record);
+                    if self.early_exit.is_none() {
+                        self.early_exit = saved;
+                    }
+                    return None;
+                }
+                None => return Some(collected),
+            }
+        }
+        self.iterator_close(record);
+        None
+    }
+
     fn collect_iterable_values(&mut self, value: JsValue) -> Vec<JsValue> {
         match value {
-            JsValue::Array(v) => v,
-            JsValue::RichArray(rc) => rc.borrow().elements.clone(),
+            JsValue::Array(_)
+            | JsValue::RichArray(_)
+            | JsValue::String(_)
+            | JsValue::NodeList(_)
+            | JsValue::GeneratorObject(_) => self
+                .get_iterator_record(value)
+                .and_then(|mut record| self.collect_iterator_record_values(&mut record))
+                .unwrap_or_default(),
             JsValue::Object(ref rc) => {
-                let iter_key = "Symbol(Symbol.iterator)";
-                let iter_method = self.obj_get(rc, iter_key);
-                if self.early_exit.is_some() {
-                    return vec![];
-                }
-                if !matches!(iter_method, JsValue::Undefined | JsValue::Null) {
-                    let mut iter_obj = match iter_method {
-                        JsValue::Function(func) => {
-                            let recv = value.clone();
-                            self.call_function_with_this(func, vec![], recv).0
-                        }
-                        _ => JsValue::Undefined,
-                    };
+                if let Some(mut record) = self.get_iterator_record(value.clone()) {
+                    if let Some(collected) = self.collect_iterator_record_values(&mut record) {
+                        return collected;
+                    }
                     if self.early_exit.is_some() {
                         return vec![];
-                    }
-                    const MAX_ITER: usize = 10_000;
-                    let mut collected = vec![];
-                    let mut iter_done = false;
-                    for _ in 0..MAX_ITER {
-                        if self.execution_budget_exhausted {
-                            break;
-                        }
-                        let (next_result, new_obj) = if let JsValue::Object(ref m) = iter_obj {
-                            let next_fn = self.obj_get(m, "next");
-                            if let JsValue::Function(nf) = next_fn {
-                                self.call_function_with_this(nf, vec![], iter_obj.clone())
-                            } else {
-                                (JsValue::Undefined, iter_obj)
-                            }
-                        } else {
-                            (JsValue::Undefined, iter_obj)
-                        };
-                        iter_obj = new_obj;
-                        if self.early_exit.is_some() {
-                            return vec![];
-                        }
-                        let done = if let JsValue::Object(ref rm) = next_result {
-                            matches!(self.obj_get(rm, "done"), JsValue::Boolean(true))
-                        } else {
-                            true
-                        };
-                        if done {
-                            iter_done = true;
-                            break;
-                        }
-                        let item = if let JsValue::Object(ref rm) = next_result {
-                            self.obj_get(rm, "value")
-                        } else {
-                            JsValue::Undefined
-                        };
-                        collected.push(item);
-                    }
-                    if iter_done {
-                        return collected;
                     }
                 }
                 let len = self.to_length_from_obj(rc);
@@ -2029,8 +2348,16 @@ impl BrowserExecutionState {
                     })
                     .collect()
             }
-            JsValue::String(s) => s.chars().map(|c| JsValue::String(c.to_string())).collect(),
             _ => vec![],
+        }
+    }
+
+    fn promise_collect_iterable_values(&mut self, value: JsValue) -> Result<Vec<JsValue>, JsValue> {
+        let values = self.collect_iterable_values(value);
+        if let Some(EarlyExit::Throw(reason)) = self.early_exit.take() {
+            Err(reason)
+        } else {
+            Ok(values)
         }
     }
 
@@ -2426,60 +2753,19 @@ impl BrowserExecutionState {
                 let stmt = stmt.clone();
                 let iterable = self.execute_expression(&stmt.iterable);
                 let for_of_kind = stmt.binding_kind;
-                let items: Vec<JsValue> = match iterable {
-                    JsValue::GeneratorObject(rc) => {
-                        loop {
-                            let r = self.resume_generator_body(&rc, JsValue::Undefined);
-                            let JsValue::Object(ref o) = r else {
-                                break;
-                            };
-                            let done = matches!(
-                                o.borrow().get_own_data("done"),
-                                Some(JsValue::Boolean(true))
-                            );
-                            if done {
-                                break;
-                            }
-                            let item = o
-                                .borrow()
-                                .get_own_data("value")
-                                .unwrap_or(JsValue::Undefined);
-                            if self.execution_budget_exhausted {
-                                break;
-                            }
-                            self.stack.push(StackFrame::block_scope());
-                            self.bind_iteration_value(&stmt.binding, for_of_kind, item);
-                            self.execute_statement(&stmt.body);
-                            self.stack.pop();
-                            self.ensure_global_frame();
-                            match self.early_exit {
-                                Some(EarlyExit::Break) => {
-                                    self.early_exit = None;
-                                    break;
-                                }
-                                Some(EarlyExit::Continue) => {
-                                    self.early_exit = None;
-                                }
-                                Some(_) => break,
-                                None => {}
-                            }
-                        }
-                        return;
-                    }
-                    JsValue::Array(arr) => arr,
-                    JsValue::String(s) => {
-                        s.chars().map(|c| JsValue::String(c.to_string())).collect()
-                    }
-                    JsValue::NodeList(ids) => ids
-                        .into_iter()
-                        .map(|id| JsValue::ElementRef(existing_element_ref(&id)))
-                        .collect(),
-                    _ => vec![],
+                let Some(mut iterator) = self.get_iterator_record(iterable) else {
+                    return;
                 };
-                for item in items {
+                loop {
                     if self.execution_budget_exhausted {
                         break;
                     }
+                    let Some(item) = self.iterator_next_value(&mut iterator) else {
+                        if self.early_exit.is_some() {
+                            self.iterator_close(&mut iterator);
+                        }
+                        break;
+                    };
                     self.stack.push(StackFrame::block_scope());
                     self.bind_iteration_value(&stmt.binding, for_of_kind, item);
                     self.execute_statement(&stmt.body);
@@ -2487,13 +2773,17 @@ impl BrowserExecutionState {
                     self.ensure_global_frame();
                     match self.early_exit {
                         Some(EarlyExit::Break) => {
+                            self.iterator_close(&mut iterator);
                             self.early_exit = None;
                             break;
                         }
                         Some(EarlyExit::Continue) => {
                             self.early_exit = None;
                         }
-                        Some(_) => break,
+                        Some(_) => {
+                            self.iterator_close(&mut iterator);
+                            break;
+                        }
                         None => {}
                     }
                 }
@@ -2789,11 +3079,34 @@ impl BrowserExecutionState {
                 consequent,
                 alternate,
             } => {
-                if Self::is_truthy(&self.execute_expression(test)) {
-                    self.execute_expression(consequent)
-                } else {
-                    self.execute_expression(alternate)
+                let test_value = self.execute_expression(test);
+                if self.expression_suspended() {
+                    if Self::is_direct_expression_suspension(test) {
+                        self.set_pending_expression_continuation(
+                            ExpressionContinuation::TernaryTest {
+                                consequent: (**consequent).clone(),
+                                alternate: (**alternate).clone(),
+                            },
+                        );
+                    }
+                    return JsValue::Undefined;
                 }
+
+                let branch = if Self::is_truthy(&test_value) {
+                    consequent
+                } else {
+                    alternate
+                };
+                let value = self.execute_expression(branch);
+                if self.expression_suspended() {
+                    if Self::is_direct_expression_suspension(branch) {
+                        self.set_pending_expression_continuation(
+                            ExpressionContinuation::TernaryBranch,
+                        );
+                    }
+                    return JsValue::Undefined;
+                }
+                value
             }
             Expression::Sequence(exprs) => {
                 let exprs = exprs.clone();
@@ -2820,23 +3133,7 @@ impl BrowserExecutionState {
                     UnaryOperator::Delete => JsValue::Boolean(true),
                 }
             }
-            Expression::Array(items) => {
-                let items = items.clone();
-                let mut values: Vec<JsValue> = Vec::new();
-                for item in &items {
-                    if let Expression::Spread(inner) = item {
-                        let val = self.execute_expression(inner);
-                        if let JsValue::Array(arr) = val {
-                            values.extend(arr);
-                        } else {
-                            values.push(val);
-                        }
-                    } else {
-                        values.push(self.execute_expression(item));
-                    }
-                }
-                JsValue::Array(values)
-            }
+            Expression::Array(items) => self.evaluate_array_literal(Vec::new(), items),
             Expression::Object(properties) => {
                 JsValue::Object(self.object_from_properties(properties))
             }
@@ -2862,18 +3159,7 @@ impl BrowserExecutionState {
                 JsValue::Function(func)
             }
             Expression::TemplateLiteral(parts) => {
-                let parts = parts.clone();
-                let mut s = String::new();
-                for part in &parts {
-                    match part {
-                        crate::ast::TemplateElement::Str(text) => s.push_str(text),
-                        crate::ast::TemplateElement::Expr(expr) => {
-                            let val = self.execute_expression(expr);
-                            s.push_str(&Self::value_to_string(&val));
-                        }
-                    }
-                }
-                JsValue::String(s)
+                self.evaluate_template_literal(String::new(), parts)
             }
             Expression::Typeof(expr) => {
                 let val = if let Expression::Identifier(name) = expr.as_ref() {
@@ -2958,11 +3244,22 @@ impl BrowserExecutionState {
                 }
             }
             Expression::YieldStar(expr) => {
-                // Delegate: iterate the inner iterable and collect all its values.
                 let inner = self.execute_expression(expr);
-                let items = inner.array_elements_cloned().unwrap_or_default();
-                if let Some(ref mut entries) = self.collecting_generator {
+                if self.collecting_generator.is_some() {
+                    let items = self.collect_iterable_values(inner);
+                    let entries = self
+                        .collecting_generator
+                        .as_mut()
+                        .expect("generator collection should still be active");
                     entries.extend(items);
+                    return JsValue::Undefined;
+                }
+                if let Some(mut iterator) = self.get_iterator_record(inner) {
+                    if let Some(value) = self.iterator_next_value(&mut iterator) {
+                        self.pending_generator_yield = Some(value);
+                        self.pending_generator_resume_expression =
+                            Some(ExpressionContinuation::YieldStar { iterator });
+                    }
                 }
                 JsValue::Undefined
             }
@@ -3190,6 +3487,32 @@ impl BrowserExecutionState {
     }
 
     fn execute_call(&mut self, callee: &Expression, arguments: &[Expression]) -> JsValue {
+        if let Expression::Member {
+            object,
+            property: MemberProperty::Named(method_name),
+            optional,
+        } = callee
+        {
+            if Self::expression_contains_suspension(object) {
+                let receiver = self.execute_expression(object);
+                if self.expression_suspended() {
+                    self.set_parent_expression_continuation(
+                        ExpressionContinuation::MethodCall {
+                            receiver: JsValue::Undefined,
+                            method_name: method_name.clone(),
+                            arguments: arguments.to_vec(),
+                        },
+                        Self::is_direct_expression_suspension(object),
+                    );
+                    return JsValue::Undefined;
+                }
+                if *optional && matches!(receiver, JsValue::Null | JsValue::Undefined) {
+                    return JsValue::Undefined;
+                }
+                return self.call_named_method_value(receiver, method_name, arguments);
+            }
+        }
+
         // super(args) inside a class constructor — call the superclass constructor with current `this`.
         if matches!(callee, Expression::Super) {
             let args = self.eval_args(arguments);
@@ -3296,17 +3619,13 @@ impl BrowserExecutionState {
         }
 
         if matches!(callee, Expression::Identifier(name) if name == "fetch") {
-            let url = arguments
-                .first()
-                .map(|argument| self.execute_expression(argument))
-                .map(|value| Self::value_to_string(&value))
-                .unwrap_or_default();
+            let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                return JsValue::Undefined;
+            };
+            let url = args.first().map(Self::value_to_string).unwrap_or_default();
             let mut method = "GET".to_owned();
             let mut body = String::new();
-            if let Some(options) = arguments
-                .get(1)
-                .map(|argument| self.execute_expression(argument))
-            {
+            if let Some(options) = args.get(1) {
                 if let JsValue::Object(rc) = options {
                     if let Some(value) = rc.borrow().get_own_data("method") {
                         method = Self::value_to_string(&value).to_ascii_uppercase();
@@ -3321,10 +3640,12 @@ impl BrowserExecutionState {
         }
 
         if matches!(callee, Expression::Identifier(name) if name == "setTimeout") {
-            let delay_ms = arguments
+            let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                return JsValue::Undefined;
+            };
+            let delay_ms = args
                 .get(1)
-                .map(|a| self.execute_expression(a))
-                .map(|v| Self::value_to_number(&v).max(0.0) as u64)
+                .map(|v| Self::value_to_number(v).max(0.0) as u64)
                 .unwrap_or(0);
             if let Some(Expression::Function(func)) = arguments.first() {
                 self.pending_timers.push(PendingTimer {
@@ -3337,10 +3658,10 @@ impl BrowserExecutionState {
         }
 
         if matches!(callee, Expression::Identifier(name) if name == "getComputedStyle") {
-            let element = arguments
-                .first()
-                .map(|a| self.execute_expression(a))
-                .unwrap_or(JsValue::Undefined);
+            let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                return JsValue::Undefined;
+            };
+            let element = args.first().cloned().unwrap_or(JsValue::Undefined);
             if let JsValue::ElementRef(element_ref) = element {
                 if let Some(element_id) = existing_id_from_ref(&element_ref) {
                     let rc = JsObject::new();
@@ -3367,23 +3688,32 @@ impl BrowserExecutionState {
             match method.name.as_str() {
                 "resolve" if matches!(&method.object, Expression::Identifier(n) if n == "Promise") =>
                 {
-                    let value = arguments
-                        .first()
-                        .map(|arg| self.execute_expression(arg))
-                        .unwrap_or(JsValue::Undefined);
+                    let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                        return JsValue::Undefined;
+                    };
+                    let value = args.first().cloned().unwrap_or(JsValue::Undefined);
                     return self.promise_resolve_input(value);
                 }
                 "reject" if matches!(&method.object, Expression::Identifier(n) if n == "Promise") =>
                 {
-                    let reason = arguments
-                        .first()
-                        .map(|arg| self.execute_expression(arg))
-                        .unwrap_or(JsValue::Undefined);
+                    let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                        return JsValue::Undefined;
+                    };
+                    let reason = args.first().cloned().unwrap_or(JsValue::Undefined);
                     return Self::rejected_promise(reason);
                 }
                 "all" | "allSettled" | "race" | "any" if matches!(&method.object, Expression::Identifier(n) if n == "Promise") =>
                 {
-                    let items = self.promise_iterable_argument(arguments);
+                    let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                        return JsValue::Undefined;
+                    };
+                    let items = match args.first() {
+                        Some(value) => match self.promise_collect_iterable_values(value.clone()) {
+                            Ok(items) => items,
+                            Err(reason) => return Self::rejected_promise(reason),
+                        },
+                        None => Vec::new(),
+                    };
                     return match method.name.as_str() {
                         "all" => self.promise_all(items),
                         "allSettled" => self.promise_all_settled(items),
@@ -3391,6 +3721,36 @@ impl BrowserExecutionState {
                         "any" => self.promise_any(items),
                         _ => JsValue::Undefined,
                     };
+                }
+                "withResolvers" if matches!(&method.object, Expression::Identifier(n) if n == "Promise") =>
+                {
+                    let promise = Self::pending_promise();
+                    let (resolve, reject, _guard) = self.promise_capability_functions(&promise);
+                    let rc = JsObject::new();
+                    {
+                        let mut obj = rc.borrow_mut();
+                        obj.set("promise", JsValue::Promise(promise));
+                        obj.set("resolve", resolve);
+                        obj.set("reject", reject);
+                    }
+                    return JsValue::Object(rc);
+                }
+                "try" if matches!(&method.object, Expression::Identifier(n) if n == "Promise") => {
+                    let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                        return JsValue::Undefined;
+                    };
+                    let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    if !Self::is_callable_value(&callback) {
+                        return Self::rejected_promise(Self::make_error_obj(
+                            "TypeError",
+                            "Promise.try callback is not callable".to_owned(),
+                        ));
+                    }
+                    let result = self.call_value(callback, JsValue::Undefined, Vec::new());
+                    if let Some(EarlyExit::Throw(reason)) = self.early_exit.take() {
+                        return Self::rejected_promise(reason);
+                    }
+                    return self.promise_resolve_input(result);
                 }
                 "then" => {
                     let receiver = self.execute_expression(&method.object);
@@ -3414,14 +3774,32 @@ impl BrowserExecutionState {
                     }
                     return JsValue::Undefined;
                 }
+                "finally" => {
+                    let receiver = self.execute_expression(&method.object);
+                    if let JsValue::Promise(promise) = receiver {
+                        let on_finally = arguments
+                            .first()
+                            .and_then(|arg| self.function_from_expression(arg));
+                        let chained = Self::pending_promise();
+                        self.attach_promise_reaction(
+                            &promise,
+                            PromiseReaction::Finally {
+                                on_finally,
+                                chained: chained.clone(),
+                            },
+                        );
+                        return JsValue::Promise(chained);
+                    }
+                    return JsValue::Undefined;
+                }
                 "log" | "info" | "warn" | "error" if matches!(&method.object, Expression::Identifier(n) if n == "console") =>
                 {
-                    let text = arguments
+                    let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                        return JsValue::Undefined;
+                    };
+                    let text = args
                         .iter()
-                        .map(|a| {
-                            let v = self.execute_expression(a);
-                            Self::value_to_string(&v)
-                        })
+                        .map(Self::value_to_string)
                         .collect::<Vec<_>>()
                         .join(" ");
                     self.effects.push(BrowserEffect::ConsoleLog {
@@ -3431,35 +3809,34 @@ impl BrowserExecutionState {
                     return JsValue::Undefined;
                 }
                 "createElement" if method.receiver == MethodReceiver::Document => {
-                    let tag_name = arguments
+                    let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                        return JsValue::Undefined;
+                    };
+                    let tag_name = args
                         .first()
-                        .map(|argument| self.execute_expression(argument))
-                        .map(|value| Self::value_to_string(&value))
+                        .map(Self::value_to_string)
                         .unwrap_or_else(|| "div".to_owned());
                     return self.create_element(tag_name);
                 }
                 "createTextNode" if method.receiver == MethodReceiver::Document => {
-                    let text = arguments
-                        .first()
-                        .map(|argument| self.execute_expression(argument))
-                        .map(|value| Self::value_to_string(&value))
-                        .unwrap_or_default();
+                    let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                        return JsValue::Undefined;
+                    };
+                    let text = args.first().map(Self::value_to_string).unwrap_or_default();
                     return self.create_text_node(text);
                 }
                 "createComment" if method.receiver == MethodReceiver::Document => {
-                    let text = arguments
-                        .first()
-                        .map(|argument| self.execute_expression(argument))
-                        .map(|value| Self::value_to_string(&value))
-                        .unwrap_or_default();
+                    let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                        return JsValue::Undefined;
+                    };
+                    let text = args.first().map(Self::value_to_string).unwrap_or_default();
                     return self.create_comment_node(text);
                 }
                 "getElementById" if method.receiver == MethodReceiver::Document => {
-                    let id = arguments
-                        .first()
-                        .map(|argument| self.execute_expression(argument))
-                        .map(|value| Self::value_to_string(&value))
-                        .unwrap_or_default();
+                    let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                        return JsValue::Undefined;
+                    };
+                    let id = args.first().map(Self::value_to_string).unwrap_or_default();
                     return JsValue::ElementRef(existing_element_ref(&id));
                 }
                 "querySelector" if method.receiver == MethodReceiver::Document => {
@@ -3653,6 +4030,13 @@ impl BrowserExecutionState {
                             return JsValue::String(s);
                         }
                     }
+                    "Reflect" => {
+                        let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                            return JsValue::Undefined;
+                        };
+                        let name = format!("Reflect.{method_name}");
+                        return self.call_host_function(&name, JsValue::Undefined, args);
+                    }
                     _ => {}
                 }
             }
@@ -3662,7 +4046,9 @@ impl BrowserExecutionState {
         if let Expression::Identifier(fn_name) = callee {
             match fn_name.as_str() {
                 "parseInt" => {
-                    let args = self.eval_args(arguments);
+                    let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                        return JsValue::Undefined;
+                    };
                     let s = Self::value_to_string(args.first().unwrap_or(&JsValue::Undefined));
                     let radix = args
                         .get(1)
@@ -3691,7 +4077,9 @@ impl BrowserExecutionState {
                     };
                 }
                 "parseFloat" => {
-                    let args = self.eval_args(arguments);
+                    let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                        return JsValue::Undefined;
+                    };
                     let s = Self::value_to_string(args.first().unwrap_or(&JsValue::Undefined));
                     // consume valid float prefix
                     let trimmed = s.trim();
@@ -3718,17 +4106,23 @@ impl BrowserExecutionState {
                     };
                 }
                 "isNaN" => {
-                    let args = self.eval_args(arguments);
+                    let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                        return JsValue::Undefined;
+                    };
                     let n = Self::value_to_number(args.first().unwrap_or(&JsValue::Undefined));
                     return JsValue::Boolean(n.is_nan());
                 }
                 "isFinite" => {
-                    let args = self.eval_args(arguments);
+                    let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                        return JsValue::Undefined;
+                    };
                     let n = Self::value_to_number(args.first().unwrap_or(&JsValue::Undefined));
                     return JsValue::Boolean(n.is_finite());
                 }
                 "encodeURIComponent" => {
-                    let args = self.eval_args(arguments);
+                    let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                        return JsValue::Undefined;
+                    };
                     let s = Self::value_to_string(args.first().unwrap_or(&JsValue::Undefined));
                     let encoded: String = s
                         .bytes()
@@ -3743,7 +4137,9 @@ impl BrowserExecutionState {
                     return JsValue::String(encoded);
                 }
                 "decodeURIComponent" => {
-                    let args = self.eval_args(arguments);
+                    let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                        return JsValue::Undefined;
+                    };
                     let s = Self::value_to_string(args.first().unwrap_or(&JsValue::Undefined));
                     return JsValue::String(s); // passthrough approximation
                 }
@@ -4424,15 +4820,33 @@ impl BrowserExecutionState {
                             .first()
                             .map(|a| self.execute_expression(a))
                             .unwrap_or(JsValue::Undefined);
+                        let mut delegated_iterator = None;
                         {
                             let mut state = rc.borrow_mut();
                             state.pending_binding = None;
                             state.pending_assignment = None;
+                            match state.pending_expression.take() {
+                                Some(ExpressionContinuation::YieldStar { iterator }) => {
+                                    delegated_iterator = Some(iterator);
+                                }
+                                other => {
+                                    state.pending_expression = other;
+                                }
+                            }
                             if !state.started || state.done {
                                 state.done = true;
                                 state.stack.clear();
                                 return GeneratorState::result(val, true);
                             }
+                        }
+                        if let Some(mut iterator) = delegated_iterator {
+                            self.iterator_return(&mut iterator, val.clone());
+                            let mut state = rc.borrow_mut();
+                            state.done = true;
+                            state.stack.clear();
+                            state.body.clear();
+                            state.frames.clear();
+                            return GeneratorState::result(val, true);
                         }
                         self.early_exit = Some(EarlyExit::Return(val));
                         return self.resume_generator_body(&rc, JsValue::Undefined);
@@ -4442,14 +4856,45 @@ impl BrowserExecutionState {
                             .first()
                             .map(|a| self.execute_expression(a))
                             .unwrap_or(JsValue::Undefined);
+                        let mut delegated_iterator = None;
                         {
                             let mut state = rc.borrow_mut();
                             state.pending_binding = None;
                             state.pending_assignment = None;
+                            match state.pending_expression.take() {
+                                Some(ExpressionContinuation::YieldStar { iterator }) => {
+                                    delegated_iterator = Some(iterator);
+                                }
+                                other => {
+                                    state.pending_expression = other;
+                                }
+                            }
                             if !state.started || state.done {
                                 state.done = true;
                                 state.stack.clear();
                                 self.early_exit = Some(EarlyExit::Throw(err));
+                                return JsValue::Undefined;
+                            }
+                        }
+                        if let Some(mut iterator) = delegated_iterator {
+                            if let Some((value, done)) =
+                                self.iterator_throw(&mut iterator, err.clone())
+                            {
+                                if done {
+                                    let mut state = rc.borrow_mut();
+                                    state.pending_expression = None;
+                                    state.done = true;
+                                    state.stack.clear();
+                                    state.body.clear();
+                                    state.frames.clear();
+                                    return GeneratorState::result(value, true);
+                                }
+                                let mut state = rc.borrow_mut();
+                                state.pending_expression =
+                                    Some(ExpressionContinuation::YieldStar { iterator });
+                                return GeneratorState::result(value, false);
+                            }
+                            if self.early_exit.is_some() {
                                 return JsValue::Undefined;
                             }
                         }
@@ -4594,6 +5039,10 @@ impl BrowserExecutionState {
                     let args = self.eval_args(arguments);
                     return self.call_host_function(&name, receiver.clone(), args);
                 }
+                if let JsValue::BoundHostFunction { .. } = method_val {
+                    let args = self.eval_args(arguments);
+                    return self.call_value(method_val, receiver.clone(), args);
+                }
                 // hasOwnProperty on any object
                 if method_name == "hasOwnProperty" {
                     let key = arguments
@@ -4620,6 +5069,15 @@ impl BrowserExecutionState {
         }
 
         let func_val = self.execute_expression(callee);
+        if self.expression_suspended() {
+            self.set_parent_expression_continuation(
+                ExpressionContinuation::CallCallee {
+                    arguments: arguments.to_vec(),
+                },
+                Self::is_direct_expression_suspension(callee),
+            );
+            return JsValue::Undefined;
+        }
         let Some(args) = self.eval_call_args_with_expression_continuation(
             func_val.clone(),
             arguments,
@@ -6127,18 +6585,122 @@ impl BrowserExecutionState {
         }
     }
 
+    fn evaluate_array_literal(
+        &mut self,
+        mut values: Vec<JsValue>,
+        items: &[Expression],
+    ) -> JsValue {
+        for (index, item) in items.iter().enumerate() {
+            let resume_spread = matches!(item, Expression::Spread(_));
+            let value = if let Expression::Spread(inner) = item {
+                self.execute_expression(inner)
+            } else {
+                self.execute_expression(item)
+            };
+            if self.expression_suspended() {
+                self.set_parent_expression_continuation(
+                    ExpressionContinuation::ArrayLiteral {
+                        values,
+                        remaining: items[index + 1..].to_vec(),
+                        resume_spread,
+                    },
+                    Self::is_direct_array_item_suspension(item),
+                );
+                return JsValue::Undefined;
+            }
+            Self::push_array_literal_value(&mut values, value, resume_spread);
+        }
+        JsValue::Array(values)
+    }
+
+    fn push_array_literal_value(values: &mut Vec<JsValue>, value: JsValue, spread: bool) {
+        if spread {
+            if let JsValue::Array(items) = value {
+                values.extend(items);
+            } else {
+                values.push(value);
+            }
+        } else {
+            values.push(value);
+        }
+    }
+
+    fn is_direct_array_item_suspension(item: &Expression) -> bool {
+        match item {
+            Expression::Spread(inner) => Self::is_direct_expression_suspension(inner),
+            _ => Self::is_direct_expression_suspension(item),
+        }
+    }
+
     fn object_from_properties(&mut self, properties: &[ObjectProperty]) -> Rc<RefCell<JsObject>> {
-        let rc = JsObject::new();
-        for property in properties {
+        self.continue_object_from_properties(JsObject::new(), properties)
+    }
+
+    fn continue_object_from_properties(
+        &mut self,
+        rc: Rc<RefCell<JsObject>>,
+        properties: &[ObjectProperty],
+    ) -> Rc<RefCell<JsObject>> {
+        for (index, property) in properties.iter().enumerate() {
             let key = if let Some(key_expr) = &property.computed_key {
-                Self::value_to_string(&self.execute_expression(key_expr))
+                let key_value = self.execute_expression(key_expr);
+                if self.expression_suspended() {
+                    self.set_parent_expression_continuation(
+                        ExpressionContinuation::ObjectLiteralKey {
+                            object: Rc::clone(&rc),
+                            property: property.clone(),
+                            remaining: properties[index + 1..].to_vec(),
+                        },
+                        Self::is_direct_expression_suspension(key_expr),
+                    );
+                    return rc;
+                }
+                Self::value_to_string(&key_value)
             } else {
                 property.key.clone()
             };
             let val = self.execute_expression(&property.value);
+            if self.expression_suspended() {
+                self.set_parent_expression_continuation(
+                    ExpressionContinuation::ObjectLiteralValue {
+                        object: Rc::clone(&rc),
+                        key,
+                        remaining: properties[index + 1..].to_vec(),
+                    },
+                    Self::is_direct_expression_suspension(&property.value),
+                );
+                return rc;
+            }
             rc.borrow_mut().set(key, val);
         }
         rc
+    }
+
+    fn evaluate_template_literal(
+        &mut self,
+        mut text: String,
+        parts: &[TemplateElement],
+    ) -> JsValue {
+        for (index, part) in parts.iter().enumerate() {
+            match part {
+                TemplateElement::Str(segment) => text.push_str(segment),
+                TemplateElement::Expr(expr) => {
+                    let value = self.execute_expression(expr);
+                    if self.expression_suspended() {
+                        self.set_parent_expression_continuation(
+                            ExpressionContinuation::TemplateLiteral {
+                                text,
+                                remaining: parts[index + 1..].to_vec(),
+                            },
+                            Self::is_direct_expression_suspension(expr),
+                        );
+                        return JsValue::Undefined;
+                    }
+                    text.push_str(&Self::value_to_string(&value));
+                }
+            }
+        }
+        JsValue::String(text)
     }
 
     fn query_selector_first_id(&self, selector: &str) -> Option<String> {
@@ -6620,47 +7182,15 @@ impl BrowserExecutionState {
         self.set_element_attribute(&element_ref, "style", merged);
     }
 
-    fn eval_member(&mut self, expression: &Expression) -> JsValue {
-        if let Some(global_name) = extract_window_global_name(expression) {
-            return self.globals.get(&global_name).cloned().unwrap_or_else(|| {
-                match global_name.as_str() {
-                    "ActiveXObject" => JsValue::HostFunction("ActiveXObject".into()),
-                    "external" => JsValue::from_map([(
-                        "msActiveXFilteringEnabled".to_owned(),
-                        JsValue::HostFunction("msActiveXFilteringEnabled".into()),
-                    )]),
-                    _ => JsValue::Undefined,
-                }
-            });
-        }
-        let Expression::Member {
-            object,
-            property,
-            optional,
-        } = expression
-        else {
-            return JsValue::Undefined;
-        };
-        // Optional chaining: null?.foo → undefined
-        if *optional {
-            let receiver = self.execute_expression(object);
-            if matches!(receiver, JsValue::Null | JsValue::Undefined) {
-                return JsValue::Undefined;
-            }
-        }
+    fn member_value_from_receiver(
+        &mut self,
+        receiver: JsValue,
+        property: &MemberProperty,
+        computed_key: Option<JsValue>,
+    ) -> JsValue {
         match property {
-            MemberProperty::Computed(index_expr) => {
-                let receiver = self.execute_expression(object);
-                let index = self.execute_expression(index_expr);
-                if matches!(receiver, JsValue::Undefined | JsValue::Null) {
-                    self.trace_member_read(
-                        object,
-                        "[computed]",
-                        &receiver,
-                        &JsValue::Undefined,
-                        false,
-                    );
-                }
+            MemberProperty::Computed(_) => {
+                let index = computed_key.unwrap_or(JsValue::Undefined);
                 match receiver {
                     JsValue::Proxy { target, get } => {
                         let key = Self::value_to_string(&index);
@@ -6711,6 +7241,200 @@ impl BrowserExecutionState {
                     }
                     _ => JsValue::Undefined,
                 }
+            }
+            MemberProperty::Named(property) => {
+                self.named_member_value_from_receiver(receiver, property)
+            }
+        }
+    }
+
+    fn named_member_value_from_receiver(&mut self, receiver: JsValue, property: &str) -> JsValue {
+        match receiver {
+            JsValue::Proxy { target, get } => self.proxy_get_property(*target, get, property),
+            JsValue::String(ref s) if property == "length" => {
+                JsValue::Number(s.chars().count() as f64)
+            }
+            JsValue::String(_) => self
+                .native_prototype_property("String", property)
+                .unwrap_or(JsValue::Undefined),
+            JsValue::Object(rc) => self
+                .object_property_or_native_fallback(&rc, property)
+                .unwrap_or(JsValue::Undefined),
+            JsValue::Array(items) if property == "length" => JsValue::Number(items.len() as f64),
+            JsValue::Array(_) => self
+                .native_prototype_property("Array", property)
+                .unwrap_or(JsValue::Undefined),
+            JsValue::Function(func) => match property {
+                "name" => func
+                    .name
+                    .as_deref()
+                    .map(|n| JsValue::String(n.to_owned()))
+                    .unwrap_or(JsValue::String(String::new())),
+                "length" => {
+                    let arity = func
+                        .params
+                        .iter()
+                        .take_while(|p| !p.rest && p.default.is_none())
+                        .count();
+                    JsValue::Number(arity as f64)
+                }
+                "prototype" => func
+                    .properties
+                    .get("prototype")
+                    .cloned()
+                    .unwrap_or_else(JsValue::new_object),
+                "call" | "apply" | "bind" => {
+                    JsValue::HostFunction(format!("Function.prototype.{property}"))
+                }
+                _ => {
+                    let receiver = JsValue::Function(func.clone());
+                    let value = self.function_get(&func, receiver, property);
+                    if matches!(value, JsValue::Undefined) {
+                        self.native_prototype_property("Function", property)
+                            .unwrap_or(JsValue::Undefined)
+                    } else {
+                        value
+                    }
+                }
+            },
+            JsValue::HostFunction(ref fn_name) => match property {
+                "call" | "apply" | "bind" => JsValue::HostFunction(fn_name.clone()),
+                "prototype" => Self::constructor_prototype_object(fn_name)
+                    .unwrap_or_else(|| Self::host_function_prototype(fn_name)),
+                "name" => JsValue::String(Self::host_fn_short_name(fn_name)),
+                "length" => JsValue::Number(Self::host_fn_arity(fn_name) as f64),
+                _ => Self::host_fn_static_member(fn_name, property)
+                    .or_else(|| self.native_prototype_property("Function", property))
+                    .or_else(|| self.native_prototype_property("Object", property))
+                    .unwrap_or(JsValue::Undefined),
+            },
+            JsValue::WindowRef => self
+                .globals
+                .get(property)
+                .cloned()
+                .unwrap_or(JsValue::Undefined),
+            JsValue::DocumentRef => match property {
+                "body" => JsValue::ElementRef(existing_element_ref("body")),
+                "head" => JsValue::ElementRef(existing_element_ref("head")),
+                "documentElement" => JsValue::ElementRef(existing_element_ref("html")),
+                "readyState" => JsValue::String("complete".to_owned()),
+                _ => JsValue::Undefined,
+            },
+            JsValue::ElementRef(element_ref) if property == "style" => {
+                existing_id_from_ref(&element_ref)
+                    .map(JsValue::StyleRef)
+                    .unwrap_or(JsValue::Undefined)
+            }
+            JsValue::ElementRef(element_ref) if dom_property_is_text_content(property) => {
+                JsValue::String(
+                    self.get_element_text_content(&element_ref)
+                        .unwrap_or_default(),
+                )
+            }
+            JsValue::ElementRef(element_ref) if dom_property_is_inner_html(property) => {
+                JsValue::String(
+                    self.get_element_inner_html(&element_ref)
+                        .unwrap_or_default(),
+                )
+            }
+            JsValue::ElementRef(element_ref) => JsValue::String(
+                self.get_element_attribute(&element_ref, dom_property_to_attribute_name(property))
+                    .unwrap_or_default(),
+            ),
+            JsValue::GeneratorObject(_) => {
+                JsValue::HostFunction(format!("GeneratorPrototype.{property}"))
+            }
+            JsValue::RichArray(rc) if property == "length" => {
+                JsValue::Number(rc.borrow().elements.len() as f64)
+            }
+            JsValue::RichArray(rc) => {
+                if let Ok(idx) = property.parse::<usize>() {
+                    return rc
+                        .borrow()
+                        .elements
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined);
+                }
+                self.native_prototype_property("Array", property)
+                    .unwrap_or(JsValue::Undefined)
+            }
+            _ => JsValue::Undefined,
+        }
+    }
+
+    fn call_named_method_value(
+        &mut self,
+        receiver: JsValue,
+        method_name: &str,
+        arguments: &[Expression],
+    ) -> JsValue {
+        let method = self.named_member_value_from_receiver(receiver.clone(), method_name);
+        let Some(args) =
+            self.eval_call_args_with_expression_continuation(method.clone(), arguments, Vec::new())
+        else {
+            return JsValue::Undefined;
+        };
+        self.call_value(method, receiver, args)
+    }
+
+    fn eval_member(&mut self, expression: &Expression) -> JsValue {
+        if let Some(global_name) = extract_window_global_name(expression) {
+            return self.globals.get(&global_name).cloned().unwrap_or_else(|| {
+                match global_name.as_str() {
+                    "ActiveXObject" => JsValue::HostFunction("ActiveXObject".into()),
+                    "external" => JsValue::from_map([(
+                        "msActiveXFilteringEnabled".to_owned(),
+                        JsValue::HostFunction("msActiveXFilteringEnabled".into()),
+                    )]),
+                    _ => JsValue::Undefined,
+                }
+            });
+        }
+        let Expression::Member {
+            object,
+            property,
+            optional,
+        } = expression
+        else {
+            return JsValue::Undefined;
+        };
+        match property {
+            MemberProperty::Computed(index_expr) => {
+                let receiver = self.execute_expression(object);
+                if self.expression_suspended() {
+                    self.set_parent_expression_continuation(
+                        ExpressionContinuation::MemberObject {
+                            property: property.clone(),
+                            optional: *optional,
+                        },
+                        Self::is_direct_expression_suspension(object),
+                    );
+                    return JsValue::Undefined;
+                }
+                if *optional && matches!(receiver, JsValue::Null | JsValue::Undefined) {
+                    return JsValue::Undefined;
+                }
+                let index = self.execute_expression(index_expr);
+                if self.expression_suspended() {
+                    self.set_parent_expression_continuation(
+                        ExpressionContinuation::MemberComputedKey {
+                            receiver: receiver.clone(),
+                        },
+                        Self::is_direct_expression_suspension(index_expr),
+                    );
+                    return JsValue::Undefined;
+                }
+                if matches!(receiver, JsValue::Undefined | JsValue::Null) {
+                    self.trace_member_read(
+                        object,
+                        "[computed]",
+                        &receiver,
+                        &JsValue::Undefined,
+                        false,
+                    );
+                }
+                self.member_value_from_receiver(receiver, property, Some(index))
             }
             MemberProperty::Named(property) => {
                 // Static namespace constants (Math.PI, etc.) — check raw expression before eval
@@ -6806,6 +7530,19 @@ impl BrowserExecutionState {
                 }
 
                 let receiver = self.execute_expression(object);
+                if self.expression_suspended() {
+                    self.set_parent_expression_continuation(
+                        ExpressionContinuation::MemberObject {
+                            property: MemberProperty::Named(property.clone()),
+                            optional: *optional,
+                        },
+                        Self::is_direct_expression_suspension(object),
+                    );
+                    return JsValue::Undefined;
+                }
+                if *optional && matches!(receiver, JsValue::Null | JsValue::Undefined) {
+                    return JsValue::Undefined;
+                }
                 let result = match receiver.clone() {
                     JsValue::Proxy { target, get } => {
                         self.proxy_get_property(*target, get, property)
@@ -7445,6 +8182,48 @@ impl BrowserExecutionState {
         out
     }
 
+    fn eval_args_or_suspend_call(
+        &mut self,
+        callee: &Expression,
+        arguments: &[Expression],
+    ) -> Option<Vec<JsValue>> {
+        let mut out = Vec::new();
+        for arg in arguments {
+            if let Expression::Spread(inner) = arg {
+                let val = self.execute_expression(inner);
+                if self.expression_suspended() {
+                    self.set_parent_expression_continuation(
+                        ExpressionContinuation::ReevaluateCall {
+                            callee: callee.clone(),
+                            arguments: arguments.to_vec(),
+                        },
+                        Self::is_direct_expression_suspension(inner),
+                    );
+                    return None;
+                }
+                if let JsValue::Array(items) = val {
+                    out.extend(items);
+                } else {
+                    out.push(val);
+                }
+            } else {
+                let value = self.execute_expression(arg);
+                if self.expression_suspended() {
+                    self.set_parent_expression_continuation(
+                        ExpressionContinuation::ReevaluateCall {
+                            callee: callee.clone(),
+                            arguments: arguments.to_vec(),
+                        },
+                        Self::is_direct_expression_suspension(arg),
+                    );
+                    return None;
+                }
+                out.push(value);
+            }
+        }
+        Some(out)
+    }
+
     fn eval_call_args_with_expression_continuation(
         &mut self,
         callee: JsValue,
@@ -7466,18 +8245,14 @@ impl BrowserExecutionState {
 
             if self.pending_async_await.is_some() || self.pending_generator_yield.is_some() {
                 prefix.truncate(before_len);
-                if Self::is_direct_call_argument_suspension(arg) {
-                    let continuation = ExpressionContinuation::Call {
+                self.set_parent_expression_continuation(
+                    ExpressionContinuation::Call {
                         callee,
                         prefix,
                         remaining: arguments[i + 1..].to_vec(),
-                    };
-                    if self.pending_async_await.is_some() {
-                        self.pending_async_resume_expression = Some(continuation);
-                    } else {
-                        self.pending_generator_resume_expression = Some(continuation);
-                    }
-                }
+                    },
+                    Self::is_direct_call_argument_suspension(arg),
+                );
                 return None;
             }
         }
@@ -7485,7 +8260,103 @@ impl BrowserExecutionState {
     }
 
     fn is_direct_call_argument_suspension(arg: &Expression) -> bool {
-        matches!(arg, Expression::Await(_) | Expression::Yield(_))
+        match arg {
+            Expression::Spread(inner) => Self::is_direct_expression_suspension(inner),
+            _ => Self::is_direct_expression_suspension(arg),
+        }
+    }
+
+    fn is_direct_expression_suspension(expression: &Expression) -> bool {
+        matches!(expression, Expression::Await(_) | Expression::Yield(_))
+    }
+
+    fn expression_contains_suspension(expression: &Expression) -> bool {
+        match expression {
+            Expression::Await(_) | Expression::Yield(_) | Expression::YieldStar(_) => true,
+            Expression::Array(items) | Expression::Sequence(items) => {
+                items.iter().any(Self::expression_contains_suspension)
+            }
+            Expression::Object(properties) => properties.iter().any(|property| {
+                property
+                    .computed_key
+                    .as_deref()
+                    .is_some_and(Self::expression_contains_suspension)
+                    || Self::expression_contains_suspension(&property.value)
+            }),
+            Expression::TemplateLiteral(parts) => parts.iter().any(|part| {
+                matches!(part, TemplateElement::Expr(expr) if Self::expression_contains_suspension(expr))
+            }),
+            Expression::New { callee, arguments } | Expression::Call { callee, arguments } => {
+                Self::expression_contains_suspension(callee)
+                    || arguments.iter().any(Self::expression_contains_suspension)
+            }
+            Expression::Member {
+                object, property, ..
+            } => {
+                Self::expression_contains_suspension(object)
+                    || matches!(property, MemberProperty::Computed(expr) if Self::expression_contains_suspension(expr))
+            }
+            Expression::Binary { left, right, .. } => {
+                Self::expression_contains_suspension(left)
+                    || Self::expression_contains_suspension(right)
+            }
+            Expression::Unary { expr, .. }
+            | Expression::Typeof(expr)
+            | Expression::Void(expr)
+            | Expression::Delete(expr)
+            | Expression::Spread(expr) => Self::expression_contains_suspension(expr),
+            Expression::Assignment { target, value } => {
+                Self::expression_contains_suspension(target)
+                    || Self::expression_contains_suspension(value)
+            }
+            Expression::Ternary {
+                test,
+                consequent,
+                alternate,
+            } => {
+                Self::expression_contains_suspension(test)
+                    || Self::expression_contains_suspension(consequent)
+                    || Self::expression_contains_suspension(alternate)
+            }
+            _ => false,
+        }
+    }
+
+    fn expression_suspended(&self) -> bool {
+        self.pending_async_await.is_some() || self.pending_generator_yield.is_some()
+    }
+
+    fn set_pending_expression_continuation(&mut self, continuation: ExpressionContinuation) {
+        if self.pending_async_await.is_some() {
+            self.pending_async_resume_expression = Some(continuation);
+        } else if self.pending_generator_yield.is_some() {
+            self.pending_generator_resume_expression = Some(continuation);
+        }
+    }
+
+    fn take_pending_expression_continuation(&mut self) -> Option<ExpressionContinuation> {
+        if self.pending_async_await.is_some() {
+            self.pending_async_resume_expression.take()
+        } else if self.pending_generator_yield.is_some() {
+            self.pending_generator_resume_expression.take()
+        } else {
+            None
+        }
+    }
+
+    fn set_parent_expression_continuation(
+        &mut self,
+        parent: ExpressionContinuation,
+        direct_child_suspension: bool,
+    ) {
+        if direct_child_suspension {
+            self.set_pending_expression_continuation(parent);
+        } else if let Some(child) = self.take_pending_expression_continuation() {
+            self.set_pending_expression_continuation(ExpressionContinuation::Then {
+                first: Box::new(child),
+                next: Box::new(parent),
+            });
+        }
     }
 
     fn resume_expression_continuation(
@@ -7494,6 +8365,13 @@ impl BrowserExecutionState {
         resume_value: JsValue,
     ) -> JsValue {
         match continuation {
+            ExpressionContinuation::Then { first, next } => {
+                let value = self.resume_expression_continuation(*first, resume_value);
+                if self.expression_suspended() {
+                    return JsValue::Undefined;
+                }
+                self.resume_expression_continuation(*next, value)
+            }
             ExpressionContinuation::Call {
                 callee,
                 mut prefix,
@@ -7508,6 +8386,142 @@ impl BrowserExecutionState {
                     Some(args) => self.call_evaluated_callee(callee, args),
                     None => JsValue::Undefined,
                 }
+            }
+            ExpressionContinuation::CallCallee { arguments } => {
+                let Some(args) = self.eval_call_args_with_expression_continuation(
+                    resume_value.clone(),
+                    &arguments,
+                    Vec::new(),
+                ) else {
+                    return JsValue::Undefined;
+                };
+                self.call_evaluated_callee(resume_value, args)
+            }
+            ExpressionContinuation::ReevaluateCall { callee, arguments } => {
+                self.execute_call(&callee, &arguments)
+            }
+            ExpressionContinuation::MethodCall {
+                receiver,
+                method_name,
+                arguments,
+            } => {
+                let receiver = if matches!(receiver, JsValue::Undefined) {
+                    resume_value
+                } else {
+                    receiver
+                };
+                self.call_named_method_value(receiver, &method_name, &arguments)
+            }
+            ExpressionContinuation::MemberObject { property, optional } => {
+                if optional && matches!(resume_value, JsValue::Null | JsValue::Undefined) {
+                    JsValue::Undefined
+                } else {
+                    match &property {
+                        MemberProperty::Computed(index_expr) => {
+                            let index = self.execute_expression(index_expr);
+                            if self.expression_suspended() {
+                                self.set_parent_expression_continuation(
+                                    ExpressionContinuation::MemberComputedKey {
+                                        receiver: resume_value,
+                                    },
+                                    Self::is_direct_expression_suspension(index_expr),
+                                );
+                                return JsValue::Undefined;
+                            }
+                            self.member_value_from_receiver(resume_value, &property, Some(index))
+                        }
+                        MemberProperty::Named(_) => {
+                            self.member_value_from_receiver(resume_value, &property, None)
+                        }
+                    }
+                }
+            }
+            ExpressionContinuation::MemberComputedKey { receiver } => self
+                .member_value_from_receiver(
+                    receiver,
+                    &MemberProperty::Computed(Box::new(Expression::Undefined)),
+                    Some(resume_value),
+                ),
+            ExpressionContinuation::BinaryLeft { op, right } => {
+                self.continue_binary_after_left(&op, resume_value, &right)
+            }
+            ExpressionContinuation::BinaryRight { op, left } => {
+                Self::apply_binary_values(&op, left, resume_value)
+            }
+            ExpressionContinuation::TernaryTest {
+                consequent,
+                alternate,
+            } => {
+                let branch = if Self::is_truthy(&resume_value) {
+                    consequent
+                } else {
+                    alternate
+                };
+                let value = self.execute_expression(&branch);
+                if self.expression_suspended() {
+                    if Self::is_direct_expression_suspension(&branch) {
+                        self.set_pending_expression_continuation(
+                            ExpressionContinuation::TernaryBranch,
+                        );
+                    }
+                    return JsValue::Undefined;
+                }
+                value
+            }
+            ExpressionContinuation::TernaryBranch => resume_value,
+            ExpressionContinuation::YieldStar { mut iterator } => {
+                if let Some(value) = self.iterator_next_value(&mut iterator) {
+                    self.pending_generator_yield = Some(value);
+                    self.pending_generator_resume_expression =
+                        Some(ExpressionContinuation::YieldStar { iterator });
+                    JsValue::Undefined
+                } else {
+                    JsValue::Undefined
+                }
+            }
+            ExpressionContinuation::ArrayLiteral {
+                mut values,
+                remaining,
+                resume_spread,
+            } => {
+                Self::push_array_literal_value(&mut values, resume_value, resume_spread);
+                self.evaluate_array_literal(values, &remaining)
+            }
+            ExpressionContinuation::ObjectLiteralKey {
+                object,
+                property,
+                remaining,
+            } => {
+                let key = Self::value_to_string(&resume_value);
+                let value = self.execute_expression(&property.value);
+                if self.expression_suspended() {
+                    self.set_parent_expression_continuation(
+                        ExpressionContinuation::ObjectLiteralValue {
+                            object: Rc::clone(&object),
+                            key,
+                            remaining,
+                        },
+                        Self::is_direct_expression_suspension(&property.value),
+                    );
+                    return JsValue::Undefined;
+                }
+                object.borrow_mut().set(key, value);
+                JsValue::Object(self.continue_object_from_properties(object, &remaining))
+            }
+            ExpressionContinuation::ObjectLiteralValue {
+                object,
+                key,
+                remaining,
+            } => {
+                object.borrow_mut().set(key, resume_value);
+                JsValue::Object(self.continue_object_from_properties(object, &remaining))
+            }
+            ExpressionContinuation::TemplateLiteral {
+                mut text,
+                remaining,
+            } => {
+                text.push_str(&Self::value_to_string(&resume_value));
+                self.evaluate_template_literal(text, &remaining)
             }
         }
     }
@@ -7733,6 +8747,7 @@ impl BrowserExecutionState {
             }
         } else {
             let mut value = resume;
+            let mut completed_expression = false;
             if let Some(expression) = pending_expression.take() {
                 value = self.resume_expression_continuation(expression, value);
                 if let Some(yielded) = self.pending_generator_yield.take() {
@@ -7746,12 +8761,15 @@ impl BrowserExecutionState {
                     state.pending_expression = pending_expression;
                     return GeneratorState::result(yielded, false);
                 }
+                completed_expression = true;
             }
             if let Some((binding, kind)) = rc.borrow_mut().pending_binding.take() {
                 self.bind_generator_resume_value(&binding, kind, value);
                 index += 1;
             } else if let Some(target) = rc.borrow_mut().pending_assignment.take() {
                 self.user_assign(&target, value);
+                index += 1;
+            } else if completed_expression {
                 index += 1;
             }
         }
@@ -7787,6 +8805,9 @@ impl BrowserExecutionState {
                                 index = 0;
                                 handled = true;
                                 break;
+                            }
+                            AsyncFrameKind::Loop { mut cursor } => {
+                                self.close_loop_cursor(&mut cursor);
                             }
                             _ => {}
                         }
@@ -7837,6 +8858,9 @@ impl BrowserExecutionState {
                                 index = 0;
                                 handled = true;
                                 break;
+                            }
+                            AsyncFrameKind::Loop { mut cursor } => {
+                                self.close_loop_cursor(&mut cursor);
                             }
                             AsyncFrameKind::Try {
                                 catch_body: None,
@@ -8121,6 +9145,28 @@ impl BrowserExecutionState {
                     index = 0;
                     continue;
                 }
+                Statement::ForOf(for_of_stmt) => {
+                    let Some(cursor) = self.begin_for_of_loop_cursor(for_of_stmt.clone()) else {
+                        index += 1;
+                        continue;
+                    };
+                    let parent_body = std::mem::take(&mut body);
+                    frames.push(AsyncStatementFrame {
+                        body: parent_body,
+                        index: index + 1,
+                        pop_scope: false,
+                        kind: AsyncFrameKind::Plain,
+                    });
+                    frames.push(AsyncStatementFrame {
+                        body: Vec::new(),
+                        index: 0,
+                        pop_scope: true,
+                        kind: AsyncFrameKind::Loop { cursor },
+                    });
+                    body = vec![*for_of_stmt.body];
+                    index = 0;
+                    continue;
+                }
                 Statement::TryCatch(tc) => {
                     let parent_body = std::mem::take(&mut body);
                     frames.push(AsyncStatementFrame {
@@ -8227,7 +9273,8 @@ impl BrowserExecutionState {
                             self.stack.pop();
                             self.ensure_global_frame();
                         }
-                        if let AsyncFrameKind::Loop { .. } = frame.kind {
+                        if let AsyncFrameKind::Loop { mut cursor } = frame.kind {
+                            self.close_loop_cursor(&mut cursor);
                             if let Some(parent) = frames.pop() {
                                 if parent.pop_scope {
                                     self.stack.pop();
@@ -8320,6 +9367,24 @@ impl BrowserExecutionState {
             keys,
             next_index: 1,
         })
+    }
+
+    fn begin_for_of_loop_cursor(&mut self, statement: ForOfStatement) -> Option<LoopCursor> {
+        let iterable = self.execute_expression(&statement.iterable);
+        let mut iterator = self.get_iterator_record(iterable)?;
+        let first_value = self.iterator_next_value(&mut iterator)?;
+        self.stack.push(StackFrame::block_scope());
+        self.bind_iteration_value(&statement.binding, statement.binding_kind, first_value);
+        Some(LoopCursor::ForOf {
+            statement,
+            iterator,
+        })
+    }
+
+    fn close_loop_cursor(&mut self, cursor: &mut LoopCursor) {
+        if let LoopCursor::ForOf { iterator, .. } = cursor {
+            self.iterator_close(iterator);
+        }
     }
 
     fn call_function_with_this(
@@ -8520,6 +9585,15 @@ impl BrowserExecutionState {
                 *next_index += 1;
                 Some(*statement.body.clone())
             }
+            LoopCursor::ForOf {
+                statement,
+                iterator,
+            } => {
+                let value = self.iterator_next_value(iterator)?;
+                self.stack.push(StackFrame::block_scope());
+                self.bind_iteration_value(&statement.binding, statement.binding_kind, value);
+                Some(*statement.body.clone())
+            }
         }
     }
 
@@ -8592,6 +9666,7 @@ impl BrowserExecutionState {
                 }
             } else {
                 let mut value = resume_value;
+                let mut completed_expression = false;
                 if let Some(expression) = continuation.pending_expression.take() {
                     value = self.resume_expression_continuation(expression, value);
                     if let Some(awaited) = self.pending_async_await.take() {
@@ -8605,6 +9680,7 @@ impl BrowserExecutionState {
                         self.async_continuations.insert(id, continuation);
                         return;
                     }
+                    completed_expression = true;
                 }
                 if let Some((binding, kind)) = continuation.pending_binding.take() {
                     self.bind_generator_resume_value(&binding, kind, value);
@@ -8616,6 +9692,8 @@ impl BrowserExecutionState {
                     let _ = std::mem::replace(&mut self.stack, saved_stack);
                     self.settle_promise(&continuation.promise, PromiseStatus::Fulfilled(value));
                     return;
+                } else if completed_expression {
+                    continuation.index += 1;
                 }
             }
         } else {
@@ -8676,6 +9754,9 @@ impl BrowserExecutionState {
                             self.early_exit = Some(EarlyExit::Throw(reason.clone()));
                             handled = true;
                             break;
+                        }
+                        AsyncFrameKind::Loop { mut cursor } => {
+                            self.close_loop_cursor(&mut cursor);
                         }
                         _ => {}
                     }
@@ -8937,6 +10018,28 @@ impl BrowserExecutionState {
                     continuation.index = 0;
                     continue;
                 }
+                Statement::ForOf(for_of_stmt) => {
+                    let Some(cursor) = self.begin_for_of_loop_cursor(for_of_stmt.clone()) else {
+                        continuation.index += 1;
+                        continue;
+                    };
+                    let parent_body = std::mem::take(&mut continuation.body);
+                    continuation.frames.push(AsyncStatementFrame {
+                        body: parent_body,
+                        index: continuation.index + 1,
+                        pop_scope: false,
+                        kind: AsyncFrameKind::Plain,
+                    });
+                    continuation.frames.push(AsyncStatementFrame {
+                        body: Vec::new(),
+                        index: 0,
+                        pop_scope: true,
+                        kind: AsyncFrameKind::Loop { cursor },
+                    });
+                    continuation.body = vec![*for_of_stmt.body];
+                    continuation.index = 0;
+                    continue;
+                }
                 Statement::TryCatch(tc) => {
                     let parent_body = std::mem::take(&mut continuation.body);
                     continuation.frames.push(AsyncStatementFrame {
@@ -8990,6 +10093,11 @@ impl BrowserExecutionState {
             continuation.index += 1;
             match self.early_exit.take() {
                 Some(EarlyExit::Return(value)) => {
+                    for frame in continuation.frames.iter_mut().rev() {
+                        if let AsyncFrameKind::Loop { cursor } = &mut frame.kind {
+                            self.close_loop_cursor(cursor);
+                        }
+                    }
                     let _ = std::mem::replace(&mut self.stack, saved_stack);
                     self.settle_promise(&continuation.promise, PromiseStatus::Fulfilled(value));
                     return;
@@ -9043,7 +10151,8 @@ impl BrowserExecutionState {
                             self.stack.pop();
                             self.ensure_global_frame();
                         }
-                        if let AsyncFrameKind::Loop { .. } = frame.kind {
+                        if let AsyncFrameKind::Loop { mut cursor } = frame.kind {
+                            self.close_loop_cursor(&mut cursor);
                             if let Some(parent) = continuation.frames.pop() {
                                 if parent.pop_scope {
                                     self.stack.pop();
@@ -9189,26 +10298,42 @@ impl BrowserExecutionState {
         left: &Expression,
         right: &Expression,
     ) -> JsValue {
-        // Short-circuit operators — evaluate right side only when needed.
+        let lv = self.execute_expression(left);
+        if self.expression_suspended() {
+            if Self::is_direct_expression_suspension(left) {
+                self.set_pending_expression_continuation(ExpressionContinuation::BinaryLeft {
+                    op: op.clone(),
+                    right: right.clone(),
+                });
+            }
+            return JsValue::Undefined;
+        }
+
+        self.continue_binary_after_left(op, lv, right)
+    }
+
+    fn continue_binary_after_left(
+        &mut self,
+        op: &BinaryOperator,
+        left: JsValue,
+        right: &Expression,
+    ) -> JsValue {
         match op {
             BinaryOperator::LogicalAnd => {
-                let left = self.execute_expression(left);
                 if !Self::is_truthy(&left) {
                     return left;
                 }
-                return self.execute_expression(right);
+                return self.evaluate_binary_right(op, left, right);
             }
             BinaryOperator::LogicalOr => {
-                let left = self.execute_expression(left);
                 if Self::is_truthy(&left) {
                     return left;
                 }
-                return self.execute_expression(right);
+                return self.evaluate_binary_right(op, left, right);
             }
             BinaryOperator::NullishCoalescing => {
-                let left = self.execute_expression(left);
                 return if matches!(left, JsValue::Null | JsValue::Undefined) {
-                    self.execute_expression(right)
+                    self.evaluate_binary_right(op, left, right)
                 } else {
                     left
                 };
@@ -9216,9 +10341,29 @@ impl BrowserExecutionState {
             _ => {}
         }
 
-        let lv = self.execute_expression(left);
-        let rv = self.execute_expression(right);
+        self.evaluate_binary_right(op, left, right)
+    }
 
+    fn evaluate_binary_right(
+        &mut self,
+        op: &BinaryOperator,
+        left: JsValue,
+        right: &Expression,
+    ) -> JsValue {
+        let right_value = self.execute_expression(right);
+        if self.expression_suspended() {
+            if Self::is_direct_expression_suspension(right) {
+                self.set_pending_expression_continuation(ExpressionContinuation::BinaryRight {
+                    op: op.clone(),
+                    left,
+                });
+            }
+            return JsValue::Undefined;
+        }
+        Self::apply_binary_values(op, left, right_value)
+    }
+
+    fn apply_binary_values(op: &BinaryOperator, lv: JsValue, rv: JsValue) -> JsValue {
         match op {
             BinaryOperator::Add => match (&lv, &rv) {
                 (JsValue::Number(a), JsValue::Number(b)) => JsValue::Number(a + b),
@@ -9334,9 +10479,7 @@ impl BrowserExecutionState {
             },
             BinaryOperator::LogicalAnd
             | BinaryOperator::LogicalOr
-            | BinaryOperator::NullishCoalescing => {
-                unreachable!("handled above")
-            }
+            | BinaryOperator::NullishCoalescing => rv,
         }
     }
 
@@ -9594,6 +10737,80 @@ impl BrowserExecutionState {
                 }
                 JsValue::Undefined
             }
+            "Promise.resolve" => {
+                let value = args.first().cloned().unwrap_or(JsValue::Undefined);
+                self.promise_resolve_input(value)
+            }
+            "Promise.reject" => {
+                let reason = args.first().cloned().unwrap_or(JsValue::Undefined);
+                Self::rejected_promise(reason)
+            }
+            "Promise.all" => {
+                let items = match args.first() {
+                    Some(value) => match self.promise_collect_iterable_values(value.clone()) {
+                        Ok(items) => items,
+                        Err(reason) => return Self::rejected_promise(reason),
+                    },
+                    None => Vec::new(),
+                };
+                self.promise_all(items)
+            }
+            "Promise.allSettled" => {
+                let items = match args.first() {
+                    Some(value) => match self.promise_collect_iterable_values(value.clone()) {
+                        Ok(items) => items,
+                        Err(reason) => return Self::rejected_promise(reason),
+                    },
+                    None => Vec::new(),
+                };
+                self.promise_all_settled(items)
+            }
+            "Promise.race" => {
+                let items = match args.first() {
+                    Some(value) => match self.promise_collect_iterable_values(value.clone()) {
+                        Ok(items) => items,
+                        Err(reason) => return Self::rejected_promise(reason),
+                    },
+                    None => Vec::new(),
+                };
+                self.promise_race(items)
+            }
+            "Promise.any" => {
+                let items = match args.first() {
+                    Some(value) => match self.promise_collect_iterable_values(value.clone()) {
+                        Ok(items) => items,
+                        Err(reason) => return Self::rejected_promise(reason),
+                    },
+                    None => Vec::new(),
+                };
+                self.promise_any(items)
+            }
+            "Promise.withResolvers" => {
+                let promise = Self::pending_promise();
+                let (resolve, reject, _guard) = self.promise_capability_functions(&promise);
+                let rc = JsObject::new();
+                {
+                    let mut obj = rc.borrow_mut();
+                    obj.set("promise", JsValue::Promise(promise));
+                    obj.set("resolve", resolve);
+                    obj.set("reject", reject);
+                }
+                JsValue::Object(rc)
+            }
+            "Promise.try" => {
+                let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                if !Self::is_callable_value(&callback) {
+                    return Self::rejected_promise(Self::make_error_obj(
+                        "TypeError",
+                        "Promise.try callback is not callable".to_owned(),
+                    ));
+                }
+                let result = self.call_value(callback, JsValue::Undefined, Vec::new());
+                if let Some(EarlyExit::Throw(reason)) = self.early_exit.take() {
+                    return Self::rejected_promise(reason);
+                }
+                self.promise_resolve_input(result)
+            }
             "Array.isArray" => JsValue::Boolean(matches!(args.first(), Some(JsValue::Array(_)))),
             "Array.of" => {
                 match this_arg {
@@ -9636,98 +10853,7 @@ impl BrowserExecutionState {
             "Array.from" => {
                 let mut args_iter = args.into_iter();
                 let items_val = args_iter.next().unwrap_or(JsValue::Undefined);
-                // Collect items into a Vec — try iterator protocol first for Objects.
-                let items: Vec<JsValue> = match items_val {
-                    JsValue::Array(v) => v,
-                    JsValue::Object(ref rc) => {
-                        // Check for Symbol.iterator (including getters that may throw).
-                        let iter_key = "Symbol(Symbol.iterator)";
-                        let iter_method = self.obj_get(rc, iter_key);
-                        if self.early_exit.is_some() {
-                            return JsValue::Undefined;
-                        }
-                        if !matches!(iter_method, JsValue::Undefined | JsValue::Null) {
-                            // Has an iterator. Call it to get the iterator object.
-                            let mut iter_obj = match iter_method {
-                                JsValue::Function(func) => {
-                                    let recv = items_val.clone();
-                                    self.call_function_with_this(func, vec![], recv).0
-                                }
-                                _ => JsValue::Undefined,
-                            };
-                            if self.early_exit.is_some() {
-                                return JsValue::Undefined;
-                            }
-                            // Consume the iterator, capping at MAX_ITER to avoid infinite loops.
-                            const MAX_ITER: usize = 10_000;
-                            let mut collected = vec![];
-                            let mut iter_done = false;
-                            for _ in 0..MAX_ITER {
-                                if self.execution_budget_exhausted {
-                                    break;
-                                }
-                                let (next_result, new_obj) = if let JsValue::Object(ref m) =
-                                    iter_obj
-                                {
-                                    let next_fn = self.obj_get(m, "next");
-                                    if let JsValue::Function(nf) = next_fn {
-                                        self.call_function_with_this(nf, vec![], iter_obj.clone())
-                                    } else {
-                                        (JsValue::Undefined, iter_obj)
-                                    }
-                                } else {
-                                    (JsValue::Undefined, iter_obj)
-                                };
-                                iter_obj = new_obj;
-                                if self.early_exit.is_some() {
-                                    return JsValue::Undefined;
-                                }
-                                let done = if let JsValue::Object(ref rm) = next_result {
-                                    matches!(self.obj_get(rm, "done"), JsValue::Boolean(true))
-                                } else {
-                                    true
-                                };
-                                if done {
-                                    iter_done = true;
-                                    break;
-                                }
-                                let value = if let JsValue::Object(ref rm) = next_result {
-                                    self.obj_get(rm, "value")
-                                } else {
-                                    JsValue::Undefined
-                                };
-                                collected.push(value);
-                            }
-                            if iter_done {
-                                collected
-                            } else {
-                                // Non-terminating iterator — fall back to array-like.
-                                let len = self.to_length_from_obj(rc);
-                                (0..len)
-                                    .map(|i| {
-                                        rc.borrow()
-                                            .get_own_data(&i.to_string())
-                                            .unwrap_or(JsValue::Undefined)
-                                    })
-                                    .collect()
-                            }
-                        } else {
-                            // No iterator — fall back to array-like (length + numeric keys).
-                            let len = self.to_length_from_obj(rc);
-                            (0..len)
-                                .map(|i| {
-                                    rc.borrow()
-                                        .get_own_data(&i.to_string())
-                                        .unwrap_or(JsValue::Undefined)
-                                })
-                                .collect()
-                        }
-                    }
-                    JsValue::String(ref s) => {
-                        s.chars().map(|c| JsValue::String(c.to_string())).collect()
-                    }
-                    _ => vec![],
-                };
+                let items = self.collect_iterable_values(items_val);
                 // Apply mapfn if provided
                 let mapfn = args_iter.next().unwrap_or(JsValue::Undefined);
                 let mapped: Vec<JsValue> = if let JsValue::Function(func) = mapfn {
@@ -9830,6 +10956,42 @@ impl BrowserExecutionState {
                 }
                 JsValue::new_object()
             }
+            "Reflect.getOwnPropertyDescriptor" => {
+                let mut iter = args.into_iter();
+                let obj = iter.next().unwrap_or(JsValue::Undefined);
+                let prop = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
+                Self::static_get_own_property_descriptor(&obj, &prop)
+            }
+            "Reflect.deleteProperty" => {
+                let mut iter = args.into_iter();
+                let obj = iter.next().unwrap_or(JsValue::Undefined);
+                let prop = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
+                match obj {
+                    JsValue::Object(rc) => JsValue::Boolean(rc.borrow_mut().delete_own(&prop)),
+                    _ => JsValue::Boolean(true),
+                }
+            }
+            "Reflect.ownKeys" => match args.into_iter().next().unwrap_or(JsValue::Undefined) {
+                JsValue::Object(rc) => JsValue::Array(
+                    rc.borrow()
+                        .all_own_keys()
+                        .into_iter()
+                        .map(JsValue::String)
+                        .collect(),
+                ),
+                _ => JsValue::Array(vec![]),
+            },
+            "Reflect.isExtensible" => match args.first() {
+                Some(JsValue::Object(rc)) => JsValue::Boolean(rc.borrow().extensible),
+                _ => JsValue::Boolean(false),
+            },
+            "Reflect.preventExtensions" => match args.first() {
+                Some(JsValue::Object(rc)) => {
+                    rc.borrow_mut().extensible = false;
+                    JsValue::Boolean(true)
+                }
+                _ => JsValue::Boolean(false),
+            },
             "Object.prototype.toString" => {
                 JsValue::String(format!("[object {}]", Self::object_tag(&this_arg)))
             }
@@ -11347,7 +12509,14 @@ impl BrowserExecutionState {
             "RegExp" => matches!(property, "escape"),
             "Promise" => matches!(
                 property,
-                "resolve" | "reject" | "all" | "allSettled" | "any" | "race"
+                "resolve"
+                    | "reject"
+                    | "all"
+                    | "allSettled"
+                    | "any"
+                    | "race"
+                    | "try"
+                    | "withResolvers"
             ),
             "Symbol" => matches!(property, "for" | "keyFor"),
             "JSON" => matches!(property, "parse" | "stringify" | "rawJSON" | "isRawJSON"),
@@ -11508,6 +12677,7 @@ impl BrowserExecutionState {
             | "Promise.allSettled"
             | "Promise.any"
             | "Promise.race"
+            | "Promise.try"
             | "JSON.parse" => 1,
             "Array" | "Object" | "Function" | "String" | "Number" | "Boolean" | "RegExp"
             | "Error" | "TypeError" | "RangeError" | "ReferenceError" | "SyntaxError"
@@ -11515,7 +12685,7 @@ impl BrowserExecutionState {
             "BigInt.asIntN" | "BigInt.asUintN" | "Object.groupBy" => 2,
             "Date.parse" | "Date.UTC" | "Date.now" | "Map.groupBy" | "RegExp.escape" => 1,
             "BigInt" => 1,
-            "Math.random" | "Array.fromAsync" => 0,
+            "Math.random" | "Array.fromAsync" | "Promise.withResolvers" => 0,
             "String.prototype.link"
             | "String.prototype.anchor"
             | "String.prototype.fontcolor"
@@ -13653,6 +14823,35 @@ mod tests {
     }
 
     #[test]
+    fn promise_all_consumes_string_iterator_input() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            Promise.all("XY").then(function (values) {
+                output = values.join("");
+            });
+
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "XY".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
     fn promise_combinators_settle_from_inputs() {
         let program = crate::parse_script(
             r#"
@@ -13687,6 +14886,556 @@ mod tests {
             vec![BrowserEffect::SetTextContent {
                 element_id: "result".to_owned(),
                 value: "RAfulfilled:ok/rejected:no".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn promise_finally_runs_callback_and_preserves_fulfillment_value() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            Promise.resolve("V")
+                .finally(function () {
+                    output = output + "F";
+                })
+                .then(function (value) {
+                    output = output + value;
+                });
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "FV".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn promise_finally_waits_for_returned_thenable_and_preserves_rejection() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            Promise.reject("R")
+                .finally(function () {
+                    output = output + "F";
+                    return {
+                        then: function (resolve) {
+                            output = output + "T";
+                            resolve("ignored");
+                        }
+                    };
+                })
+                .then(undefined, function (reason) {
+                    output = output + reason;
+                });
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "FTR".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn promise_finally_rejects_when_callback_throws() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            Promise.resolve("V")
+                .finally(function () {
+                    throw "bad";
+                })
+                .then(undefined, function (reason) {
+                    output = reason;
+                });
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "bad".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn promise_any_rejection_exposes_aggregate_error_errors() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            Promise.any([Promise.reject("A"), Promise.reject("B")])
+                .then(undefined, function (error) {
+                    output = error.name + ":" + error.errors.join("");
+                });
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "AggregateError:AB".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn promise_all_rejects_and_closes_when_iterator_next_throws() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            let iterable = {};
+            iterable[Symbol.iterator] = function () {
+                let i = 0;
+                return {
+                    next: function () {
+                        i = i + 1;
+                        if (i === 1) {
+                            return { value: Promise.resolve("A"), done: false };
+                        }
+                        throw "next-bad";
+                    },
+                    return: function () {
+                        output = output + "C";
+                        return { done: true };
+                    }
+                };
+            };
+
+            Promise.all(iterable).then(undefined, function (reason) {
+                output = output + "/" + reason;
+            });
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "C/next-bad".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn promise_all_rejects_and_closes_when_iterator_done_getter_throws() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            let iterable = {};
+            iterable[Symbol.iterator] = function () {
+                return {
+                    next: function () {
+                        let result = {};
+                        Object.defineProperty(result, "done", {
+                            get: function () { throw "done-bad"; }
+                        });
+                        return result;
+                    },
+                    return: function () {
+                        output = output + "C";
+                        return { done: true };
+                    }
+                };
+            };
+
+            Promise.all(iterable).then(undefined, function (reason) {
+                output = output + "/" + reason;
+            });
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "C/done-bad".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn promise_all_rejects_and_closes_when_iterator_value_getter_throws() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            let iterable = {};
+            iterable[Symbol.iterator] = function () {
+                return {
+                    next: function () {
+                        let result = { done: false };
+                        Object.defineProperty(result, "value", {
+                            get: function () { throw "value-bad"; }
+                        });
+                        return result;
+                    },
+                    return: function () {
+                        output = output + "C";
+                        return { done: true };
+                    }
+                };
+            };
+
+            Promise.all(iterable).then(undefined, function (reason) {
+                output = output + "/" + reason;
+            });
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "C/value-bad".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn promise_all_rejects_and_closes_when_iterator_next_returns_non_object() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            let iterable = {};
+            iterable[Symbol.iterator] = function () {
+                let i = 0;
+                return {
+                    next: function () {
+                        i = i + 1;
+                        if (i === 1) {
+                            return { value: Promise.resolve("A"), done: false };
+                        }
+                        return "bad-result";
+                    },
+                    return: function () {
+                        output = output + "C";
+                        return { done: true };
+                    }
+                };
+            };
+
+            Promise.all(iterable).then(undefined, function (reason) {
+                output = output + "/" + reason.name;
+            });
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "C/TypeError".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn promise_race_rejects_and_closes_when_iterator_next_returns_non_object() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            let iterable = {};
+            iterable[Symbol.iterator] = function () {
+                let i = 0;
+                return {
+                    next: function () {
+                        i = i + 1;
+                        if (i === 1) {
+                            return { value: Promise.resolve("A"), done: false };
+                        }
+                        return "bad-result";
+                    },
+                    return: function () {
+                        output = output + "C";
+                        return { done: true };
+                    }
+                };
+            };
+
+            Promise.race(iterable).then(undefined, function (reason) {
+                output = output + "/" + reason.name;
+            });
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "C/TypeError".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn promise_with_resolvers_exposes_capability_functions() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            let cap = Promise.withResolvers();
+            cap.promise.then(function (value) {
+                output = output + value;
+            });
+            cap.resolve("A");
+            cap.reject("B");
+            setTimeout(function () {
+                document.getElementById("result").textContent =
+                    output + "/" + Promise.withResolvers.length;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "A/0".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn promise_try_resolves_return_and_rejects_throw() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            Promise.try(function () {
+                return "A";
+            }).then(function (value) {
+                output = output + value;
+            });
+            Promise.try(function () {
+                throw "B";
+            }).then(undefined, function (reason) {
+                output = output + reason;
+            });
+            setTimeout(function () {
+                document.getElementById("result").textContent =
+                    output + "/" + Promise.try.length;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "AB/1".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn detached_promise_static_host_functions_dispatch() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            let resolve = Promise.resolve;
+            let reject = Promise.reject;
+            let all = Promise.all;
+            let withResolvers = Promise.withResolvers;
+            let promiseTry = Promise.try;
+
+            resolve("A").then(function (value) { output = output + value; });
+            reject("B").then(undefined, function (reason) { output = output + reason; });
+            all([Promise.resolve("C"), "D"]).then(function (values) {
+                output = output + values.join("");
+            });
+            let cap = withResolvers();
+            cap.promise.then(function (value) { output = output + value; });
+            cap.resolve("E");
+            promiseTry(function () { return "F"; }).then(function (value) {
+                output = output + value;
+            });
+
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "ABEFCD".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn reflect_construct_static_call_reaches_host_dispatch() {
+        let program = crate::parse_script(
+            r#"
+            function Target() {}
+            let value = Reflect.construct(Target, [], Target);
+            document.getElementById("result").textContent =
+                Object.prototype.toString.call(value) + "/" + Reflect.construct.length;
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "[object Object]/2".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn reflect_basic_object_operations_dispatch() {
+        let program = crate::parse_script(
+            r#"
+            let obj = {};
+            Object.defineProperty(obj, "x", { value: "A", configurable: true });
+            Object.defineProperty(obj, "locked", { value: "B", configurable: false });
+            let before = Reflect.ownKeys(obj).join(",");
+            let desc = Reflect.getOwnPropertyDescriptor(obj, "x");
+            let deleted = Reflect.deleteProperty(obj, "x");
+            let lockedDeleted = Reflect.deleteProperty(obj, "locked");
+            document.getElementById("result").textContent =
+                before + "/" + desc.value + "/" + String(deleted) + "/" +
+                String(lockedDeleted) + "/" + Reflect.ownKeys(obj).join(",");
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "locked,x/A/true/false/locked".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn reflect_prevent_extensions_updates_is_extensible() {
+        let program = crate::parse_script(
+            r#"
+            let obj = {};
+            let before = Reflect.isExtensible(obj);
+            let prevented = Reflect.preventExtensions(obj);
+            let after = Reflect.isExtensible(obj);
+            document.getElementById("result").textContent =
+                String(before) + "/" + String(prevented) + "/" + String(after);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "true/true/false".to_owned(),
             }]
         );
     }
@@ -14393,6 +16142,514 @@ mod tests {
     }
 
     #[test]
+    fn async_pending_await_in_binary_expression_resumes_operator() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let output = "";
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+
+            async function run() {
+                output = output + "A";
+                let value = (await p) + "D";
+                output = output + value;
+            }
+
+            run().then(function () { output = output + "E"; });
+            output = output + "S";
+            setTimeout(function () { resolveLater("C"); }, 0);
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "ASCDE".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_pending_await_in_logical_expression_resumes_short_circuit_operator() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let output = "";
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+
+            async function run() {
+                output = output + "A";
+                let skipped = false && await p;
+                output = output + String(skipped);
+                let value = true && await p;
+                output = output + value;
+            }
+
+            run().then(function () { output = output + "E"; });
+            output = output + "S";
+            setTimeout(function () { resolveLater("C"); }, 0);
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "AfalseSCE".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_pending_await_in_conditional_expression_resumes_branch_selection() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let output = "";
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+
+            async function run() {
+                output = output + "A";
+                let value = (await p) ? "T" : "F";
+                output = output + value;
+            }
+
+            run().then(function () { output = output + "E"; });
+            output = output + "S";
+            setTimeout(function () { resolveLater(true); }, 0);
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "ASTE".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_pending_await_in_array_literal_resumes_literal_evaluation() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let output = "";
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+
+            async function run() {
+                output = output + "A";
+                let value = ["B", await p, "D"];
+                output = output + value[0] + value[1] + value[2];
+            }
+
+            run().then(function () { output = output + "E"; });
+            output = output + "S";
+            setTimeout(function () { resolveLater("C"); }, 0);
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "ASBCDE".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_pending_await_in_object_literal_resumes_key_and_value() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let output = "";
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+
+            async function run() {
+                output = output + "A";
+                let value = { a: await p, [await p]: "D" };
+                output = output + value.a + value.C;
+            }
+
+            run().then(function () { output = output + "E"; });
+            output = output + "S";
+            setTimeout(function () { resolveLater("C"); }, 0);
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "ASCDE".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_pending_await_in_template_literal_resumes_literal_evaluation() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let output = "";
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+
+            async function run() {
+                output = output + "A";
+                let value = `B${await p}D`;
+                output = output + value;
+            }
+
+            run().then(function () { output = output + "E"; });
+            output = output + "S";
+            setTimeout(function () { resolveLater("C"); }, 0);
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "ASBCDE".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_pending_nested_await_in_literals_resumes_outer_literal() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let output = "";
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+
+            async function run() {
+                output = output + "A";
+                let arr = ["B", (await p) + "D"];
+                let obj = { [(await p) + "Key"]: (await p) + "Value" };
+                let text = `T${(await p) + "Z"}`;
+                output = output + arr[0] + arr[1] + obj.CKey + text;
+            }
+
+            run().then(function () { output = output + "E"; });
+            output = output + "S";
+            setTimeout(function () { resolveLater("C"); }, 0);
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "ASBCDCValueTCZE".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_pending_await_in_member_expression_resumes_property_read() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let output = "";
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+
+            async function run() {
+                let obj = { key: "B" };
+                output = output + "A";
+                let first = obj[await p];
+                let second = (await Promise.resolve(obj)).key;
+                output = output + first + second;
+            }
+
+            run().then(function () { output = output + "E"; });
+            output = output + "S";
+            setTimeout(function () { resolveLater("key"); }, 0);
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "ASBBE".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_pending_await_in_call_callee_resumes_call() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let output = "";
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+
+            function join(value) {
+                return "B" + value;
+            }
+
+            async function run() {
+                output = output + "A";
+                let value = (await p)("C");
+                output = output + value;
+            }
+
+            run().then(function () { output = output + "E"; });
+            output = output + "S";
+            setTimeout(function () { resolveLater(join); }, 0);
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "ASBCE".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_pending_await_in_method_receiver_preserves_this_binding() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let output = "";
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+            let holder = {
+                prefix: "B",
+                method: function (value) {
+                    return this.prefix + value;
+                }
+            };
+
+            async function run() {
+                output = output + "A";
+                let value = (await p).method("C");
+                output = output + value;
+            }
+
+            run().then(function () { output = output + "E"; });
+            output = output + "S";
+            setTimeout(function () { resolveLater(holder); }, 0);
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "ASBCE".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_pending_nested_await_in_call_argument_resumes_call() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let output = "";
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+
+            function join(a, b) {
+                return a + b;
+            }
+
+            async function run() {
+                output = output + "A";
+                let value = join("B", (await p) + "D");
+                output = output + value;
+            }
+
+            run().then(function () { output = output + "E"; });
+            output = output + "S";
+            setTimeout(function () { resolveLater("C"); }, 0);
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "ASBCDE".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_pending_await_in_special_call_arguments_resumes_call() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let output = "";
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+
+            async function run() {
+                output = output + "A";
+                let el = document.createElement(await p);
+                console.log("tag", await p);
+                let parsed = parseInt(await p, 10);
+                let resolved = await Promise.resolve(await p);
+                output = output + String(parsed) + resolved;
+                document.getElementById("result").textContent = output;
+            }
+
+            run();
+            output = output + "S";
+            setTimeout(function () { resolveLater("7"); }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![
+                BrowserEffect::ConsoleLog {
+                    level: "log".to_owned(),
+                    text: "tag 7".to_owned(),
+                },
+                BrowserEffect::SetTextContent {
+                    element_id: "result".to_owned(),
+                    value: "AS77".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn async_pending_await_in_fetch_argument_waits_before_network_effect() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+
+            async function run() {
+                await fetch(await p);
+            }
+
+            run();
+            setTimeout(function () { resolveLater("/ready"); }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![
+                BrowserEffect::RuntimeTrace {
+                    kind: "network.request".to_owned(),
+                    detail: "GET /ready body_bytes=0".to_owned(),
+                },
+                BrowserEffect::NetworkRequest {
+                    method: "GET".to_owned(),
+                    url: "/ready".to_owned(),
+                    body: String::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn generator_call_is_lazy_until_first_next() {
         let program = crate::parse_script(
             r#"
@@ -14460,6 +16717,215 @@ mod tests {
             vec![BrowserEffect::SetTextContent {
                 element_id: "result".to_owned(),
                 value: "pause/ABC/false".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn generator_yield_in_binary_expression_resumes_operator() {
+        let program = crate::parse_script(
+            r#"
+            function* gen() {
+                let value = (yield "pause") + "C";
+                yield value;
+            }
+            let g = gen();
+            let r1 = g.next();
+            let r2 = g.next("B");
+            document.getElementById("result").textContent =
+                r1.value + "/" + r2.value + "/" + String(r2.done);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "pause/BC/false".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn generator_yield_in_logical_expression_resumes_short_circuit_operator() {
+        let program = crate::parse_script(
+            r#"
+            function* gen() {
+                let skipped = false && (yield "skip");
+                let value = true && (yield "pause");
+                yield String(skipped) + "/" + value;
+            }
+            let g = gen();
+            let r1 = g.next();
+            let r2 = g.next("B");
+            let r3 = g.next();
+            document.getElementById("result").textContent =
+                r1.value + "/" + r2.value + "/" + r3.value + "/" + String(r3.done);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "pause/false/B/undefined/true".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn generator_yield_in_conditional_expression_resumes_branch_selection() {
+        let program = crate::parse_script(
+            r#"
+            function* gen() {
+                let value = (yield "pause") ? "T" : "F";
+                yield value;
+            }
+            let g = gen();
+            let r1 = g.next();
+            let r2 = g.next(true);
+            document.getElementById("result").textContent =
+                r1.value + "/" + r2.value + "/" + String(r2.done);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "pause/T/false".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn generator_yield_in_array_object_template_literals_resumes_outer_literals() {
+        let program = crate::parse_script(
+            r#"
+            function* gen() {
+                let arr = ["A", (yield "array") + "C"];
+                yield arr[0] + arr[1];
+                let obj = { [(yield "key") + "Key"]: (yield "value") + "Value" };
+                yield obj.BKey;
+                let text = `T${(yield "template") + "Z"}`;
+                yield text;
+            }
+            let g = gen();
+            let r1 = g.next();
+            let r2 = g.next("B");
+            let r3 = g.next();
+            let r4 = g.next("B");
+            let r5 = g.next("C");
+            let r6 = g.next();
+            let r7 = g.next("C");
+            document.getElementById("result").textContent =
+                r1.value + "/" + r2.value + "/" + r3.value + "/" +
+                r4.value + "/" + r5.value + "/" + r6.value + "/" + r7.value;
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "array/ABC/key/value/CValue/template/TCZ".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn generator_yield_star_delegates_array_lazily() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            function* gen() {
+                output = output + "A";
+                yield* ["B", "C"];
+                output = output + "D";
+            }
+            let g = gen();
+            let r1 = g.next();
+            let afterFirst = output;
+            let r2 = g.next();
+            let afterSecond = output;
+            let r3 = g.next();
+            document.getElementById("result").textContent =
+                r1.value + "/" + r2.value + "/" + String(r3.done) + "/" +
+                afterFirst + "/" + afterSecond + "/" + output;
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "B/C/true/A/A/AD".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn generator_yield_star_delegates_custom_iterator() {
+        let program = crate::parse_script(
+            r#"
+            let iterable = {};
+            iterable[Symbol.iterator] = function () {
+                let i = 0;
+                return {
+                    next: function () {
+                        i = i + 1;
+                        if (i === 1) {
+                            return { value: "A", done: false };
+                        }
+                        if (i === 2) {
+                            return { value: "B", done: false };
+                        }
+                        return { done: true };
+                    }
+                };
+            };
+            function* gen() {
+                yield* iterable;
+                yield "C";
+            }
+            let g = gen();
+            let r1 = g.next();
+            let r2 = g.next();
+            let r3 = g.next();
+            document.getElementById("result").textContent =
+                r1.value + "/" + r2.value + "/" + r3.value + "/" + String(r3.done);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "A/B/C/false".to_owned(),
             }]
         );
     }
@@ -14649,6 +17115,284 @@ mod tests {
             vec![BrowserEffect::SetTextContent {
                 element_id: "result".to_owned(),
                 value: "G1B1G2B2".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn for_of_break_closes_generator_iterator_finally() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            function* gen() {
+                try {
+                    yield "A";
+                    yield "B";
+                } finally {
+                    output = output + "F";
+                }
+            }
+            for (const value of gen()) {
+                output = output + value;
+                break;
+            }
+            document.getElementById("result").textContent = output;
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "AF".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn generator_yield_inside_for_of_resumes_loop_cursor() {
+        let program = crate::parse_script(
+            r#"
+            function* gen() {
+                for (const value of ["A", "B"]) {
+                    yield value;
+                }
+                yield "C";
+            }
+            let g = gen();
+            let r1 = g.next();
+            let r2 = g.next();
+            let r3 = g.next();
+            let r4 = g.next();
+            document.getElementById("result").textContent =
+                r1.value + "/" + r2.value + "/" + r3.value + "/" +
+                String(r4.value) + "/" + String(r4.done);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "A/B/C/undefined/true".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_await_inside_for_of_resumes_loop_cursor() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+            let output = "";
+
+            async function run() {
+                for (const value of ["A", "B"]) {
+                    let awaited = await p;
+                    output = output + awaited + value;
+                }
+                document.getElementById("result").textContent = output;
+            }
+
+            run();
+            setTimeout(function () { resolveLater("X"); }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "XAXB".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn generator_return_closes_yield_star_custom_iterator() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            let iterable = {};
+            iterable[Symbol.iterator] = function () {
+                let i = 0;
+                return {
+                    next: function () {
+                        i = i + 1;
+                        return { value: "A" + String(i), done: false };
+                    },
+                    return: function (value) {
+                        output = output + "R" + value;
+                        return { value: "closed", done: true };
+                    }
+                };
+            };
+            function* gen() {
+                yield* iterable;
+                output = output + "X";
+            }
+            let g = gen();
+            let r1 = g.next();
+            let r2 = g.return("Z");
+            let r3 = g.next();
+            document.getElementById("result").textContent =
+                r1.value + "/" + r2.value + "/" + String(r2.done) + "/" +
+                String(r3.done) + "/" + output;
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "A1/Z/true/true/RZ".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn generator_throw_forwards_to_yield_star_custom_iterator() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            let iterable = {};
+            iterable[Symbol.iterator] = function () {
+                let i = 0;
+                return {
+                    next: function () {
+                        i = i + 1;
+                        return { value: "A" + String(i), done: false };
+                    },
+                    throw: function (reason) {
+                        output = output + "T" + reason;
+                        return { value: "handled", done: false };
+                    }
+                };
+            };
+            function* gen() {
+                yield* iterable;
+                output = output + "X";
+            }
+            let g = gen();
+            let r1 = g.next();
+            let r2 = g.throw("E");
+            let r3 = g.next();
+            document.getElementById("result").textContent =
+                r1.value + "/" + r2.value + "/" + String(r2.done) + "/" +
+                r3.value + "/" + output;
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "A1/handled/false/A2/TE".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn for_of_consumes_custom_iterator_record() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            let iterable = {};
+            iterable[Symbol.iterator] = function () {
+                let i = 0;
+                return {
+                    next: function () {
+                        i = i + 1;
+                        if (i === 1) {
+                            return { value: "A", done: false };
+                        }
+                        if (i === 2) {
+                            return { value: "B", done: false };
+                        }
+                        return { done: true };
+                    }
+                };
+            };
+
+            for (const value of iterable) {
+                output = output + value;
+            }
+            document.getElementById("result").textContent = output;
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "AB".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn for_of_closes_custom_iterator_on_break() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            let iterable = {};
+            iterable[Symbol.iterator] = function () {
+                let i = 0;
+                return {
+                    next: function () {
+                        i = i + 1;
+                        return { value: "A" + String(i), done: false };
+                    },
+                    return: function () {
+                        output = output + "R";
+                        return { done: true };
+                    }
+                };
+            };
+
+            for (const value of iterable) {
+                output = output + value;
+                break;
+            }
+            document.getElementById("result").textContent = output;
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "A1R".to_owned(),
             }]
         );
     }
@@ -15304,6 +18048,75 @@ mod tests {
             vec![BrowserEffect::SetTextContent {
                 element_id: "result".to_owned(),
                 value: "boom".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn generator_next_after_natural_completion_stays_done() {
+        let program = crate::parse_script(
+            r#"
+            function* gen() {
+                yield "first";
+                return "done";
+            }
+            let g = gen();
+            let r1 = g.next();
+            let r2 = g.next();
+            let r3 = g.next("ignored");
+            document.getElementById("result").textContent =
+                r1.value + "/" +
+                r2.value + "/" + String(r2.done) + "/" +
+                String(r3.value) + "/" + String(r3.done);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "first/done/true/undefined/true".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn generator_throw_after_completion_rethrows_without_restarting() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            function* gen() {
+                output = output + "A";
+                yield "first";
+                output = output + "B";
+            }
+            let g = gen();
+            g.next();
+            g.next();
+            try {
+                g.throw("boom");
+            } catch (e) {
+                output = output + "C" + e;
+            }
+            let r = g.next();
+            document.getElementById("result").textContent =
+                output + "/" + String(r.value) + "/" + String(r.done);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "ABCboom/undefined/true".to_owned(),
             }]
         );
     }
