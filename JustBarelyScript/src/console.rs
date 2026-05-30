@@ -132,6 +132,7 @@ fn collect_statement_console_messages(statement: &Statement, out: &mut Vec<Conso
             collect_statement_console_messages(&statement.body, out);
         }
         Statement::Block(block) => collect_block_console_messages(block, out),
+        Statement::Labeled(statement) => collect_statement_console_messages(&statement.body, out),
         Statement::Expression(expression) => collect_expression_console_messages(expression, out),
         Statement::Empty => {}
     }

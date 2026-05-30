@@ -240,11 +240,27 @@ enum LoopCursor {
 }
 
 #[derive(Clone, Debug)]
+enum LoopCursorStep {
+    Body(Statement),
+    Done,
+    Suspended,
+}
+
+#[derive(Clone, Debug)]
 struct AsyncStatementFrame {
     body: Vec<Statement>,
     index: usize,
     pop_scope: bool,
     kind: AsyncFrameKind,
+}
+
+#[derive(Clone, Debug)]
+enum AsyncPendingLoopHeader {
+    ForInit(ForStatement),
+    ForTest(ForStatement),
+    ForUpdate(LoopCursor),
+    ForInObject(ForInStatement),
+    ForOfIterable(ForOfStatement),
 }
 
 #[derive(Clone, Debug)]
@@ -258,6 +274,7 @@ struct AsyncContinuation {
     pending_binding: Option<(Binding, VarKind)>,
     pending_assignment: Option<Expression>,
     pending_if: Option<IfStatement>,
+    pending_loop_header: Option<AsyncPendingLoopHeader>,
     pending_return: bool,
 }
 
@@ -332,8 +349,8 @@ enum ExpressionContinuation {
 enum EarlyExit {
     Return(JsValue),
     Throw(JsValue),
-    Break,
-    Continue,
+    Break(Option<String>),
+    Continue(Option<String>),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -928,6 +945,16 @@ impl BrowserExecutionState {
             return self.obj_get(&proto, key);
         }
         JsValue::Undefined
+    }
+
+    fn obj_has_property(rc: &Rc<RefCell<JsObject>>, key: &str) -> bool {
+        if rc.borrow().has_own(key) {
+            return true;
+        }
+        let proto = rc.borrow().prototype.clone();
+        proto
+            .as_ref()
+            .is_some_and(|proto| Self::obj_has_property(proto, key))
     }
 
     /// `[[Set]]` — invokes accessor setters or writes a data property.
@@ -2556,6 +2583,23 @@ impl BrowserExecutionState {
     }
 
     fn execute_statement(&mut self, statement: &Statement) {
+        self.execute_statement_with_label(statement, None);
+    }
+
+    fn exit_matches_label(target: &Option<String>, active_label: Option<&str>) -> bool {
+        match (target.as_deref(), active_label) {
+            (None, None) => true,
+            (None, Some(_)) => true,
+            (Some(target), Some(label)) => target == label,
+            (Some(_), None) => false,
+        }
+    }
+
+    fn exit_matches_exact_label(target: &Option<String>, label: &str) -> bool {
+        matches!(target.as_deref(), Some(target) if target == label)
+    }
+
+    fn execute_statement_with_label(&mut self, statement: &Statement, active_label: Option<&str>) {
         if !self.consume_execution_budget() {
             return;
         }
@@ -2588,11 +2632,15 @@ impl BrowserExecutionState {
                     }
                     self.execute_statement(&statement.body);
                     match self.early_exit {
-                        Some(EarlyExit::Break) => {
+                        Some(EarlyExit::Break(ref label))
+                            if Self::exit_matches_label(label, active_label) =>
+                        {
                             self.early_exit = None;
                             break;
                         }
-                        Some(EarlyExit::Continue) => {
+                        Some(EarlyExit::Continue(ref label))
+                            if Self::exit_matches_label(label, active_label) =>
+                        {
                             self.early_exit = None;
                         }
                         Some(_) => break,
@@ -2608,11 +2656,15 @@ impl BrowserExecutionState {
                     }
                     self.execute_statement(&statement.body);
                     match self.early_exit {
-                        Some(EarlyExit::Break) => {
+                        Some(EarlyExit::Break(ref label))
+                            if Self::exit_matches_label(label, active_label) =>
+                        {
                             self.early_exit = None;
                             break;
                         }
-                        Some(EarlyExit::Continue) => {
+                        Some(EarlyExit::Continue(ref label))
+                            if Self::exit_matches_label(label, active_label) =>
+                        {
                             self.early_exit = None;
                         }
                         Some(_) => break,
@@ -2642,11 +2694,15 @@ impl BrowserExecutionState {
                     }
                     self.execute_statement(&statement.body);
                     match self.early_exit {
-                        Some(EarlyExit::Break) => {
+                        Some(EarlyExit::Break(ref label))
+                            if Self::exit_matches_label(label, active_label) =>
+                        {
                             self.early_exit = None;
                             break;
                         }
-                        Some(EarlyExit::Continue) => {
+                        Some(EarlyExit::Continue(ref label))
+                            if Self::exit_matches_label(label, active_label) =>
+                        {
                             self.early_exit = None;
                         }
                         Some(_) => break,
@@ -2694,11 +2750,21 @@ impl BrowserExecutionState {
                 let value = self.execute_expression(&stmt.argument.clone());
                 self.early_exit = Some(EarlyExit::Throw(value));
             }
-            Statement::Break(_) => {
-                self.early_exit = Some(EarlyExit::Break);
+            Statement::Break(stmt) => {
+                self.early_exit = Some(EarlyExit::Break(stmt.label.clone()));
             }
-            Statement::Continue(_) => {
-                self.early_exit = Some(EarlyExit::Continue);
+            Statement::Continue(stmt) => {
+                self.early_exit = Some(EarlyExit::Continue(stmt.label.clone()));
+            }
+            Statement::Labeled(stmt) => {
+                self.execute_statement_with_label(&stmt.body, Some(&stmt.label));
+                if matches!(
+                    &self.early_exit,
+                    Some(EarlyExit::Break(label))
+                        if Self::exit_matches_exact_label(label, &stmt.label)
+                ) {
+                    self.early_exit = None;
+                }
             }
             Statement::TryCatch(tc) => {
                 let tc = tc.clone();
@@ -2772,12 +2838,16 @@ impl BrowserExecutionState {
                     self.stack.pop();
                     self.ensure_global_frame();
                     match self.early_exit {
-                        Some(EarlyExit::Break) => {
+                        Some(EarlyExit::Break(ref label))
+                            if Self::exit_matches_label(label, active_label) =>
+                        {
                             self.iterator_close(&mut iterator);
                             self.early_exit = None;
                             break;
                         }
-                        Some(EarlyExit::Continue) => {
+                        Some(EarlyExit::Continue(ref label))
+                            if Self::exit_matches_label(label, active_label) =>
+                        {
                             self.early_exit = None;
                         }
                         Some(_) => {
@@ -2823,11 +2893,15 @@ impl BrowserExecutionState {
                     self.stack.pop();
                     self.ensure_global_frame();
                     match self.early_exit {
-                        Some(EarlyExit::Break) => {
+                        Some(EarlyExit::Break(ref label))
+                            if Self::exit_matches_label(label, active_label) =>
+                        {
                             self.early_exit = None;
                             break;
                         }
-                        Some(EarlyExit::Continue) => {
+                        Some(EarlyExit::Continue(ref label))
+                            if Self::exit_matches_label(label, active_label) =>
+                        {
                             self.early_exit = None;
                         }
                         Some(_) => break,
@@ -2836,7 +2910,7 @@ impl BrowserExecutionState {
                 }
             }
             Statement::Switch(stmt) => {
-                self.execute_switch(stmt);
+                self.execute_switch(stmt, active_label);
             }
             Statement::Empty => {}
         }
@@ -2867,7 +2941,7 @@ impl BrowserExecutionState {
         true
     }
 
-    fn execute_switch(&mut self, stmt: &SwitchStatement) {
+    fn execute_switch(&mut self, stmt: &SwitchStatement, active_label: Option<&str>) {
         let stmt = stmt.clone();
         let discriminant = self.execute_expression(&stmt.discriminant);
 
@@ -2903,23 +2977,32 @@ impl BrowserExecutionState {
         }
 
         // `break` inside switch exits the switch, not an outer loop.
-        if matches!(self.early_exit, Some(EarlyExit::Break)) {
+        if matches!(
+            &self.early_exit,
+            Some(EarlyExit::Break(label)) if Self::exit_matches_label(label, active_label)
+        ) {
             self.early_exit = None;
         }
     }
 
     fn hoist_function_declarations(&mut self, stmts: &[Statement]) {
         for stmt in stmts {
-            if let Statement::FunctionDeclaration(decl) = stmt {
-                let mut func = JsFunction::plain(
-                    Some(decl.name.clone()),
-                    decl.params.clone(),
-                    FunctionBody::Block(decl.body.clone()),
-                    self.stack.clone(),
-                );
-                func.is_async = decl.is_async;
-                func.is_generator = decl.is_generator;
-                self.set_local(&decl.name, JsValue::Function(func));
+            match stmt {
+                Statement::FunctionDeclaration(decl) => {
+                    let mut func = JsFunction::plain(
+                        Some(decl.name.clone()),
+                        decl.params.clone(),
+                        FunctionBody::Block(decl.body.clone()),
+                        self.stack.clone(),
+                    );
+                    func.is_async = decl.is_async;
+                    func.is_generator = decl.is_generator;
+                    self.set_local(&decl.name, JsValue::Function(func));
+                }
+                Statement::Labeled(labeled) => {
+                    self.hoist_function_declarations(std::slice::from_ref(labeled.body.as_ref()));
+                }
+                _ => {}
             }
         }
     }
@@ -6023,7 +6106,7 @@ impl BrowserExecutionState {
                         );
                         if matches!(
                             self.early_exit,
-                            Some(EarlyExit::Break) | Some(EarlyExit::Continue)
+                            Some(EarlyExit::Break(_)) | Some(EarlyExit::Continue(_))
                         ) {
                             self.early_exit = None;
                         }
@@ -8913,25 +8996,53 @@ impl BrowserExecutionState {
                             index = frame.index;
                         }
                         AsyncFrameKind::Loop { mut cursor } => {
-                            if let Some(next_body) = self.next_loop_cursor_body(&mut cursor) {
-                                frames.push(AsyncStatementFrame {
-                                    body: Vec::new(),
-                                    index: 0,
-                                    pop_scope: false,
-                                    kind: AsyncFrameKind::Loop { cursor },
-                                });
-                                body = vec![next_body];
-                                index = 0;
-                            } else if let Some(parent) = frames.pop() {
-                                if parent.pop_scope {
-                                    self.stack.pop();
-                                    self.ensure_global_frame();
+                            match self.next_loop_cursor_body(&mut cursor) {
+                                LoopCursorStep::Body(next_body) => {
+                                    frames.push(AsyncStatementFrame {
+                                        body: Vec::new(),
+                                        index: 0,
+                                        pop_scope: false,
+                                        kind: AsyncFrameKind::Loop { cursor },
+                                    });
+                                    body = vec![next_body];
+                                    index = 0;
                                 }
-                                body = parent.body;
-                                index = parent.index;
-                            } else {
-                                body = Vec::new();
-                                index = 0;
+                                LoopCursorStep::Done => {
+                                    if let Some(parent) = frames.pop() {
+                                        if parent.pop_scope {
+                                            self.stack.pop();
+                                            self.ensure_global_frame();
+                                        }
+                                        body = parent.body;
+                                        index = parent.index;
+                                    } else {
+                                        body = Vec::new();
+                                        index = 0;
+                                    }
+                                }
+                                LoopCursorStep::Suspended => {
+                                    frames.push(AsyncStatementFrame {
+                                        body: Vec::new(),
+                                        index: 0,
+                                        pop_scope: false,
+                                        kind: AsyncFrameKind::Loop { cursor },
+                                    });
+                                    if let Some(yielded) = self.pending_generator_yield.take() {
+                                        let stack = std::mem::replace(&mut self.stack, saved_stack);
+                                        let mut state = rc.borrow_mut();
+                                        state.stack = stack;
+                                        state.index = index;
+                                        state.body = body;
+                                        state.frames = frames;
+                                        state.pending_expression =
+                                            self.pending_generator_resume_expression.take();
+                                        state.pending_binding =
+                                            self.pending_generator_resume_binding.take();
+                                        state.pending_assignment =
+                                            self.pending_generator_resume_assignment.take();
+                                        return GeneratorState::result(yielded, false);
+                                    }
+                                }
                             }
                         }
                         AsyncFrameKind::Finally { after } => {
@@ -9228,7 +9339,7 @@ impl BrowserExecutionState {
                     self.early_exit = Some(throw);
                     continue;
                 }
-                Some(EarlyExit::Continue) => {
+                Some(EarlyExit::Continue(label)) if label.is_none() => {
                     let mut handled = false;
                     while let Some(frame) = frames.pop() {
                         if frame.pop_scope {
@@ -9236,25 +9347,38 @@ impl BrowserExecutionState {
                             self.ensure_global_frame();
                         }
                         if let AsyncFrameKind::Loop { mut cursor } = frame.kind {
-                            if let Some(next_body) = self.next_loop_cursor_body(&mut cursor) {
-                                frames.push(AsyncStatementFrame {
-                                    body: Vec::new(),
-                                    index: 0,
-                                    pop_scope: false,
-                                    kind: AsyncFrameKind::Loop { cursor },
-                                });
-                                body = vec![next_body];
-                                index = 0;
-                            } else if let Some(parent) = frames.pop() {
-                                if parent.pop_scope {
-                                    self.stack.pop();
-                                    self.ensure_global_frame();
+                            match self.next_loop_cursor_body(&mut cursor) {
+                                LoopCursorStep::Body(next_body) => {
+                                    frames.push(AsyncStatementFrame {
+                                        body: Vec::new(),
+                                        index: 0,
+                                        pop_scope: false,
+                                        kind: AsyncFrameKind::Loop { cursor },
+                                    });
+                                    body = vec![next_body];
+                                    index = 0;
                                 }
-                                body = parent.body;
-                                index = parent.index;
-                            } else {
-                                body = Vec::new();
-                                index = 0;
+                                LoopCursorStep::Done => {
+                                    if let Some(parent) = frames.pop() {
+                                        if parent.pop_scope {
+                                            self.stack.pop();
+                                            self.ensure_global_frame();
+                                        }
+                                        body = parent.body;
+                                        index = parent.index;
+                                    } else {
+                                        body = Vec::new();
+                                        index = 0;
+                                    }
+                                }
+                                LoopCursorStep::Suspended => {
+                                    frames.push(AsyncStatementFrame {
+                                        body: Vec::new(),
+                                        index: 0,
+                                        pop_scope: false,
+                                        kind: AsyncFrameKind::Loop { cursor },
+                                    });
+                                }
                             }
                             handled = true;
                             break;
@@ -9263,10 +9387,10 @@ impl BrowserExecutionState {
                     if handled {
                         continue;
                     }
-                    self.early_exit = Some(EarlyExit::Continue);
+                    self.early_exit = Some(EarlyExit::Continue(None));
                     break;
                 }
-                Some(EarlyExit::Break) => {
+                Some(EarlyExit::Break(label)) if label.is_none() => {
                     let mut handled = false;
                     while let Some(frame) = frames.pop() {
                         if frame.pop_scope {
@@ -9293,7 +9417,11 @@ impl BrowserExecutionState {
                     if handled {
                         continue;
                     }
-                    self.early_exit = Some(EarlyExit::Break);
+                    self.early_exit = Some(EarlyExit::Break(None));
+                    break;
+                }
+                Some(other @ EarlyExit::Continue(_)) | Some(other @ EarlyExit::Break(_)) => {
+                    self.early_exit = Some(other);
                     break;
                 }
                 None => {}
@@ -9525,6 +9653,7 @@ impl BrowserExecutionState {
                 pending_binding: None,
                 pending_assignment: None,
                 pending_if: None,
+                pending_loop_header: None,
                 pending_return: false,
             },
         );
@@ -9532,22 +9661,28 @@ impl BrowserExecutionState {
         JsValue::Promise(promise)
     }
 
-    fn next_loop_cursor_body(&mut self, cursor: &mut LoopCursor) -> Option<Statement> {
+    fn next_loop_cursor_body(&mut self, cursor: &mut LoopCursor) -> LoopCursorStep {
         match cursor {
             LoopCursor::While(statement) => {
                 let condition = self.execute_expression(&statement.test);
+                if self.expression_suspended() || self.early_exit.is_some() {
+                    return LoopCursorStep::Suspended;
+                }
                 if Self::is_truthy(&condition) {
-                    Some(*statement.body.clone())
+                    LoopCursorStep::Body(*statement.body.clone())
                 } else {
-                    None
+                    LoopCursorStep::Done
                 }
             }
             LoopCursor::DoWhile(statement) => {
                 let condition = self.execute_expression(&statement.test);
+                if self.expression_suspended() || self.early_exit.is_some() {
+                    return LoopCursorStep::Suspended;
+                }
                 if Self::is_truthy(&condition) {
-                    Some(*statement.body.clone())
+                    LoopCursorStep::Body(*statement.body.clone())
                 } else {
-                    None
+                    LoopCursorStep::Done
                 }
             }
             LoopCursor::For(statement) => {
@@ -9557,16 +9692,19 @@ impl BrowserExecutionState {
                         || self.pending_async_await.is_some()
                         || self.pending_generator_yield.is_some()
                     {
-                        return None;
+                        return LoopCursorStep::Suspended;
                     }
                 }
                 if let Some(test) = &statement.test {
                     let condition = self.execute_expression(test);
+                    if self.expression_suspended() || self.early_exit.is_some() {
+                        return LoopCursorStep::Suspended;
+                    }
                     if !Self::is_truthy(&condition) {
-                        return None;
+                        return LoopCursorStep::Done;
                     }
                 }
-                Some(*statement.body.clone())
+                LoopCursorStep::Body(*statement.body.clone())
             }
             LoopCursor::ForIn {
                 statement,
@@ -9574,7 +9712,7 @@ impl BrowserExecutionState {
                 next_index,
             } => {
                 if *next_index >= keys.len() {
-                    return None;
+                    return LoopCursorStep::Done;
                 }
                 self.stack.push(StackFrame::block_scope());
                 self.bind_iteration_value(
@@ -9583,16 +9721,18 @@ impl BrowserExecutionState {
                     JsValue::String(keys[*next_index].clone()),
                 );
                 *next_index += 1;
-                Some(*statement.body.clone())
+                LoopCursorStep::Body(*statement.body.clone())
             }
             LoopCursor::ForOf {
                 statement,
                 iterator,
             } => {
-                let value = self.iterator_next_value(iterator)?;
+                let Some(value) = self.iterator_next_value(iterator) else {
+                    return LoopCursorStep::Done;
+                };
                 self.stack.push(StackFrame::block_scope());
                 self.bind_iteration_value(&statement.binding, statement.binding_kind, value);
-                Some(*statement.body.clone())
+                LoopCursorStep::Body(*statement.body.clone())
             }
         }
     }
@@ -9664,6 +9804,210 @@ impl BrowserExecutionState {
                 } else {
                     continuation.index += 1;
                 }
+            } else if let Some(loop_header) = continuation.pending_loop_header.take() {
+                let mut value = resume_value;
+                if let Some(expression) = continuation.pending_expression.take() {
+                    value = self.resume_expression_continuation(expression, value);
+                    if let Some(awaited) = self.pending_async_await.take() {
+                        continuation.stack = std::mem::replace(&mut self.stack, saved_stack);
+                        continuation.pending_expression =
+                            self.pending_async_resume_expression.take();
+                        continuation.pending_loop_header = Some(loop_header);
+                        self.attach_promise_reaction(
+                            &awaited,
+                            PromiseReaction::AsyncContinuation { id },
+                        );
+                        self.async_continuations.insert(id, continuation);
+                        return;
+                    }
+                }
+                if let Some((binding, kind)) = continuation.pending_binding.take() {
+                    self.bind_generator_resume_value(&binding, kind, value.clone());
+                } else if let Some(target) = continuation.pending_assignment.take() {
+                    self.user_assign(&target, value.clone());
+                }
+
+                match loop_header {
+                    AsyncPendingLoopHeader::ForInit(for_stmt)
+                    | AsyncPendingLoopHeader::ForTest(for_stmt) => {
+                        let mut enter_body = true;
+                        if let Some(test) = &for_stmt.test {
+                            let condition = self.execute_expression(test);
+                            if let Some(awaited) = self.pending_async_await.take() {
+                                continuation.stack =
+                                    std::mem::replace(&mut self.stack, saved_stack);
+                                continuation.pending_expression =
+                                    self.pending_async_resume_expression.take();
+                                continuation.pending_loop_header =
+                                    Some(AsyncPendingLoopHeader::ForTest(for_stmt));
+                                self.attach_promise_reaction(
+                                    &awaited,
+                                    PromiseReaction::AsyncContinuation { id },
+                                );
+                                self.async_continuations.insert(id, continuation);
+                                return;
+                            }
+                            if self.early_exit.is_some() {
+                                enter_body = false;
+                            } else if !Self::is_truthy(&condition) {
+                                self.stack.pop();
+                                self.ensure_global_frame();
+                                continuation.index += 1;
+                                enter_body = false;
+                            }
+                        }
+                        if enter_body {
+                            let parent_body = std::mem::take(&mut continuation.body);
+                            continuation.frames.push(AsyncStatementFrame {
+                                body: parent_body,
+                                index: continuation.index + 1,
+                                pop_scope: true,
+                                kind: AsyncFrameKind::Plain,
+                            });
+                            continuation.frames.push(AsyncStatementFrame {
+                                body: Vec::new(),
+                                index: 0,
+                                pop_scope: false,
+                                kind: AsyncFrameKind::Loop {
+                                    cursor: LoopCursor::For(for_stmt.clone()),
+                                },
+                            });
+                            continuation.body = vec![*for_stmt.body];
+                            continuation.index = 0;
+                        }
+                    }
+                    AsyncPendingLoopHeader::ForUpdate(mut cursor) => {
+                        let step = match &mut cursor {
+                            LoopCursor::For(statement) => {
+                                if let Some(test) = &statement.test {
+                                    let condition = self.execute_expression(test);
+                                    if self.expression_suspended() || self.early_exit.is_some() {
+                                        LoopCursorStep::Suspended
+                                    } else if Self::is_truthy(&condition) {
+                                        LoopCursorStep::Body(*statement.body.clone())
+                                    } else {
+                                        LoopCursorStep::Done
+                                    }
+                                } else {
+                                    LoopCursorStep::Body(*statement.body.clone())
+                                }
+                            }
+                            _ => self.next_loop_cursor_body(&mut cursor),
+                        };
+                        match step {
+                            LoopCursorStep::Body(next_body) => {
+                                continuation.frames.push(AsyncStatementFrame {
+                                    body: Vec::new(),
+                                    index: 0,
+                                    pop_scope: false,
+                                    kind: AsyncFrameKind::Loop { cursor },
+                                });
+                                continuation.body = vec![next_body];
+                                continuation.index = 0;
+                            }
+                            LoopCursorStep::Done => {
+                                if let Some(parent) = continuation.frames.pop() {
+                                    if parent.pop_scope {
+                                        self.stack.pop();
+                                        self.ensure_global_frame();
+                                    }
+                                    continuation.body = parent.body;
+                                    continuation.index = parent.index;
+                                } else {
+                                    continuation.body = Vec::new();
+                                    continuation.index = 0;
+                                }
+                            }
+                            LoopCursorStep::Suspended => {
+                                if let Some(awaited) = self.pending_async_await.take() {
+                                    continuation.stack =
+                                        std::mem::replace(&mut self.stack, saved_stack);
+                                    continuation.pending_expression =
+                                        self.pending_async_resume_expression.take();
+                                    continuation.pending_loop_header =
+                                        Some(AsyncPendingLoopHeader::ForUpdate(cursor));
+                                    self.attach_promise_reaction(
+                                        &awaited,
+                                        PromiseReaction::AsyncContinuation { id },
+                                    );
+                                    self.async_continuations.insert(id, continuation);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    AsyncPendingLoopHeader::ForInObject(for_in_stmt) => {
+                        let keys: Vec<String> = match value {
+                            JsValue::Object(rc) => rc.borrow().own_enumerable_keys(),
+                            _ => vec![],
+                        };
+                        if let Some(first_key) = keys.first().cloned() {
+                            self.stack.push(StackFrame::block_scope());
+                            self.bind_iteration_value(
+                                &for_in_stmt.binding,
+                                for_in_stmt.binding_kind,
+                                JsValue::String(first_key),
+                            );
+                            let cursor = LoopCursor::ForIn {
+                                statement: for_in_stmt.clone(),
+                                keys,
+                                next_index: 1,
+                            };
+                            let parent_body = std::mem::take(&mut continuation.body);
+                            continuation.frames.push(AsyncStatementFrame {
+                                body: parent_body,
+                                index: continuation.index + 1,
+                                pop_scope: false,
+                                kind: AsyncFrameKind::Plain,
+                            });
+                            continuation.frames.push(AsyncStatementFrame {
+                                body: Vec::new(),
+                                index: 0,
+                                pop_scope: true,
+                                kind: AsyncFrameKind::Loop { cursor },
+                            });
+                            continuation.body = vec![*for_in_stmt.body];
+                            continuation.index = 0;
+                        } else {
+                            continuation.index += 1;
+                        }
+                    }
+                    AsyncPendingLoopHeader::ForOfIterable(for_of_stmt) => {
+                        if let Some(mut iterator) = self.get_iterator_record(value) {
+                            if let Some(first_value) = self.iterator_next_value(&mut iterator) {
+                                self.stack.push(StackFrame::block_scope());
+                                self.bind_iteration_value(
+                                    &for_of_stmt.binding,
+                                    for_of_stmt.binding_kind,
+                                    first_value,
+                                );
+                                let cursor = LoopCursor::ForOf {
+                                    statement: for_of_stmt.clone(),
+                                    iterator,
+                                };
+                                let parent_body = std::mem::take(&mut continuation.body);
+                                continuation.frames.push(AsyncStatementFrame {
+                                    body: parent_body,
+                                    index: continuation.index + 1,
+                                    pop_scope: false,
+                                    kind: AsyncFrameKind::Plain,
+                                });
+                                continuation.frames.push(AsyncStatementFrame {
+                                    body: Vec::new(),
+                                    index: 0,
+                                    pop_scope: true,
+                                    kind: AsyncFrameKind::Loop { cursor },
+                                });
+                                continuation.body = vec![*for_of_stmt.body];
+                                continuation.index = 0;
+                            } else {
+                                continuation.index += 1;
+                            }
+                        } else {
+                            continuation.index += 1;
+                        }
+                    }
+                }
             } else {
                 let mut value = resume_value;
                 let mut completed_expression = false;
@@ -9701,6 +10045,7 @@ impl BrowserExecutionState {
             continuation.pending_binding = None;
             continuation.pending_assignment = None;
             continuation.pending_if = None;
+            continuation.pending_loop_header = None;
             continuation.pending_return = false;
         }
         self.pending_async_await = None;
@@ -9781,25 +10126,50 @@ impl BrowserExecutionState {
                             continuation.index = frame.index;
                         }
                         AsyncFrameKind::Loop { mut cursor } => {
-                            if let Some(next_body) = self.next_loop_cursor_body(&mut cursor) {
-                                continuation.frames.push(AsyncStatementFrame {
-                                    body: Vec::new(),
-                                    index: 0,
-                                    pop_scope: false,
-                                    kind: AsyncFrameKind::Loop { cursor },
-                                });
-                                continuation.body = vec![next_body];
-                                continuation.index = 0;
-                            } else if let Some(parent) = continuation.frames.pop() {
-                                if parent.pop_scope {
-                                    self.stack.pop();
-                                    self.ensure_global_frame();
+                            match self.next_loop_cursor_body(&mut cursor) {
+                                LoopCursorStep::Body(next_body) => {
+                                    continuation.frames.push(AsyncStatementFrame {
+                                        body: Vec::new(),
+                                        index: 0,
+                                        pop_scope: false,
+                                        kind: AsyncFrameKind::Loop { cursor },
+                                    });
+                                    continuation.body = vec![next_body];
+                                    continuation.index = 0;
                                 }
-                                continuation.body = parent.body;
-                                continuation.index = parent.index;
-                            } else {
-                                continuation.body = Vec::new();
-                                continuation.index = 0;
+                                LoopCursorStep::Done => {
+                                    if let Some(parent) = continuation.frames.pop() {
+                                        if parent.pop_scope {
+                                            self.stack.pop();
+                                            self.ensure_global_frame();
+                                        }
+                                        continuation.body = parent.body;
+                                        continuation.index = parent.index;
+                                    } else {
+                                        continuation.body = Vec::new();
+                                        continuation.index = 0;
+                                    }
+                                }
+                                LoopCursorStep::Suspended => {
+                                    if let Some(awaited) = self.pending_async_await.take() {
+                                        continuation.stack =
+                                            std::mem::replace(&mut self.stack, saved_stack);
+                                        continuation.pending_expression =
+                                            self.pending_async_resume_expression.take();
+                                        continuation.pending_binding =
+                                            self.pending_async_resume_binding.take();
+                                        continuation.pending_assignment =
+                                            self.pending_async_resume_assignment.take();
+                                        continuation.pending_loop_header =
+                                            Some(AsyncPendingLoopHeader::ForUpdate(cursor));
+                                        self.attach_promise_reaction(
+                                            &awaited,
+                                            PromiseReaction::AsyncContinuation { id },
+                                        );
+                                        self.async_continuations.insert(id, continuation);
+                                        return;
+                                    }
+                                }
                             }
                         }
                         AsyncFrameKind::Finally { after } => {
@@ -9960,14 +10330,41 @@ impl BrowserExecutionState {
                     if let Some(init) = &for_stmt.init {
                         self.execute_statement(init);
                     }
-                    if self.pending_async_await.is_some() || self.early_exit.is_some() {
-                        self.execute_statement(&Statement::For(for_stmt));
+                    if let Some(awaited) = self.pending_async_await.take() {
+                        continuation.stack = std::mem::replace(&mut self.stack, saved_stack);
+                        continuation.pending_expression =
+                            self.pending_async_resume_expression.take();
+                        continuation.pending_binding = self.pending_async_resume_binding.take();
+                        continuation.pending_assignment =
+                            self.pending_async_resume_assignment.take();
+                        continuation.pending_loop_header =
+                            Some(AsyncPendingLoopHeader::ForInit(for_stmt));
+                        self.attach_promise_reaction(
+                            &awaited,
+                            PromiseReaction::AsyncContinuation { id },
+                        );
+                        self.async_continuations.insert(id, continuation);
+                        return;
+                    }
+                    if self.early_exit.is_some() {
                         continue;
                     }
                     if let Some(test) = &for_stmt.test {
                         let condition = self.execute_expression(test);
-                        if self.pending_async_await.is_some() || self.early_exit.is_some() {
-                            self.execute_statement(&Statement::For(for_stmt));
+                        if let Some(awaited) = self.pending_async_await.take() {
+                            continuation.stack = std::mem::replace(&mut self.stack, saved_stack);
+                            continuation.pending_expression =
+                                self.pending_async_resume_expression.take();
+                            continuation.pending_loop_header =
+                                Some(AsyncPendingLoopHeader::ForTest(for_stmt));
+                            self.attach_promise_reaction(
+                                &awaited,
+                                PromiseReaction::AsyncContinuation { id },
+                            );
+                            self.async_continuations.insert(id, continuation);
+                            return;
+                        }
+                        if self.early_exit.is_some() {
                             continue;
                         }
                         if !Self::is_truthy(&condition) {
@@ -9998,6 +10395,19 @@ impl BrowserExecutionState {
                 }
                 Statement::ForIn(for_in_stmt) => {
                     let Some(cursor) = self.begin_for_in_loop_cursor(for_in_stmt.clone()) else {
+                        if let Some(awaited) = self.pending_async_await.take() {
+                            continuation.stack = std::mem::replace(&mut self.stack, saved_stack);
+                            continuation.pending_expression =
+                                self.pending_async_resume_expression.take();
+                            continuation.pending_loop_header =
+                                Some(AsyncPendingLoopHeader::ForInObject(for_in_stmt));
+                            self.attach_promise_reaction(
+                                &awaited,
+                                PromiseReaction::AsyncContinuation { id },
+                            );
+                            self.async_continuations.insert(id, continuation);
+                            return;
+                        }
                         continuation.index += 1;
                         continue;
                     };
@@ -10020,6 +10430,19 @@ impl BrowserExecutionState {
                 }
                 Statement::ForOf(for_of_stmt) => {
                     let Some(cursor) = self.begin_for_of_loop_cursor(for_of_stmt.clone()) else {
+                        if let Some(awaited) = self.pending_async_await.take() {
+                            continuation.stack = std::mem::replace(&mut self.stack, saved_stack);
+                            continuation.pending_expression =
+                                self.pending_async_resume_expression.take();
+                            continuation.pending_loop_header =
+                                Some(AsyncPendingLoopHeader::ForOfIterable(for_of_stmt));
+                            self.attach_promise_reaction(
+                                &awaited,
+                                PromiseReaction::AsyncContinuation { id },
+                            );
+                            self.async_continuations.insert(id, continuation);
+                            return;
+                        }
                         continuation.index += 1;
                         continue;
                     };
@@ -10106,7 +10529,7 @@ impl BrowserExecutionState {
                     self.early_exit = Some(EarlyExit::Throw(reason));
                     continue;
                 }
-                Some(EarlyExit::Continue) => {
+                Some(EarlyExit::Continue(label)) if label.is_none() => {
                     let mut handled = false;
                     while let Some(frame) = continuation.frames.pop() {
                         if frame.pop_scope {
@@ -10114,25 +10537,50 @@ impl BrowserExecutionState {
                             self.ensure_global_frame();
                         }
                         if let AsyncFrameKind::Loop { mut cursor } = frame.kind {
-                            if let Some(next_body) = self.next_loop_cursor_body(&mut cursor) {
-                                continuation.frames.push(AsyncStatementFrame {
-                                    body: Vec::new(),
-                                    index: 0,
-                                    pop_scope: false,
-                                    kind: AsyncFrameKind::Loop { cursor },
-                                });
-                                continuation.body = vec![next_body];
-                                continuation.index = 0;
-                            } else if let Some(parent) = continuation.frames.pop() {
-                                if parent.pop_scope {
-                                    self.stack.pop();
-                                    self.ensure_global_frame();
+                            match self.next_loop_cursor_body(&mut cursor) {
+                                LoopCursorStep::Body(next_body) => {
+                                    continuation.frames.push(AsyncStatementFrame {
+                                        body: Vec::new(),
+                                        index: 0,
+                                        pop_scope: false,
+                                        kind: AsyncFrameKind::Loop { cursor },
+                                    });
+                                    continuation.body = vec![next_body];
+                                    continuation.index = 0;
                                 }
-                                continuation.body = parent.body;
-                                continuation.index = parent.index;
-                            } else {
-                                continuation.body = Vec::new();
-                                continuation.index = 0;
+                                LoopCursorStep::Done => {
+                                    if let Some(parent) = continuation.frames.pop() {
+                                        if parent.pop_scope {
+                                            self.stack.pop();
+                                            self.ensure_global_frame();
+                                        }
+                                        continuation.body = parent.body;
+                                        continuation.index = parent.index;
+                                    } else {
+                                        continuation.body = Vec::new();
+                                        continuation.index = 0;
+                                    }
+                                }
+                                LoopCursorStep::Suspended => {
+                                    if let Some(awaited) = self.pending_async_await.take() {
+                                        continuation.stack =
+                                            std::mem::replace(&mut self.stack, saved_stack);
+                                        continuation.pending_expression =
+                                            self.pending_async_resume_expression.take();
+                                        continuation.pending_binding =
+                                            self.pending_async_resume_binding.take();
+                                        continuation.pending_assignment =
+                                            self.pending_async_resume_assignment.take();
+                                        continuation.pending_loop_header =
+                                            Some(AsyncPendingLoopHeader::ForUpdate(cursor));
+                                        self.attach_promise_reaction(
+                                            &awaited,
+                                            PromiseReaction::AsyncContinuation { id },
+                                        );
+                                        self.async_continuations.insert(id, continuation);
+                                        return;
+                                    }
+                                }
                             }
                             handled = true;
                             break;
@@ -10141,10 +10589,10 @@ impl BrowserExecutionState {
                     if handled {
                         continue;
                     }
-                    self.early_exit = Some(EarlyExit::Continue);
+                    self.early_exit = Some(EarlyExit::Continue(None));
                     break;
                 }
-                Some(EarlyExit::Break) => {
+                Some(EarlyExit::Break(label)) if label.is_none() => {
                     let mut handled = false;
                     while let Some(frame) = continuation.frames.pop() {
                         if frame.pop_scope {
@@ -10171,7 +10619,11 @@ impl BrowserExecutionState {
                     if handled {
                         continue;
                     }
-                    self.early_exit = Some(EarlyExit::Break);
+                    self.early_exit = Some(EarlyExit::Break(None));
+                    break;
+                }
+                Some(other @ EarlyExit::Continue(_)) | Some(other @ EarlyExit::Break(_)) => {
+                    self.early_exit = Some(other);
                     break;
                 }
                 None => {}
@@ -10934,6 +11386,22 @@ impl BrowserExecutionState {
                 }
                 err
             }
+            "Reflect.apply" => {
+                let target = args.first().cloned().unwrap_or(JsValue::Undefined);
+                if !Self::is_callable_value(&target) {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        "Reflect.apply target is not callable".to_owned(),
+                    )));
+                    return JsValue::Undefined;
+                }
+                let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let arguments = args
+                    .get(2)
+                    .map(|value| self.collect_iterable_values(value.clone()))
+                    .unwrap_or_default();
+                self.call_value(target, this_arg, arguments)
+            }
             "Reflect.construct" => {
                 // Reflect.construct(target, args, newTarget)
                 // Throws TypeError if newTarget is not a callable/constructor value.
@@ -10962,6 +11430,18 @@ impl BrowserExecutionState {
                 let prop = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
                 Self::static_get_own_property_descriptor(&obj, &prop)
             }
+            "Reflect.defineProperty" => {
+                let mut iter = args.into_iter();
+                let obj = iter.next().unwrap_or(JsValue::Undefined);
+                let prop = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
+                let descriptor = iter.next().unwrap_or(JsValue::Undefined);
+                match (obj, descriptor) {
+                    (JsValue::Object(rc), JsValue::Object(desc)) => {
+                        JsValue::Boolean(Self::apply_property_descriptor(&rc, prop, &desc))
+                    }
+                    _ => JsValue::Boolean(false),
+                }
+            }
             "Reflect.deleteProperty" => {
                 let mut iter = args.into_iter();
                 let obj = iter.next().unwrap_or(JsValue::Undefined);
@@ -10969,6 +11449,34 @@ impl BrowserExecutionState {
                 match obj {
                     JsValue::Object(rc) => JsValue::Boolean(rc.borrow_mut().delete_own(&prop)),
                     _ => JsValue::Boolean(true),
+                }
+            }
+            "Reflect.get" => {
+                let mut iter = args.into_iter();
+                let obj = iter.next().unwrap_or(JsValue::Undefined);
+                let prop = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
+                match obj {
+                    JsValue::Object(rc) => self.obj_get(&rc, &prop),
+                    _ => JsValue::Undefined,
+                }
+            }
+            "Reflect.getPrototypeOf" => match args.into_iter().next().unwrap_or(JsValue::Undefined)
+            {
+                JsValue::Object(rc) => rc
+                    .borrow()
+                    .prototype
+                    .as_ref()
+                    .map(|p| JsValue::Object(Rc::clone(p)))
+                    .unwrap_or(JsValue::Null),
+                _ => JsValue::Null,
+            },
+            "Reflect.has" => {
+                let mut iter = args.into_iter();
+                let obj = iter.next().unwrap_or(JsValue::Undefined);
+                let prop = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
+                match obj {
+                    JsValue::Object(rc) => JsValue::Boolean(Self::obj_has_property(&rc, &prop)),
+                    _ => JsValue::Boolean(false),
                 }
             }
             "Reflect.ownKeys" => match args.into_iter().next().unwrap_or(JsValue::Undefined) {
@@ -10992,6 +11500,35 @@ impl BrowserExecutionState {
                 }
                 _ => JsValue::Boolean(false),
             },
+            "Reflect.set" => {
+                let mut iter = args.into_iter();
+                let obj = iter.next().unwrap_or(JsValue::Undefined);
+                let prop = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
+                let value = iter.next().unwrap_or(JsValue::Undefined);
+                match obj {
+                    JsValue::Object(rc) => {
+                        self.obj_set(&rc, &prop, value);
+                        JsValue::Boolean(self.early_exit.is_none())
+                    }
+                    _ => JsValue::Boolean(false),
+                }
+            }
+            "Reflect.setPrototypeOf" => {
+                let mut iter = args.into_iter();
+                let obj = iter.next().unwrap_or(JsValue::Undefined);
+                let proto = iter.next().unwrap_or(JsValue::Undefined);
+                match (obj, proto) {
+                    (JsValue::Object(rc), JsValue::Object(proto_rc)) => {
+                        rc.borrow_mut().prototype = Some(proto_rc);
+                        JsValue::Boolean(true)
+                    }
+                    (JsValue::Object(rc), JsValue::Null) => {
+                        rc.borrow_mut().prototype = None;
+                        JsValue::Boolean(true)
+                    }
+                    _ => JsValue::Boolean(false),
+                }
+            }
             "Object.prototype.toString" => {
                 JsValue::String(format!("[object {}]", Self::object_tag(&this_arg)))
             }
@@ -15441,6 +15978,95 @@ mod tests {
     }
 
     #[test]
+    fn reflect_property_and_prototype_dispatch() {
+        let program = crate::parse_script(
+            r#"
+            let proto = { inherited: "P" };
+            let obj = {};
+            let setProto = Reflect.setPrototypeOf(obj, proto);
+            let protoValue = Reflect.getPrototypeOf(obj).inherited;
+            let defined = Reflect.defineProperty(obj, "own", {
+                value: "O",
+                configurable: true
+            });
+            let setOwn = Reflect.set(obj, "newOwn", "N");
+            document.getElementById("result").textContent =
+                String(setProto) + "/" + protoValue + "/" +
+                String(defined) + "/" + String(Reflect.has(obj, "inherited")) + "/" +
+                Reflect.get(obj, "inherited") + "/" + Reflect.get(obj, "own") + "/" +
+                String(setOwn) + "/" + Reflect.get(obj, "newOwn");
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "true/P/true/true/P/O/true/N".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn reflect_define_property_reports_false_for_non_configurable_change() {
+        let program = crate::parse_script(
+            r#"
+            let obj = {};
+            Object.defineProperty(obj, "locked", {
+                value: "A",
+                configurable: false,
+                writable: false
+            });
+            let changed = Reflect.defineProperty(obj, "locked", { value: "B" });
+            document.getElementById("result").textContent =
+                String(changed) + "/" + Reflect.get(obj, "locked");
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "false/A".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn reflect_apply_calls_function_with_this_and_arguments() {
+        let program = crate::parse_script(
+            r#"
+            let receiver = { prefix: "R" };
+            function join(a, b) {
+                return this.prefix + a + b;
+            }
+            document.getElementById("result").textContent =
+                Reflect.apply(join, receiver, ["A", "B"]);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "RAB".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
     fn async_function_returns_fulfilled_promise() {
         let program = crate::parse_script(
             r#"
@@ -16048,6 +16674,197 @@ mod tests {
             vec![BrowserEffect::SetTextContent {
                 element_id: "result".to_owned(),
                 value: "B0SA0B1B2A2B3DE".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_pending_await_in_for_init_resumes_without_rerunning_loop() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let output = "";
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+
+            async function run() {
+                for (let i = await p; i < 3; i = i + 1) {
+                    output = output + "B" + String(i);
+                }
+                output = output + "D";
+            }
+
+            run().then(function () { output = output + "E"; });
+            output = output + "S";
+            setTimeout(function () { resolveLater(1); }, 0);
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "SB1B2DE".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_pending_await_in_for_update_resumes_without_rerunning_body() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let output = "";
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+
+            async function run() {
+                for (let i = 0; i < 3; i = i + await p) {
+                    output = output + "B" + String(i);
+                }
+                output = output + "D";
+            }
+
+            run().then(function () { output = output + "E"; });
+            output = output + "S";
+            setTimeout(function () { resolveLater(1); }, 0);
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "B0SB1B2DE".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_pending_await_in_for_test_resumes_without_skipping_body() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let output = "";
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+
+            async function run() {
+                for (let i = 0; await p; i = i + 1) {
+                    output = output + "B" + String(i);
+                    break;
+                }
+                output = output + "D";
+            }
+
+            run().then(function () { output = output + "E"; });
+            output = output + "S";
+            setTimeout(function () { resolveLater(true); }, 0);
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "SB0DE".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_pending_await_in_for_in_object_resumes_iteration_setup() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let output = "";
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+
+            async function run() {
+                for (let key in await p) {
+                    output = output + key;
+                }
+                output = output + "D";
+            }
+
+            run().then(function () { output = output + "E"; });
+            output = output + "S";
+            setTimeout(function () { resolveLater({ a: 1, b: 2 }); }, 0);
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "SabDE".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_pending_await_in_for_of_iterable_resumes_iteration_setup() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let output = "";
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+
+            async function run() {
+                for (let value of await p) {
+                    output = output + value;
+                }
+                output = output + "D";
+            }
+
+            run().then(function () { output = output + "E"; });
+            output = output + "S";
+            setTimeout(function () { resolveLater(["A", "B"]); }, 0);
+            setTimeout(function () {
+                document.getElementById("result").textContent = output;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "SABDE".to_owned(),
             }]
         );
     }
@@ -18317,6 +19134,147 @@ mod tests {
                 BrowserEffect::RuntimeTrace { kind, .. } if kind == expected_kind
             )
         })
+    }
+
+    #[test]
+    fn labeled_break_exits_outer_loop() {
+        let effects = run(r#"
+            let out = "";
+            outer: for (let i = 0; i < 3; i = i + 1) {
+                for (let j = 0; j < 3; j = j + 1) {
+                    if (i === 1 && j === 1) {
+                        break outer;
+                    }
+                    out = out + String(i) + ":" + String(j) + ",";
+                }
+            }
+            document.getElementById("result").textContent = out;
+            "#);
+        assert_eq!(effects, vec![text("result", "0:0,0:1,0:2,1:0,")]);
+    }
+
+    #[test]
+    fn labeled_continue_continues_outer_loop() {
+        let effects = run(r#"
+            let out = "";
+            outer: for (let i = 0; i < 3; i = i + 1) {
+                for (let j = 0; j < 3; j = j + 1) {
+                    if (j === 1) {
+                        continue outer;
+                    }
+                    out = out + String(i) + ":" + String(j) + ",";
+                }
+            }
+            document.getElementById("result").textContent = out;
+            "#);
+        assert_eq!(effects, vec![text("result", "0:0,1:0,2:0,")]);
+    }
+
+    #[test]
+    fn labeled_block_break_skips_to_after_block() {
+        let effects = run(r#"
+            let out = "";
+            done: {
+                out = out + "a";
+                break done;
+                out = out + "b";
+            }
+            out = out + "c";
+            document.getElementById("result").textContent = out;
+            "#);
+        assert_eq!(effects, vec![text("result", "ac")]);
+    }
+
+    #[test]
+    fn labeled_switch_break_exits_switch() {
+        let effects = run(r#"
+            let out = "";
+            target: switch (1) {
+                case 1:
+                    out = out + "a";
+                    break target;
+                    out = out + "b";
+                default:
+                    out = out + "c";
+            }
+            out = out + "d";
+            document.getElementById("result").textContent = out;
+            "#);
+        assert_eq!(effects, vec![text("result", "ad")]);
+    }
+
+    #[test]
+    fn generator_labeled_break_after_yield_targets_outer_loop() {
+        let program = crate::parse_script(
+            r#"
+            function* gen() {
+                let out = "";
+                outer: for (let i = 0; i < 3; i = i + 1) {
+                    for (let j = 0; j < 3; j = j + 1) {
+                        out = out + String(i) + ":" + String(j) + ",";
+                        yield "pause";
+                        break outer;
+                    }
+                }
+                yield out;
+            }
+            let g = gen();
+            let r1 = g.next();
+            let r2 = g.next();
+            document.getElementById("result").textContent =
+                r1.value + "/" + r2.value + "/" + String(r2.done);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "pause/0:0,/false".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_labeled_break_after_await_targets_outer_loop() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+            let out = "";
+
+            async function run() {
+                outer: for (let i = 0; i < 3; i = i + 1) {
+                    for (let j = 0; j < 3; j = j + 1) {
+                        out = out + String(i) + ":" + String(j) + ",";
+                        await p;
+                        break outer;
+                    }
+                }
+                document.getElementById("result").textContent = out;
+            }
+
+            run();
+            setTimeout(function () { resolveLater("resume"); }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "0:0,".to_owned(),
+            }]
+        );
     }
 
     // 031 – default parameters

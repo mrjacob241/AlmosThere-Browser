@@ -4,9 +4,9 @@ use crate::{
         BinaryOperator, Binding, BlockStatement, ClassDeclaration, ClassField, ClassMethod,
         DoWhileStatement, ExportDeclaration, ExportDefaultDeclaration, ExportSpecifier, Expression,
         ForInStatement, ForOfStatement, ForStatement, FunctionBody, FunctionDeclaration,
-        FunctionExpression, IfStatement, ImportDeclaration, ImportSpecifier, MemberProperty,
-        MethodKind, ObjectBindingProp, ObjectProperty, Param, ReturnStatement, Statement,
-        SwitchCase, SwitchStatement, TemplateElement, ThrowStatement, TryCatchStatement,
+        FunctionExpression, IfStatement, ImportDeclaration, ImportSpecifier, LabeledStatement,
+        MemberProperty, MethodKind, ObjectBindingProp, ObjectProperty, Param, ReturnStatement,
+        Statement, SwitchCase, SwitchStatement, TemplateElement, ThrowStatement, TryCatchStatement,
         UnaryOperator, VarKind, VariableDeclaration, VariableDeclarator, WhileStatement,
     },
     error::JsError,
@@ -79,21 +79,30 @@ impl Parser {
             TokenKind::Switch => self.parse_switch_statement().map(Statement::Switch),
             TokenKind::Break => {
                 let span = self.advance().span;
-                // optional label — skip identifier if present
-                if matches!(self.current_kind(), TokenKind::Identifier(_)) {
-                    self.advance();
-                }
+                let label = match self.current_kind().clone() {
+                    TokenKind::Identifier(name) => {
+                        self.advance();
+                        Some(name)
+                    }
+                    _ => None,
+                };
                 self.consume_semicolon();
-                Ok(Statement::Break(span))
+                Ok(Statement::Break(crate::ast::BreakStatement { label, span }))
             }
             TokenKind::Continue => {
                 let span = self.advance().span;
-                // optional label — skip identifier if present
-                if matches!(self.current_kind(), TokenKind::Identifier(_)) {
-                    self.advance();
-                }
+                let label = match self.current_kind().clone() {
+                    TokenKind::Identifier(name) => {
+                        self.advance();
+                        Some(name)
+                    }
+                    _ => None,
+                };
                 self.consume_semicolon();
-                Ok(Statement::Continue(span))
+                Ok(Statement::Continue(crate::ast::ContinueStatement {
+                    label,
+                    span,
+                }))
             }
             TokenKind::LeftBrace => self.parse_block().map(Statement::Block),
             TokenKind::Semicolon => {
@@ -108,10 +117,15 @@ impl Parser {
                 .map(Statement::ImportDeclaration),
             _ => {
                 let first = self.parse_expression(0)?;
-                // Labeled statement: `label: statement` — discard label, parse body
-                if let Expression::Identifier(_) = &first {
+                // Labeled statement: `label: statement`.
+                if let Expression::Identifier(label) = &first {
                     if self.eat(TokenKind::Colon) {
-                        return self.parse_statement();
+                        let body = self.parse_statement()?;
+                        return Ok(Statement::Labeled(LabeledStatement {
+                            label: label.clone(),
+                            body: Box::new(body),
+                            span: crate::lexer::Span::default(),
+                        }));
                     }
                 }
                 // Comma (sequence) operator at statement level: a=1, b=2, c=3;
@@ -2091,6 +2105,40 @@ mod tests {
             panic!("expected expression statement");
         };
         assert!(matches!(expr, Expression::Yield(None)));
+    }
+
+    #[test]
+    fn parses_labeled_statements_and_labeled_control_flow() {
+        let program = parse_script("outer: for (let i = 0; i < 1; i++) { break outer; }").unwrap();
+        let Statement::Labeled(labeled) = &program.body[0] else {
+            panic!("expected labeled statement");
+        };
+        assert_eq!(labeled.label, "outer");
+        let Statement::For(for_stmt) = labeled.body.as_ref() else {
+            panic!("expected labeled for statement");
+        };
+        let Statement::Block(block) = for_stmt.body.as_ref() else {
+            panic!("expected for block body");
+        };
+        let Statement::Break(stmt) = &block.body[0] else {
+            panic!("expected labeled break");
+        };
+        assert_eq!(stmt.label.as_deref(), Some("outer"));
+
+        let program = parse_script("outer: while (true) { continue outer; }").unwrap();
+        let Statement::Labeled(labeled) = &program.body[0] else {
+            panic!("expected labeled statement");
+        };
+        let Statement::While(while_stmt) = labeled.body.as_ref() else {
+            panic!("expected labeled while statement");
+        };
+        let Statement::Block(block) = while_stmt.body.as_ref() else {
+            panic!("expected while block body");
+        };
+        let Statement::Continue(stmt) = &block.body[0] else {
+            panic!("expected labeled continue");
+        };
+        assert_eq!(stmt.label.as_deref(), Some("outer"));
     }
 
     #[test]

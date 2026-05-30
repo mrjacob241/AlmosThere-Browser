@@ -22,11 +22,31 @@ pub enum Statement {
     ForIn(ForInStatement),
     TryCatch(TryCatchStatement),
     Switch(SwitchStatement),
-    Break(Span),
-    Continue(Span),
+    Labeled(LabeledStatement),
+    Break(BreakStatement),
+    Continue(ContinueStatement),
     Block(BlockStatement),
     Expression(Expression),
     Empty,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LabeledStatement {
+    pub label: String,
+    pub body: Box<Statement>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BreakStatement {
+    pub label: Option<String>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContinueStatement {
+    pub label: Option<String>,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]
