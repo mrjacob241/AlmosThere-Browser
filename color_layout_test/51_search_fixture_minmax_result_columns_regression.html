@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>51 - Search Fixture Minmax Result Columns Regression</title>
+<style>
+:root {
+  --line: rgba(20, 30, 40, 0.18);
+  --page: #f7f8fa;
+  --green: #51cf66;
+  --yellow: #ffd43b;
+  --cyan: #22b8cf;
+  --blue: #4dabf7;
+  --orange: #f59f00;
+  --pink: #f783ac;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body {
+  background: var(--page);
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+}
+.box {
+  min-height: 48px;
+  border: 1px solid var(--line);
+  display: grid;
+  place-items: center;
+  padding: 10px;
+  font-size: 13px;
+  font-weight: 700;
+  color: rgba(0,0,0,0.74);
+  text-align: center;
+}
+.page {
+  min-height: 100vh;
+  display: grid;
+  grid-template-rows: 72px 1fr;
+}
+header {
+  display: grid;
+  grid-template-columns: 160px minmax(240px, 720px) 1fr;
+  gap: 12px;
+  padding: 12px 20px;
+  background: var(--green);
+}
+.logo { background: var(--yellow); }
+.search { background: #ffffff; }
+.tools { background: var(--blue); }
+main {
+  display: grid;
+  grid-template-columns: minmax(0, 740px) 320px;
+  gap: 28px;
+  width: 1088px;
+  padding: 20px 0;
+  margin-left: 20px;
+}
+.results {
+  display: grid;
+  gap: 14px;
+  background: rgba(34,184,207,0.18);
+}
+.result { background: var(--cyan); min-height: 96px; }
+.panel { background: var(--orange); min-height: 320px; }
+.probe {
+  height: 18px;
+  background: var(--pink);
+  width: 100%;
+}
+.label {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  padding: 6px 8px;
+  background: rgba(255,255,255,0.88);
+  border: 1px solid var(--line);
+  font-size: 12px;
+}
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <div class="box logo">160px logo</div>
+    <div class="box search">minmax(240px, 720px) search column</div>
+    <div class="box tools">auto/fr tools</div>
+  </header>
+  <main>
+    <section class="results">
+      <div class="probe"></div>
+      <article class="box result">minmax(0, 740px) result column should be wide</article>
+      <article class="box result">second result block</article>
+      <article class="box result">third result block</article>
+    </section>
+    <aside class="box panel">320px knowledge panel</aside>
+  </main>
+</div>
+<div class="label">51 / regression - Search Fixture Minmax Result Columns</div>
+</body>
+</html>

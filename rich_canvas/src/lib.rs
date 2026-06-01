@@ -108,6 +108,7 @@ pub struct ElementStyleKey {
     pub id: Option<String>,
     pub classes: Vec<String>,
     pub attributes: Vec<String>,
+    pub child_index: Option<usize>,
     pub parent: Option<Box<ElementStyleKey>>,
     pub previous_sibling: Option<Box<ElementStyleKey>>,
 }
@@ -125,6 +126,7 @@ pub struct CssSelector {
     pub id: Option<String>,
     pub classes: Vec<String>,
     pub attributes: Vec<String>,
+    pub nth_child: Option<CssNthChild>,
     pub ancestor: Option<SimpleCssSelector>,
     pub parent: Option<SimpleCssSelector>,
     pub previous_sibling: Option<SimpleCssSelector>,
@@ -137,6 +139,13 @@ pub struct SimpleCssSelector {
     pub id: Option<String>,
     pub classes: Vec<String>,
     pub attributes: Vec<String>,
+    pub nth_child: Option<CssNthChild>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CssNthChild {
+    pub step: i32,
+    pub offset: i32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -172,9 +181,13 @@ pub struct CssBoxStyle {
     pub text_align: Option<CssTextAlign>,
     pub flex_grow: Option<f32>,
     pub flex_direction: Option<CssFlexDirection>,
+    pub flex_wrap: Option<CssFlexWrap>,
     pub justify_content: Option<CssJustifyContent>,
     pub align_items: Option<CssAlignItems>,
     pub grid_template_columns: Option<usize>,
+    pub grid_template_column_tracks: Option<Vec<CssLength>>,
+    pub grid_auto_repeat_min_column_width: Option<CssLength>,
+    pub grid_template_rows: Option<Vec<CssLength>>,
     pub grid_template_areas: Option<Vec<Vec<String>>>,
     pub grid_area: Option<String>,
     pub gap: Option<f32>,
@@ -185,6 +198,7 @@ pub struct CssBoxStyle {
     pub z_index: Option<i32>,
     pub inset: Option<CssEdges>,
     pub inset_sides: CssInset,
+    pub transform: Option<CssTransform>,
     pub object_fit: Option<CssObjectFit>,
     pub box_sizing_border_box: Option<bool>,
 }
@@ -215,9 +229,13 @@ pub struct ResolvedBoxStyle {
     pub text_align: CssTextAlign,
     pub flex_grow: f32,
     pub flex_direction: CssFlexDirection,
+    pub flex_wrap: CssFlexWrap,
     pub justify_content: CssJustifyContent,
     pub align_items: CssAlignItems,
     pub grid_template_columns: Option<usize>,
+    pub grid_template_column_tracks: Option<Vec<CssLength>>,
+    pub grid_auto_repeat_min_column_width: Option<CssLength>,
+    pub grid_template_rows: Option<Vec<CssLength>>,
     pub grid_template_areas: Option<Vec<Vec<String>>>,
     pub grid_area: Option<String>,
     pub gap: f32,
@@ -228,6 +246,7 @@ pub struct ResolvedBoxStyle {
     pub z_index: Option<i32>,
     pub inset: Option<CssEdges>,
     pub inset_sides: CssInset,
+    pub transform: CssTransform,
     pub object_fit: CssObjectFit,
     pub box_sizing_border_box: bool,
 }
@@ -259,9 +278,13 @@ impl Default for ResolvedBoxStyle {
             text_align: CssTextAlign::Left,
             flex_grow: 0.0,
             flex_direction: CssFlexDirection::Row,
+            flex_wrap: CssFlexWrap::NoWrap,
             justify_content: CssJustifyContent::FlexStart,
             align_items: CssAlignItems::Stretch,
             grid_template_columns: None,
+            grid_template_column_tracks: None,
+            grid_auto_repeat_min_column_width: None,
+            grid_template_rows: None,
             grid_template_areas: None,
             grid_area: None,
             gap: 0.0,
@@ -272,6 +295,7 @@ impl Default for ResolvedBoxStyle {
             z_index: None,
             inset: None,
             inset_sides: CssInset::default(),
+            transform: CssTransform::default(),
             object_fit: CssObjectFit::Fill,
             box_sizing_border_box: false,
         }
@@ -322,11 +346,29 @@ pub struct CssInset {
     pub left: Option<f32>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CssTransform {
+    pub translate_x: Option<CssLength>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CssLength {
     Auto,
     Px(f32),
     Percent(f32),
+    Fr(f32),
+    Vw(f32),
+    Vh(f32),
+    Calc(CssLengthExpression),
+    Min(CssLengthExpression, CssLengthExpression),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CssLengthExpression {
+    pub px: f32,
+    pub percent: f32,
+    pub vw: f32,
+    pub vh: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -340,6 +382,12 @@ pub enum CssTextAlign {
 pub enum CssFlexDirection {
     Row,
     Column,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CssFlexWrap {
+    NoWrap,
+    Wrap,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2429,11 +2477,47 @@ fn paint_css_box(
 }
 
 fn css_length_px(length: CssLength, containing_width: f32) -> f32 {
+    const DEFAULT_VIEWPORT_WIDTH: f32 = 1280.0;
+    const DEFAULT_VIEWPORT_HEIGHT: f32 = 900.0;
+
     match length {
         CssLength::Auto => containing_width,
         CssLength::Px(px) => px,
         CssLength::Percent(percent) => containing_width * percent / 100.0,
+        CssLength::Fr(_) => containing_width,
+        CssLength::Vw(vw) => DEFAULT_VIEWPORT_WIDTH * vw / 100.0,
+        CssLength::Vh(vh) => DEFAULT_VIEWPORT_HEIGHT * vh / 100.0,
+        CssLength::Calc(expression) => css_length_expression_px(
+            expression,
+            containing_width,
+            DEFAULT_VIEWPORT_WIDTH,
+            DEFAULT_VIEWPORT_HEIGHT,
+        ),
+        CssLength::Min(left, right) => css_length_expression_px(
+            left,
+            containing_width,
+            DEFAULT_VIEWPORT_WIDTH,
+            DEFAULT_VIEWPORT_HEIGHT,
+        )
+        .min(css_length_expression_px(
+            right,
+            containing_width,
+            DEFAULT_VIEWPORT_WIDTH,
+            DEFAULT_VIEWPORT_HEIGHT,
+        )),
     }
+}
+
+fn css_length_expression_px(
+    expression: CssLengthExpression,
+    containing_width: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> f32 {
+    expression.px
+        + containing_width * expression.percent / 100.0
+        + viewport_width * expression.vw / 100.0
+        + viewport_height * expression.vh / 100.0
 }
 
 fn paint_resolved_css_box(
@@ -3485,7 +3569,7 @@ fn parse_basic_css_inner(
             apply_css_rule(&mut style, selector, declarations, &variables);
             if let (Some(selector), Some(box_style)) = (
                 parse_css_selector(selector),
-                parse_css_box_style_with_vars(declarations, &style.css_variables),
+                parse_css_box_style_with_vars(declarations, &style.css_variables, viewport_width),
             ) {
                 style.block_rules.push(CssBlockRule {
                     selector,
@@ -3523,7 +3607,10 @@ fn collect_css_custom_properties(css: &str, root_classes: &[String]) -> HashMap<
 fn selector_list_contains_root(selectors: &str, root_classes: &[String]) -> bool {
     selectors.split(',').any(|selector| {
         let selector = selector.trim();
-        if selector == ":root" || selector == "html" {
+        if selector == ":root" || selector == "html" || selector == "body" {
+            return true;
+        }
+        if selector_targets_document_container(selector) {
             return true;
         }
         if let Some(class_name) = selector.strip_prefix('.') {
@@ -3540,6 +3627,24 @@ fn selector_list_contains_root(selectors: &str, root_classes: &[String]) -> bool
     })
 }
 
+fn selector_targets_document_container(selector: &str) -> bool {
+    let selector = selector.trim().to_ascii_lowercase();
+    if selector.contains(char::is_whitespace)
+        || selector.contains('>')
+        || selector.contains('+')
+        || selector.contains('~')
+    {
+        return false;
+    }
+    const ROOT_IDS: [&str; 5] = ["app", "root", "__next", "__nuxt", "svelte"];
+    ROOT_IDS.iter().any(|id| {
+        selector == format!("#{id}")
+            || selector.starts_with(&format!("#{id}."))
+            || selector.contains(&format!("[id=\"{id}\"]"))
+            || selector.contains(&format!("[id='{id}']"))
+    })
+}
+
 fn resolve_css_vars(value: &str, variables: &HashMap<String, String>) -> String {
     let mut resolved = value.to_owned();
     for _ in 0..8 {
@@ -3551,11 +3656,13 @@ fn resolve_css_vars(value: &str, variables: &HashMap<String, String>) -> String 
         };
         let inner = &resolved[start + 4..end];
         let (name, fallback) = split_css_function_args(inner);
-        let replacement = variables
+        let Some(replacement) = variables
             .get(name.trim())
             .cloned()
             .or_else(|| fallback.map(|value| value.trim().to_owned()))
-            .unwrap_or_default();
+        else {
+            break;
+        };
         resolved.replace_range(start..=end, &replacement);
     }
     resolved
@@ -3879,7 +3986,7 @@ pub fn computed_box_style(style: &BrowserStyle, key: &ElementStyleKey) -> CssBox
 }
 
 pub fn parse_inline_box_style(declarations: &str) -> Option<CssBoxStyle> {
-    parse_css_box_style_with_vars(declarations, &HashMap::new())
+    parse_css_box_style_with_vars(declarations, &HashMap::new(), None)
 }
 
 fn css_selector_matches(selector: &CssSelector, key: &ElementStyleKey) -> bool {
@@ -3888,6 +3995,7 @@ fn css_selector_matches(selector: &CssSelector, key: &ElementStyleKey) -> bool {
         id: selector.id.clone(),
         classes: selector.classes.clone(),
         attributes: selector.attributes.clone(),
+        nth_child: selector.nth_child,
     };
     if !simple_css_selector_matches(&current, key) {
         return false;
@@ -3930,6 +4038,14 @@ fn simple_css_selector_matches(selector: &SimpleCssSelector, key: &ElementStyleK
             return false;
         }
     }
+    if let Some(nth_child) = selector.nth_child {
+        let Some(child_index) = key.child_index else {
+            return false;
+        };
+        if !nth_child_matches(nth_child, child_index) {
+            return false;
+        }
+    }
     selector
         .classes
         .iter()
@@ -3939,6 +4055,20 @@ fn simple_css_selector_matches(selector: &SimpleCssSelector, key: &ElementStyleK
                 .iter()
                 .any(|key_attribute| key_attribute == attribute)
         })
+}
+
+fn nth_child_matches(nth_child: CssNthChild, child_index: usize) -> bool {
+    let child_index = child_index as i32;
+    if child_index <= 0 {
+        return false;
+    }
+    match nth_child.step {
+        0 => child_index == nth_child.offset,
+        step if step > 0 => {
+            child_index >= nth_child.offset && (child_index - nth_child.offset) % step == 0
+        }
+        step => child_index <= nth_child.offset && (nth_child.offset - child_index) % -step == 0,
+    }
 }
 
 fn ancestor_css_selector_matches(
@@ -3961,6 +4091,7 @@ fn css_selector_specificity(selector: &CssSelector) -> usize {
         id: selector.id.clone(),
         classes: selector.classes.clone(),
         attributes: selector.attributes.clone(),
+        nth_child: selector.nth_child,
     };
     simple_css_selector_specificity(&current)
         + selector
@@ -3982,7 +4113,8 @@ fn css_selector_specificity(selector: &CssSelector) -> usize {
 
 fn simple_css_selector_specificity(selector: &SimpleCssSelector) -> usize {
     selector.id.iter().count() * 100
-        + (selector.classes.len() + selector.attributes.len()) * 10
+        + (selector.classes.len() + selector.attributes.len() + selector.nth_child.iter().count())
+            * 10
         + selector.tag.iter().count()
 }
 
@@ -4098,6 +4230,9 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
     if source.flex_direction.is_some() {
         target.flex_direction = source.flex_direction;
     }
+    if source.flex_wrap.is_some() {
+        target.flex_wrap = source.flex_wrap;
+    }
     if source.justify_content.is_some() {
         target.justify_content = source.justify_content;
     }
@@ -4106,6 +4241,15 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
     }
     if source.grid_template_columns.is_some() {
         target.grid_template_columns = source.grid_template_columns;
+    }
+    if source.grid_template_column_tracks.is_some() {
+        target.grid_template_column_tracks = source.grid_template_column_tracks.clone();
+    }
+    if source.grid_auto_repeat_min_column_width.is_some() {
+        target.grid_auto_repeat_min_column_width = source.grid_auto_repeat_min_column_width;
+    }
+    if source.grid_template_rows.is_some() {
+        target.grid_template_rows = source.grid_template_rows.clone();
     }
     if source.grid_template_areas.is_some() {
         target.grid_template_areas = source.grid_template_areas.clone();
@@ -4146,6 +4290,9 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
     if source.inset_sides.left.is_some() {
         target.inset_sides.left = source.inset_sides.left;
     }
+    if source.transform.is_some() {
+        target.transform = source.transform;
+    }
     if source.object_fit.is_some() {
         target.object_fit = source.object_fit;
     }
@@ -4156,8 +4303,11 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
 
 fn parse_css_selector(selector: &str) -> Option<CssSelector> {
     let selector = normalize_css_selector(selector)?;
-    if selector.is_empty() || selector == "*" {
+    if selector.is_empty() {
         return None;
+    }
+    if selector == "*" {
+        return Some(CssSelector::default());
     }
 
     if let Some((left, right)) = split_selector_once(&selector, '+') {
@@ -4168,6 +4318,7 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             id: right.id,
             classes: right.classes,
             attributes: right.attributes,
+            nth_child: right.nth_child,
             ancestor: None,
             parent,
             previous_sibling: Some(previous_sibling),
@@ -4183,6 +4334,7 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             id: child.id,
             classes: child.classes,
             attributes: child.attributes,
+            nth_child: child.nth_child,
             ancestor: None,
             parent: Some(parent),
             previous_sibling: None,
@@ -4190,7 +4342,7 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
         });
     }
 
-    if selector.chars().any(char::is_whitespace) {
+    if selector_has_top_level_whitespace(&selector) {
         let (ancestor, descendant) = split_descendant_selector(&selector)?;
         let descendant = parse_simple_css_selector(descendant)?;
         let ancestor = parse_simple_css_selector(ancestor)?;
@@ -4199,6 +4351,7 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             id: descendant.id,
             classes: descendant.classes,
             attributes: descendant.attributes,
+            nth_child: descendant.nth_child,
             ancestor: Some(ancestor),
             parent: None,
             previous_sibling: None,
@@ -4211,6 +4364,7 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
         && simple.id.is_none()
         && simple.classes.is_empty()
         && simple.attributes.is_empty()
+        && simple.nth_child.is_none()
     {
         None
     } else {
@@ -4219,6 +4373,7 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             id: simple.id,
             classes: simple.classes,
             attributes: simple.attributes,
+            nth_child: simple.nth_child,
             ancestor: None,
             parent: None,
             previous_sibling: None,
@@ -4228,13 +4383,17 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
 }
 
 fn split_descendant_selector(selector: &str) -> Option<(&str, &str)> {
-    let mut parts = selector.split_whitespace().collect::<Vec<_>>();
+    let mut parts = split_selector_by_top_level_whitespace(selector);
     if parts.len() != 2 {
         return None;
     }
     let descendant = parts.pop()?;
     let ancestor = parts.pop()?;
-    if ancestor.contains(['>', '+']) || descendant.contains(['>', '+']) {
+    if find_top_level_char(ancestor, '>').is_some()
+        || find_top_level_char(ancestor, '+').is_some()
+        || find_top_level_char(descendant, '>').is_some()
+        || find_top_level_char(descendant, '+').is_some()
+    {
         None
     } else {
         Some((ancestor, descendant))
@@ -4257,9 +4416,9 @@ fn parse_previous_sibling_selector(
 fn parse_simple_css_selector(selector: &str) -> Option<SimpleCssSelector> {
     let selector = selector.trim();
     if selector.is_empty()
-        || selector.chars().any(char::is_whitespace)
-        || selector.contains('>')
-        || selector.contains('+')
+        || selector_has_top_level_whitespace(selector)
+        || find_top_level_char(selector, '>').is_some()
+        || find_top_level_char(selector, '+').is_some()
     {
         return None;
     }
@@ -4268,6 +4427,7 @@ fn parse_simple_css_selector(selector: &str) -> Option<SimpleCssSelector> {
     let mut id = None;
     let mut classes = Vec::new();
     let (selector, attributes) = strip_simple_selector_attributes(selector);
+    let (selector, nth_child) = strip_simple_selector_pseudo_classes(&selector)?;
     let mut token = String::new();
     let mut mode = 't';
     for ch in selector.chars().chain(std::iter::once('.')) {
@@ -4285,6 +4445,7 @@ fn parse_simple_css_selector(selector: &str) -> Option<SimpleCssSelector> {
         id,
         classes,
         attributes,
+        nth_child,
     })
 }
 
@@ -4317,6 +4478,64 @@ fn strip_simple_selector_attributes(selector: &str) -> (String, Vec<String>) {
     (simple, attributes)
 }
 
+fn strip_simple_selector_pseudo_classes(selector: &str) -> Option<(String, Option<CssNthChild>)> {
+    let mut simple = String::new();
+    let mut nth_child = None;
+    let mut index = 0usize;
+    while index < selector.len() {
+        let rest = &selector[index..];
+        if rest.starts_with(":nth-child(") {
+            let open_paren = index + ":nth-child".len();
+            let end = find_function_end(selector, open_paren)?;
+            nth_child = Some(parse_nth_child_formula(&selector[open_paren + 1..end])?);
+            index = end + 1;
+            continue;
+        }
+
+        let ch = rest.chars().next()?;
+        if ch == ':' {
+            return None;
+        }
+        simple.push(ch);
+        index += ch.len_utf8();
+    }
+    Some((simple, nth_child))
+}
+
+fn parse_nth_child_formula(formula: &str) -> Option<CssNthChild> {
+    let formula = formula
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    match formula.as_str() {
+        "odd" => {
+            return Some(CssNthChild { step: 2, offset: 1 });
+        }
+        "even" => {
+            return Some(CssNthChild { step: 2, offset: 0 });
+        }
+        _ => {}
+    }
+
+    if let Ok(offset) = formula.parse::<i32>() {
+        return (offset > 0).then_some(CssNthChild { step: 0, offset });
+    }
+
+    let n_index = formula.find('n')?;
+    let step = match &formula[..n_index] {
+        "" | "+" => 1,
+        "-" => -1,
+        value => value.parse::<i32>().ok()?,
+    };
+    let offset = match &formula[n_index + 1..] {
+        "" => 0,
+        value => value.parse::<i32>().ok()?,
+    };
+    (step != 0).then_some(CssNthChild { step, offset })
+}
+
 fn normalize_css_selector(selector: &str) -> Option<String> {
     let selector = selector.trim();
     if selector.is_empty() {
@@ -4332,29 +4551,7 @@ fn normalize_css_selector(selector: &str) -> Option<String> {
         return None;
     }
 
-    let mut normalized = String::new();
-    let mut in_pseudo = false;
-    let mut pseudo_depth = 0usize;
-    for ch in selector.chars() {
-        match ch {
-            ':' => in_pseudo = true,
-            '(' if in_pseudo => pseudo_depth += 1,
-            ')' if in_pseudo && pseudo_depth > 0 => {
-                pseudo_depth -= 1;
-                if pseudo_depth == 0 {
-                    in_pseudo = false;
-                }
-            }
-            ch if in_pseudo && pseudo_depth == 0 && matches!(ch, '.' | '#' | ' ' | '>' | '+') => {
-                in_pseudo = false;
-                normalized.push(ch);
-            }
-            _ if !in_pseudo => normalized.push(ch),
-            _ => {}
-        }
-    }
-    let normalized = normalized.trim().to_owned();
-    (!normalized.is_empty()).then_some(normalized)
+    Some(selector.to_owned())
 }
 
 fn selector_contains_dynamic_pseudo_class(selector: &str) -> bool {
@@ -4380,14 +4577,89 @@ fn selector_contains_dynamic_pseudo_class(selector: &str) -> bool {
 }
 
 fn split_selector_once(selector: &str, combinator: char) -> Option<(&str, &str)> {
-    let index = selector.find(combinator)?;
+    let index = find_top_level_char(selector, combinator)?;
     let left = selector[..index].trim();
     let right = selector[index + combinator.len_utf8()..].trim();
-    if left.is_empty() || right.is_empty() || right.contains('>') || right.contains('+') {
+    if left.is_empty()
+        || right.is_empty()
+        || find_top_level_char(right, '>').is_some()
+        || find_top_level_char(right, '+').is_some()
+    {
         None
     } else {
         Some((left, right))
     }
+}
+
+fn find_top_level_char(selector: &str, target: char) -> Option<usize> {
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    for (index, ch) in selector.char_indices() {
+        match ch {
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '(' if bracket_depth == 0 => paren_depth += 1,
+            ')' if bracket_depth == 0 => paren_depth = paren_depth.saturating_sub(1),
+            ch if ch == target && paren_depth == 0 && bracket_depth == 0 => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn selector_has_top_level_whitespace(selector: &str) -> bool {
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    for ch in selector.chars() {
+        match ch {
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '(' if bracket_depth == 0 => paren_depth += 1,
+            ')' if bracket_depth == 0 => paren_depth = paren_depth.saturating_sub(1),
+            ch if ch.is_whitespace() && paren_depth == 0 && bracket_depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn split_selector_by_top_level_whitespace(selector: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut start = None;
+    for (index, ch) in selector.char_indices() {
+        match ch {
+            '[' => {
+                bracket_depth += 1;
+                start.get_or_insert(index);
+            }
+            ']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                start.get_or_insert(index);
+            }
+            '(' if bracket_depth == 0 => {
+                paren_depth += 1;
+                start.get_or_insert(index);
+            }
+            ')' if bracket_depth == 0 => {
+                paren_depth = paren_depth.saturating_sub(1);
+                start.get_or_insert(index);
+            }
+            ch if ch.is_whitespace() && paren_depth == 0 && bracket_depth == 0 => {
+                if let Some(part_start) = start.take() {
+                    parts.push(&selector[part_start..index]);
+                }
+            }
+            _ => {
+                start.get_or_insert(index);
+            }
+        }
+    }
+    if let Some(part_start) = start {
+        parts.push(&selector[part_start..]);
+    }
+    parts
 }
 
 fn push_selector_part(
@@ -4412,6 +4684,7 @@ fn push_selector_part(
 fn parse_css_box_style_with_vars(
     declarations: &str,
     variables: &HashMap<String, String>,
+    viewport_width: Option<f32>,
 ) -> Option<CssBoxStyle> {
     let mut style = CssBoxStyle::default();
     let mut seen = false;
@@ -4594,6 +4867,26 @@ fn parse_css_box_style_with_vars(
                 };
                 seen |= style.flex_direction.is_some();
             }
+            "flex-wrap" => {
+                style.flex_wrap = parse_flex_wrap(value);
+                seen |= style.flex_wrap.is_some();
+            }
+            "flex-flow" => {
+                for token in split_css_value_list(value) {
+                    let token = token.trim();
+                    if style.flex_direction.is_none() {
+                        style.flex_direction = match token {
+                            "row" | "row-reverse" => Some(CssFlexDirection::Row),
+                            "column" | "column-reverse" => Some(CssFlexDirection::Column),
+                            _ => None,
+                        };
+                    }
+                    if style.flex_wrap.is_none() {
+                        style.flex_wrap = parse_flex_wrap(token);
+                    }
+                }
+                seen |= style.flex_direction.is_some() || style.flex_wrap.is_some();
+            }
             "justify-content" => {
                 style.justify_content = match value {
                     "center" => Some(CssJustifyContent::Center),
@@ -4614,9 +4907,29 @@ fn parse_css_box_style_with_vars(
                 };
                 seen |= style.align_items.is_some();
             }
+            "place-items" => {
+                let values = split_css_value_list(value);
+                if values
+                    .iter()
+                    .any(|value| value.trim().eq_ignore_ascii_case("center"))
+                {
+                    style.align_items = Some(CssAlignItems::Center);
+                    style.justify_content = Some(CssJustifyContent::Center);
+                    seen = true;
+                }
+            }
             "grid-template-columns" => {
                 style.grid_template_columns = parse_grid_template_columns(value);
-                seen |= style.grid_template_columns.is_some();
+                style.grid_template_column_tracks = parse_grid_template_column_tracks(value);
+                style.grid_auto_repeat_min_column_width =
+                    parse_grid_auto_repeat_min_column_width(value);
+                seen |= style.grid_template_columns.is_some()
+                    || style.grid_template_column_tracks.is_some()
+                    || style.grid_auto_repeat_min_column_width.is_some();
+            }
+            "grid-template-rows" => {
+                style.grid_template_rows = parse_grid_template_rows(value);
+                seen |= style.grid_template_rows.is_some();
             }
             "grid-template-areas" => {
                 style.grid_template_areas = parse_grid_template_areas(value);
@@ -4627,11 +4940,19 @@ fn parse_css_box_style_with_vars(
                 seen |= style.grid_area.is_some();
             }
             "grid-template" => {
+                style.grid_template_rows = parse_grid_template_shorthand_rows(value);
                 style.grid_template_columns = parse_grid_template_shorthand_columns(value);
-                seen |= style.grid_template_columns.is_some();
+                style.grid_template_column_tracks =
+                    parse_grid_template_shorthand_column_tracks(value);
+                style.grid_auto_repeat_min_column_width =
+                    parse_grid_template_shorthand_auto_repeat_min_column_width(value);
+                seen |= style.grid_template_rows.is_some()
+                    || style.grid_template_columns.is_some()
+                    || style.grid_template_column_tracks.is_some()
+                    || style.grid_auto_repeat_min_column_width.is_some();
             }
             "gap" | "row-gap" | "column-gap" => {
-                style.gap = parse_px(value);
+                style.gap = parse_gap(value);
                 seen |= style.gap.is_some();
             }
             "visibility" => {
@@ -4673,25 +4994,24 @@ fn parse_css_box_style_with_vars(
                 }
             }
             "inset" => {
-                style.inset = parse_edges(value);
-                if let Some(edges) = style.inset {
-                    style.inset_sides = CssInset {
-                        top: Some(edges.top),
-                        right: Some(edges.right),
-                        bottom: Some(edges.bottom),
-                        left: Some(edges.left),
-                    };
+                if let Some((edges, sides)) = parse_inset_edges(value, viewport_width) {
+                    style.inset = Some(edges);
+                    style.inset_sides = sides;
+                    seen = true;
                 }
-                seen |= style.inset.is_some();
             }
             "top" | "right" | "bottom" | "left" => {
                 let mut edges = style.inset.unwrap_or_default();
-                if let Some(px) = parse_px(value) {
+                if let Some(px) = parse_inset_value(value, viewport_width) {
                     set_edge(&mut edges, property, px);
                     set_inset_side(&mut style.inset_sides, property, px);
                     style.inset = Some(edges);
                     seen = true;
                 }
+            }
+            "transform" => {
+                style.transform = parse_css_transform(value);
+                seen |= style.transform.is_some();
             }
             "object-fit" => {
                 style.object_fit = match value {
@@ -4742,6 +5062,14 @@ fn parse_flex_grow(value: &str) -> Option<f32> {
     }
 }
 
+fn parse_flex_wrap(value: &str) -> Option<CssFlexWrap> {
+    match value.trim() {
+        "wrap" | "wrap-reverse" => Some(CssFlexWrap::Wrap),
+        "nowrap" => Some(CssFlexWrap::NoWrap),
+        _ => None,
+    }
+}
+
 fn parse_grid_template_columns(value: &str) -> Option<usize> {
     let value = value.trim();
     if value.is_empty() || value == "none" {
@@ -4749,7 +5077,12 @@ fn parse_grid_template_columns(value: &str) -> Option<usize> {
     }
     if let Some(repeat_start) = value.find("repeat(") {
         let inner = &value[repeat_start + "repeat(".len()..];
-        let count = inner.split(',').next()?.trim().parse::<usize>().ok()?;
+        let (count, track) = split_css_function_args(inner);
+        let count = count.trim();
+        if count.eq_ignore_ascii_case("auto-fit") || count.eq_ignore_ascii_case("auto-fill") {
+            return parse_grid_auto_repeat_column_count(track?.trim());
+        }
+        let count = count.parse::<usize>().ok()?;
         return (count > 0).then_some(count);
     }
     let columns = split_css_value_list(value)
@@ -4762,9 +5095,175 @@ fn parse_grid_template_columns(value: &str) -> Option<usize> {
     (columns > 0).then_some(columns)
 }
 
+fn parse_grid_template_column_tracks(value: &str) -> Option<Vec<CssLength>> {
+    parse_grid_template_tracks(value, false)
+}
+
+fn parse_grid_template_tracks(value: &str, allow_auto_repeat: bool) -> Option<Vec<CssLength>> {
+    let value = value.trim();
+    if value.is_empty() || value == "none" {
+        return None;
+    }
+    let mut tracks = Vec::new();
+    for token in split_css_value_list(value) {
+        let token = token.trim();
+        if token.is_empty() || token == "/" || token.eq_ignore_ascii_case("subgrid") {
+            continue;
+        }
+        if let Some(repeated) =
+            parse_grid_template_repeat_tracks_with_auto(token, allow_auto_repeat)
+        {
+            tracks.extend(repeated);
+            continue;
+        }
+        tracks.push(parse_grid_template_track_size(token).unwrap_or(CssLength::Auto));
+    }
+    (!tracks.is_empty()).then_some(tracks)
+}
+
+fn parse_grid_template_track_size(token: &str) -> Option<CssLength> {
+    let token = token.trim();
+    if let Some(track) = parse_grid_minmax_preferred_track(token) {
+        return Some(track);
+    }
+    parse_css_length(token)
+}
+
+fn parse_grid_auto_repeat_column_count(track: &str) -> Option<usize> {
+    let min_track = parse_grid_minmax_min_track(track).unwrap_or_else(|| track.trim());
+    let min_px = parse_px(min_track).unwrap_or(240.0).max(1.0);
+    Some(((1280.0 / min_px).floor() as usize).clamp(1, 12))
+}
+
+fn parse_grid_auto_repeat_min_column_width(value: &str) -> Option<CssLength> {
+    let value = value.trim();
+    let repeat_start = value.find("repeat(")?;
+    let inner = &value[repeat_start + "repeat(".len()..];
+    let (count, track) = split_css_function_args(inner);
+    let count = count.trim();
+    if !count.eq_ignore_ascii_case("auto-fit") && !count.eq_ignore_ascii_case("auto-fill") {
+        return None;
+    }
+    let min_track = parse_grid_minmax_min_track(track?.trim())?;
+    parse_css_length(min_track)
+}
+
+fn parse_grid_minmax_min_track(track: &str) -> Option<&str> {
+    let track = track.trim();
+    let minmax_start = track.find("minmax(")?;
+    let open_paren = minmax_start + "minmax".len();
+    let close_paren = find_function_end(track, open_paren)?;
+    let inner = &track[open_paren + 1..close_paren];
+    let (min, _) = split_css_function_args(inner);
+    Some(min.trim())
+}
+
+fn parse_grid_minmax_max_track(track: &str) -> Option<&str> {
+    let track = track.trim();
+    let minmax_start = track.find("minmax(")?;
+    let open_paren = minmax_start + "minmax".len();
+    let close_paren = find_function_end(track, open_paren)?;
+    let inner = &track[open_paren + 1..close_paren];
+    let (_, max) = split_css_function_args(inner);
+    max.map(str::trim)
+}
+
+fn parse_grid_minmax_preferred_track(track: &str) -> Option<CssLength> {
+    let min_track = parse_grid_minmax_min_track(track)?;
+    let max_track = parse_grid_minmax_max_track(track)?;
+    if let Some(max_length) = parse_css_length(max_track) {
+        return Some(max_length);
+    }
+    if max_track.contains("var(") {
+        return Some(CssLength::Auto);
+    }
+    parse_css_length(min_track)
+}
+
+fn parse_grid_template_rows(value: &str) -> Option<Vec<CssLength>> {
+    let value = value.trim();
+    if value.is_empty() || value == "none" {
+        return None;
+    }
+    let mut rows = Vec::new();
+    for token in split_css_value_list(value) {
+        let token = token.trim();
+        if token.is_empty() || token == "/" || token.eq_ignore_ascii_case("subgrid") {
+            continue;
+        }
+        if let Some(repeated) = parse_grid_template_repeat_tracks_with_auto(token, true) {
+            rows.extend(repeated);
+            continue;
+        }
+        rows.push(parse_grid_template_track_size(token).unwrap_or(CssLength::Auto));
+    }
+    (!rows.is_empty()).then_some(rows)
+}
+
 fn parse_grid_template_shorthand_columns(value: &str) -> Option<usize> {
     let (_, columns) = value.rsplit_once('/')?;
     parse_grid_template_columns(columns)
+}
+
+fn parse_grid_template_shorthand_column_tracks(value: &str) -> Option<Vec<CssLength>> {
+    let (_, columns) = value.rsplit_once('/')?;
+    parse_grid_template_column_tracks(columns)
+}
+
+fn parse_grid_template_shorthand_auto_repeat_min_column_width(value: &str) -> Option<CssLength> {
+    let (_, columns) = value.rsplit_once('/')?;
+    parse_grid_auto_repeat_min_column_width(columns)
+}
+
+fn parse_grid_template_shorthand_rows(value: &str) -> Option<Vec<CssLength>> {
+    let (rows, _) = value.rsplit_once('/')?;
+    let row_tracks = rows
+        .lines()
+        .filter_map(|line| {
+            let after_area = line
+                .rfind(['\'', '"'])
+                .map(|index| &line[index + 1..])
+                .unwrap_or(line);
+            parse_grid_template_rows(after_area)
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    (!row_tracks.is_empty()).then_some(row_tracks)
+}
+
+fn parse_grid_template_repeat_tracks_with_auto(
+    value: &str,
+    allow_auto_repeat: bool,
+) -> Option<Vec<CssLength>> {
+    let inner = value
+        .strip_prefix("repeat(")
+        .and_then(|value| value.strip_suffix(')'))?;
+    let (count, track) = split_css_function_args(inner);
+    let count = count.trim();
+    if count.eq_ignore_ascii_case("auto-fit") || count.eq_ignore_ascii_case("auto-fill") {
+        if !allow_auto_repeat {
+            return None;
+        }
+        return Some(vec![
+            parse_grid_template_track_size(track?.trim()).unwrap_or(CssLength::Auto),
+        ]);
+    }
+    let count = count.parse::<usize>().ok()?;
+    if count == 0 {
+        return None;
+    }
+    let tracks = split_css_value_list(track?)
+        .into_iter()
+        .map(|track| parse_grid_template_track_size(&track).unwrap_or(CssLength::Auto))
+        .collect::<Vec<_>>();
+    if tracks.is_empty() {
+        return None;
+    }
+    let mut repeated = Vec::with_capacity(tracks.len() * count);
+    for _ in 0..count {
+        repeated.extend(tracks.iter().copied());
+    }
+    Some(repeated)
 }
 
 fn parse_grid_template_areas(value: &str) -> Option<Vec<Vec<String>>> {
@@ -4920,14 +5419,260 @@ fn set_inset_side(inset: &mut CssInset, property: &str, px: f32) {
     }
 }
 
+fn parse_inset_edges(value: &str, viewport_width: Option<f32>) -> Option<(CssEdges, CssInset)> {
+    let values = split_css_value_list(value);
+    let expanded = match values.as_slice() {
+        [all] => [all.as_str(), all.as_str(), all.as_str(), all.as_str()],
+        [vertical, horizontal] => [
+            vertical.as_str(),
+            horizontal.as_str(),
+            vertical.as_str(),
+            horizontal.as_str(),
+        ],
+        [top, horizontal, bottom] => [
+            top.as_str(),
+            horizontal.as_str(),
+            bottom.as_str(),
+            horizontal.as_str(),
+        ],
+        [top, right, bottom, left, ..] => {
+            [top.as_str(), right.as_str(), bottom.as_str(), left.as_str()]
+        }
+        _ => return None,
+    };
+
+    let mut edges = CssEdges::default();
+    let mut sides = CssInset::default();
+    let mut saw_side = false;
+    for (index, token) in expanded.iter().enumerate() {
+        if token.eq_ignore_ascii_case("auto") {
+            continue;
+        }
+        let px = parse_inset_value(token, viewport_width)?;
+        saw_side = true;
+        match index {
+            0 => {
+                edges.top = px;
+                sides.top = Some(px);
+            }
+            1 => {
+                edges.right = px;
+                sides.right = Some(px);
+            }
+            2 => {
+                edges.bottom = px;
+                sides.bottom = Some(px);
+            }
+            3 => {
+                edges.left = px;
+                sides.left = Some(px);
+            }
+            _ => {}
+        }
+    }
+    saw_side.then_some((edges, sides))
+}
+
+fn parse_inset_value(value: &str, viewport_width: Option<f32>) -> Option<f32> {
+    parse_px(value).or_else(|| {
+        parse_signed_percent(value)
+            .map(|percent| viewport_width.unwrap_or(1280.0) * percent / 100.0)
+    })
+}
+
+fn parse_css_transform(value: &str) -> Option<CssTransform> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") {
+        return Some(CssTransform::default());
+    }
+    let lower = value.to_ascii_lowercase();
+    let inner = lower
+        .strip_prefix("translatex(")
+        .and_then(|value| value.strip_suffix(')'))?;
+    Some(CssTransform {
+        translate_x: parse_css_transform_length(inner.trim()),
+    })
+    .filter(|transform| transform.translate_x.is_some())
+}
+
+fn parse_css_transform_length(value: &str) -> Option<CssLength> {
+    if let Some(percent) = parse_signed_percent(value) {
+        Some(CssLength::Percent(percent))
+    } else {
+        parse_px(value).map(CssLength::Px)
+    }
+}
+
 fn parse_css_length(value: &str) -> Option<CssLength> {
-    if value.trim().eq_ignore_ascii_case("auto") {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
         Some(CssLength::Auto)
+    } else if let Some(inner) = value
+        .strip_prefix("min(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let (left, right) = split_css_function_args(inner);
+        Some(CssLength::Min(
+            parse_css_length_expression(left.trim())?,
+            parse_css_length_expression(right?.trim())?,
+        ))
+    } else if let Some(inner) = value
+        .strip_prefix("calc(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        Some(css_length_from_expression(parse_css_length_expression(
+            inner,
+        )?))
+    } else if let Some(vw) = value.strip_suffix("vw") {
+        vw.trim().parse::<f32>().ok().map(CssLength::Vw)
+    } else if let Some(vh) = value.strip_suffix("vh") {
+        vh.trim().parse::<f32>().ok().map(CssLength::Vh)
+    } else if let Some(fr) = value.strip_suffix("fr") {
+        fr.trim().parse::<f32>().ok().map(CssLength::Fr)
     } else {
         parse_percent(value)
             .map(CssLength::Percent)
             .or_else(|| parse_px(value).map(CssLength::Px))
     }
+}
+
+fn css_length_from_expression(expression: CssLengthExpression) -> CssLength {
+    if expression.percent == 0.0 && expression.vw == 0.0 && expression.vh == 0.0 {
+        CssLength::Px(expression.px)
+    } else {
+        CssLength::Calc(expression)
+    }
+}
+
+fn parse_gap(value: &str) -> Option<f32> {
+    split_css_value_list(value)
+        .into_iter()
+        .find_map(|part| parse_px(&part))
+}
+
+fn parse_css_length_expression(value: &str) -> Option<CssLengthExpression> {
+    let mut expression = CssLengthExpression::default();
+    let mut current = String::new();
+    let mut sign = 1.0;
+    let mut depth = 0usize;
+    let mut saw_term = false;
+
+    for ch in value.chars().chain(std::iter::once('+')) {
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            '+' | '-' if depth == 0 => {
+                if !current.trim().is_empty() {
+                    expression = add_css_length_expression_term(
+                        expression,
+                        parse_css_length_expression_term(current.trim())?,
+                        sign,
+                    );
+                    current.clear();
+                    saw_term = true;
+                }
+                sign = if ch == '-' { -1.0 } else { 1.0 };
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    saw_term.then_some(expression)
+}
+
+fn add_css_length_expression_term(
+    mut expression: CssLengthExpression,
+    term: CssLengthExpression,
+    sign: f32,
+) -> CssLengthExpression {
+    expression.px += term.px * sign;
+    expression.percent += term.percent * sign;
+    expression.vw += term.vw * sign;
+    expression.vh += term.vh * sign;
+    expression
+}
+
+fn parse_css_length_expression_term(value: &str) -> Option<CssLengthExpression> {
+    let value = value.trim();
+    if value.contains('*') {
+        let parts = value.split('*').map(str::trim).collect::<Vec<_>>();
+        if parts.len() != 2 {
+            return None;
+        }
+        if let Ok(factor) = parts[0].parse::<f32>() {
+            return scale_css_length_expression(
+                parse_css_length_expression_term(parts[1])?,
+                factor,
+            );
+        }
+        if let Ok(factor) = parts[1].parse::<f32>() {
+            return scale_css_length_expression(
+                parse_css_length_expression_term(parts[0])?,
+                factor,
+            );
+        }
+        return None;
+    }
+    if let Some((left, right)) = value.split_once('/') {
+        let denominator = right.trim().parse::<f32>().ok()?;
+        if denominator == 0.0 {
+            return None;
+        }
+        return scale_css_length_expression(
+            parse_css_length_expression_term(left.trim())?,
+            1.0 / denominator,
+        );
+    }
+    parse_css_length_expression_factor(value)
+}
+
+fn scale_css_length_expression(
+    mut expression: CssLengthExpression,
+    factor: f32,
+) -> Option<CssLengthExpression> {
+    expression.px *= factor;
+    expression.percent *= factor;
+    expression.vw *= factor;
+    expression.vh *= factor;
+    Some(expression)
+}
+
+fn parse_css_length_expression_factor(value: &str) -> Option<CssLengthExpression> {
+    let value = value.trim();
+    if let Some(inner) = value
+        .strip_prefix("calc(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return parse_css_length_expression(inner);
+    }
+    if let Some(percent) = parse_percent(value) {
+        return Some(CssLengthExpression {
+            percent,
+            ..CssLengthExpression::default()
+        });
+    }
+    if let Some(vw) = value.strip_suffix("vw") {
+        return Some(CssLengthExpression {
+            vw: vw.trim().parse::<f32>().ok()?,
+            ..CssLengthExpression::default()
+        });
+    }
+    if let Some(vh) = value.strip_suffix("vh") {
+        return Some(CssLengthExpression {
+            vh: vh.trim().parse::<f32>().ok()?,
+            ..CssLengthExpression::default()
+        });
+    }
+    Some(CssLengthExpression {
+        px: parse_px(value)?,
+        ..CssLengthExpression::default()
+    })
 }
 
 fn button_width_for_text(text: &str, style: &BrowserStyle, font_scale: f32) -> f32 {
@@ -5017,6 +5762,13 @@ fn parse_px(value: &str) -> Option<f32> {
     {
         return parse_calc_length(inner);
     }
+    if let Some(inner) = value
+        .strip_prefix("min(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let (left, right) = split_css_function_args(inner);
+        return Some(parse_px(left.trim())?.min(parse_px(right?.trim())?));
+    }
     if let Some(rem) = value.strip_suffix("rem") {
         return rem.trim().parse::<f32>().ok().map(|rem| rem * 16.0);
     }
@@ -5086,13 +5838,11 @@ fn parse_calc_length_factor(value: &str) -> Option<f32> {
 }
 
 fn parse_percent(value: &str) -> Option<f32> {
-    value
-        .trim()
-        .strip_suffix('%')?
-        .trim()
-        .parse::<f32>()
-        .ok()
-        .filter(|percent| *percent > 0.0)
+    parse_signed_percent(value).filter(|percent| *percent > 0.0)
+}
+
+fn parse_signed_percent(value: &str) -> Option<f32> {
+    value.trim().strip_suffix('%')?.trim().parse::<f32>().ok()
 }
 
 fn parse_hex_color(value: &str) -> Option<Color32> {
@@ -5678,12 +6428,94 @@ mod tests {
     }
 
     #[test]
+    fn nth_child_pseudo_classes_stay_bound_to_compound_selectors() {
+        let selector = parse_css_selector(".tile:nth-child(3n)").unwrap();
+
+        assert_eq!(selector.classes, vec!["tile"]);
+        assert_eq!(selector.nth_child, Some(CssNthChild { step: 3, offset: 0 }));
+    }
+
+    #[test]
+    fn computed_box_style_matches_classed_nth_child_cascade() {
+        let style = parse_basic_css(
+            r#"
+            .tile { background: #ff66aa; }
+            .tile:nth-child(3n) { background: #f59e0b; }
+            .tile:nth-child(4n) { background: #22d3ee; }
+            "#,
+        );
+        let tile = |child_index| ElementStyleKey {
+            tag: "section".to_owned(),
+            classes: vec!["tile".to_owned()],
+            child_index: Some(child_index),
+            ..ElementStyleKey::default()
+        };
+
+        assert_eq!(
+            computed_box_style(&style, &tile(1)).background,
+            Some(Color32::from_rgb(0xff, 0x66, 0xaa))
+        );
+        assert_eq!(
+            computed_box_style(&style, &tile(3)).background,
+            Some(Color32::from_rgb(0xf5, 0x9e, 0x0b))
+        );
+        assert_eq!(
+            computed_box_style(&style, &tile(4)).background,
+            Some(Color32::from_rgb(0x22, 0xd3, 0xee))
+        );
+        assert_eq!(
+            computed_box_style(&style, &tile(12)).background,
+            Some(Color32::from_rgb(0x22, 0xd3, 0xee))
+        );
+
+        let non_tile = ElementStyleKey {
+            tag: "section".to_owned(),
+            classes: vec!["card".to_owned()],
+            child_index: Some(3),
+            ..ElementStyleKey::default()
+        };
+        assert_eq!(computed_box_style(&style, &non_tile).background, None);
+    }
+
+    #[test]
+    fn computed_box_style_matches_odd_nth_child_with_ancestor_class() {
+        let style = parse_basic_css(
+            r#"
+            .gallery .box { background: #14b8a6; }
+            .gallery .box:nth-child(odd) { background: #ec4899; }
+            "#,
+        );
+        let gallery = ElementStyleKey {
+            tag: "section".to_owned(),
+            classes: vec!["gallery".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let gallery_child = |child_index| ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["box".to_owned()],
+            child_index: Some(child_index),
+            parent: Some(Box::new(gallery.clone())),
+            ..ElementStyleKey::default()
+        };
+
+        assert_eq!(
+            computed_box_style(&style, &gallery_child(1)).background,
+            Some(Color32::from_rgb(0xec, 0x48, 0x99))
+        );
+        assert_eq!(
+            computed_box_style(&style, &gallery_child(2)).background,
+            Some(Color32::from_rgb(0x14, 0xb8, 0xa6))
+        );
+    }
+
+    #[test]
     fn parse_basic_css_carries_flex_layout_properties() {
         let style = parse_basic_css(
             r#"
             .toolbar {
                 display: flex;
                 flex-direction: row;
+                flex-wrap: wrap;
                 justify-content: space-between;
                 align-items: center;
                 gap: 12px;
@@ -5700,12 +6532,39 @@ mod tests {
 
         assert_eq!(computed.display, Some(CssDisplay::Flex));
         assert_eq!(computed.flex_direction, Some(CssFlexDirection::Row));
+        assert_eq!(computed.flex_wrap, Some(CssFlexWrap::Wrap));
         assert_eq!(
             computed.justify_content,
             Some(CssJustifyContent::SpaceBetween)
         );
         assert_eq!(computed.align_items, Some(CssAlignItems::Center));
         assert_eq!(computed.gap, Some(12.0));
+    }
+
+    #[test]
+    fn parse_basic_css_applies_universal_box_sizing_rule_to_box_styles() {
+        let style = parse_basic_css("* { box-sizing: border-box; } .item { min-width: 0; }");
+        let key = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["item".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &key);
+
+        assert_eq!(computed.box_sizing_border_box, Some(true));
+        assert_eq!(computed.min_width, Some(CssLength::Px(0.0)));
+    }
+
+    #[test]
+    fn parse_basic_css_accepts_two_value_gap_shorthand() {
+        let style = parse_basic_css(".tabs { display: flex; gap: 8px 12px; }");
+        let key = ElementStyleKey {
+            tag: "nav".to_owned(),
+            classes: vec!["tabs".to_owned()],
+            ..ElementStyleKey::default()
+        };
+
+        assert_eq!(computed_box_style(&style, &key).gap, Some(8.0));
     }
 
     #[test]
@@ -5727,6 +6586,38 @@ mod tests {
 
         assert_eq!(computed.position, Some(CssPosition::Sticky));
         assert_eq!(computed.z_index, Some(3));
+    }
+
+    #[test]
+    fn parse_basic_css_carries_fixed_overlay_inset_and_translate_x() {
+        let style = parse_basic_css_for_viewport(
+            r#"
+            .overlay {
+                position: fixed;
+                inset: 96px auto auto 50%;
+                transform: translateX(-50%);
+            }
+            "#,
+            1280.0,
+        );
+        let key = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["overlay".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &key);
+
+        assert_eq!(computed.position, Some(CssPosition::Fixed));
+        assert_eq!(computed.inset_sides.top, Some(96.0));
+        assert_eq!(computed.inset_sides.right, None);
+        assert_eq!(computed.inset_sides.bottom, None);
+        assert_eq!(computed.inset_sides.left, Some(640.0));
+        assert_eq!(
+            computed
+                .transform
+                .and_then(|transform| transform.translate_x),
+            Some(CssLength::Percent(-50.0))
+        );
     }
 
     #[test]
@@ -5843,7 +6734,7 @@ mod tests {
     #[test]
     fn parse_basic_css_carries_grid_template_column_count() {
         let style = parse_basic_css(
-            ".counter { display: grid; grid-template-columns: 1fr auto 1fr; } .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); } .page { grid-template: min-content 1fr / 12.25rem minmax(0, 1fr); }",
+            ".counter { display: grid; grid-template-columns: 1fr auto 1fr; } .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); } .auto { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); } .page { grid-template: min-content 48px / 12.25rem minmax(0, 1fr); } .rows { grid-template-rows: 40px 25%; }",
         );
         let counter = ElementStyleKey {
             tag: "div".to_owned(),
@@ -5860,6 +6751,16 @@ mod tests {
             classes: vec!["page".to_owned()],
             ..ElementStyleKey::default()
         };
+        let rows = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["rows".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let auto = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["auto".to_owned()],
+            ..ElementStyleKey::default()
+        };
 
         assert_eq!(
             computed_box_style(&style, &counter).grid_template_columns,
@@ -5872,6 +6773,149 @@ mod tests {
         assert_eq!(
             computed_box_style(&style, &page).grid_template_columns,
             Some(2)
+        );
+        assert_eq!(
+            computed_box_style(&style, &counter).grid_template_column_tracks,
+            Some(vec![
+                CssLength::Fr(1.0),
+                CssLength::Auto,
+                CssLength::Fr(1.0)
+            ])
+        );
+        assert_eq!(
+            computed_box_style(&style, &cards).grid_template_column_tracks,
+            Some(vec![
+                CssLength::Fr(1.0),
+                CssLength::Fr(1.0),
+                CssLength::Fr(1.0),
+                CssLength::Fr(1.0),
+            ])
+        );
+        assert_eq!(
+            computed_box_style(&style, &page).grid_template_column_tracks,
+            Some(vec![CssLength::Px(196.0), CssLength::Fr(1.0)])
+        );
+        assert_eq!(
+            computed_box_style(&style, &auto).grid_template_columns,
+            Some(8)
+        );
+        assert_eq!(
+            computed_box_style(&style, &auto).grid_auto_repeat_min_column_width,
+            Some(CssLength::Px(160.0))
+        );
+        assert_eq!(
+            computed_box_style(&style, &page).grid_template_rows,
+            Some(vec![CssLength::Auto, CssLength::Px(48.0)])
+        );
+        assert_eq!(
+            computed_box_style(&style, &rows).grid_template_rows,
+            Some(vec![CssLength::Px(40.0), CssLength::Percent(25.0)])
+        );
+    }
+
+    #[test]
+    fn parse_basic_css_preserves_auto_fit_minmax_track_floor() {
+        let style = parse_basic_css(
+            ".cards { grid-template-columns: repeat(auto-fit, minmax(min(18rem, 100%), 1fr)); } .zero { grid-template-columns: repeat(4, minmax(0, 1fr)); }",
+        );
+        let cards = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["cards".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let zero = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["zero".to_owned()],
+            ..ElementStyleKey::default()
+        };
+
+        assert!(matches!(
+            computed_box_style(&style, &cards).grid_auto_repeat_min_column_width,
+            Some(CssLength::Min(_, _))
+        ));
+        assert_eq!(
+            computed_box_style(&style, &zero).grid_template_columns,
+            Some(4)
+        );
+        assert_eq!(
+            computed_box_style(&style, &zero).grid_auto_repeat_min_column_width,
+            None
+        );
+    }
+
+    #[test]
+    fn parse_basic_css_uses_minmax_maximum_for_explicit_grid_tracks() {
+        let style = parse_basic_css(
+            ".results { grid-template-columns: minmax(0, 740px) 320px; } .header { grid-template-columns: 160px minmax(240px, 720px) 1fr; } .flexible { grid-template-columns: minmax(0, 1fr) 290px; }",
+        );
+        let results = ElementStyleKey {
+            tag: "main".to_owned(),
+            classes: vec!["results".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let header = ElementStyleKey {
+            tag: "header".to_owned(),
+            classes: vec!["header".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let flexible = ElementStyleKey {
+            tag: "main".to_owned(),
+            classes: vec!["flexible".to_owned()],
+            ..ElementStyleKey::default()
+        };
+
+        assert_eq!(
+            computed_box_style(&style, &results).grid_template_column_tracks,
+            Some(vec![CssLength::Px(740.0), CssLength::Px(320.0)])
+        );
+        assert_eq!(
+            computed_box_style(&style, &header).grid_template_column_tracks,
+            Some(vec![
+                CssLength::Px(160.0),
+                CssLength::Px(720.0),
+                CssLength::Fr(1.0)
+            ])
+        );
+        assert_eq!(
+            computed_box_style(&style, &flexible).grid_template_column_tracks,
+            Some(vec![CssLength::Fr(1.0), CssLength::Px(290.0)])
+        );
+    }
+
+    #[test]
+    fn parse_basic_css_preserves_viewport_and_function_lengths() {
+        let style = parse_basic_css(
+            ".hero { width: 50vw; height: 100vh; min-height: calc(100vh - 2rem); max-width: min(100vw, 72rem); }",
+        );
+        let hero = ElementStyleKey {
+            tag: "section".to_owned(),
+            classes: vec!["hero".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &hero);
+
+        assert_eq!(computed.width, Some(CssLength::Vw(50.0)));
+        assert_eq!(computed.height, Some(CssLength::Vh(100.0)));
+        assert_eq!(
+            computed.min_height,
+            Some(CssLength::Calc(CssLengthExpression {
+                px: -32.0,
+                vh: 100.0,
+                ..CssLengthExpression::default()
+            }))
+        );
+        assert_eq!(
+            computed.max_width,
+            Some(CssLength::Min(
+                CssLengthExpression {
+                    vw: 100.0,
+                    ..CssLengthExpression::default()
+                },
+                CssLengthExpression {
+                    px: 1152.0,
+                    ..CssLengthExpression::default()
+                },
+            ))
         );
     }
 
@@ -6033,6 +7077,61 @@ mod tests {
         );
         assert_eq!(computed.color, Some(Color32::from_rgb(18, 52, 86)));
         assert_eq!(computed.width, Some(CssLength::Px(180.0)));
+    }
+
+    #[test]
+    fn css_custom_properties_resolve_from_document_container_rules() {
+        let style = parse_basic_css_for_viewport(
+            r#"
+            #app {
+                --main-column: 654px;
+                --left-gutter: 0px;
+            }
+            @media only screen and (min-width: 80rem) {
+                #app { --left-gutter: 120px; }
+            }
+            .web {
+                display: grid;
+                grid-template-areas: "left-gutter mainline mid-gutter sidebar";
+                grid-template-columns: var(--left-gutter) minmax(0, var(--main-column)) 40px minmax(0, 360px);
+            }
+            .mainline { grid-area: mainline; }
+            "#,
+            1280.0,
+        );
+        let web = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["web".to_owned()],
+            ..ElementStyleKey::default()
+        };
+
+        let computed = computed_box_style(&style, &web);
+        assert_eq!(
+            computed.grid_template_column_tracks,
+            Some(vec![
+                CssLength::Px(120.0),
+                CssLength::Px(654.0),
+                CssLength::Px(40.0),
+                CssLength::Px(360.0),
+            ])
+        );
+    }
+
+    #[test]
+    fn grid_minmax_with_unresolved_var_does_not_collapse_to_zero_track() {
+        let style = parse_basic_css(
+            ".web { grid-template-columns: minmax(0, var(--missing-main-width)) 320px; }",
+        );
+        let web = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["web".to_owned()],
+            ..ElementStyleKey::default()
+        };
+
+        assert_eq!(
+            computed_box_style(&style, &web).grid_template_column_tracks,
+            Some(vec![CssLength::Auto, CssLength::Px(320.0)])
+        );
     }
 
     #[test]

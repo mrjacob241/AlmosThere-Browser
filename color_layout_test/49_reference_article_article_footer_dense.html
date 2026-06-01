@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>49 - Reference Article Article Footer Dense</title>
+<style>
+
+:root {
+  --ink: #17212b;
+  --muted: #5c6670;
+  --page: #f7f8fa;
+  --line: rgba(20, 30, 40, 0.18);
+  --red: #ff6b6b;
+  --orange: #f59f00;
+  --yellow: #ffd43b;
+  --green: #51cf66;
+  --teal: #20c997;
+  --cyan: #22b8cf;
+  --blue: #4dabf7;
+  --indigo: #748ffc;
+  --violet: #9775fa;
+  --pink: #f783ac;
+  --gray: #ced4da;
+  --dark: #495057;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--page);
+}
+.box {
+  min-height: 48px;
+  border: 1px solid var(--line);
+  display: grid;
+  place-items: center;
+  padding: 10px;
+  font-size: 13px;
+  font-weight: 700;
+  color: rgba(0,0,0,0.74);
+  text-align: center;
+}
+.tall { min-height: 160px; }
+.xtall { min-height: 300px; }
+.label {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  z-index: 20;
+  padding: 6px 8px;
+  background: rgba(255,255,255,0.88);
+  border: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+
+.page { min-height: 100vh; display: grid; grid-template-columns: 176px minmax(0, 1fr); }
+nav { background: var(--gray); }
+.article { display: grid; grid-template-rows: 56px auto 1fr auto; }
+.top { background: var(--blue); display: grid; grid-template-columns: 1fr 120px 120px; gap: 8px; padding: 8px; }
+.heading { background: var(--yellow); min-height: 96px; }
+.content { padding: 18px; display: grid; grid-template-columns: minmax(0, 1fr) 290px; gap: 20px; }
+.text { display: grid; gap: 12px; } .text .box { background: var(--green); min-height: 118px; }
+.infobox { background: var(--orange); min-height: 420px; } footer { background: var(--teal); min-height: 72px; }
+@media (max-width: 900px) { .page { grid-template-columns: 1fr; } nav { min-height: 56px; } .content { grid-template-columns: 1fr; } }
+
+</style>
+</head>
+<body>
+<div class="page"><nav class="box">left wiki nav</nav><main class="article"><header class="top"><div class="box">search</div><div class="box">read</div><div class="box">edit</div></header><section class="box heading">article title region</section><section class="content"><div class="text"><section class="box">article block 1</section><section class="box">article block 2</section><section class="box">article block 3</section><section class="box">article block 4</section><section class="box">article block 5</section></div><aside class="box infobox">infobox / toc</aside></section><footer class="box">footer</footer></main></div>
+<div class="label">49 / 50 - Reference Article Article Footer Dense</div>
+</body>
+</html>

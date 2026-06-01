@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 - Overflow Stress</title>
+<style>
+
+:root {
+  --ink: #17212b;
+  --muted: #5c6670;
+  --page: #f7f8fa;
+  --line: rgba(20, 30, 40, 0.18);
+  --red: #ff6b6b;
+  --orange: #f59f00;
+  --yellow: #ffd43b;
+  --green: #51cf66;
+  --teal: #20c997;
+  --cyan: #22b8cf;
+  --blue: #4dabf7;
+  --indigo: #748ffc;
+  --violet: #9775fa;
+  --pink: #f783ac;
+  --gray: #ced4da;
+  --dark: #495057;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--page);
+}
+.box {
+  min-height: 48px;
+  border: 1px solid var(--line);
+  display: grid;
+  place-items: center;
+  padding: 10px;
+  font-size: 13px;
+  font-weight: 700;
+  color: rgba(0,0,0,0.74);
+  text-align: center;
+}
+.tall { min-height: 160px; }
+.xtall { min-height: 300px; }
+.label {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  z-index: 20;
+  padding: 6px 8px;
+  background: rgba(255,255,255,0.88);
+  border: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+
+.page { height: 100vh; display: grid; grid-template-rows: 64px minmax(0,1fr) 56px; }
+header { background: var(--red); } footer { background: var(--yellow); }
+.scroller { overflow: auto; padding: 12px; display: grid; gap: 12px; background: var(--gray); }
+.row { min-height: 120px; background: var(--blue); }
+
+</style>
+</head>
+<body>
+<div class="page"><header class="box">fixed row</header><main class="scroller"><section class="box row">overflow row 1</section><section class="box row">overflow row 2</section><section class="box row">overflow row 3</section><section class="box row">overflow row 4</section><section class="box row">overflow row 5</section><section class="box row">overflow row 6</section><section class="box row">overflow row 7</section><section class="box row">overflow row 8</section><section class="box row">overflow row 9</section><section class="box row">overflow row 10</section><section class="box row">overflow row 11</section><section class="box row">overflow row 12</section><section class="box row">overflow row 13</section></main><footer class="box">footer</footer></div>
+<div class="label">10 / 50 - Overflow Stress</div>
+</body>
+</html>

@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Color Layout Test Index</title>
+<style>
+
+:root {
+  --ink: #17212b;
+  --muted: #5c6670;
+  --page: #f7f8fa;
+  --line: rgba(20, 30, 40, 0.18);
+  --red: #ff6b6b;
+  --orange: #f59f00;
+  --yellow: #ffd43b;
+  --green: #51cf66;
+  --teal: #20c997;
+  --cyan: #22b8cf;
+  --blue: #4dabf7;
+  --indigo: #748ffc;
+  --violet: #9775fa;
+  --pink: #f783ac;
+  --gray: #ced4da;
+  --dark: #495057;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--page);
+}
+.box {
+  min-height: 48px;
+  border: 1px solid var(--line);
+  display: grid;
+  place-items: center;
+  padding: 10px;
+  font-size: 13px;
+  font-weight: 700;
+  color: rgba(0,0,0,0.74);
+  text-align: center;
+}
+.tall { min-height: 160px; }
+.xtall { min-height: 300px; }
+.label {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  z-index: 20;
+  padding: 6px 8px;
+  background: rgba(255,255,255,0.88);
+  border: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+body { padding: 24px; }
+main { max-width: 920px; margin: 0 auto; }
+h1 { margin: 0 0 16px; }
+ol { columns: 2; gap: 32px; padding-left: 24px; }
+li { break-inside: avoid; margin: 0 0 8px; }
+a { color: #1c7ed6; font-weight: 700; }
+@media (max-width: 760px) { ol { columns: 1; } }
+</style>
+</head>
+<body>
+<main>
+<h1>Color Layout Test Index</h1>
+<p>Standalone HTML/CSS color-block layout fixtures, including simple primitives, Search Fixture-inspired search/result layouts, Reference Article-inspired article layouts, and targeted regression pages.</p>
+<ol>
+<li><a href="01_single_centered_column.html">01. Single Centered Column</a></li>
+<li><a href="02_two_column_sidebar.html">02. Two Column Sidebar</a></li>
+<li><a href="03_header_sidebar_content.html">03. Header Sidebar Content</a></li>
+<li><a href="04_three_equal_cards.html">04. Three Equal Cards</a></li>
+<li><a href="05_auto_fit_card_grid.html">05. Auto Fit Card Grid</a></li>
+<li><a href="06_sticky_top_bar.html">06. Sticky Top Bar</a></li>
+<li><a href="07_holy_grail.html">07. Holy Grail Layout</a></li>
+<li><a href="08_split_pane.html">08. Split Pane</a></li>
+<li><a href="09_dashboard_shell.html">09. Dashboard Shell</a></li>
+<li><a href="10_overflow_stress.html">10. Overflow Stress</a></li>
+<li><a href="11_asymmetric_mosaic.html">11. Asymmetric Mosaic</a></li>
+<li><a href="12_nested_grid.html">12. Nested Grid</a></li>
+<li><a href="13_search_fixture_home_centered_search.html">13. Search Fixture Home Centered Search</a></li>
+<li><a href="14_search_fixture_home_with_top_nav.html">14. Search Fixture Home With Top Nav</a></li>
+<li><a href="15_search_fixture_home_mobile_stack.html">15. Search Fixture Home Mobile Stack</a></li>
+<li><a href="16_search_fixture_search_bar_button.html">16. Search Fixture Search Bar Button</a></li>
+<li><a href="17_search_fixture_suggestions_overlay.html">17. Search Fixture Suggestions Overlay</a></li>
+<li><a href="18_search_fixture_results_basic.html">18. Search Fixture Results Basic</a></li>
+<li><a href="19_search_fixture_results_with_ads.html">19. Search Fixture Results With Ads</a></li>
+<li><a href="20_search_fixture_results_sticky_search.html">20. Search Fixture Results Sticky Search</a></li>
+<li><a href="21_search_fixture_results_cards.html">21. Search Fixture Results Cards</a></li>
+<li><a href="22_search_fixture_results_news_strip.html">22. Search Fixture Results News Strip</a></li>
+<li><a href="23_search_fixture_search_header_tabs.html">23. Search Fixture Search Header Tabs</a></li>
+<li><a href="24_search_fixture_image_results_grid.html">24. Search Fixture Image Results Grid</a></li>
+<li><a href="25_search_fixture_video_results_grid.html">25. Search Fixture Video Results Grid</a></li>
+<li><a href="26_search_fixture_knowledge_panel.html">26. Search Fixture Knowledge Panel</a></li>
+<li><a href="27_search_fixture_settings_panel.html">27. Search Fixture Settings Panel</a></li>
+<li><a href="28_search_fixture_cookie_banner.html">28. Search Fixture Cookie Banner</a></li>
+<li><a href="29_search_fixture_overlay_modal.html">29. Search Fixture Overlay Modal</a></li>
+<li><a href="30_search_fixture_search_home_dense_footer.html">30. Search Fixture Search Home Dense Footer</a></li>
+<li><a href="31_reference_article_article_classic.html">31. Reference Article Article Classic</a></li>
+<li><a href="32_reference_article_article_sticky_toc.html">32. Reference Article Article Sticky Toc</a></li>
+<li><a href="33_reference_article_article_infobox.html">33. Reference Article Article Infobox</a></li>
+<li><a href="34_reference_article_article_wide_lead.html">34. Reference Article Article Wide Lead</a></li>
+<li><a href="35_reference_article_article_mobile.html">35. Reference Article Article Mobile</a></li>
+<li><a href="36_reference_article_article_history_tabs.html">36. Reference Article Article History Tabs</a></li>
+<li><a href="37_reference_article_article_gallery.html">37. Reference Article Article Gallery</a></li>
+<li><a href="38_reference_article_article_table_heavy.html">38. Reference Article Article Table Heavy</a></li>
+<li><a href="39_reference_article_article_references.html">39. Reference Article Article References</a></li>
+<li><a href="40_reference_article_article_sidebar_collapsed.html">40. Reference Article Article Sidebar Collapsed</a></li>
+<li><a href="41_reference_article_article_talk_page.html">41. Reference Article Article Talk Page</a></li>
+<li><a href="42_reference_article_article_search_results.html">42. Reference Article Article Search Results</a></li>
+<li><a href="43_reference_article_article_disambiguation.html">43. Reference Article Article Disambiguation</a></li>
+<li><a href="44_reference_article_article_language_panel.html">44. Reference Article Article Language Panel</a></li>
+<li><a href="45_reference_article_article_print_view.html">45. Reference Article Article Print View</a></li>
+<li><a href="46_reference_article_article_code_blocks.html">46. Reference Article Article Code Blocks</a></li>
+<li><a href="47_reference_article_article_portal.html">47. Reference Article Article Portal</a></li>
+<li><a href="48_reference_article_article_category_page.html">48. Reference Article Article Category Page</a></li>
+<li><a href="49_reference_article_article_footer_dense.html">49. Reference Article Article Footer Dense</a></li>
+<li><a href="50_reference_article_article_full_complex.html">50. Reference Article Article Full Complex</a></li>
+<li><a href="51_search_fixture_minmax_result_columns_regression.html">51. Search Fixture Minmax Result Columns Regression</a></li>
+<li><a href="52_search_fixture_flex_wrap_claims_regression.html">52. Search Fixture Flex Wrap Claims Regression</a></li>
+</ol>
+</main>
+</body>
+</html>

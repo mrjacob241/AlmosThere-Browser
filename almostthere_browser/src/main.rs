@@ -18,10 +18,10 @@ use rich_canvas::{
     CanvasButtonObject, CanvasClipObject, CanvasGraph, CanvasImageObject, CanvasInputKind,
     CanvasInputObject, CanvasLinkHitObject, CanvasMediaObject, CanvasObject, CanvasRectObject,
     CanvasSvgObject, CanvasTextObject, CssAlignItems, CssBoxStyle, CssDisplay, CssEdges,
-    CssFlexDirection, CssJustifyContent, CssLength, CssObjectFit, CssPosition, CssTextAlign,
-    ElementStyleKey, HitTarget, ImageBlock, InlineSpan, ResolvedBoxStyle, SvgBlock, SvgShape,
-    computed_box_style, configure_browser_fonts, parse_basic_css_for_viewport_with_root_classes,
-    parse_inline_box_style, wrap_browser_textboxes,
+    CssFlexDirection, CssFlexWrap, CssJustifyContent, CssLength, CssObjectFit, CssPosition,
+    CssTextAlign, ElementStyleKey, HitTarget, ImageBlock, InlineSpan, ResolvedBoxStyle, SvgBlock,
+    SvgShape, computed_box_style, configure_browser_fonts,
+    parse_basic_css_for_viewport_with_root_classes, parse_inline_box_style, wrap_browser_textboxes,
 };
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
 
@@ -35,6 +35,8 @@ const BOOKMARKS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bookmarks.
 const DEBUG_EXPORT_DIR: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/../target/render_debug_export");
 const URL_SCREENSHOTS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/url_screenshots");
+const DEFAULT_LAYOUT_VIEWPORT_WIDTH: f32 = 1280.0;
+const DEFAULT_LAYOUT_VIEWPORT_HEIGHT: f32 = 1800.0;
 const DEFAULT_BOOKMARK_TITLE: &str = "AlmostThere Sample Page";
 const DEFAULT_URL_BOOKMARK_TITLE: &str = "HTML5 Test Page";
 const LOCAL_BOOKMARK_TOKEN: &str = "[local]";
@@ -2844,7 +2846,8 @@ fn seed_script_computed_styles_from_html(
     state: &mut justbarelyscript::BrowserExecutionState,
 ) {
     let css = collect_embedded_styles(html);
-    let browser_style = parse_basic_css_for_viewport_with_root_classes(&css, 1280.0, &[]);
+    let browser_style =
+        parse_basic_css_for_viewport_with_root_classes(&css, DEFAULT_LAYOUT_VIEWPORT_WIDTH, &[]);
 
     let mut offset = 0;
     let mut remaining = html;
@@ -2881,6 +2884,7 @@ fn seed_script_computed_styles_from_html(
             id: Some(id.clone()),
             classes,
             attributes: vec![],
+            child_index: None,
             parent: None,
             previous_sibling: None,
         };
@@ -2925,7 +2929,11 @@ fn parse_html_document_from_live_html(
         .trim()
         .to_owned();
     let root_classes = document_theme_root_classes(&dom, text_metrics);
-    let style = parse_basic_css_for_viewport_with_root_classes(&css, 1280.0, &root_classes);
+    let style = parse_basic_css_for_viewport_with_root_classes(
+        &css,
+        DEFAULT_LAYOUT_VIEWPORT_WIDTH,
+        &root_classes,
+    );
     let render_graph = build_render_graph(&dom, &style);
     let canvas_graph = render_graph_to_canvas_graph(
         &render_graph,
@@ -6129,7 +6137,11 @@ fn parse_html_document_with_text_metrics(
         .trim()
         .to_owned();
     let root_classes = document_theme_root_classes(&dom, text_metrics);
-    let style = parse_basic_css_for_viewport_with_root_classes(&css, 1280.0, &root_classes);
+    let style = parse_basic_css_for_viewport_with_root_classes(
+        &css,
+        DEFAULT_LAYOUT_VIEWPORT_WIDTH,
+        &root_classes,
+    );
     let render_graph = build_render_graph(&dom, &style);
     let canvas_graph = render_graph_to_canvas_graph(
         &render_graph,
@@ -6156,7 +6168,11 @@ fn parse_render_graph_debug_dump(html: &str, source: &str) -> String {
     let html = remove_non_visual_metadata_elements(&html);
     let dom = parse_dom_document(&html);
     let root_classes = document_theme_root_classes(&dom, None);
-    let style = parse_basic_css_for_viewport_with_root_classes(&css, 1280.0, &root_classes);
+    let style = parse_basic_css_for_viewport_with_root_classes(
+        &css,
+        DEFAULT_LAYOUT_VIEWPORT_WIDTH,
+        &root_classes,
+    );
     let render_graph = build_render_graph(&dom, &style);
     render_graph_debug_string(&render_graph)
 }
@@ -6218,6 +6234,7 @@ fn build_render_graph(dom: &DomDocument, document_style: &BrowserStyle) -> Rende
                 body,
                 None,
                 None,
+                None,
                 &root_style,
                 document_style,
             )]
@@ -6237,6 +6254,7 @@ fn build_render_node(
     node: &DomNode,
     parent_element: Option<&DomElement>,
     previous_element_sibling: Option<&DomElement>,
+    child_index: Option<usize>,
     parent_style: &ResolvedBoxStyle,
     document_style: &BrowserStyle,
 ) -> Option<RenderNode> {
@@ -6250,6 +6268,7 @@ fn build_render_node(
             element,
             parent_element,
             previous_element_sibling,
+            child_index,
             parent_style,
             document_style,
         )),
@@ -6275,6 +6294,7 @@ fn build_render_element(
     element: &DomElement,
     parent_element: Option<&DomElement>,
     previous_element_sibling: Option<&DomElement>,
+    child_index: Option<usize>,
     parent_style: &ResolvedBoxStyle,
     document_style: &BrowserStyle,
 ) -> RenderNode {
@@ -6282,6 +6302,7 @@ fn build_render_element(
         element,
         parent_element,
         previous_element_sibling,
+        child_index,
         parent_style,
         document_style,
     );
@@ -6302,11 +6323,19 @@ fn build_render_children(
 ) -> Vec<RenderNode> {
     let mut out = Vec::new();
     let mut previous_element_sibling = None;
+    let mut child_index = 0usize;
     for child in children {
+        let current_child_index = if matches!(child, DomNode::Element(_)) {
+            child_index += 1;
+            Some(child_index)
+        } else {
+            None
+        };
         if let Some(node) = build_render_node(
             child,
             parent_element,
             previous_element_sibling,
+            current_child_index,
             parent_style,
             document_style,
         ) {
@@ -6332,11 +6361,17 @@ fn compute_render_style(
     element: &DomElement,
     parent_element: Option<&DomElement>,
     previous_element_sibling: Option<&DomElement>,
+    child_index: Option<usize>,
     parent: &ResolvedBoxStyle,
     document_style: &BrowserStyle,
 ) -> ResolvedBoxStyle {
     let mut out = inherited_style_for_element(element, parent, document_style);
-    let key = element_style_key_with_context(element, parent_element, previous_element_sibling);
+    let key = element_style_key_with_context(
+        element,
+        parent_element,
+        previous_element_sibling,
+        child_index,
+    );
     let matched = computed_box_style(document_style, &key);
     apply_css_box_style(&mut out, &matched, parent, document_style);
     if let Some(inline) = element.attr("style").and_then(parse_inline_box_style) {
@@ -6671,6 +6706,9 @@ fn apply_css_box_style(
     if let Some(flex_direction) = source.flex_direction {
         target.flex_direction = flex_direction;
     }
+    if let Some(flex_wrap) = source.flex_wrap {
+        target.flex_wrap = flex_wrap;
+    }
     if let Some(justify_content) = source.justify_content {
         target.justify_content = justify_content;
     }
@@ -6679,6 +6717,15 @@ fn apply_css_box_style(
     }
     if let Some(grid_template_columns) = source.grid_template_columns {
         target.grid_template_columns = Some(grid_template_columns);
+    }
+    if let Some(grid_template_column_tracks) = &source.grid_template_column_tracks {
+        target.grid_template_column_tracks = Some(grid_template_column_tracks.clone());
+    }
+    if let Some(grid_auto_repeat_min_column_width) = source.grid_auto_repeat_min_column_width {
+        target.grid_auto_repeat_min_column_width = Some(grid_auto_repeat_min_column_width);
+    }
+    if let Some(grid_template_rows) = &source.grid_template_rows {
+        target.grid_template_rows = Some(grid_template_rows.clone());
     }
     if let Some(grid_template_areas) = &source.grid_template_areas {
         target.grid_template_areas = Some(grid_template_areas.clone());
@@ -6719,6 +6766,9 @@ fn apply_css_box_style(
     if source.inset_sides.left.is_some() {
         target.inset_sides.left = source.inset_sides.left;
     }
+    if let Some(transform) = source.transform {
+        target.transform = transform;
+    }
     if let Some(object_fit) = source.object_fit {
         target.object_fit = object_fit;
     }
@@ -6732,7 +6782,23 @@ fn resolve_css_length(length: CssLength, parent_width: f32) -> f32 {
         CssLength::Auto => parent_width,
         CssLength::Px(px) => px,
         CssLength::Percent(percent) => parent_width * percent / 100.0,
+        CssLength::Fr(_) => parent_width,
+        CssLength::Vw(vw) => DEFAULT_LAYOUT_VIEWPORT_WIDTH * vw / 100.0,
+        CssLength::Vh(vh) => DEFAULT_LAYOUT_VIEWPORT_HEIGHT * vh / 100.0,
+        CssLength::Calc(expression) => resolve_css_length_expression(expression, parent_width),
+        CssLength::Min(left, right) => resolve_css_length_expression(left, parent_width)
+            .min(resolve_css_length_expression(right, parent_width)),
     }
+}
+
+fn resolve_css_length_expression(
+    expression: rich_canvas::CssLengthExpression,
+    parent_width: f32,
+) -> f32 {
+    expression.px
+        + parent_width * expression.percent / 100.0
+        + DEFAULT_LAYOUT_VIEWPORT_WIDTH * expression.vw / 100.0
+        + DEFAULT_LAYOUT_VIEWPORT_HEIGHT * expression.vh / 100.0
 }
 
 fn resolve_optional_css_length(length: CssLength, parent_width: f32) -> Option<f32> {
@@ -6994,14 +7060,25 @@ fn css_layout_box_is_inline_level(box_: &CssLayoutBox<'_>) -> bool {
 fn layout_css_layout_tree(
     root: &mut CssLayoutBox<'_>,
     viewport_width: f32,
+    viewport_height: f32,
     source: &str,
     image_height_auto: bool,
     text_metrics: Option<&egui::Context>,
 ) {
-    root.dimensions.content =
-        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(viewport_width.max(1.0), 0.0));
+    root.dimensions.content = egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(viewport_width.max(1.0), viewport_height.max(1.0)),
+    );
     let height = layout_css_block_children(root, source, image_height_auto, text_metrics);
-    root.dimensions.content.max.y = root.dimensions.content.min.y + height;
+    root.dimensions.content.max.y =
+        root.dimensions.content.min.y + height.max(viewport_height.max(1.0));
+    layout_css_out_of_flow_children(
+        root,
+        source,
+        image_height_auto,
+        text_metrics,
+        css_layout_viewport_rect(viewport_width, viewport_height),
+    );
 }
 
 fn layout_css_block_children(
@@ -7062,10 +7139,7 @@ fn layout_css_box(
         + box_.dimensions.border.right
         + box_.dimensions.padding.left
         + box_.dimensions.padding.right;
-    let border_padding = box_.dimensions.border.left
-        + box_.dimensions.border.right
-        + box_.dimensions.padding.left
-        + box_.dimensions.padding.right;
+    let border_padding = css_style_horizontal_border_padding(&box_.style);
     let percent_width = box_.style.width_percent.map(|percent| {
         let declared = containing_width * percent / 100.0;
         if box_.style.box_sizing_border_box {
@@ -7091,7 +7165,7 @@ fn layout_css_box(
             (containing_width - horizontal_non_content).max(1.0)
         }
         .min(containing_width)
-        .max(box_.style.min_width.unwrap_or(1.0));
+        .max(css_used_content_min_width(&box_.style, 1.0));
     if box_.style.width.is_none()
         && box_.style.max_width.is_none()
         && let Some(node) = box_.node
@@ -7102,7 +7176,7 @@ fn layout_css_box(
         content_width = replaced_content_size(&block, content_width, box_.style.font_size)
             .x
             .min((containing_width - horizontal_non_content).max(1.0))
-            .max(box_.style.min_width.unwrap_or(1.0));
+            .max(css_used_content_min_width(&box_.style, 1.0));
     }
 
     let mut content_x = containing_x
@@ -7123,6 +7197,11 @@ fn layout_css_box(
         egui::pos2(content_x, content_y),
         egui::vec2(content_width, 0.0),
     );
+    if let Some(provisional_height) =
+        css_provisional_content_height(&box_.style, containing_height, content_width)
+    {
+        box_.dimensions.content.max.y = box_.dimensions.content.min.y + provisional_height.max(0.0);
+    }
 
     let intrinsic_height = match box_.kind {
         CssLayoutKind::Document => {
@@ -7219,7 +7298,16 @@ fn layout_css_box(
     if box_.node.is_some_and(css_layout_node_is_button) {
         center_css_button_children(box_);
     }
-    layout_css_out_of_flow_children(box_, source, image_height_auto, text_metrics);
+    layout_css_out_of_flow_children(
+        box_,
+        source,
+        image_height_auto,
+        text_metrics,
+        css_layout_viewport_rect(
+            DEFAULT_LAYOUT_VIEWPORT_WIDTH,
+            DEFAULT_LAYOUT_VIEWPORT_HEIGHT,
+        ),
+    );
 }
 
 fn layout_css_inline_visual_children(
@@ -7425,8 +7513,28 @@ fn layout_css_flex_children(
         .collect::<Vec<_>>();
     let child_count = flow_indices.len();
     if child_count == 0 {
-        layout_css_out_of_flow_children(container, source, image_height_auto, text_metrics);
+        layout_css_out_of_flow_children(
+            container,
+            source,
+            image_height_auto,
+            text_metrics,
+            css_layout_viewport_rect(
+                DEFAULT_LAYOUT_VIEWPORT_WIDTH,
+                DEFAULT_LAYOUT_VIEWPORT_HEIGHT,
+            ),
+        );
         return 0.0;
+    }
+    if is_row && container.style.flex_wrap == CssFlexWrap::Wrap {
+        return layout_css_wrapped_row_flex_children(
+            container,
+            source,
+            image_height_auto,
+            text_metrics,
+            &flow_indices,
+            gap,
+            content,
+        );
     }
 
     let item_widths = if is_row {
@@ -7450,7 +7558,7 @@ fn layout_css_flex_children(
                     .or(child.style.max_width)
                     .unwrap_or(content.width())
                     .min(content.width())
-                    .max(child.style.min_width.unwrap_or(1.0))
+                    .max(css_flex_item_min_width(child))
             })
             .collect::<Vec<_>>()
     };
@@ -7594,8 +7702,183 @@ fn layout_css_flex_children(
             + distributed_gap;
     }
 
-    layout_css_out_of_flow_children(container, source, image_height_auto, text_metrics);
+    layout_css_out_of_flow_children(
+        container,
+        source,
+        image_height_auto,
+        text_metrics,
+        css_layout_viewport_rect(
+            DEFAULT_LAYOUT_VIEWPORT_WIDTH,
+            DEFAULT_LAYOUT_VIEWPORT_HEIGHT,
+        ),
+    );
     if is_row { available_cross } else { total_main }
+}
+
+fn layout_css_wrapped_row_flex_children(
+    container: &mut CssLayoutBox<'_>,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+    flow_indices: &[usize],
+    gap: f32,
+    content: egui::Rect,
+) -> f32 {
+    let child_count = flow_indices.len();
+    let mut base_widths = flow_indices
+        .iter()
+        .map(|index| {
+            let child = &container.children[*index];
+            css_flex_item_base_width(child, content.width(), text_metrics)
+                .min(content.width().max(1.0))
+                .max(css_flex_item_min_width(child))
+        })
+        .collect::<Vec<_>>();
+    if base_widths.is_empty() {
+        return 0.0;
+    }
+
+    let mut lines: Vec<Vec<usize>> = Vec::new();
+    let mut current_line = Vec::new();
+    let mut current_width = 0.0;
+    for (slot, width) in base_widths.iter().copied().enumerate() {
+        let next_width = if current_line.is_empty() {
+            width
+        } else {
+            current_width + gap + width
+        };
+        if !current_line.is_empty() && next_width > content.width().max(1.0) {
+            lines.push(current_line);
+            current_line = Vec::new();
+            current_width = 0.0;
+        }
+        current_width = if current_line.is_empty() {
+            width
+        } else {
+            current_width + gap + width
+        };
+        current_line.push(slot);
+    }
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
+
+    for line in &lines {
+        let children = line
+            .iter()
+            .map(|slot| &container.children[flow_indices[*slot]])
+            .collect::<Vec<_>>();
+        let line_widths = css_flex_row_item_widths(&children, content.width(), gap, text_metrics);
+        for (slot, width) in line.iter().copied().zip(line_widths) {
+            base_widths[slot] = width;
+        }
+    }
+
+    let mut item_sizes = vec![egui::Vec2::ZERO; child_count];
+    for (slot, index) in flow_indices.iter().enumerate() {
+        let child = &mut container.children[*index];
+        layout_css_box(
+            child,
+            0.0,
+            0.0,
+            base_widths[slot].max(1.0),
+            content.height().max(0.0),
+            source,
+            image_height_auto,
+            text_metrics,
+        );
+        item_sizes[slot] = css_margin_box(child).size();
+    }
+
+    let mut cross_cursor = 0.0;
+    for line in &lines {
+        let line_main = line.iter().map(|slot| item_sizes[*slot].x).sum::<f32>()
+            + gap * line.len().saturating_sub(1) as f32;
+        let line_cross = line
+            .iter()
+            .map(|slot| item_sizes[*slot].y)
+            .fold(0.0, f32::max);
+        let free_space = (content.width() - line_main).max(0.0);
+        let auto_margin_count = line
+            .iter()
+            .map(|slot| {
+                let auto = container.children[flow_indices[*slot]].style.margin_auto;
+                auto.left as usize + auto.right as usize
+            })
+            .sum::<usize>();
+        let auto_margin_share = if auto_margin_count > 0 {
+            free_space / auto_margin_count as f32
+        } else {
+            0.0
+        };
+        let mut main_cursor = if auto_margin_count > 0 {
+            0.0
+        } else {
+            match container.style.justify_content {
+                CssJustifyContent::Center => free_space * 0.5,
+                CssJustifyContent::FlexStart | CssJustifyContent::SpaceBetween => 0.0,
+            }
+        };
+        let distributed_gap = if auto_margin_count == 0
+            && container.style.justify_content == CssJustifyContent::SpaceBetween
+            && line.len() > 1
+        {
+            gap + free_space / (line.len() - 1) as f32
+        } else {
+            gap
+        };
+
+        for slot in line {
+            let child = &mut container.children[flow_indices[*slot]];
+            let size = item_sizes[*slot];
+            let child_margin = child.dimensions.margin;
+            let child_border = child.dimensions.border;
+            let child_padding = child.dimensions.padding;
+            let main_auto_before = if child.style.margin_auto.left {
+                auto_margin_share
+            } else {
+                0.0
+            };
+            let main_auto_after = if child.style.margin_auto.right {
+                auto_margin_share
+            } else {
+                0.0
+            };
+            let cross_offset = match container.style.align_items {
+                CssAlignItems::Center => ((line_cross - size.y) * 0.5).max(0.0),
+                CssAlignItems::Stretch | CssAlignItems::FlexStart => 0.0,
+            };
+            let content_x = content.left()
+                + main_cursor
+                + main_auto_before
+                + child_margin.left
+                + child_border.left
+                + child_padding.left;
+            let content_y = content.top()
+                + cross_cursor
+                + cross_offset
+                + child_margin.top
+                + child_border.top
+                + child_padding.top;
+            let current_min = child.dimensions.content.min;
+            translate_css_layout_box(child, egui::pos2(content_x, content_y) - current_min);
+            main_cursor += main_auto_before + size.x + main_auto_after + distributed_gap;
+        }
+        cross_cursor += line_cross + gap;
+    }
+
+    layout_css_out_of_flow_children(
+        container,
+        source,
+        image_height_auto,
+        text_metrics,
+        css_layout_viewport_rect(
+            DEFAULT_LAYOUT_VIEWPORT_WIDTH,
+            DEFAULT_LAYOUT_VIEWPORT_HEIGHT,
+        ),
+    );
+
+    (cross_cursor - gap).max(0.0)
 }
 
 fn css_flex_row_item_widths(
@@ -7700,6 +7983,9 @@ fn css_flex_item_min_width(child: &CssLayoutBox<'_>) -> f32 {
 }
 
 fn css_flex_item_shrink_floor(child: &CssLayoutBox<'_>, base_width: f32) -> f32 {
+    if child.style.min_width.is_some() {
+        return css_flex_item_min_width(child);
+    }
     if css_layout_box_contains_text_form_control(child) {
         css_flex_item_min_width(child)
     } else {
@@ -7745,7 +8031,9 @@ fn css_layout_preferred_content_width(
                 .is_some_and(css_layout_node_is_replaced_or_special)
             {
                 if let Some(width) = box_.style.width.or(box_.style.max_width) {
-                    return width.max(box_.style.min_width.unwrap_or(1.0)).max(1.0);
+                    return width
+                        .max(css_used_content_min_width(&box_.style, 1.0))
+                        .max(1.0);
                 }
                 let text_width = if let Some(node) = box_.node {
                     if let RenderNodeKind::Element(element) = &node.kind {
@@ -7801,15 +8089,84 @@ fn css_layout_preferred_outer_width(
         + box_.style.padding.right
 }
 
+fn css_style_horizontal_border_padding(style: &ResolvedBoxStyle) -> f32 {
+    style.border_width * 2.0 + style.padding.left + style.padding.right
+}
+
+fn css_style_vertical_border_padding(style: &ResolvedBoxStyle) -> f32 {
+    style.border_width * 2.0 + style.padding.top + style.padding.bottom
+}
+
+fn css_used_content_box_extent(declared_extent: f32, border_padding: f32, border_box: bool) -> f32 {
+    if border_box {
+        (declared_extent - border_padding).max(0.0)
+    } else {
+        declared_extent.max(0.0)
+    }
+}
+
+fn css_used_content_min_width(style: &ResolvedBoxStyle, default: f32) -> f32 {
+    match style.min_width {
+        Some(min_width) => css_used_content_box_extent(
+            min_width,
+            css_style_horizontal_border_padding(style),
+            style.box_sizing_border_box,
+        ),
+        None => default,
+    }
+}
+
 fn css_definite_box_height(style: &ResolvedBoxStyle, containing_width: f32) -> Option<f32> {
-    let _ = containing_width;
+    let vertical_border_padding = css_style_vertical_border_padding(style);
     [style.height, style.min_height]
         .into_iter()
         .flatten()
         .find_map(|height| match height {
             CssLength::Px(px) => Some(px),
-            CssLength::Auto | CssLength::Percent(_) => None,
+            CssLength::Vh(vh) => Some(DEFAULT_LAYOUT_VIEWPORT_HEIGHT * vh / 100.0),
+            CssLength::Vw(vw) => Some(DEFAULT_LAYOUT_VIEWPORT_WIDTH * vw / 100.0),
+            CssLength::Calc(expression) => {
+                Some(resolve_css_length_expression(expression, containing_width))
+            }
+            CssLength::Min(left, right) => Some(
+                resolve_css_length_expression(left, containing_width)
+                    .min(resolve_css_length_expression(right, containing_width)),
+            ),
+            CssLength::Auto | CssLength::Percent(_) | CssLength::Fr(_) => None,
         })
+        .map(|height| {
+            css_used_content_box_extent(
+                height,
+                vertical_border_padding,
+                style.box_sizing_border_box,
+            )
+        })
+}
+
+fn css_provisional_content_height(
+    style: &ResolvedBoxStyle,
+    containing_height: f32,
+    containing_width: f32,
+) -> Option<f32> {
+    let _ = containing_width;
+    let vertical_border_padding = css_style_vertical_border_padding(style);
+    let height = style
+        .height
+        .and_then(|height| resolve_css_used_height_length(height, containing_height));
+    let min_height = style
+        .min_height
+        .and_then(|height| resolve_css_used_height_length(height, containing_height));
+    let used_height = match (height, min_height) {
+        (Some(height), Some(min_height)) => height.max(min_height),
+        (Some(height), None) => height,
+        (None, Some(min_height)) => min_height,
+        (None, None) => return None,
+    };
+    Some(css_used_content_box_extent(
+        used_height,
+        vertical_border_padding,
+        style.box_sizing_border_box,
+    ))
 }
 
 fn translate_css_layout_box(box_: &mut CssLayoutBox<'_>, delta: egui::Vec2) {
@@ -7820,6 +8177,32 @@ fn translate_css_layout_box(box_: &mut CssLayoutBox<'_>, delta: egui::Vec2) {
     for child in &mut box_.children {
         translate_css_layout_box(child, delta);
     }
+}
+
+fn css_layout_viewport_rect(width: f32, height: f32) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(width.max(1.0), height.max(1.0)),
+    )
+}
+
+fn apply_css_layout_transform(box_: &mut CssLayoutBox<'_>) {
+    let Some(translate_x) = box_.style.transform.translate_x else {
+        return;
+    };
+    let reference_width = css_border_box(&box_.dimensions).width().max(1.0);
+    let delta_x = match translate_x {
+        CssLength::Auto => 0.0,
+        CssLength::Px(px) => px,
+        CssLength::Percent(percent) => reference_width * percent / 100.0,
+        CssLength::Fr(_) => 0.0,
+        CssLength::Vw(vw) => DEFAULT_LAYOUT_VIEWPORT_WIDTH * vw / 100.0,
+        CssLength::Vh(vh) => DEFAULT_LAYOUT_VIEWPORT_HEIGHT * vh / 100.0,
+        CssLength::Calc(expression) => resolve_css_length_expression(expression, reference_width),
+        CssLength::Min(left, right) => resolve_css_length_expression(left, reference_width)
+            .min(resolve_css_length_expression(right, reference_width)),
+    };
+    translate_css_layout_box(box_, egui::vec2(delta_x, 0.0));
 }
 
 fn layout_css_grid_children(
@@ -7845,16 +8228,34 @@ fn layout_css_grid_children(
         return height;
     }
 
-    let columns = container
-        .style
-        .grid_template_columns
-        .unwrap_or(flow_count)
-        .clamp(1, flow_count);
-    let auto_width =
-        ((content.width() - gap * columns.saturating_sub(1) as f32) / columns as f32).max(1.0);
+    let column_widths = css_grid_column_widths(&container.style, flow_count, content.width(), gap);
+    let columns = column_widths.len().max(1);
+    let row_count = flow_count.div_ceil(columns).max(1);
+    let mut explicit_row_heights =
+        css_grid_explicit_row_heights(&container.style, row_count, content.height(), gap);
+    if container.style.grid_template_rows.is_none() && content.height() > 0.0 {
+        let gap_total = gap * row_count.saturating_sub(1) as f32;
+        let stretched_row_height = ((content.height() - gap_total) / row_count as f32).max(0.0);
+        for height in &mut explicit_row_heights {
+            *height = Some(stretched_row_height);
+        }
+    }
+    let mut row_heights = explicit_row_heights
+        .iter()
+        .map(|height| height.unwrap_or(0.0))
+        .collect::<Vec<_>>();
+    css_seed_definite_grid_fr_row_heights(
+        &container.style,
+        &mut row_heights,
+        &explicit_row_heights,
+        content.height(),
+        gap,
+    );
+
     let mut column = 0usize;
+    let mut row = 0usize;
     let mut cursor_y = content.top();
-    let mut row_height: f32 = 0.0;
+    let mut row_height = row_heights.get(row).copied().unwrap_or(0.0);
     let mut max_bottom = content.top();
 
     for child in &mut container.children {
@@ -7863,34 +8264,234 @@ fn layout_css_grid_children(
         }
         if column >= columns {
             cursor_y += row_height + gap;
+            row += 1;
             column = 0;
-            row_height = 0.0;
+            row_height = row_heights.get(row).copied().unwrap_or(0.0);
         }
-        let cursor_x = content.left() + column as f32 * (auto_width + gap);
-        let item_width = child
-            .style
-            .width
-            .or(child.style.max_width)
-            .unwrap_or(auto_width)
-            .min(auto_width)
-            .max(child.style.min_width.unwrap_or(1.0));
+        let mut cursor_x = css_grid_column_x(content.left(), &column_widths, gap, column);
+        let track_width = column_widths.get(column).copied().unwrap_or(1.0);
+        let item_width = css_grid_item_used_width(&child.style, track_width);
+        if matches!(container.style.justify_content, CssJustifyContent::Center) {
+            cursor_x += ((track_width - item_width) / 2.0).max(0.0);
+        }
         layout_css_box(
             child,
             cursor_x,
             cursor_y,
             item_width,
-            content.height().max(0.0),
+            row_heights
+                .get(row)
+                .copied()
+                .filter(|height| *height > 0.0)
+                .unwrap_or_else(|| content.height().max(0.0)),
             source,
             image_height_auto,
             text_metrics,
         );
         let margin_box = css_margin_box(child);
         row_height = row_height.max(margin_box.height());
+        if let Some(height) = row_heights.get_mut(row) {
+            *height = (*height).max(row_height);
+        }
         max_bottom = max_bottom.max(margin_box.bottom());
         column += 1;
     }
 
+    css_distribute_grid_fr_row_heights(&container.style, &mut row_heights, content.height(), gap);
+    css_stretch_auto_grid_rows_to_container(
+        &container.style,
+        &mut row_heights,
+        content.height(),
+        gap,
+    );
+
+    column = 0;
+    row = 0;
+    cursor_y = content.top();
+    max_bottom = content.top();
+    for child in &mut container.children {
+        if css_layout_box_is_out_of_flow(child) {
+            continue;
+        }
+        if column >= columns {
+            row += 1;
+            column = 0;
+            cursor_y =
+                content.top() + row_heights[..row].iter().copied().sum::<f32>() + gap * row as f32;
+        }
+        let mut cursor_x = css_grid_column_x(content.left(), &column_widths, gap, column);
+        let track_width = column_widths.get(column).copied().unwrap_or(1.0);
+        let item_width = css_grid_item_used_width(&child.style, track_width);
+        if matches!(container.style.justify_content, CssJustifyContent::Center) {
+            cursor_x += ((track_width - item_width) / 2.0).max(0.0);
+        }
+        let track_height = row_heights.get(row).copied().unwrap_or(0.0);
+        let align_center = matches!(container.style.align_items, CssAlignItems::Center);
+        layout_css_box(
+            child,
+            cursor_x,
+            cursor_y,
+            item_width,
+            if align_center {
+                0.0
+            } else if track_height > 0.0 {
+                track_height
+            } else {
+                content.height().max(0.0)
+            },
+            source,
+            image_height_auto,
+            text_metrics,
+        );
+        if align_center && track_height > 0.0 {
+            let margin_box = css_margin_box(child);
+            let offset_y = ((track_height - margin_box.height()) / 2.0).max(0.0);
+            translate_css_layout_box(child, egui::vec2(0.0, offset_y));
+        } else if track_height > 0.0 {
+            stretch_and_relayout_css_grid_child_to_margin_box_height(
+                child,
+                track_height,
+                source,
+                image_height_auto,
+                text_metrics,
+            );
+        }
+        max_bottom = max_bottom.max(css_margin_box(child).bottom());
+        column += 1;
+    }
+
     (max_bottom - content.top()).max(0.0)
+}
+
+fn css_grid_column_count(
+    style: &ResolvedBoxStyle,
+    flow_count: usize,
+    content_width: f32,
+    gap: f32,
+) -> usize {
+    let flow_count = flow_count.max(1);
+    if let Some(min_column_width) = style.grid_auto_repeat_min_column_width {
+        let min_column_width = resolve_css_grid_track_min_width(min_column_width, content_width);
+        let min_column_width = min_column_width.max(1.0);
+        let columns =
+            ((content_width.max(1.0) + gap) / (min_column_width + gap.max(0.0))).floor() as usize;
+        return columns.clamp(1, flow_count);
+    }
+    if let Some(tracks) = &style.grid_template_column_tracks {
+        let columns = tracks.len().max(1);
+        return columns.clamp(1, flow_count.max(columns));
+    }
+    style
+        .grid_template_columns
+        .unwrap_or(1)
+        .clamp(1, flow_count)
+}
+
+fn css_grid_column_widths(
+    style: &ResolvedBoxStyle,
+    flow_count: usize,
+    content_width: f32,
+    gap: f32,
+) -> Vec<f32> {
+    let columns = css_grid_column_count(style, flow_count, content_width, gap);
+    if style.grid_auto_repeat_min_column_width.is_some() {
+        return css_equal_grid_column_widths(columns, content_width, gap);
+    }
+    let Some(tracks) = &style.grid_template_column_tracks else {
+        return css_equal_grid_column_widths(columns, content_width, gap);
+    };
+    let tracks = tracks.iter().copied().take(columns).collect::<Vec<_>>();
+    if tracks.is_empty() {
+        return css_equal_grid_column_widths(columns, content_width, gap);
+    }
+    css_resolve_grid_column_tracks(&tracks, content_width, gap)
+}
+
+fn css_equal_grid_column_widths(columns: usize, content_width: f32, gap: f32) -> Vec<f32> {
+    let columns = columns.max(1);
+    let width =
+        ((content_width - gap * columns.saturating_sub(1) as f32) / columns as f32).max(1.0);
+    vec![width; columns]
+}
+
+fn css_grid_item_used_width(style: &ResolvedBoxStyle, track_width: f32) -> f32 {
+    let track_width = track_width.max(1.0);
+    let min_width = style.min_width.unwrap_or(1.0).max(0.0);
+    let mut width = style.width.unwrap_or(track_width).min(track_width);
+    if style.width.is_none()
+        && let Some(max_width) = style.max_width
+    {
+        width = width.min(max_width.max(min_width));
+    }
+    width.max(min_width).min(track_width.max(min_width))
+}
+
+fn css_resolve_grid_column_tracks(tracks: &[CssLength], content_width: f32, gap: f32) -> Vec<f32> {
+    let gap_total = gap * tracks.len().saturating_sub(1) as f32;
+    let mut widths = vec![0.0; tracks.len()];
+    let mut fixed_total = 0.0;
+    let mut flexible_total = 0.0;
+
+    for (index, track) in tracks.iter().copied().enumerate() {
+        match track {
+            CssLength::Fr(fr) if fr > 0.0 => {
+                flexible_total += fr;
+            }
+            CssLength::Auto => {
+                flexible_total += 1.0;
+            }
+            length => {
+                let width = resolve_css_grid_track_min_width(length, content_width).max(0.0);
+                widths[index] = width;
+                fixed_total += width;
+            }
+        }
+    }
+
+    let remaining = (content_width - gap_total - fixed_total).max(0.0);
+    let flexible_columns = tracks
+        .iter()
+        .filter(|track| {
+            matches!(track, CssLength::Fr(fr) if *fr > 0.0) || **track == CssLength::Auto
+        })
+        .count();
+    let flexible_floor = if flexible_columns > 0 {
+        ((content_width - gap_total).max(1.0) / tracks.len().max(1) as f32)
+            .min(320.0)
+            .max(96.0)
+    } else {
+        1.0
+    };
+    for (index, track) in tracks.iter().copied().enumerate() {
+        let share = match track {
+            CssLength::Fr(fr) if fr > 0.0 && flexible_total > 0.0 => Some(fr),
+            CssLength::Auto if flexible_total > 0.0 => Some(1.0),
+            _ => None,
+        };
+        if let Some(share) = share {
+            widths[index] = (remaining * share / flexible_total).max(flexible_floor);
+        }
+    }
+
+    widths.into_iter().map(|width| width.max(1.0)).collect()
+}
+
+fn css_grid_column_x(left: f32, column_widths: &[f32], gap: f32, column: usize) -> f32 {
+    left + column_widths.iter().take(column).copied().sum::<f32>() + gap * column as f32
+}
+
+fn resolve_css_grid_track_min_width(length: CssLength, containing_width: f32) -> f32 {
+    match length {
+        CssLength::Auto => containing_width,
+        CssLength::Px(px) => px,
+        CssLength::Percent(percent) => containing_width * percent / 100.0,
+        CssLength::Fr(_) => 0.0,
+        CssLength::Vw(vw) => DEFAULT_LAYOUT_VIEWPORT_WIDTH * vw / 100.0,
+        CssLength::Vh(vh) => DEFAULT_LAYOUT_VIEWPORT_HEIGHT * vh / 100.0,
+        CssLength::Calc(expression) => resolve_css_length_expression(expression, containing_width),
+        CssLength::Min(left, right) => resolve_css_length_expression(left, containing_width)
+            .min(resolve_css_length_expression(right, containing_width)),
+    }
 }
 
 fn layout_named_css_grid_children(
@@ -7905,18 +8506,37 @@ fn layout_named_css_grid_children(
         return None;
     }
 
-    let content = container.dimensions.content;
-    let explicit_columns = container.style.grid_template_columns.unwrap_or(0);
     let area_columns = areas.iter().map(Vec::len).max().unwrap_or(0);
+    let content = container.dimensions.content;
+    let explicit_columns =
+        css_grid_column_count(&container.style, area_columns.max(1), content.width(), gap);
     let columns = explicit_columns.max(area_columns);
     if columns == 0 {
         return None;
     }
 
-    let auto_width =
-        ((content.width() - gap * columns.saturating_sub(1) as f32) / columns as f32).max(1.0);
+    let column_widths = css_grid_column_widths(&container.style, columns, content.width(), gap);
     let mut placed_named_child = false;
-    let mut row_heights: Vec<f32> = vec![0.0; areas.len()];
+    let row_count = areas.len().max(
+        container
+            .style
+            .grid_template_rows
+            .as_ref()
+            .map_or(0, Vec::len),
+    );
+    let explicit_row_heights =
+        css_grid_explicit_row_heights(&container.style, row_count, content.height(), gap);
+    let mut row_heights = explicit_row_heights
+        .iter()
+        .map(|height| height.unwrap_or(0.0))
+        .collect::<Vec<_>>();
+    css_seed_definite_grid_fr_row_heights(
+        &container.style,
+        &mut row_heights,
+        &explicit_row_heights,
+        content.height(),
+        gap,
+    );
 
     for child in &mut container.children {
         if css_layout_box_is_out_of_flow(child) {
@@ -7931,29 +8551,40 @@ fn layout_named_css_grid_children(
             continue;
         };
         placed_named_child = true;
-        let item_width = css_grid_area_width(auto_width, gap, bounds);
+        let item_width = css_grid_area_width(&column_widths, gap, bounds);
+        let known_area_height =
+            css_grid_area_height(&row_heights, gap, bounds).filter(|height| *height > 0.0);
         layout_css_box(
             child,
-            content.left() + bounds.2 as f32 * (auto_width + gap),
+            css_grid_column_x(content.left(), &column_widths, gap, bounds.2),
             content.top(),
             item_width,
-            content.height().max(0.0),
+            known_area_height.unwrap_or_else(|| content.height().max(0.0)),
             source,
             image_height_auto,
             text_metrics,
         );
-        let row_span = (bounds.1 - bounds.0 + 1).max(1);
-        let height = (css_margin_box(child).height() - gap * row_span.saturating_sub(1) as f32)
-            .max(0.0)
-            / row_span as f32;
-        for row_height in &mut row_heights[bounds.0..=bounds.1] {
-            *row_height = (*row_height).max(height);
-        }
+        distribute_css_grid_item_height(
+            &container.style,
+            &explicit_row_heights,
+            &mut row_heights,
+            gap,
+            bounds,
+            child,
+        );
     }
 
     if !placed_named_child {
         return None;
     }
+
+    css_distribute_grid_fr_row_heights(&container.style, &mut row_heights, content.height(), gap);
+    css_stretch_auto_grid_rows_to_container(
+        &container.style,
+        &mut row_heights,
+        content.height(),
+        gap,
+    );
 
     let mut row_tops = Vec::with_capacity(row_heights.len());
     let mut cursor_y = content.top();
@@ -7961,10 +8592,7 @@ fn layout_named_css_grid_children(
         row_tops.push(cursor_y);
         cursor_y += *row_height + gap;
     }
-    let named_grid_bottom = row_heights
-        .last()
-        .and_then(|last_height| row_tops.last().map(|top| top + *last_height))
-        .unwrap_or(content.top());
+    let named_grid_bottom = css_grid_rows_bottom(content.top(), &row_heights, gap);
     let mut max_bottom = named_grid_bottom;
 
     for child in &mut container.children {
@@ -7979,18 +8607,46 @@ fn layout_named_css_grid_children(
         else {
             continue;
         };
-        let item_width = css_grid_area_width(auto_width, gap, bounds);
+        let track_width = css_grid_area_width(&column_widths, gap, bounds);
+        let item_width = css_grid_item_used_width(&child.style, track_width);
+        let mut cursor_x = css_grid_column_x(content.left(), &column_widths, gap, bounds.2);
+        if matches!(container.style.justify_content, CssJustifyContent::Center) {
+            cursor_x += ((track_width - item_width) / 2.0).max(0.0);
+        }
+        let item_height = css_grid_area_height(&row_heights, gap, bounds).unwrap_or(0.0);
+        let align_center = matches!(container.style.align_items, CssAlignItems::Center);
         layout_css_box(
             child,
-            content.left() + bounds.2 as f32 * (auto_width + gap),
+            cursor_x,
             row_tops[bounds.0],
             item_width,
-            content.height().max(0.0),
+            if align_center {
+                0.0
+            } else if item_height > 0.0 {
+                item_height
+            } else {
+                content.height().max(0.0)
+            },
             source,
             image_height_auto,
             text_metrics,
         );
-        max_bottom = max_bottom.max(css_margin_box(child).bottom());
+        if align_center && item_height > 0.0 {
+            let margin_box = css_margin_box(child);
+            let offset_y = ((item_height - margin_box.height()) / 2.0).max(0.0);
+            translate_css_layout_box(child, egui::vec2(0.0, offset_y));
+        } else if item_height > 0.0 {
+            stretch_and_relayout_css_grid_child_to_margin_box_height(
+                child,
+                item_height,
+                source,
+                image_height_auto,
+                text_metrics,
+            );
+        }
+        max_bottom = max_bottom
+            .max(css_margin_box(child).bottom())
+            .max(row_tops[bounds.1] + row_heights[bounds.1]);
     }
 
     let mut column = 0usize;
@@ -8017,14 +8673,9 @@ fn layout_named_css_grid_children(
             column = 0;
             fallback_row_height = 0.0;
         }
-        let cursor_x = content.left() + column as f32 * (auto_width + gap);
-        let item_width = child
-            .style
-            .width
-            .or(child.style.max_width)
-            .unwrap_or(auto_width)
-            .min(auto_width)
-            .max(child.style.min_width.unwrap_or(1.0));
+        let cursor_x = css_grid_column_x(content.left(), &column_widths, gap, column);
+        let track_width = column_widths.get(column).copied().unwrap_or(1.0);
+        let item_width = css_grid_item_used_width(&child.style, track_width);
         layout_css_box(
             child,
             cursor_x,
@@ -8044,9 +8695,283 @@ fn layout_named_css_grid_children(
     Some((max_bottom - content.top()).max(0.0))
 }
 
-fn css_grid_area_width(column_width: f32, gap: f32, bounds: (usize, usize, usize, usize)) -> f32 {
-    let column_span = (bounds.3 - bounds.2 + 1).max(1);
-    (column_width * column_span as f32 + gap * column_span.saturating_sub(1) as f32).max(1.0)
+fn css_grid_area_width(
+    column_widths: &[f32],
+    gap: f32,
+    bounds: (usize, usize, usize, usize),
+) -> f32 {
+    if bounds.2 >= column_widths.len() {
+        return 1.0;
+    }
+    let end = bounds.3.min(column_widths.len().saturating_sub(1));
+    let column_span = (end - bounds.2 + 1).max(1);
+    (column_widths[bounds.2..=end].iter().copied().sum::<f32>()
+        + gap * column_span.saturating_sub(1) as f32)
+        .max(1.0)
+}
+
+fn css_grid_area_height(
+    row_heights: &[f32],
+    gap: f32,
+    bounds: (usize, usize, usize, usize),
+) -> Option<f32> {
+    if bounds.1 >= row_heights.len() {
+        return None;
+    }
+    let row_span = (bounds.1 - bounds.0 + 1).max(1);
+    Some(
+        row_heights[bounds.0..=bounds.1]
+            .iter()
+            .copied()
+            .sum::<f32>()
+            + gap * row_span.saturating_sub(1) as f32,
+    )
+}
+
+fn css_grid_explicit_row_height(
+    style: &ResolvedBoxStyle,
+    row: usize,
+    containing_height: f32,
+) -> Option<f32> {
+    style
+        .grid_template_rows
+        .as_ref()
+        .and_then(|rows| rows.get(row))
+        .and_then(|height| resolve_css_used_height_length(*height, containing_height))
+}
+
+fn css_grid_explicit_row_heights(
+    style: &ResolvedBoxStyle,
+    row_count: usize,
+    containing_height: f32,
+    gap: f32,
+) -> Vec<Option<f32>> {
+    let Some(rows) = &style.grid_template_rows else {
+        return vec![None; row_count];
+    };
+    let mut heights = Vec::with_capacity(row_count);
+    let mut fixed_total = 0.0;
+    let mut fr_total = 0.0;
+    for row in 0..row_count {
+        let track = rows.get(row).copied();
+        let resolved = match track {
+            Some(CssLength::Fr(fr)) if fr > 0.0 => {
+                fr_total += fr;
+                None
+            }
+            Some(length) => resolve_css_used_height_length(length, containing_height),
+            None => None,
+        };
+        if let Some(height) = resolved {
+            fixed_total += height;
+        }
+        heights.push(resolved);
+    }
+
+    let _ = (fixed_total, fr_total, containing_height, gap);
+    heights
+}
+
+fn css_distribute_grid_fr_row_heights(
+    style: &ResolvedBoxStyle,
+    row_heights: &mut [f32],
+    containing_height: f32,
+    gap: f32,
+) {
+    if containing_height <= 0.0 || row_heights.is_empty() {
+        return;
+    }
+    let Some(rows) = &style.grid_template_rows else {
+        return;
+    };
+    let fr_total = rows
+        .iter()
+        .take(row_heights.len())
+        .filter_map(|track| match track {
+            CssLength::Fr(fr) if *fr > 0.0 => Some(*fr),
+            _ => None,
+        })
+        .sum::<f32>();
+    if fr_total <= 0.0 {
+        return;
+    }
+    let non_fr_total = row_heights
+        .iter()
+        .enumerate()
+        .filter(|(row, _)| !css_grid_row_is_fr(style, *row))
+        .map(|(_, height)| *height)
+        .sum::<f32>();
+    let gap_total = gap * row_heights.len().saturating_sub(1) as f32;
+    let remaining = (containing_height - non_fr_total - gap_total).max(0.0);
+    for (row, height) in row_heights.iter_mut().enumerate() {
+        if let Some(CssLength::Fr(fr)) = rows.get(row).copied()
+            && fr > 0.0
+        {
+            *height = remaining * fr / fr_total;
+        }
+    }
+}
+
+fn css_seed_definite_grid_fr_row_heights(
+    style: &ResolvedBoxStyle,
+    row_heights: &mut [f32],
+    explicit_row_heights: &[Option<f32>],
+    containing_height: f32,
+    gap: f32,
+) {
+    if containing_height <= 0.0 || row_heights.is_empty() {
+        return;
+    }
+    let Some(rows) = &style.grid_template_rows else {
+        return;
+    };
+    let mut fixed_total = 0.0;
+    let mut fr_total = 0.0;
+    for row in 0..row_heights.len() {
+        match rows.get(row).copied() {
+            Some(CssLength::Fr(fr)) if fr > 0.0 => fr_total += fr,
+            _ => {
+                let Some(height) = explicit_row_heights.get(row).copied().flatten() else {
+                    return;
+                };
+                fixed_total += height;
+            }
+        }
+    }
+    if fr_total <= 0.0 {
+        return;
+    }
+    let gap_total = gap * row_heights.len().saturating_sub(1) as f32;
+    let remaining = (containing_height - fixed_total - gap_total).max(0.0);
+    for (row, height) in row_heights.iter_mut().enumerate() {
+        if let Some(CssLength::Fr(fr)) = rows.get(row).copied()
+            && fr > 0.0
+        {
+            *height = remaining * fr / fr_total;
+        }
+    }
+}
+
+fn css_stretch_auto_grid_rows_to_container(
+    style: &ResolvedBoxStyle,
+    row_heights: &mut [f32],
+    containing_height: f32,
+    gap: f32,
+) {
+    if containing_height <= 0.0 || row_heights.is_empty() {
+        return;
+    }
+    let Some(rows) = &style.grid_template_rows else {
+        let gap_total = gap * row_heights.len().saturating_sub(1) as f32;
+        let used = row_heights.iter().copied().sum::<f32>() + gap_total;
+        let extra = (containing_height - used).max(0.0);
+        if extra > 0.0 {
+            let per_row = extra / row_heights.len() as f32;
+            for height in row_heights {
+                *height += per_row;
+            }
+        }
+        return;
+    };
+    let auto_rows = (0..row_heights.len())
+        .filter(|row| rows.get(*row).is_none_or(|track| *track == CssLength::Auto))
+        .collect::<Vec<_>>();
+    if auto_rows.is_empty() {
+        return;
+    }
+    let gap_total = gap * row_heights.len().saturating_sub(1) as f32;
+    let used = row_heights.iter().copied().sum::<f32>() + gap_total;
+    let extra = (containing_height - used).max(0.0);
+    if extra <= 0.0 {
+        return;
+    }
+    let per_row = extra / auto_rows.len() as f32;
+    for row in auto_rows {
+        row_heights[row] += per_row;
+    }
+}
+
+fn css_grid_row_is_fr(style: &ResolvedBoxStyle, row: usize) -> bool {
+    matches!(
+        style.grid_template_rows.as_ref().and_then(|rows| rows.get(row)),
+        Some(CssLength::Fr(fr)) if *fr > 0.0
+    )
+}
+
+fn distribute_css_grid_item_height(
+    style: &ResolvedBoxStyle,
+    explicit_row_heights: &[Option<f32>],
+    row_heights: &mut [f32],
+    gap: f32,
+    bounds: (usize, usize, usize, usize),
+    child: &CssLayoutBox<'_>,
+) {
+    if bounds.1 >= row_heights.len() {
+        return;
+    }
+    let row_span = (bounds.1 - bounds.0 + 1).max(1);
+    let explicit_height = explicit_row_heights[bounds.0..=bounds.1]
+        .iter()
+        .flatten()
+        .copied()
+        .sum::<f32>();
+    let auto_rows = explicit_row_heights[bounds.0..=bounds.1]
+        .iter()
+        .enumerate()
+        .filter(|(offset, height)| {
+            height.is_none() && !css_grid_row_is_fr(style, bounds.0 + *offset)
+        })
+        .count();
+    let item_height =
+        (css_margin_box(child).height() - gap * row_span.saturating_sub(1) as f32).max(0.0);
+    if auto_rows == 0 {
+        return;
+    }
+    let auto_height = ((item_height - explicit_height).max(0.0)) / auto_rows as f32;
+    for (offset, row_height) in row_heights[bounds.0..=bounds.1].iter_mut().enumerate() {
+        if explicit_row_heights[bounds.0 + offset].is_none() {
+            if css_grid_row_is_fr(style, bounds.0 + offset) {
+                continue;
+            }
+            *row_height = (*row_height).max(auto_height);
+        }
+    }
+}
+
+fn css_grid_rows_bottom(top: f32, row_heights: &[f32], gap: f32) -> f32 {
+    if row_heights.is_empty() {
+        return top;
+    }
+    top + row_heights.iter().copied().sum::<f32>()
+        + gap * row_heights.len().saturating_sub(1) as f32
+}
+
+fn stretch_css_grid_child_to_margin_box_height(
+    child: &mut CssLayoutBox<'_>,
+    target_margin_box_height: f32,
+) -> bool {
+    if child.style.height.is_some() {
+        return false;
+    }
+    let current = css_margin_box(child).height();
+    if target_margin_box_height > current {
+        child.dimensions.content.max.y += target_margin_box_height - current;
+        return true;
+    }
+    false
+}
+
+fn stretch_and_relayout_css_grid_child_to_margin_box_height(
+    child: &mut CssLayoutBox<'_>,
+    target_margin_box_height: f32,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+) {
+    let stretched = stretch_css_grid_child_to_margin_box_height(child, target_margin_box_height);
+    if stretched && child.style.display == CssDisplay::Grid {
+        layout_css_grid_children(child, source, image_height_auto, text_metrics);
+    }
 }
 
 fn css_grid_area_bounds(areas: &[Vec<String>], name: &str) -> Option<(usize, usize, usize, usize)> {
@@ -8090,13 +9015,28 @@ fn css_resolve_used_height(
     containing_width: f32,
 ) -> f32 {
     let _ = containing_width;
+    let vertical_border_padding = css_style_vertical_border_padding(style);
     let mut height = style
         .height
         .and_then(|height| resolve_css_used_height_length(height, containing_height))
+        .map(|height| {
+            css_used_content_box_extent(
+                height,
+                vertical_border_padding,
+                style.box_sizing_border_box,
+            )
+        })
         .unwrap_or(intrinsic_height);
     if let Some(min_height) = style
         .min_height
         .and_then(|height| resolve_css_used_height_length(height, containing_height))
+        .map(|height| {
+            css_used_content_box_extent(
+                height,
+                vertical_border_padding,
+                style.box_sizing_border_box,
+            )
+        })
     {
         height = height.max(min_height);
     }
@@ -8107,6 +9047,16 @@ fn resolve_css_used_height_length(length: CssLength, percent_basis: f32) -> Opti
     match length {
         CssLength::Auto => None,
         CssLength::Px(px) => Some(px),
+        CssLength::Fr(_) => None,
+        CssLength::Vh(vh) => Some(DEFAULT_LAYOUT_VIEWPORT_HEIGHT * vh / 100.0),
+        CssLength::Vw(vw) => Some(DEFAULT_LAYOUT_VIEWPORT_WIDTH * vw / 100.0),
+        CssLength::Calc(expression) => {
+            Some(resolve_css_length_expression(expression, percent_basis))
+        }
+        CssLength::Min(left, right) => Some(
+            resolve_css_length_expression(left, percent_basis)
+                .min(resolve_css_length_expression(right, percent_basis)),
+        ),
         CssLength::Percent(percent) if percent_basis > 0.0 => Some(percent_basis * percent / 100.0),
         CssLength::Percent(_) => None,
     }
@@ -8117,6 +9067,7 @@ fn layout_css_out_of_flow_children(
     source: &str,
     image_height_auto: bool,
     text_metrics: Option<&egui::Context>,
+    viewport: egui::Rect,
 ) {
     let containing = css_padding_box(&parent.dimensions);
     if containing.width() <= 0.0 {
@@ -8129,6 +9080,7 @@ fn layout_css_out_of_flow_children(
                 layout_css_out_of_flow_descendants_for_containing_block(
                     child,
                     containing,
+                    viewport,
                     source,
                     image_height_auto,
                     text_metrics,
@@ -8136,13 +9088,21 @@ fn layout_css_out_of_flow_children(
             }
             continue;
         }
-        layout_css_out_of_flow_child(child, containing, source, image_height_auto, text_metrics);
+        layout_css_out_of_flow_child(
+            child,
+            containing,
+            viewport,
+            source,
+            image_height_auto,
+            text_metrics,
+        );
     }
 }
 
 fn layout_css_out_of_flow_descendants_for_containing_block(
     box_: &mut CssLayoutBox<'_>,
     containing: egui::Rect,
+    viewport: egui::Rect,
     source: &str,
     image_height_auto: bool,
     text_metrics: Option<&egui::Context>,
@@ -8152,6 +9112,7 @@ fn layout_css_out_of_flow_descendants_for_containing_block(
             layout_css_out_of_flow_child(
                 child,
                 containing,
+                viewport,
                 source,
                 image_height_auto,
                 text_metrics,
@@ -8160,6 +9121,7 @@ fn layout_css_out_of_flow_descendants_for_containing_block(
             layout_css_out_of_flow_descendants_for_containing_block(
                 child,
                 containing,
+                viewport,
                 source,
                 image_height_auto,
                 text_metrics,
@@ -8171,10 +9133,16 @@ fn layout_css_out_of_flow_descendants_for_containing_block(
 fn layout_css_out_of_flow_child(
     child: &mut CssLayoutBox<'_>,
     containing: egui::Rect,
+    viewport: egui::Rect,
     source: &str,
     image_height_auto: bool,
     text_metrics: Option<&egui::Context>,
 ) {
+    let containing = if child.style.position == CssPosition::Fixed {
+        viewport
+    } else {
+        containing
+    };
     let inset = child.style.inset.unwrap_or_default();
     let left = child.style.inset_sides.left;
     let right = child.style.inset_sides.right;
@@ -8207,6 +9175,7 @@ fn layout_css_out_of_flow_child(
     if delta != egui::Vec2::ZERO {
         translate_css_layout_box(child, delta);
     }
+    apply_css_layout_transform(child);
 }
 
 fn measure_css_inline_children_height(
@@ -8335,7 +9304,14 @@ fn render_graph_to_canvas_graph(
     text_metrics: Option<&egui::Context>,
     reveal_hydration_hidden_content: bool,
 ) -> CanvasGraph {
-    let viewport = egui::vec2(graph.root.style.max_width.unwrap_or(1280.0), 0.0);
+    let viewport = egui::vec2(
+        graph
+            .root
+            .style
+            .max_width
+            .unwrap_or(DEFAULT_LAYOUT_VIEWPORT_WIDTH),
+        DEFAULT_LAYOUT_VIEWPORT_HEIGHT,
+    );
     let mut layout_root = build_css_layout_tree(&graph.root);
     let mut canvas_graph = CanvasGraph {
         viewport,
@@ -8355,6 +9331,7 @@ fn render_graph_to_canvas_graph(
     layout_css_layout_tree(
         &mut layout_root,
         viewport.x,
+        viewport.y,
         source,
         image_height_auto,
         text_metrics,
@@ -8374,8 +9351,29 @@ fn render_graph_to_canvas_graph(
             &mut canvas_graph,
         );
     }
-    canvas_graph.viewport.y = cursor.y.max(layout_root.dimensions.content.height());
+    canvas_graph.viewport.y = cursor
+        .y
+        .max(layout_root.dimensions.content.height())
+        .max(canvas_graph_content_bottom(&canvas_graph))
+        .max(DEFAULT_LAYOUT_VIEWPORT_HEIGHT);
     canvas_graph
+}
+
+fn canvas_graph_content_bottom(graph: &CanvasGraph) -> f32 {
+    graph.objects.iter().fold(0.0, |bottom, object| {
+        bottom.max(match object {
+            CanvasObject::ClipStart(clip) => clip.rect.bottom(),
+            CanvasObject::ClipEnd => 0.0,
+            CanvasObject::Text(text) => text.rect.bottom(),
+            CanvasObject::Rect(rect) => rect.rect.bottom(),
+            CanvasObject::Button(button) => button.rect.bottom(),
+            CanvasObject::Input(input) => input.rect.bottom(),
+            CanvasObject::Image(image) => image.rect.bottom(),
+            CanvasObject::Svg(svg) => svg.rect.bottom(),
+            CanvasObject::Media(media) => media.rect.bottom(),
+            CanvasObject::LinkHit(link) => link.rect.bottom(),
+        })
+    })
 }
 
 fn collect_canvas_forms(node: &RenderNode, forms: &mut HashMap<String, CanvasFormMetadata>) {
@@ -11025,13 +12023,14 @@ fn dom_list_blocks(
 }
 
 fn element_style_key(element: &DomElement) -> ElementStyleKey {
-    element_style_key_with_context(element, None, None)
+    element_style_key_with_context(element, None, None, None)
 }
 
 fn element_style_key_with_context(
     element: &DomElement,
     parent: Option<&DomElement>,
     previous_sibling: Option<&DomElement>,
+    child_index: Option<usize>,
 ) -> ElementStyleKey {
     ElementStyleKey {
         tag: element.tag_name.clone(),
@@ -11047,6 +12046,7 @@ fn element_style_key_with_context(
             .iter()
             .map(|attribute| attribute.name.to_ascii_lowercase())
             .collect(),
+        child_index,
         parent: parent.map(|parent| Box::new(element_style_key(parent))),
         previous_sibling: previous_sibling.map(|previous| Box::new(element_style_key(previous))),
     }
@@ -13537,6 +14537,70 @@ mod tests {
     }
 
     #[test]
+    fn render_graph_matches_nth_child_color_cascade() {
+        let html = r#"
+            <html>
+              <head>
+                <style>
+                  .tile { background: #ff66aa; }
+                  .tile:nth-child(3n) { background: #f59e0b; }
+                  .tile:nth-child(4n) { background: #22d3ee; }
+                </style>
+              </head>
+              <body>
+                <main>
+                  <section id="tile-1" class="tile">One</section>
+                  <section id="tile-2" class="tile">Two</section>
+                  <section id="tile-3" class="tile">Three</section>
+                  <section id="tile-4" class="tile">Four</section>
+                  <section id="tile-5" class="tile">Five</section>
+                  <section id="tile-6" class="tile">Six</section>
+                  <section id="tile-7" class="tile">Seven</section>
+                  <section id="tile-8" class="tile">Eight</section>
+                  <section id="tile-9" class="tile">Nine</section>
+                  <section id="tile-10" class="tile">Ten</section>
+                  <section id="tile-11" class="tile">Eleven</section>
+                  <section id="tile-12" class="tile">Twelve</section>
+                </main>
+              </body>
+            </html>
+        "#;
+        let html = remove_html_comments(html);
+        let dom = parse_dom_document(&html);
+        let style = rich_canvas::parse_basic_css(extract_tag_inner(&html, "style").unwrap_or(""));
+        let graph = build_render_graph(&dom, &style);
+
+        assert_eq!(
+            find_render_element_by_id(&graph.root, "tile-1")
+                .unwrap()
+                .style
+                .background,
+            egui::Color32::from_rgb(0xff, 0x66, 0xaa)
+        );
+        assert_eq!(
+            find_render_element_by_id(&graph.root, "tile-3")
+                .unwrap()
+                .style
+                .background,
+            egui::Color32::from_rgb(0xf5, 0x9e, 0x0b)
+        );
+        assert_eq!(
+            find_render_element_by_id(&graph.root, "tile-4")
+                .unwrap()
+                .style
+                .background,
+            egui::Color32::from_rgb(0x22, 0xd3, 0xee)
+        );
+        assert_eq!(
+            find_render_element_by_id(&graph.root, "tile-12")
+                .unwrap()
+                .style
+                .background,
+            egui::Color32::from_rgb(0x22, 0xd3, 0xee)
+        );
+    }
+
+    #[test]
     fn render_graph_merges_side_specific_margin_rules() {
         let html = r#"
             <html>
@@ -14486,6 +15550,324 @@ mod tests {
     }
 
     #[test]
+    fn grid_without_explicit_columns_stacks_items_vertically() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .grid { display: grid; gap: 10px; width: 300px; }
+                </style>
+              </head>
+              <body>
+                <div class="grid">
+                  <div>One</div>
+                  <div>Two</div>
+                  <div>Three</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let one = find_canvas_text(&document.canvas_graph, "One").expect("expected one");
+        let two = find_canvas_text(&document.canvas_graph, "Two").expect("expected two");
+        let three = find_canvas_text(&document.canvas_graph, "Three").expect("expected three");
+
+        assert!(two.rect.top() > one.rect.top());
+        assert!(three.rect.top() > two.rect.top());
+        assert!((two.rect.left() - one.rect.left()).abs() <= 1.0);
+        assert!((three.rect.left() - one.rect.left()).abs() <= 1.0);
+    }
+
+    #[test]
+    fn auto_fit_minmax_columns_follow_container_width() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .grid {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+                    gap: 10px;
+                    width: 500px;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="grid">
+                  <div>One</div>
+                  <div>Two</div>
+                  <div>Three</div>
+                  <div>Four</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let one = find_canvas_text(&document.canvas_graph, "One").expect("expected one");
+        let two = find_canvas_text(&document.canvas_graph, "Two").expect("expected two");
+        let three = find_canvas_text(&document.canvas_graph, "Three").expect("expected three");
+        let four = find_canvas_text(&document.canvas_graph, "Four").expect("expected four");
+
+        assert_eq!(one.rect.top(), two.rect.top());
+        assert_eq!(one.rect.top(), three.rect.top());
+        assert!(two.rect.left() > one.rect.right());
+        assert!(three.rect.left() > two.rect.right());
+        assert!(four.rect.top() > one.rect.top());
+        assert!((four.rect.left() - one.rect.left()).abs() <= 1.0);
+    }
+
+    #[test]
+    fn grid_place_items_center_places_child_in_track_center() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .grid {
+                    display: grid;
+                    place-items: center;
+                    width: 400px;
+                    height: 300px;
+                  }
+                  .child {
+                    width: 100px;
+                    min-height: 50px;
+                    background: #00ff00;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="grid"><div class="child">Centered</div></div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let child =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected centered child background");
+
+        assert!((child.rect.left() - 150.0).abs() <= 1.0);
+        assert!((child.rect.top() - 125.0).abs() <= 1.0);
+    }
+
+    #[test]
+    fn full_page_grid_fr_row_centers_nested_search_panel() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .page {
+                    display: grid;
+                    grid-template-rows: 64px 1fr 88px;
+                    min-height: 100vh;
+                    width: 100vw;
+                  }
+                  nav { background: #111111; }
+                  main {
+                    display: grid;
+                    place-items: center;
+                    background: #222222;
+                  }
+                  .search {
+                    width: 720px;
+                    min-height: 56px;
+                    background: #00ff00;
+                  }
+                  footer { background: #333333; }
+                </style>
+              </head>
+              <body>
+                <div class="page">
+                  <nav></nav>
+                  <main><form class="search">Search</form></main>
+                  <footer></footer>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let main = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x22, 0x22, 0x22),
+        )
+        .expect("expected main background");
+        let search =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected search background");
+        let expected_main_height = DEFAULT_LAYOUT_VIEWPORT_HEIGHT - 64.0 - 88.0;
+        let expected_search_top = 64.0 + (expected_main_height - 56.0) / 2.0;
+
+        assert!(
+            (main.rect.top() - 64.0).abs() <= 1.0,
+            "main={:?}",
+            main.rect
+        );
+        assert!(
+            (main.rect.height() - expected_main_height).abs() <= 1.0,
+            "main={:?}",
+            main.rect
+        );
+        assert!(
+            (search.rect.top() - expected_search_top).abs() <= 1.0,
+            "main={:?} search={:?}",
+            main.rect,
+            search.rect
+        );
+    }
+
+    #[test]
+    fn grid_template_rows_offset_and_stretch_grid_items() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .grid {
+                    display: grid;
+                    grid-template-columns: 1fr;
+                    grid-template-rows: 40px 80px;
+                    gap: 5px;
+                    width: 200px;
+                  }
+                  .first { background: #ff0000; }
+                  .second { background: #0000ff; }
+                </style>
+              </head>
+              <body>
+                <div class="grid">
+                  <div class="first">First</div>
+                  <div class="second">Second</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let first =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected first grid item background");
+        let second =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 0, 255))
+                .expect("expected second grid item background");
+
+        assert!((first.rect.height() - 40.0).abs() <= 1.0);
+        assert!((second.rect.height() - 80.0).abs() <= 1.0);
+        assert!((second.rect.top() - first.rect.bottom() - 5.0).abs() <= 1.0);
+    }
+
+    #[test]
+    fn implicit_grid_row_stretches_to_definite_container_height() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .page {
+                    display: grid;
+                    grid-template-columns: 260px 1fr;
+                    min-height: 100vh;
+                  }
+                  aside { background: #ffaa00; }
+                  main { background: #28b8c8; }
+                  aside,
+                  main {
+                    display: grid;
+                    min-height: 48px;
+                    place-items: center;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="page">
+                  <aside>Sidebar</aside>
+                  <main>Main content</main>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let sidebar =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 170, 0))
+                .expect("expected sidebar background");
+        let main = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(40, 184, 200),
+        )
+        .expect("expected main background");
+
+        assert!((sidebar.rect.height() - DEFAULT_LAYOUT_VIEWPORT_HEIGHT).abs() <= 1.0);
+        assert!((main.rect.height() - DEFAULT_LAYOUT_VIEWPORT_HEIGHT).abs() <= 1.0);
+        assert!((sidebar.rect.width() - 260.0).abs() <= 1.0);
+        assert!((main.rect.left() - sidebar.rect.right()).abs() <= 1.0);
+        assert!((main.rect.width() - (DEFAULT_LAYOUT_VIEWPORT_WIDTH - 260.0)).abs() <= 1.0);
+    }
+
+    #[test]
+    fn grid_flexible_text_column_keeps_readable_width_when_fixed_tracks_overflow() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .results {
+                    display: grid;
+                    grid-template-columns: 160px minmax(240px, 720px) 1fr;
+                    gap: 20px;
+                    width: 620px;
+                  }
+                  .logo { background: #111111; min-height: 40px; }
+                  .search { background: #222222; min-height: 40px; }
+                  .summary {
+                    background: #00ff00;
+                    min-height: 40px;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="results">
+                  <div class="logo"></div>
+                  <div class="search"></div>
+                  <div class="summary">Hello world result summary should not become a one-letter column.</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let summary =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected summary background");
+
+        assert!(
+            summary.rect.width() >= 96.0,
+            "summary text column collapsed to {:?}",
+            summary.rect
+        );
+    }
+
+    #[test]
     fn grid_template_areas_position_items_by_declared_names() {
         let document = parse_html_document(
             r#"
@@ -14527,6 +15909,452 @@ mod tests {
         assert!(main.rect.left() > side.rect.right());
         assert!(foot.rect.top() > side.rect.top());
         assert!(foot.rect.left() <= side.rect.left() + 1.0);
+    }
+
+    #[test]
+    fn named_grid_area_uses_var_resolved_mainline_track_after_left_gutter() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  #app {
+                    --page-container-width-desktop: 654px;
+                    --page-container-left-space-desktop: 120px;
+                  }
+                  body { padding: 0; }
+                  .web {
+                    display: grid;
+                    grid-template-areas: "left-gutter mainline mid-gutter sidebar";
+                    grid-template-columns:
+                      var(--page-container-left-space-desktop)
+                      minmax(0, var(--page-container-width-desktop))
+                      40px
+                      minmax(0, 360px);
+                    width: 1174px;
+                  }
+                  .mainline {
+                    grid-area: mainline;
+                    background: #00ff00;
+                  }
+                  .sidebar {
+                    grid-area: sidebar;
+                    background: #ff0000;
+                  }
+                </style>
+              </head>
+              <body>
+                <div id="app">
+                  <div class="web">
+                    <main class="mainline">Hello world result summary should stay readable.</main>
+                    <aside class="sidebar">Sidebar</aside>
+                  </div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let mainline =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected mainline background");
+        let sidebar =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected sidebar background");
+
+        assert!(
+            mainline.rect.left() >= 119.5,
+            "mainline should start after left gutter, got {:?}",
+            mainline.rect
+        );
+        assert!(
+            mainline.rect.width() >= 600.0,
+            "mainline track collapsed to {:?}",
+            mainline.rect
+        );
+        assert!(
+            sidebar.rect.left() >= mainline.rect.right() + 39.5,
+            "sidebar should sit after the 40px gutter, got mainline={:?} sidebar={:?}",
+            mainline.rect,
+            sidebar.rect
+        );
+    }
+
+    #[test]
+    fn named_grid_area_spans_use_declared_row_tracks() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .grid {
+                    display: grid;
+                    grid-template-areas:
+                      "hero side"
+                      "hero foot";
+                    grid-template-columns: 100px 120px;
+                    grid-template-rows: 30px 50px;
+                    gap: 10px;
+                    width: 230px;
+                  }
+                  .hero { grid-area: hero; background: #ff0000; }
+                  .side { grid-area: side; background: #00ff00; }
+                  .foot { grid-area: foot; background: #0000ff; }
+                </style>
+              </head>
+              <body>
+                <div class="grid">
+                  <div class="hero">Hero</div>
+                  <div class="side">Side</div>
+                  <div class="foot">Foot</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let hero =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected hero background");
+        let side =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected side background");
+        let foot =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 0, 255))
+                .expect("expected foot background");
+
+        assert!((hero.rect.height() - 90.0).abs() <= 1.0);
+        assert!((side.rect.height() - 30.0).abs() <= 1.0);
+        assert!((foot.rect.height() - 50.0).abs() <= 1.0);
+        assert!((foot.rect.top() - side.rect.bottom() - 10.0).abs() <= 1.0);
+        assert!(side.rect.left() > hero.rect.right());
+        assert!(foot.rect.left() > hero.rect.right());
+    }
+
+    #[test]
+    fn grid_min_height_distributes_fr_after_auto_rows_and_stretches_nested_grid_items() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .page {
+                    display: grid;
+                    grid-template-areas:
+                      "head head"
+                      "notice notice"
+                      "side content"
+                      "foot foot";
+                    grid-template-columns: 220px 1fr;
+                    grid-template-rows: 56px auto 1fr auto;
+                    gap: 8px;
+                    width: 1000px;
+                    min-height: 100vh;
+                  }
+                  .head { grid-area: head; background: #ff0000; }
+                  .notice { grid-area: notice; height: 40px; background: #00ff00; }
+                  .side { grid-area: side; background: #0000ff; }
+                  .content {
+                    grid-area: content;
+                    display: grid;
+                    grid-template-columns: 180px 1fr;
+                    gap: 12px;
+                    background: #ffff00;
+                  }
+                  .toc { background: #ff00ff; }
+                  .article { background: #00ffff; }
+                  .foot { grid-area: foot; height: 32px; background: #333333; }
+                </style>
+              </head>
+              <body>
+                <div class="page">
+                  <div class="head">Header</div>
+                  <div class="notice">Notice</div>
+                  <div class="side">Sidebar</div>
+                  <div class="content">
+                    <div class="toc">Table of contents</div>
+                    <div class="article">Article body</div>
+                  </div>
+                  <div class="foot">Footer</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let header =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected header background");
+        let notice =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected notice background");
+        let sidebar =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 0, 255))
+                .expect("expected sidebar background");
+        let content =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 255, 0))
+                .expect("expected content background");
+        let toc =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 255))
+                .expect("expected toc background");
+        let article =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 255))
+                .expect("expected article background");
+        let footer =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(51, 51, 51))
+                .expect("expected footer background");
+
+        assert!((header.rect.height() - 56.0).abs() <= 1.0);
+        assert!((notice.rect.height() - 40.0).abs() <= 1.0);
+        assert!(sidebar.rect.height() > 1600.0, "sidebar was {sidebar:?}");
+        assert!((content.rect.height() - sidebar.rect.height()).abs() <= 1.0);
+        assert!((toc.rect.height() - content.rect.height()).abs() <= 1.0);
+        assert!((article.rect.height() - content.rect.height()).abs() <= 1.0);
+        assert!((footer.rect.bottom() - DEFAULT_LAYOUT_VIEWPORT_HEIGHT).abs() <= 1.0);
+    }
+
+    #[test]
+    fn fixed_bottom_right_uses_viewport_and_stays_out_of_flow() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .host { margin-left: 160px; width: 240px; height: 120px; background: #dddddd; }
+                  .badge {
+                    position: fixed;
+                    right: 12px;
+                    bottom: 12px;
+                    width: 100px;
+                    height: 30px;
+                    background: #ff0000;
+                  }
+                  .flow { width: 80px; height: 20px; background: #0000ff; }
+                </style>
+              </head>
+              <body>
+                <div class="host"><div class="badge">Fixed</div></div>
+                <div class="flow">Flow</div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let badge =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected fixed badge background");
+        let flow =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 0, 255))
+                .expect("expected flow background");
+
+        assert!((badge.rect.right() - (DEFAULT_LAYOUT_VIEWPORT_WIDTH - 12.0)).abs() <= 1.0);
+        assert!((badge.rect.bottom() - (DEFAULT_LAYOUT_VIEWPORT_HEIGHT - 12.0)).abs() <= 1.0);
+        assert!(flow.rect.top() < 130.0, "flow rect was {:?}", flow.rect);
+    }
+
+    #[test]
+    fn fixed_center_overlay_honors_percent_inset_and_translate_x() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .overlay {
+                    position: fixed;
+                    inset: 96px auto auto 50%;
+                    transform: translateX(-50%);
+                    width: 240px;
+                    height: 80px;
+                    background: #00ff00;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="overlay">Overlay</div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let overlay =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected fixed overlay background");
+
+        assert!((overlay.rect.width() - 240.0).abs() <= 1.0);
+        assert!((overlay.rect.left() - 520.0).abs() <= 1.0);
+        assert!((overlay.rect.top() - 96.0).abs() <= 1.0);
+    }
+
+    #[test]
+    #[ignore = "requires Chrome/Chromium; run with CHROME_BIN=/path/to/chrome cargo test -p almostthere_browser color_layout_fixtures_generate_static_pngs -- --ignored --nocapture"]
+    fn color_layout_fixtures_generate_static_pngs() {
+        let chrome = find_chrome_binary().expect(
+            "set CHROME_BIN or install chromium/google-chrome to render color layout references",
+        );
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../color_layout_test");
+        let mut fixtures = fs::read_dir(&fixture_dir)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to read color layout fixture dir {}: {error}",
+                    fixture_dir.display()
+                )
+            })
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension().and_then(|ext| ext.to_str()) == Some("html")
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.as_bytes().first().is_some_and(u8::is_ascii_digit))
+            })
+            .collect::<Vec<_>>();
+        fixtures.sort();
+        assert!(
+            fixtures.len() >= 50,
+            "expected at least the original 50 numbered color layout fixtures"
+        );
+
+        let report_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/color_layout_reference");
+        fs::create_dir_all(&report_dir).expect("failed to create color layout report dir");
+
+        let mut index_rows = Vec::new();
+        for fixture in fixtures {
+            let name = fixture
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("<unknown>")
+                .to_owned();
+            let html = fs::read_to_string(&fixture)
+                .unwrap_or_else(|error| panic!("failed to read {}: {error}", fixture.display()));
+            let stem = fixture
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("fixture");
+            let chrome_png = report_dir.join(format!("{stem}.chrome.png"));
+            let almost_png = report_dir.join(format!("{stem}.almostthere.png"));
+
+            render_chrome_color_layout_png(&chrome, &fixture, &chrome_png);
+            render_almostthere_color_layout_png(&html, &fixture, &almost_png);
+
+            index_rows.push(format!(
+                r#"<section class="pair"><h2>{}</h2><div><figure><figcaption>Chrome</figcaption><img src="{}"></figure><figure><figcaption>AlmostThere</figcaption><img src="{}"></figure></div></section>"#,
+                html_escape(&name),
+                html_escape(chrome_png.file_name().and_then(|name| name.to_str()).unwrap_or("")),
+                html_escape(almost_png.file_name().and_then(|name| name.to_str()).unwrap_or(""))
+            ));
+        }
+
+        let index_path = report_dir.join("index.html");
+        fs::write(&index_path, color_layout_reference_index(&index_rows))
+            .expect("failed to write color layout reference index");
+        eprintln!("color layout PNG review index: {}", index_path.display());
+    }
+
+    fn find_chrome_binary() -> Option<PathBuf> {
+        if let Ok(path) = std::env::var("CHROME_BIN") {
+            let path = PathBuf::from(path);
+            if chrome_binary_works(&path) {
+                return Some(path);
+            }
+        }
+
+        [
+            "chromium",
+            "chromium-browser",
+            "google-chrome",
+            "google-chrome-stable",
+            "chrome",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|candidate| chrome_binary_works(candidate))
+    }
+
+    fn chrome_binary_works(path: &Path) -> bool {
+        std::process::Command::new(path)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    fn render_chrome_color_layout_png(chrome: &Path, fixture: &Path, output_path: &Path) {
+        let output = std::process::Command::new(chrome)
+            .arg("--headless=new")
+            .arg("--disable-gpu")
+            .arg("--no-sandbox")
+            .arg("--disable-dev-shm-usage")
+            .arg("--allow-file-access-from-files")
+            .arg("--window-size=1280,1800")
+            .arg(format!("--screenshot={}", output_path.display()))
+            .arg(path_to_file_url(fixture))
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run Chrome {}: {error}", chrome.display()));
+
+        assert!(
+            output.status.success(),
+            "Chrome failed for {}:\n{}",
+            fixture.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn render_almostthere_color_layout_png(html: &str, fixture: &Path, output_path: &Path) {
+        let source = path_to_file_url(fixture);
+        let document = parse_html_document(html, &source);
+        let image = rasterize_canvas_graph_debug_frame(&document.canvas_graph);
+        image
+            .save(output_path)
+            .unwrap_or_else(|error| panic!("failed to write {}: {error}", output_path.display()));
+    }
+
+    fn color_layout_reference_index(rows: &[String]) -> String {
+        format!(
+            r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Color Layout PNG Reference</title>
+<style>
+body {{ margin: 0; padding: 24px; font-family: sans-serif; background: #f5f7fa; color: #17212b; }}
+h1 {{ margin: 0 0 16px; }}
+.pair {{ margin: 0 0 28px; padding-bottom: 28px; border-bottom: 1px solid #c9d1d9; }}
+.pair h2 {{ margin: 0 0 12px; font-size: 16px; }}
+.pair > div {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }}
+figure {{ margin: 0; background: white; border: 1px solid #c9d1d9; }}
+figcaption {{ padding: 8px 10px; font-weight: 700; background: #eef2f7; border-bottom: 1px solid #c9d1d9; }}
+img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
+@media (max-width: 900px) {{ .pair > div {{ grid-template-columns: 1fr; }} }}
+</style>
+</head>
+<body>
+<h1>Color Layout PNG Reference</h1>
+<p>Manual visual comparison only. Left is Chrome/Chromium headless, right is AlmostThere.</p>
+{}
+</body>
+</html>
+"#,
+            rows.join("\n")
+        )
+    }
+
+    fn html_escape(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
     }
 
     #[test]
@@ -14728,6 +16556,198 @@ mod tests {
     }
 
     #[test]
+    fn universal_border_box_keeps_padding_inside_declared_width_and_height() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  * { box-sizing: border-box; }
+                  body { padding: 0; }
+                  .box {
+                    width: 120px;
+                    height: 80px;
+                    padding: 12px;
+                    border: 4px solid #ff0000;
+                    background: #00ff00;
+                  }
+                </style>
+              </head>
+              <body><div class="box">Text</div></body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let rect = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0x00, 0xff, 0x00) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("expected box background");
+
+        assert!((rect.width() - 120.0).abs() < 0.1, "got {rect:?}");
+        assert!((rect.height() - 80.0).abs() < 0.1, "got {rect:?}");
+    }
+
+    #[test]
+    fn flex_row_min_width_zero_allows_item_to_shrink_before_fixed_action() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .row { display: flex; width: 160px; gap: 8px; background: #111111; }
+                  .label { flex: 1; min-width: 0; background: #00ff00; }
+                  .action { width: 48px; background: #ff0000; }
+                </style>
+              </head>
+              <body>
+                <div class="row">
+                  <div class="label">A very long flexible label</div>
+                  <div class="action">Go</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let action = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0xff, 0x00, 0x00) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("expected action background");
+
+        assert!(
+            action.right() <= 160.5,
+            "fixed action should stay inside row after flexible item shrinks, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn flex_wrap_places_fixed_width_items_on_multiple_rows() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .claims { display: flex; flex-wrap: wrap; width: 760px; gap: 0; }
+                  .claim { width: 380px; height: 48px; }
+                  .one { background: #00ff00; }
+                  .two { background: #0000ff; }
+                  .three { background: #ff0000; }
+                </style>
+              </head>
+              <body>
+                <ol class="claims">
+                  <li class="claim one">One</li>
+                  <li class="claim two">Two</li>
+                  <li class="claim three">Three</li>
+                </ol>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let one = find_canvas_text(&document.canvas_graph, "One").expect("expected first claim");
+        let two = find_canvas_text(&document.canvas_graph, "Two").expect("expected second claim");
+        let three =
+            find_canvas_text(&document.canvas_graph, "Three").expect("expected third claim");
+
+        assert_eq!(one.rect.top(), two.rect.top());
+        assert!(
+            two.rect.left() >= one.rect.right() - 0.5,
+            "expected second claim beside first, got one={:?} two={:?}",
+            one.rect,
+            two.rect
+        );
+        assert!(
+            three.rect.top() >= one.rect.bottom() - 0.5,
+            "expected third claim on next flex line, got one={:?} three={:?}",
+            one.rect,
+            three.rect
+        );
+        assert!((three.rect.left() - one.rect.left()).abs() < 0.5);
+    }
+
+    #[test]
+    fn flex_column_uses_gap_on_vertical_axis() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .col { display: flex; flex-direction: column; gap: 10px; width: 100px; }
+                  .first { width: 80px; height: 20px; background: #00ff00; }
+                  .second { width: 80px; height: 20px; background: #ff0000; }
+                </style>
+              </head>
+              <body>
+                <div class="col">
+                  <div class="first"></div>
+                  <div class="second"></div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let first = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0x00, 0xff, 0x00) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("expected first background");
+        let second = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0xff, 0x00, 0x00) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("expected second background");
+
+        assert!((first.left() - second.left()).abs() < 0.1);
+        assert!(
+            second.top() - first.bottom() >= 9.9,
+            "expected vertical gap between column flex items, got first={first:?} second={second:?}"
+        );
+    }
+
+    #[test]
     fn flex_placeholder_span_and_button_render_horizontally() {
         let document = parse_html_document(
             r#"
@@ -14830,6 +16850,325 @@ mod tests {
             search_rect.height() < 100.0,
             "percentage height in an indefinite container should stay intrinsic, got {:?}",
             search_rect
+        );
+    }
+
+    #[test]
+    fn viewport_height_lengths_create_full_viewport_boxes() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .hero {
+                    min-height: 100vh;
+                    width: 100vw;
+                    background: #123456;
+                  }
+                </style>
+              </head>
+              <body><section class="hero">Hero</section></body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let hero_rect = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0x12, 0x34, 0x56) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("expected hero background");
+
+        assert!(
+            (hero_rect.width() - 1280.0).abs() < 0.1,
+            "got {hero_rect:?}"
+        );
+        assert!(
+            (hero_rect.height() - DEFAULT_LAYOUT_VIEWPORT_HEIGHT).abs() < 0.1,
+            "got {hero_rect:?}"
+        );
+        assert!(document.canvas_graph.viewport.y >= DEFAULT_LAYOUT_VIEWPORT_HEIGHT);
+    }
+
+    #[test]
+    fn nested_min_height_page_propagates_height_to_grid_rows() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  html, body { padding: 0; margin: 0; }
+                  .page {
+                    display: grid;
+                    grid-template-rows: 120px 1fr 80px;
+                    min-height: 100vh;
+                    width: 100vw;
+                  }
+                  .header { background: #111111; }
+                  .main {
+                    display: grid;
+                    grid-template-rows: 1fr 1fr;
+                    background: #222222;
+                  }
+                  .top { background: #333333; }
+                  .bottom { background: #444444; }
+                  .footer { background: #555555; }
+                </style>
+              </head>
+              <body>
+                <main class="page">
+                  <section class="header"></section>
+                  <section class="main">
+                    <div class="top"></div>
+                    <div class="bottom"></div>
+                  </section>
+                  <section class="footer"></section>
+                </main>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let header = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x11, 0x11, 0x11),
+        )
+        .expect("expected header background");
+        let main = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x22, 0x22, 0x22),
+        )
+        .expect("expected main background");
+        let top = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x33, 0x33, 0x33),
+        )
+        .expect("expected nested top background");
+        let bottom = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x44, 0x44, 0x44),
+        )
+        .expect("expected nested bottom background");
+        let footer = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x55, 0x55, 0x55),
+        )
+        .expect("expected footer background");
+
+        assert!(
+            (header.rect.height() - 120.0).abs() <= 1.0,
+            "header={:?} main={:?} top={:?} bottom={:?} footer={:?}",
+            header.rect,
+            main.rect,
+            top.rect,
+            bottom.rect,
+            footer.rect
+        );
+        let main_height = DEFAULT_LAYOUT_VIEWPORT_HEIGHT - 200.0;
+        let nested_row_height = main_height * 0.5;
+        let footer_top = DEFAULT_LAYOUT_VIEWPORT_HEIGHT - 80.0;
+
+        assert!(
+            (main.rect.height() - main_height).abs() <= 1.0,
+            "header={:?} main={:?} top={:?} bottom={:?} footer={:?}",
+            header.rect,
+            main.rect,
+            top.rect,
+            bottom.rect,
+            footer.rect
+        );
+        assert!(
+            (top.rect.height() - nested_row_height).abs() <= 1.0,
+            "header={:?} main={:?} top={:?} bottom={:?} footer={:?}",
+            header.rect,
+            main.rect,
+            top.rect,
+            bottom.rect,
+            footer.rect
+        );
+        assert!(
+            (bottom.rect.height() - nested_row_height).abs() <= 1.0,
+            "header={:?} main={:?} top={:?} bottom={:?} footer={:?}",
+            header.rect,
+            main.rect,
+            top.rect,
+            bottom.rect,
+            footer.rect
+        );
+        assert!(
+            (footer.rect.top() - footer_top).abs() <= 1.0,
+            "header={:?} main={:?} top={:?} bottom={:?} footer={:?}",
+            header.rect,
+            main.rect,
+            top.rect,
+            bottom.rect,
+            footer.rect
+        );
+        assert!(
+            (footer.rect.height() - 80.0).abs() <= 1.0,
+            "header={:?} main={:?} top={:?} bottom={:?} footer={:?}",
+            header.rect,
+            main.rect,
+            top.rect,
+            bottom.rect,
+            footer.rect
+        );
+    }
+
+    #[test]
+    fn nested_min_height_page_propagates_height_to_percent_child() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  html, body { padding: 0; margin: 0; }
+                  .page {
+                    min-height: 100vh;
+                    width: 100vw;
+                    background: #101010;
+                  }
+                  .fill {
+                    height: 100%;
+                    background: #abcdef;
+                  }
+                </style>
+              </head>
+              <body>
+                <main class="page"><section class="fill"></section></main>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let page = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x10, 0x10, 0x10),
+        )
+        .expect("expected page background");
+        let fill = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0xab, 0xcd, 0xef),
+        )
+        .expect("expected fill background");
+
+        assert!(
+            (page.rect.height() - DEFAULT_LAYOUT_VIEWPORT_HEIGHT).abs() <= 1.0,
+            "page={:?} fill={:?}",
+            page.rect,
+            fill.rect
+        );
+        assert!(
+            (fill.rect.height() - DEFAULT_LAYOUT_VIEWPORT_HEIGHT).abs() <= 1.0,
+            "page={:?} fill={:?}",
+            page.rect,
+            fill.rect
+        );
+    }
+
+    #[test]
+    fn css_min_and_calc_lengths_resolve_against_viewport() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .panel {
+                    width: min(50vw, 700px);
+                    height: calc(50vh - 25px);
+                    background: #abcdef;
+                  }
+                </style>
+              </head>
+              <body><div class="panel"></div></body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let panel_rect = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0xab, 0xcd, 0xef) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("expected panel background");
+
+        assert!(
+            (panel_rect.width() - 640.0).abs() < 0.1,
+            "got {panel_rect:?}"
+        );
+        assert!(
+            (panel_rect.height() - 425.0).abs() < 0.1,
+            "got {panel_rect:?}"
+        );
+    }
+
+    #[test]
+    fn canvas_graph_height_includes_out_of_flow_layout_bottom() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .anchor { position: relative; height: 20px; }
+                  .floating {
+                    position: absolute;
+                    top: 1100px;
+                    left: 0;
+                    width: 80px;
+                    height: 40px;
+                    background: #fedcba;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="anchor"><div class="floating"></div></div>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let floating_rect = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0xfe, 0xdc, 0xba) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("expected floating background");
+
+        assert!(floating_rect.bottom() > 1100.0, "got {floating_rect:?}");
+        assert!(
+            document.canvas_graph.viewport.y >= floating_rect.bottom(),
+            "viewport {:?} clipped {:?}",
+            document.canvas_graph.viewport,
+            floating_rect
         );
     }
 
@@ -16453,6 +18792,16 @@ mod tests {
     fn find_canvas_text<'a>(graph: &'a CanvasGraph, value: &str) -> Option<&'a CanvasTextObject> {
         graph.objects.iter().find_map(|object| match object {
             CanvasObject::Text(text) if text.text == value => Some(text),
+            _ => None,
+        })
+    }
+
+    fn find_canvas_rect_by_fill(
+        graph: &CanvasGraph,
+        fill: egui::Color32,
+    ) -> Option<&CanvasRectObject> {
+        graph.objects.iter().find_map(|object| match object {
+            CanvasObject::Rect(rect) if rect.fill == fill => Some(rect),
             _ => None,
         })
     }

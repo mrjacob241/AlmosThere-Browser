@@ -890,9 +890,24 @@ enum JsValue {
     },
     Proxy {
         target: Box<JsValue>,
-        get: Option<JsFunction>,
+        traps: Box<ProxyTraps>,
     },
     WeakMap(HashMap<String, JsValue>),
+}
+
+#[derive(Clone, Debug)]
+struct ProxyTraps {
+    get: Option<JsFunction>,
+    set: Option<JsFunction>,
+    has: Option<JsFunction>,
+    delete_property: Option<JsFunction>,
+    define_property: Option<JsFunction>,
+    own_keys: Option<JsFunction>,
+    get_own_property_descriptor: Option<JsFunction>,
+    get_prototype_of: Option<JsFunction>,
+    set_prototype_of: Option<JsFunction>,
+    is_extensible: Option<JsFunction>,
+    prevent_extensions: Option<JsFunction>,
 }
 
 #[derive(Clone, Debug)]
@@ -4135,10 +4150,11 @@ impl BrowserExecutionState {
                     let promise = Self::pending_promise();
                     let executor = arguments
                         .first()
-                        .and_then(|argument| self.function_from_expression(argument));
-                    if let Some(executor) = executor {
+                        .map(|argument| self.execute_expression(argument))
+                        .unwrap_or(JsValue::Undefined);
+                    if Self::is_callable_value(&executor) {
                         let (resolve, reject, guard) = self.promise_capability_functions(&promise);
-                        self.call_function(executor, vec![resolve, reject]);
+                        self.call_value(executor, JsValue::Undefined, vec![resolve, reject]);
                         if let Some(EarlyExit::Throw(error)) = self.early_exit.take() {
                             if self.promise_resolve_guards.insert(guard) {
                                 self.settle_promise(&promise, PromiseStatus::Rejected(error));
@@ -4155,19 +4171,25 @@ impl BrowserExecutionState {
                 {
                     let args = self.eval_args(arguments);
                     let target = args.get(0).cloned().unwrap_or(JsValue::Undefined);
-                    let get = args.get(1).and_then(|handler| {
-                        if let JsValue::Object(rc) = handler {
-                            match rc.borrow().get_own_data("get") {
-                                Some(JsValue::Function(func)) => Some(func),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        }
-                    });
+                    let handler = args.get(1);
                     JsValue::Proxy {
                         target: Box::new(target),
-                        get,
+                        traps: Box::new(ProxyTraps {
+                            get: Self::handler_trap(handler, "get"),
+                            set: Self::handler_trap(handler, "set"),
+                            has: Self::handler_trap(handler, "has"),
+                            delete_property: Self::handler_trap(handler, "deleteProperty"),
+                            define_property: Self::handler_trap(handler, "defineProperty"),
+                            own_keys: Self::handler_trap(handler, "ownKeys"),
+                            get_own_property_descriptor: Self::handler_trap(
+                                handler,
+                                "getOwnPropertyDescriptor",
+                            ),
+                            get_prototype_of: Self::handler_trap(handler, "getPrototypeOf"),
+                            set_prototype_of: Self::handler_trap(handler, "setPrototypeOf"),
+                            is_extensible: Self::handler_trap(handler, "isExtensible"),
+                            prevent_extensions: Self::handler_trap(handler, "preventExtensions"),
+                        }),
                     }
                 } else if matches!(callee.as_ref(), Expression::Identifier(name) if name == "WeakMap" || name == "Map")
                 {
@@ -8382,6 +8404,9 @@ impl BrowserExecutionState {
             let key = Self::value_to_string(&self.execute_expression(key_expr));
             let receiver = self.execute_expression(object);
             match receiver {
+                JsValue::Proxy { target, traps } => {
+                    self.proxy_set_property(*target, traps.set.clone(), &key, value);
+                }
                 JsValue::Object(rc) => {
                     self.obj_set(&rc, &key, value);
                     // Writeback so newly-created Rcs (e.g. uninitialized Function.prototype)
@@ -8448,6 +8473,10 @@ impl BrowserExecutionState {
         if let Some((object, property)) = member_assignment_target(target) {
             let receiver = self.execute_expression(object);
             match receiver {
+                JsValue::Proxy { target, traps } => {
+                    self.proxy_set_property(*target, traps.set.clone(), &property, value);
+                    return;
+                }
                 JsValue::ElementRef(element_ref) => {
                     if let Some(event_type) = Self::event_type_from_handler_property(&property) {
                         let element_id = existing_id_from_ref(&element_ref)
@@ -8921,9 +8950,9 @@ impl BrowserExecutionState {
             MemberProperty::Computed(_) => {
                 let index = computed_key.unwrap_or(JsValue::Undefined);
                 match receiver {
-                    JsValue::Proxy { target, get } => {
+                    JsValue::Proxy { target, traps } => {
                         let key = Self::value_to_string(&index);
-                        self.proxy_get_property(*target, get, &key)
+                        self.proxy_get_property(*target, traps.get.clone(), &key)
                     }
                     JsValue::Array(items) => {
                         let idx = Self::value_to_number(&index);
@@ -8968,6 +8997,17 @@ impl BrowserExecutionState {
                             .cloned()
                             .unwrap_or(JsValue::Undefined)
                     }
+                    JsValue::HostFunction(fn_name) => {
+                        let key = Self::value_to_string(&index);
+                        if key == "Symbol(Symbol.species)"
+                            && matches!(fn_name.as_str(), "Array" | "Promise")
+                        {
+                            JsValue::HostFunction(fn_name)
+                        } else {
+                            Self::host_fn_static_member(&fn_name, &key)
+                                .unwrap_or(JsValue::Undefined)
+                        }
+                    }
                     _ => JsValue::Undefined,
                 }
             }
@@ -8979,7 +9019,9 @@ impl BrowserExecutionState {
 
     fn named_member_value_from_receiver(&mut self, receiver: JsValue, property: &str) -> JsValue {
         match receiver {
-            JsValue::Proxy { target, get } => self.proxy_get_property(*target, get, property),
+            JsValue::Proxy { target, traps } => {
+                self.proxy_get_property(*target, traps.get.clone(), property)
+            }
             JsValue::String(ref s) if property == "length" => {
                 JsValue::Number(s.chars().count() as f64)
             }
@@ -9276,8 +9318,8 @@ impl BrowserExecutionState {
                     return JsValue::Undefined;
                 }
                 let result = match receiver.clone() {
-                    JsValue::Proxy { target, get } => {
-                        self.proxy_get_property(*target, get, property)
+                    JsValue::Proxy { target, traps } => {
+                        self.proxy_get_property(*target, traps.get.clone(), property)
                     }
                     JsValue::String(ref s) if property == "length" => {
                         JsValue::Number(s.chars().count() as f64)
@@ -9650,6 +9692,91 @@ impl BrowserExecutionState {
             JsValue::Object(rc) => self.obj_get(&rc, property),
             JsValue::Array(items) if property == "length" => JsValue::Number(items.len() as f64),
             _ => JsValue::Undefined,
+        }
+    }
+
+    fn handler_trap(handler: Option<&JsValue>, name: &str) -> Option<JsFunction> {
+        let Some(JsValue::Object(rc)) = handler else {
+            return None;
+        };
+        match rc.borrow().get_own_data(name) {
+            Some(JsValue::Function(func)) => Some(func),
+            _ => None,
+        }
+    }
+
+    fn proxy_set_property(
+        &mut self,
+        target: JsValue,
+        set: Option<JsFunction>,
+        property: &str,
+        value: JsValue,
+    ) -> bool {
+        if let Some(setter) = set {
+            let result = self.call_function(
+                setter,
+                vec![target, JsValue::String(property.to_owned()), value],
+            );
+            return Self::is_truthy(&result);
+        }
+        match target {
+            JsValue::Object(rc) => {
+                self.obj_set(&rc, property, value);
+                self.early_exit.is_none()
+            }
+            _ => false,
+        }
+    }
+
+    fn proxy_has_property(
+        &mut self,
+        target: JsValue,
+        has: Option<JsFunction>,
+        property: &str,
+    ) -> bool {
+        if let Some(has_fn) = has {
+            let result =
+                self.call_function(has_fn, vec![target, JsValue::String(property.to_owned())]);
+            return Self::is_truthy(&result);
+        }
+        match target {
+            JsValue::Object(rc) => Self::obj_has_property(&rc, property),
+            _ => false,
+        }
+    }
+
+    fn proxy_delete_property(
+        &mut self,
+        target: JsValue,
+        delete_property: Option<JsFunction>,
+        property: &str,
+    ) -> bool {
+        if let Some(delete_fn) = delete_property {
+            let result = self.call_function(
+                delete_fn,
+                vec![target, JsValue::String(property.to_owned())],
+            );
+            return Self::is_truthy(&result);
+        }
+        match target {
+            JsValue::Object(rc) => rc.borrow_mut().delete_own(property),
+            _ => true,
+        }
+    }
+
+    fn proxy_own_keys(&mut self, target: JsValue, own_keys: Option<JsFunction>) -> Vec<JsValue> {
+        if let Some(own_keys_fn) = own_keys {
+            let keys = self.call_function(own_keys_fn, vec![target]);
+            return self.collect_iterable_values(keys);
+        }
+        match target {
+            JsValue::Object(rc) => rc
+                .borrow()
+                .all_own_keys()
+                .into_iter()
+                .map(JsValue::String)
+                .collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -13975,7 +14102,7 @@ impl BrowserExecutionState {
                 }
             }
             // Array[@@species] getter — returns `this` (the constructor).
-            "Array.@@species.get" => this_arg,
+            "Array.@@species.get" | "Promise.@@species.get" => this_arg,
             "Error" | "TypeError" | "RangeError" | "ReferenceError" | "SyntaxError"
             | "URIError" | "EvalError" => {
                 let message = args.first().map(Self::value_to_string).unwrap_or_default();
@@ -14003,6 +14130,13 @@ impl BrowserExecutionState {
                     }
                 }
                 err
+            }
+            "Promise" => {
+                self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                    "TypeError",
+                    "Promise constructor cannot be invoked without 'new'".to_owned(),
+                )));
+                JsValue::Undefined
             }
             "Reflect.apply" => {
                 let target = args.first().cloned().unwrap_or(JsValue::Undefined);
@@ -14046,7 +14180,16 @@ impl BrowserExecutionState {
                 let mut iter = args.into_iter();
                 let obj = iter.next().unwrap_or(JsValue::Undefined);
                 let prop = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
-                Self::static_get_own_property_descriptor(&obj, &prop)
+                match obj {
+                    JsValue::Proxy { target, traps } => {
+                        if let Some(trap) = traps.get_own_property_descriptor.clone() {
+                            self.call_function(trap, vec![*target, JsValue::String(prop)])
+                        } else {
+                            Self::static_get_own_property_descriptor(&target, &prop)
+                        }
+                    }
+                    other => Self::static_get_own_property_descriptor(&other, &prop),
+                }
             }
             "Reflect.defineProperty" => {
                 let mut iter = args.into_iter();
@@ -14054,6 +14197,22 @@ impl BrowserExecutionState {
                 let prop = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
                 let descriptor = iter.next().unwrap_or(JsValue::Undefined);
                 match (obj, descriptor) {
+                    (JsValue::Proxy { target, traps }, descriptor) => {
+                        if let Some(trap) = traps.define_property.clone() {
+                            let result = self.call_function(
+                                trap,
+                                vec![*target, JsValue::String(prop), descriptor],
+                            );
+                            JsValue::Boolean(Self::is_truthy(&result))
+                        } else {
+                            match (*target, descriptor) {
+                                (JsValue::Object(rc), JsValue::Object(desc)) => JsValue::Boolean(
+                                    Self::apply_property_descriptor(&rc, prop, &desc),
+                                ),
+                                _ => JsValue::Boolean(false),
+                            }
+                        }
+                    }
                     (JsValue::Object(rc), JsValue::Object(desc)) => {
                         JsValue::Boolean(Self::apply_property_descriptor(&rc, prop, &desc))
                     }
@@ -14065,6 +14224,9 @@ impl BrowserExecutionState {
                 let obj = iter.next().unwrap_or(JsValue::Undefined);
                 let prop = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
                 match obj {
+                    JsValue::Proxy { target, traps } => JsValue::Boolean(
+                        self.proxy_delete_property(*target, traps.delete_property.clone(), &prop),
+                    ),
                     JsValue::Object(rc) => JsValue::Boolean(rc.borrow_mut().delete_own(&prop)),
                     _ => JsValue::Boolean(true),
                 }
@@ -14074,12 +14236,30 @@ impl BrowserExecutionState {
                 let obj = iter.next().unwrap_or(JsValue::Undefined);
                 let prop = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
                 match obj {
+                    JsValue::Proxy { target, traps } => {
+                        self.proxy_get_property(*target, traps.get.clone(), &prop)
+                    }
                     JsValue::Object(rc) => self.obj_get(&rc, &prop),
                     _ => JsValue::Undefined,
                 }
             }
             "Reflect.getPrototypeOf" => match args.into_iter().next().unwrap_or(JsValue::Undefined)
             {
+                JsValue::Proxy { target, traps } => {
+                    if let Some(trap) = traps.get_prototype_of.clone() {
+                        self.call_function(trap, vec![*target])
+                    } else {
+                        match *target {
+                            JsValue::Object(rc) => rc
+                                .borrow()
+                                .prototype
+                                .as_ref()
+                                .map(|p| JsValue::Object(Rc::clone(p)))
+                                .unwrap_or(JsValue::Null),
+                            _ => JsValue::Null,
+                        }
+                    }
+                }
                 JsValue::Object(rc) => rc
                     .borrow()
                     .prototype
@@ -14093,11 +14273,17 @@ impl BrowserExecutionState {
                 let obj = iter.next().unwrap_or(JsValue::Undefined);
                 let prop = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
                 match obj {
+                    JsValue::Proxy { target, traps } => {
+                        JsValue::Boolean(self.proxy_has_property(*target, traps.has.clone(), &prop))
+                    }
                     JsValue::Object(rc) => JsValue::Boolean(Self::obj_has_property(&rc, &prop)),
                     _ => JsValue::Boolean(false),
                 }
             }
             "Reflect.ownKeys" => match args.into_iter().next().unwrap_or(JsValue::Undefined) {
+                JsValue::Proxy { target, traps } => {
+                    JsValue::Array(self.proxy_own_keys(*target, traps.own_keys.clone()))
+                }
                 JsValue::Object(rc) => JsValue::Array(
                     rc.borrow()
                         .all_own_keys()
@@ -14108,10 +14294,35 @@ impl BrowserExecutionState {
                 _ => JsValue::Array(vec![]),
             },
             "Reflect.isExtensible" => match args.first() {
+                Some(JsValue::Proxy { target, traps }) => {
+                    if let Some(trap) = traps.is_extensible.clone() {
+                        let result = self.call_function(trap, vec![*target.clone()]);
+                        JsValue::Boolean(Self::is_truthy(&result))
+                    } else {
+                        match target.as_ref() {
+                            JsValue::Object(rc) => JsValue::Boolean(rc.borrow().extensible),
+                            _ => JsValue::Boolean(false),
+                        }
+                    }
+                }
                 Some(JsValue::Object(rc)) => JsValue::Boolean(rc.borrow().extensible),
                 _ => JsValue::Boolean(false),
             },
             "Reflect.preventExtensions" => match args.first() {
+                Some(JsValue::Proxy { target, traps }) => {
+                    if let Some(trap) = traps.prevent_extensions.clone() {
+                        let result = self.call_function(trap, vec![*target.clone()]);
+                        JsValue::Boolean(Self::is_truthy(&result))
+                    } else {
+                        match target.as_ref() {
+                            JsValue::Object(rc) => {
+                                rc.borrow_mut().extensible = false;
+                                JsValue::Boolean(true)
+                            }
+                            _ => JsValue::Boolean(false),
+                        }
+                    }
+                }
                 Some(JsValue::Object(rc)) => {
                     rc.borrow_mut().extensible = false;
                     JsValue::Boolean(true)
@@ -14124,6 +14335,12 @@ impl BrowserExecutionState {
                 let prop = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
                 let value = iter.next().unwrap_or(JsValue::Undefined);
                 match obj {
+                    JsValue::Proxy { target, traps } => JsValue::Boolean(self.proxy_set_property(
+                        *target,
+                        traps.set.clone(),
+                        &prop,
+                        value,
+                    )),
                     JsValue::Object(rc) => {
                         self.obj_set(&rc, &prop, value);
                         JsValue::Boolean(self.early_exit.is_none())
@@ -14136,6 +14353,24 @@ impl BrowserExecutionState {
                 let obj = iter.next().unwrap_or(JsValue::Undefined);
                 let proto = iter.next().unwrap_or(JsValue::Undefined);
                 match (obj, proto) {
+                    (JsValue::Proxy { target, traps }, proto) => {
+                        if let Some(trap) = traps.set_prototype_of.clone() {
+                            let result = self.call_function(trap, vec![*target, proto]);
+                            JsValue::Boolean(Self::is_truthy(&result))
+                        } else {
+                            match (*target, proto) {
+                                (JsValue::Object(rc), JsValue::Object(proto_rc)) => {
+                                    rc.borrow_mut().prototype = Some(proto_rc);
+                                    JsValue::Boolean(true)
+                                }
+                                (JsValue::Object(rc), JsValue::Null) => {
+                                    rc.borrow_mut().prototype = None;
+                                    JsValue::Boolean(true)
+                                }
+                                _ => JsValue::Boolean(false),
+                            }
+                        }
+                    }
                     (JsValue::Object(rc), JsValue::Object(proto_rc)) => {
                         rc.borrow_mut().prototype = Some(proto_rc);
                         JsValue::Boolean(true)
@@ -15438,9 +15673,11 @@ impl BrowserExecutionState {
                 }
             }
             JsValue::HostFunction(fn_name) => {
-                if prop == "Symbol(Symbol.species)" && fn_name == "Array" {
+                if prop == "Symbol(Symbol.species)"
+                    && matches!(fn_name.as_str(), "Array" | "Promise")
+                {
                     return make_accessor(
-                        JsValue::HostFunction("Array.@@species.get".into()),
+                        JsValue::HostFunction(format!("{fn_name}.@@species.get")),
                         false,
                         true,
                     );
@@ -15794,8 +16031,8 @@ impl BrowserExecutionState {
         match key {
             "name" | "length" => true,
             "prototype" => Self::constructor_prototype_object(fn_name).is_some(),
-            // Array[Symbol.species] is a getter-only accessor property.
-            "Symbol(Symbol.species)" => fn_name == "Array",
+            // Constructor[Symbol.species] is a getter-only accessor property.
+            "Symbol(Symbol.species)" => matches!(fn_name, "Array" | "Promise"),
             _ => Self::host_fn_static_member(fn_name, key).is_some(),
         }
     }
@@ -15851,7 +16088,7 @@ impl BrowserExecutionState {
     /// Returns the short name of a host function (last segment after the final dot).
     fn host_fn_short_name(fn_name: &str) -> String {
         match fn_name {
-            "Array.@@species.get" => "get [Symbol.species]".to_owned(),
+            "Array.@@species.get" | "Promise.@@species.get" => "get [Symbol.species]".to_owned(),
             _ => fn_name.rsplit('.').next().unwrap_or(fn_name).to_owned(),
         }
     }
@@ -18684,6 +18921,63 @@ mod tests {
     }
 
     #[test]
+    fn promise_constructor_edge_behavior_and_species_getter() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            let bare = "missing";
+            try {
+                Promise(function () {});
+            } catch (e) {
+                bare = e.name;
+            }
+
+            let rejected = "";
+            new Promise(function (resolve, reject) {
+                throw new TypeError("boom");
+            }).then(undefined, function (reason) {
+                rejected = reason.name;
+            });
+
+            let fulfilled = "";
+            new Promise(function (resolve, reject) {
+                resolve("kept");
+                throw new Error("ignored");
+            }).then(function (value) {
+                fulfilled = value;
+            });
+
+            let desc = Object.getOwnPropertyDescriptor(Promise, Symbol.species);
+            output =
+                bare + "/" +
+                String(Promise[Symbol.species] === Promise) + "/" +
+                desc.get.name + "/" +
+                String(desc.enumerable) + "/" +
+                String(desc.configurable);
+
+            setTimeout(function () {
+                document.getElementById("result").textContent =
+                    output + "/" + rejected + "/" + fulfilled;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        let effects = state.poll_timers(0);
+        assert_eq!(
+            effects,
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "TypeError/true/get [Symbol.species]/false/true/TypeError/kept".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
     fn promise_resolving_functions_expose_builtin_metadata() {
         let program = crate::parse_script(
             r#"
@@ -19808,6 +20102,69 @@ mod tests {
             vec![BrowserEffect::SetTextContent {
                 element_id: "result".to_owned(),
                 value: "RAB".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn reflect_operations_dispatch_proxy_traps() {
+        let program = crate::parse_script(
+            r#"
+            let target = { base: "B" };
+            let proxy = new Proxy(target, {
+                get: function (obj, prop) {
+                    return "get:" + prop + ":" + obj.base;
+                },
+                set: function (obj, prop, value) {
+                    obj.lastSet = prop + "=" + value;
+                    return true;
+                },
+                has: function (obj, prop) {
+                    return prop === "visible";
+                },
+                deleteProperty: function (obj, prop) {
+                    obj.deleted = prop;
+                    return false;
+                },
+                ownKeys: function () {
+                    return ["b", "a"];
+                },
+                getOwnPropertyDescriptor: function (obj, prop) {
+                    return { value: "desc:" + prop, configurable: true };
+                },
+                defineProperty: function (obj, prop, desc) {
+                    obj.defined = prop + "=" + desc.value;
+                    return true;
+                }
+            });
+
+            let get = Reflect.get(proxy, "name");
+            let set = Reflect.set(proxy, "x", "Y");
+            let hasVisible = Reflect.has(proxy, "visible");
+            let hasHidden = Reflect.has(proxy, "hidden");
+            let deleted = Reflect.deleteProperty(proxy, "gone");
+            let keys = Reflect.ownKeys(proxy).join(",");
+            let desc = Reflect.getOwnPropertyDescriptor(proxy, "slot").value;
+            let defined = Reflect.defineProperty(proxy, "newProp", { value: "V" });
+
+            document.getElementById("result").textContent =
+                get + "/" + String(set) + "/" + target.lastSet + "/" +
+                String(hasVisible) + "/" + String(hasHidden) + "/" +
+                String(deleted) + "/" + target.deleted + "/" + keys + "/" +
+                desc + "/" + String(defined) + "/" + target.defined;
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "get:name:B/true/x=Y/true/false/false/gone/b,a/desc:slot/true/newProp=V"
+                    .to_owned(),
             }]
         );
     }

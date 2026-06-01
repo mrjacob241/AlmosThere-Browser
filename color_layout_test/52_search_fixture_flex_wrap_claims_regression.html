@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>52 - Search Fixture Flex Wrap Claims Regression</title>
+<style>
+:root {
+  --line: rgba(20, 30, 40, 0.18);
+  --page: #f7f8fa;
+  --green: #51cf66;
+  --yellow: #ffd43b;
+  --cyan: #22b8cf;
+  --blue: #4dabf7;
+  --orange: #f59f00;
+  --pink: #f783ac;
+  --violet: #9775fa;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body {
+  background: var(--page);
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+}
+.box {
+  min-height: 48px;
+  border: 1px solid var(--line);
+  display: grid;
+  place-items: center;
+  padding: 10px;
+  font-size: 13px;
+  font-weight: 700;
+  color: rgba(0,0,0,0.74);
+  text-align: center;
+}
+.shell {
+  width: 760px;
+  margin: 24px 0 0 24px;
+  background: rgba(81,207,102,0.16);
+}
+.claims {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0;
+  width: 760px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.claim {
+  width: 380px;
+  height: 92px;
+}
+.one { background: var(--cyan); }
+.two { background: var(--yellow); }
+.three { background: var(--orange); }
+.four { background: var(--violet); }
+.search-row {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 12px;
+  width: 760px;
+  height: 72px;
+  margin-top: 24px;
+  background: rgba(77,171,247,0.18);
+}
+.icon { width: 48px; background: var(--pink); }
+.input { flex: 1; min-width: 0; background: #ffffff; }
+.button { width: 128px; background: var(--green); }
+.label {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  padding: 6px 8px;
+  background: rgba(255,255,255,0.88);
+  border: 1px solid var(--line);
+  font-size: 12px;
+}
+</style>
+</head>
+<body>
+<main class="shell">
+  <ol class="claims">
+    <li class="box claim one">claim 1 width 380</li>
+    <li class="box claim two">claim 2 width 380</li>
+    <li class="box claim three">claim 3 wraps to row 2</li>
+    <li class="box claim four">claim 4 wraps to row 2</li>
+  </ol>
+  <div class="search-row">
+    <div class="box icon">icon</div>
+    <div class="box input">flex input remains one line</div>
+    <div class="box button">button</div>
+  </div>
+</main>
+<div class="label">52 / regression - Search Fixture Flex Wrap Claims</div>
+</body>
+</html>

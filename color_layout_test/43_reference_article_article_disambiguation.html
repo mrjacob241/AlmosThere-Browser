@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>43 - Reference Article Article Disambiguation</title>
+<style>
+
+:root {
+  --ink: #17212b;
+  --muted: #5c6670;
+  --page: #f7f8fa;
+  --line: rgba(20, 30, 40, 0.18);
+  --red: #ff6b6b;
+  --orange: #f59f00;
+  --yellow: #ffd43b;
+  --green: #51cf66;
+  --teal: #20c997;
+  --cyan: #22b8cf;
+  --blue: #4dabf7;
+  --indigo: #748ffc;
+  --violet: #9775fa;
+  --pink: #f783ac;
+  --gray: #ced4da;
+  --dark: #495057;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--page);
+}
+.box {
+  min-height: 48px;
+  border: 1px solid var(--line);
+  display: grid;
+  place-items: center;
+  padding: 10px;
+  font-size: 13px;
+  font-weight: 700;
+  color: rgba(0,0,0,0.74);
+  text-align: center;
+}
+.tall { min-height: 160px; }
+.xtall { min-height: 300px; }
+.label {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  z-index: 20;
+  padding: 6px 8px;
+  background: rgba(255,255,255,0.88);
+  border: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+
+.page { min-height: 100vh; display: grid; grid-template: "side head" 64px "side main" 1fr / 190px minmax(0, 1fr); }
+.side { grid-area: side; background: var(--gray); } header { grid-area: head; background: var(--blue); display: grid; grid-template-columns: 1fr 160px; gap: 10px; padding: 10px; }
+main { grid-area: main; padding: 20px; display: grid; grid-template-columns: minmax(0, 760px) 260px; gap: 20px; }
+.results { display: grid; gap: 12px; } .result { background: var(--green); min-height: 92px; }
+.filters { background: var(--orange); }
+@media (max-width: 860px) { .page { grid-template: "head" 64px "main" 1fr / 1fr; } .side { display:none; } main { grid-template-columns: 1fr; } }
+
+</style>
+</head>
+<body>
+<div class="page"><aside class="box side">wiki nav</aside><header><div class="box">search input</div><div class="box">button</div></header><main><section class="results"><article class="box result">result 1</article><article class="box result">result 2</article><article class="box result">result 3</article><article class="box result">result 4</article><article class="box result">result 5</article><article class="box result">result 6</article><article class="box result">result 7</article></section><aside class="box filters">filters</aside></main></div>
+<div class="label">43 / 50 - Reference Article Article Disambiguation</div>
+</body>
+</html>

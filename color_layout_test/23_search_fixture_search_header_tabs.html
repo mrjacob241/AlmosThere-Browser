@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>23 - Search Fixture Search Header Tabs</title>
+<style>
+
+:root {
+  --ink: #17212b;
+  --muted: #5c6670;
+  --page: #f7f8fa;
+  --line: rgba(20, 30, 40, 0.18);
+  --red: #ff6b6b;
+  --orange: #f59f00;
+  --yellow: #ffd43b;
+  --green: #51cf66;
+  --teal: #20c997;
+  --cyan: #22b8cf;
+  --blue: #4dabf7;
+  --indigo: #748ffc;
+  --violet: #9775fa;
+  --pink: #f783ac;
+  --gray: #ced4da;
+  --dark: #495057;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--page);
+}
+.box {
+  min-height: 48px;
+  border: 1px solid var(--line);
+  display: grid;
+  place-items: center;
+  padding: 10px;
+  font-size: 13px;
+  font-weight: 700;
+  color: rgba(0,0,0,0.74);
+  text-align: center;
+}
+.tall { min-height: 160px; }
+.xtall { min-height: 300px; }
+.label {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  z-index: 20;
+  padding: 6px 8px;
+  background: rgba(255,255,255,0.88);
+  border: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+
+.page { min-height: 100vh; display: grid; grid-template-rows: 72px 46px 1fr; }
+header { background: var(--green); display: grid; grid-template-columns: 160px minmax(240px, 720px) 1fr; gap: 12px; padding: 12px 20px; }
+.logo { background: var(--yellow); } .search { background: white; } .tools { background: var(--blue); }
+.tabs { background: #e8f5ec; display: flex; gap: 8px; padding: 8px 20px; overflow: auto; }
+.tabs .box { min-width: 84px; background: var(--teal); }
+main { display: grid; grid-template-columns: minmax(0, 740px) 320px; gap: 28px; padding: 20px; }
+.results { display: grid; gap: 14px; } .result { background: var(--cyan); min-height: 112px; }
+.panel { background: var(--orange); min-height: 360px; }
+@media (max-width: 900px) { header { grid-template-columns: 1fr 72px; } .logo { display: none; } main { grid-template-columns: 1fr; } }
+
+</style>
+</head>
+<body>
+<div class="page"><header><div class="box logo">brand</div><div class="box search">search field</div><div class="box tools">tools</div></header><nav class="tabs"><div class="box">tab 1</div><div class="box">tab 2</div><div class="box">tab 3</div><div class="box">tab 4</div><div class="box">tab 5</div><div class="box">tab 6</div></nav><main><section class="results"><article class="box result">organic result 1</article><article class="box result">organic result 2</article><article class="box result">organic result 3</article><article class="box result">organic result 4</article><article class="box result">organic result 5</article><article class="box result">organic result 6</article></section><aside class="box panel">right panel</aside></main></div>
+<div class="label">23 / 50 - Search Fixture Search Header Tabs</div>
+</body>
+</html>
