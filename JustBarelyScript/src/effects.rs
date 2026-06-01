@@ -1287,6 +1287,8 @@ impl BrowserExecutionState {
             .set("now", JsValue::HostFunction("performance.now".into()));
         self.globals
             .insert("performance".into(), JsValue::Object(perf_rc));
+        self.globals
+            .insert("process".into(), Self::browser_process_object());
     }
 
     /// Seed the precomputed browser fingerprint suite into JS-facing APIs.
@@ -1750,6 +1752,12 @@ impl BrowserExecutionState {
                 .iter()
                 .flatten()
                 .flat_map(Self::binding_names)
+                .collect(),
+            Binding::ArrayRest { items, rest } => items
+                .iter()
+                .flatten()
+                .flat_map(Self::binding_names)
+                .chain(Self::binding_names(rest).into_iter())
                 .collect(),
         }
     }
@@ -3263,6 +3271,23 @@ impl BrowserExecutionState {
                     }
                 }
             }
+            Binding::ArrayRest { items, rest } => {
+                let arr = match &value {
+                    JsValue::Array(a) => a.clone(),
+                    _ => Vec::new(),
+                };
+                for (i, item) in items.iter().enumerate() {
+                    if let Some(sub_binding) = item {
+                        let elem = arr.get(i).cloned().unwrap_or(JsValue::Undefined);
+                        let sub = sub_binding.clone();
+                        self.execute_binding(&sub, elem);
+                    }
+                }
+                self.execute_binding(
+                    rest,
+                    JsValue::Array(arr.into_iter().skip(items.len()).collect()),
+                );
+            }
         }
     }
 
@@ -3303,6 +3328,23 @@ impl BrowserExecutionState {
                         self.execute_var_binding(&sub, elem);
                     }
                 }
+            }
+            Binding::ArrayRest { items, rest } => {
+                let arr = match &value {
+                    JsValue::Array(a) => a.clone(),
+                    _ => Vec::new(),
+                };
+                for (i, item) in items.iter().enumerate() {
+                    if let Some(sub_binding) = item {
+                        let elem = arr.get(i).cloned().unwrap_or(JsValue::Undefined);
+                        let sub = sub_binding.clone();
+                        self.execute_var_binding(&sub, elem);
+                    }
+                }
+                self.execute_var_binding(
+                    rest,
+                    JsValue::Array(arr.into_iter().skip(items.len()).collect()),
+                );
             }
         }
     }
@@ -4904,9 +4946,11 @@ impl BrowserExecutionState {
                     );
                 }
                 if method_name == "removeAttribute" {
-                    for arg in arguments {
-                        self.execute_expression(arg);
-                    }
+                    let name = arguments
+                        .first()
+                        .map(|a| Self::value_to_string(&self.execute_expression(a)))
+                        .unwrap_or_default();
+                    self.remove_element_attribute(&element_ref, &name);
                     return JsValue::Undefined;
                 }
                 if method_name == "querySelector" {
@@ -5341,6 +5385,10 @@ impl BrowserExecutionState {
                     return JsValue::Boolean(rc.borrow().has_own(&key));
                 }
             }
+            if Self::is_noop_style_method(&method_name) {
+                let args = self.eval_args(arguments);
+                return args.first().cloned().unwrap_or(receiver);
+            }
             // Evaluated receiver but method not found; trace it and still evaluate args for side effects.
             self.trace_runtime(
                 "unsupported.method",
@@ -5464,6 +5512,43 @@ impl BrowserExecutionState {
             method_name,
             "getComponentVersion" | "getVariable" | "GetVariable" | "IsVersionSupported"
         )
+    }
+
+    fn is_noop_style_method(method_name: &str) -> bool {
+        matches!(
+            method_name,
+            "bold"
+                | "dim"
+                | "italic"
+                | "italics"
+                | "underline"
+                | "inverse"
+                | "hidden"
+                | "strikethrough"
+                | "strike"
+                | "reset"
+                | "red"
+                | "green"
+                | "yellow"
+                | "blue"
+                | "magenta"
+                | "cyan"
+                | "white"
+                | "gray"
+                | "grey"
+        )
+    }
+
+    fn browser_process_object() -> JsValue {
+        let process_rc = JsObject::new();
+        {
+            let mut process = process_rc.borrow_mut();
+            process.set("browser", JsValue::Boolean(true));
+            process.set("env", JsValue::new_object());
+            process.set("versions", JsValue::new_object());
+            process.set("cwd", JsValue::HostFunction("process.cwd".into()));
+        }
+        JsValue::Object(process_rc)
     }
 
     fn storage_map(&self, kind: &StorageKind) -> &HashMap<String, String> {
@@ -7460,6 +7545,53 @@ impl BrowserExecutionState {
         }
     }
 
+    fn dom_token_list_object(element_ref: &str) -> JsValue {
+        JsValue::from_map([
+            (
+                "\0element_ref".to_owned(),
+                JsValue::String(element_ref.to_owned()),
+            ),
+            (
+                "add".to_owned(),
+                JsValue::HostFunction("DOMTokenList.add".into()),
+            ),
+            (
+                "remove".to_owned(),
+                JsValue::HostFunction("DOMTokenList.remove".into()),
+            ),
+            (
+                "toggle".to_owned(),
+                JsValue::HostFunction("DOMTokenList.toggle".into()),
+            ),
+            (
+                "contains".to_owned(),
+                JsValue::HostFunction("DOMTokenList.contains".into()),
+            ),
+        ])
+    }
+
+    fn dom_token_list_element_ref(value: &JsValue) -> Option<String> {
+        if let JsValue::Object(rc) = value {
+            if let Some(JsValue::String(element_ref)) = rc.borrow().get_own_data("\0element_ref") {
+                return Some(element_ref);
+            }
+        }
+        None
+    }
+
+    fn element_class_tokens(&self, element_ref: &str) -> Vec<String> {
+        self.get_element_attribute(element_ref, "class")
+            .unwrap_or_default()
+            .split_ascii_whitespace()
+            .filter(|token| !token.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn set_element_class_tokens(&mut self, element_ref: &str, tokens: Vec<String>) {
+        self.set_element_attribute(element_ref, "class", tokens.join(" "));
+    }
+
     fn assign_style_property(&mut self, element_id: &str, js_prop: &str, value: JsValue) {
         let css_prop = js_style_prop_to_css(js_prop);
         let css_value = Self::value_to_string(&value);
@@ -7601,7 +7733,7 @@ impl BrowserExecutionState {
                 .globals
                 .get(property)
                 .cloned()
-                .unwrap_or(JsValue::Undefined),
+                .unwrap_or_else(|| Self::window_fallback_property(property)),
             JsValue::DocumentRef => match property {
                 "body" => JsValue::ElementRef(existing_element_ref("body")),
                 "head" => JsValue::ElementRef(existing_element_ref("head")),
@@ -7609,6 +7741,9 @@ impl BrowserExecutionState {
                 "readyState" => JsValue::String("complete".to_owned()),
                 _ => JsValue::Undefined,
             },
+            JsValue::ElementRef(element_ref) if property == "classList" => {
+                Self::dom_token_list_object(&element_ref)
+            }
             JsValue::ElementRef(element_ref) if property == "style" => {
                 existing_id_from_ref(&element_ref)
                     .map(JsValue::StyleRef)
@@ -7676,7 +7811,7 @@ impl BrowserExecutionState {
                         "msActiveXFilteringEnabled".to_owned(),
                         JsValue::HostFunction("msActiveXFilteringEnabled".into()),
                     )]),
-                    _ => JsValue::Undefined,
+                    _ => Self::window_fallback_property(&global_name),
                 }
             });
         }
@@ -7900,6 +8035,9 @@ impl BrowserExecutionState {
                         if property == "nodeType" {
                             return JsValue::Number(1.0);
                         }
+                        if property == "classList" {
+                            return Self::dom_token_list_object(&element_ref);
+                        }
                         if dom_property_is_text_content(property) {
                             JsValue::String(
                                 self.get_element_text_content(&element_ref)
@@ -7972,7 +8110,7 @@ impl BrowserExecutionState {
                                     JsValue::HostFunction("performance.now".into()),
                                 )]),
                                 "globalThis" => JsValue::WindowRef,
-                                _ => JsValue::Undefined,
+                                _ => Self::window_fallback_property(property),
                             }
                         })
                     }
@@ -8252,6 +8390,9 @@ impl BrowserExecutionState {
         if let Some(element) = self.dom.created_elements.get_mut(element_ref) {
             element.attributes.insert(name.to_owned(), value);
         } else if let Some(element_id) = existing_id_from_ref(element_ref) {
+            if name == "class" {
+                self.update_class_selector_index(&element_id, Some(&value));
+            }
             self.dom
                 .attributes_by_id
                 .entry(element_id.clone())
@@ -8262,6 +8403,49 @@ impl BrowserExecutionState {
                 name: name.to_owned(),
                 value,
             });
+        }
+    }
+
+    fn remove_element_attribute(&mut self, element_ref: &str, name: &str) {
+        if let Some(element) = self.dom.created_elements.get_mut(element_ref) {
+            element.attributes.remove(name);
+        } else if let Some(element_id) = existing_id_from_ref(element_ref) {
+            if name == "class" {
+                self.update_class_selector_index(&element_id, None);
+            }
+            if let Some(attrs) = self.dom.attributes_by_id.get_mut(&element_id) {
+                attrs.remove(name);
+            }
+            self.effects.push(BrowserEffect::SetAttribute {
+                element_id,
+                name: name.to_owned(),
+                value: String::new(),
+            });
+        }
+    }
+
+    fn update_class_selector_index(&mut self, element_id: &str, classes: Option<&str>) {
+        self.dom
+            .query_selector_by_class
+            .retain(|_, id| id != element_id);
+        for ids in self.dom.query_selector_all_by_class.values_mut() {
+            ids.retain(|id| id != element_id);
+        }
+        self.dom
+            .query_selector_all_by_class
+            .retain(|_, ids| !ids.is_empty());
+        if let Some(classes) = classes {
+            for class_name in classes.split_ascii_whitespace() {
+                self.dom
+                    .query_selector_by_class
+                    .entry(class_name.to_owned())
+                    .or_insert_with(|| element_id.to_owned());
+                self.dom
+                    .query_selector_all_by_class
+                    .entry(class_name.to_owned())
+                    .or_default()
+                    .push(element_id.to_owned());
+            }
         }
     }
 
@@ -8297,6 +8481,10 @@ impl BrowserExecutionState {
             "window" | "this" => JsValue::WindowRef,
             "navigator" => JsValue::NavigatorRef,
             "globalThis" => JsValue::WindowRef,
+            "import" => JsValue::HostFunction("import".into()),
+            "import.meta" => {
+                JsValue::from_map([("url".to_owned(), JsValue::String(String::new()))])
+            }
             "ActiveXObject" => JsValue::HostFunction("ActiveXObject".into()),
             // Built-in constructors exposed as HostFunctions so `instanceof` and
             // `.prototype` access work correctly.
@@ -8315,6 +8503,7 @@ impl BrowserExecutionState {
             | "OfflineAudioContext"
             | "webkitOfflineAudioContext" => JsValue::HostFunction(name.to_owned()),
             "escape" | "unescape" => JsValue::HostFunction(name.to_owned()),
+            "process" => Self::browser_process_object(),
             _ => JsValue::Undefined,
         })
     }
@@ -8450,6 +8639,12 @@ impl BrowserExecutionState {
                 for item in items.iter().flatten() {
                     Self::collect_binding_names_for_tdz(item, mutable, out);
                 }
+            }
+            Binding::ArrayRest { items, rest } => {
+                for item in items.iter().flatten() {
+                    Self::collect_binding_names_for_tdz(item, mutable, out);
+                }
+                Self::collect_binding_names_for_tdz(rest, mutable, out);
             }
         }
     }
@@ -11810,6 +12005,16 @@ impl BrowserExecutionState {
             (JsValue::Number(a), JsValue::Number(b)) => a == b,
             (JsValue::BigInt(a), JsValue::BigInt(b)) => a == b,
             (JsValue::String(a), JsValue::String(b)) => a == b,
+            (JsValue::Object(a), JsValue::Object(b)) => Rc::ptr_eq(a, b),
+            (JsValue::RichArray(a), JsValue::RichArray(b)) => Rc::ptr_eq(a, b),
+            (JsValue::GeneratorObject(a), JsValue::GeneratorObject(b)) => Rc::ptr_eq(a, b),
+            (JsValue::ElementRef(a), JsValue::ElementRef(b)) => a == b,
+            (JsValue::StorageRef(a), JsValue::StorageRef(b)) => a == b,
+            (JsValue::DocumentRef, JsValue::DocumentRef)
+            | (JsValue::WindowRef, JsValue::WindowRef)
+            | (JsValue::NavigatorRef, JsValue::NavigatorRef)
+            | (JsValue::DateInstance, JsValue::DateInstance) => true,
+            (JsValue::Promise(a), JsValue::Promise(b)) => Rc::ptr_eq(a, b),
             // HostFunctions with the same name are the same function object.
             (JsValue::HostFunction(a), JsValue::HostFunction(b)) => a == b,
             // HostObjects with the same name are considered the same (best-effort).
@@ -12054,6 +12259,13 @@ impl BrowserExecutionState {
                 }
                 self.promise_resolve_input(result)
             }
+            "import" => {
+                // Minimal dynamic-import compatibility: return a fulfilled promise with an
+                // empty module namespace object. The browser module loader handles static
+                // imports; this keeps modern bundles parseable and safely resumable.
+                self.promise_resolve_input(JsValue::new_object())
+            }
+            "process.cwd" => JsValue::String(String::new()),
             "Array.isArray" => JsValue::Boolean(matches!(args.first(), Some(JsValue::Array(_)))),
             "Array.of" => {
                 match this_arg {
@@ -12319,6 +12531,77 @@ impl BrowserExecutionState {
                     }
                     _ => JsValue::Boolean(false),
                 }
+            }
+            "DOMTokenList.add" => {
+                if let Some(element_ref) = Self::dom_token_list_element_ref(&this_arg) {
+                    let mut tokens = self.element_class_tokens(&element_ref);
+                    for arg in args {
+                        let token = Self::value_to_string(&arg);
+                        if !token.is_empty() && !tokens.iter().any(|existing| existing == &token) {
+                            tokens.push(token);
+                        }
+                    }
+                    self.set_element_class_tokens(&element_ref, tokens);
+                }
+                JsValue::Undefined
+            }
+            "DOMTokenList.remove" => {
+                if let Some(element_ref) = Self::dom_token_list_element_ref(&this_arg) {
+                    let remove: HashSet<String> = args.iter().map(Self::value_to_string).collect();
+                    let tokens = self
+                        .element_class_tokens(&element_ref)
+                        .into_iter()
+                        .filter(|token| !remove.contains(token))
+                        .collect();
+                    self.set_element_class_tokens(&element_ref, tokens);
+                }
+                JsValue::Undefined
+            }
+            "DOMTokenList.toggle" => {
+                let mut enabled = false;
+                if let Some(element_ref) = Self::dom_token_list_element_ref(&this_arg) {
+                    let token = args.first().map(Self::value_to_string).unwrap_or_default();
+                    let force = args.get(1).map(Self::is_truthy);
+                    let mut tokens = self.element_class_tokens(&element_ref);
+                    let present = tokens.iter().any(|existing| existing == &token);
+                    enabled = match force {
+                        Some(true) => {
+                            if !token.is_empty() && !present {
+                                tokens.push(token);
+                            }
+                            true
+                        }
+                        Some(false) => {
+                            tokens.retain(|existing| existing != &token);
+                            false
+                        }
+                        None if present => {
+                            tokens.retain(|existing| existing != &token);
+                            false
+                        }
+                        None => {
+                            if !token.is_empty() {
+                                tokens.push(token);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                    self.set_element_class_tokens(&element_ref, tokens);
+                }
+                JsValue::Boolean(enabled)
+            }
+            "DOMTokenList.contains" => {
+                if let Some(element_ref) = Self::dom_token_list_element_ref(&this_arg) {
+                    let token = args.first().map(Self::value_to_string).unwrap_or_default();
+                    return JsValue::Boolean(
+                        self.element_class_tokens(&element_ref)
+                            .iter()
+                            .any(|existing| existing == &token),
+                    );
+                }
+                JsValue::Boolean(false)
             }
             "Object.prototype.toString" => {
                 JsValue::String(format!("[object {}]", Self::object_tag(&this_arg)))
@@ -14102,6 +14385,10 @@ impl BrowserExecutionState {
                 | "globalThis"
                 | "window"
                 | "self"
+                | "top"
+                | "parent"
+                | "frames"
+                | "length"
                 | "document"
                 | "navigator"
                 | "location"
@@ -14110,6 +14397,14 @@ impl BrowserExecutionState {
                 | "localStorage"
                 | "sessionStorage"
         )
+    }
+
+    fn window_fallback_property(property: &str) -> JsValue {
+        match property {
+            "window" | "self" | "top" | "parent" | "frames" => JsValue::WindowRef,
+            "length" | "innerWidth" | "innerHeight" | "scrollX" | "scrollY" => JsValue::Number(0.0),
+            _ => JsValue::Undefined,
+        }
     }
 
     fn navigator_soft_failure_property(property: &str) -> JsValue {
@@ -15043,6 +15338,88 @@ mod tests {
     }
 
     #[test]
+    fn class_list_mutations_update_class_attribute() {
+        let program = crate::parse_script(
+            r#"
+            let box = document.getElementById("box");
+            box.className = "alpha";
+            box.classList.add("beta", "alpha");
+            box.classList.remove("alpha");
+            document.getElementById("result").textContent =
+                String(box.classList.contains("beta")) + ":" + box.className;
+            "#,
+        )
+        .expect("script should parse");
+
+        assert_eq!(
+            collect_browser_effects(&program),
+            vec![
+                BrowserEffect::SetAttribute {
+                    element_id: "box".to_owned(),
+                    name: "class".to_owned(),
+                    value: "alpha".to_owned(),
+                },
+                BrowserEffect::SetAttribute {
+                    element_id: "box".to_owned(),
+                    name: "class".to_owned(),
+                    value: "alpha beta".to_owned(),
+                },
+                BrowserEffect::SetAttribute {
+                    element_id: "box".to_owned(),
+                    name: "class".to_owned(),
+                    value: "beta".to_owned(),
+                },
+                BrowserEffect::SetTextContent {
+                    element_id: "result".to_owned(),
+                    value: "true:beta".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn class_mutation_refreshes_selector_indexes() {
+        let mut state = BrowserExecutionState::default();
+        state.seed_existing_element("box", String::new(), HashMap::new());
+        let program = crate::parse_script(
+            r#"
+            let box = document.getElementById("box");
+            box.classList.add("active");
+            document.getElementById("result").textContent =
+                String(document.querySelectorAll(".active").length);
+            "#,
+        )
+        .expect("script should parse");
+
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![
+                BrowserEffect::SetAttribute {
+                    element_id: "box".to_owned(),
+                    name: "class".to_owned(),
+                    value: "active".to_owned(),
+                },
+                BrowserEffect::SetTextContent {
+                    element_id: "result".to_owned(),
+                    value: "1".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn window_frames_is_safe_array_like_stub() {
+        let effects = run(r#"
+            document.getElementById("result").textContent =
+                String(window.frames.length) + ":" + String(window.top === window);
+            "#);
+
+        assert_eq!(effects, vec![text("result", "0:true")]);
+    }
+
+    #[test]
     fn inner_html_assignment_is_dom_effect() {
         let program = crate::parse_script(
             r#"document.getElementById("root").innerHTML = "<span>Hello</span>";"#,
@@ -15315,6 +15692,29 @@ mod tests {
             "#);
 
         assert_eq!(effects, vec![text("result", "||")]);
+        assert!(!has_runtime_trace(&effects, "unsupported.method"));
+    }
+
+    #[test]
+    fn browser_process_polyfill_exposes_safe_cwd() {
+        let effects = run(r#"
+            document.getElementById("result").textContent =
+                String(process.browser) + ":" + process.cwd();
+            "#);
+
+        assert_eq!(effects, vec![text("result", "true:")]);
+        assert!(!has_runtime_trace(&effects, "member.receiver.warning"));
+    }
+
+    #[test]
+    fn terminal_style_helpers_soft_fail_as_identity_methods() {
+        let effects = run(r#"
+            let colors = {};
+            document.getElementById("result").textContent =
+                colors.bold("ok") + "/" + colors.underline("line");
+            "#);
+
+        assert_eq!(effects, vec![text("result", "ok/line")]);
         assert!(!has_runtime_trace(&effects, "unsupported.method"));
     }
 
@@ -21133,6 +21533,16 @@ mod tests {
             document.getElementById("result").textContent = first + "/" + third;
         "#);
         assert_eq!(effects, vec![text("result", "1/3")]);
+    }
+
+    #[test]
+    fn t042_array_destructuring_rest() {
+        let effects = run(r##"
+            var source = "path#one#two".split("#");
+            var [path, ...fragments] = source;
+            document.getElementById("result").textContent = path + "/" + fragments.join(":");
+        "##);
+        assert_eq!(effects, vec![text("result", "path/one:two")]);
     }
 
     // ── built-in methods ──────────────────────────────────────────────────

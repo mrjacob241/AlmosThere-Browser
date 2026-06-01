@@ -130,6 +130,10 @@ pub enum Binding {
     Name(String),
     Object(Vec<ObjectBindingProp>),
     Array(Vec<Option<Binding>>),
+    ArrayRest {
+        items: Vec<Option<Binding>>,
+        rest: Box<Binding>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

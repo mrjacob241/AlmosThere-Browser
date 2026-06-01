@@ -1393,6 +1393,14 @@ fn paint_canvas_graph(
                                     value,
                                 });
                             }
+                            if response.has_focus()
+                                && ui.input(|state| {
+                                    state.key_pressed(egui::Key::Enter) && !state.modifiers.shift
+                                })
+                            {
+                                submitted_forms
+                                    .push((input.form_id.clone(), input.form_action.clone()));
+                            }
                         }
                         CanvasInputKind::Text | CanvasInputKind::Password => {
                             let password = matches!(input.kind, CanvasInputKind::Password);
@@ -1424,15 +1432,11 @@ fn paint_canvas_graph(
                                     value: value.clone(),
                                 });
                             }
-                            if response.lost_focus()
+                            if response.has_focus()
                                 && ui.input(|state| state.key_pressed(egui::Key::Enter))
                             {
-                                canvas_response.submitted_inputs.push(InputSubmit {
-                                    label: input.label.clone(),
-                                    name: input.name.clone(),
-                                    value,
-                                    form_action: input.form_action.clone(),
-                                });
+                                submitted_forms
+                                    .push((input.form_id.clone(), input.form_action.clone()));
                             }
                         }
                     }
@@ -4910,6 +4914,28 @@ fn browser_bold_family() -> FontFamily {
 mod tests {
     use super::*;
 
+    fn sample_input(
+        label: &str,
+        name: &str,
+        value: &str,
+        form_id: Option<&str>,
+        form_action: Option<&str>,
+    ) -> CanvasObject {
+        CanvasObject::Input(CanvasInputObject {
+            label: label.to_owned(),
+            name: Some(name.to_owned()),
+            value: value.to_owned(),
+            default_value: value.to_owned(),
+            rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 20.0)),
+            font_size: 14.0,
+            color: Color32::BLACK,
+            form_id: form_id.map(str::to_owned),
+            form_action: form_action.map(str::to_owned),
+            element_id: None,
+            kind: CanvasInputKind::Text,
+        })
+    }
+
     #[test]
     fn browser_document_keeps_blocks_in_order() {
         let document = BrowserDocument {
@@ -4970,6 +4996,56 @@ mod tests {
             assert!(lines.len() > 1);
             assert!(lines.iter().all(|line| line.size.x <= short.x + 1.0));
         });
+    }
+
+    #[test]
+    fn form_submission_collects_all_controls_for_form() {
+        let objects = vec![
+            sample_input("Query", "q", "trees", Some("search"), Some("/search")),
+            sample_input("Page", "page", "1", Some("search"), Some("/search")),
+            sample_input("Other", "q", "ignored", Some("other"), Some("/other")),
+        ];
+        let mut response = BrowserCanvasResponse::default();
+
+        push_submitted_inputs_for_form(&objects, Some("search"), Some("/search"), &mut response);
+
+        assert_eq!(response.submitted_inputs.len(), 2);
+        assert_eq!(response.submitted_inputs[0].name.as_deref(), Some("q"));
+        assert_eq!(response.submitted_inputs[0].value, "trees");
+        assert_eq!(
+            response.submitted_inputs[0].form_action.as_deref(),
+            Some("/search")
+        );
+        assert_eq!(response.submitted_inputs[1].name.as_deref(), Some("page"));
+        assert_eq!(response.submitted_inputs[1].value, "1");
+    }
+
+    #[test]
+    fn form_reset_restores_all_controls_for_form() {
+        let mut objects = vec![
+            sample_input("Query", "q", "trees", Some("search"), Some("/search")),
+            sample_input("Other", "q", "kept", Some("other"), Some("/other")),
+        ];
+        if let CanvasObject::Input(input) = &mut objects[0] {
+            input.default_value = String::new();
+        }
+        if let CanvasObject::Input(input) = &mut objects[1] {
+            input.default_value = String::new();
+        }
+        let mut response = BrowserCanvasResponse::default();
+
+        reset_inputs_for_form(&mut objects, Some("search"), &mut response);
+
+        let CanvasObject::Input(search) = &objects[0] else {
+            panic!("expected input");
+        };
+        let CanvasObject::Input(other) = &objects[1] else {
+            panic!("expected input");
+        };
+        assert_eq!(search.value, "");
+        assert_eq!(other.value, "kept");
+        assert_eq!(response.changed_inputs.len(), 1);
+        assert_eq!(response.changed_inputs[0].label, "Query");
     }
 
     #[test]

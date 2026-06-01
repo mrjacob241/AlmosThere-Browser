@@ -225,6 +225,7 @@ fn main() -> eframe::Result<()> {
 struct AppConfig {
     record_events: bool,
     debug_socket: bool,
+    event_trace: bool,
 }
 
 impl AppConfig {
@@ -233,6 +234,7 @@ impl AppConfig {
         Self {
             record_events: args.iter().any(|a| a == "--record-events"),
             debug_socket: args.iter().any(|a| a == "--debug-socket"),
+            event_trace: args.iter().any(|a| a == "--event-trace"),
         }
     }
 }
@@ -257,6 +259,7 @@ struct AlmostThereApp {
     render_debug: PageRenderDebugState,
     page_loaded_at: std::time::Instant,
     record_events: bool,
+    event_trace: bool,
     recorded_event_count: u64,
 }
 
@@ -318,12 +321,22 @@ impl AlmostThereApp {
                         "false"
                     },
                 ),
+                (
+                    "event_trace",
+                    if config.event_trace { "true" } else { "false" },
+                ),
             ],
         );
         if config.record_events {
             telemetry.emit(
                 "event_recording.started",
                 &[("source", "cli"), ("flag", "--record-events")],
+            );
+        }
+        if config.event_trace {
+            telemetry.emit(
+                "event_trace.started",
+                &[("source", "cli"), ("flag", "--event-trace")],
             );
         }
 
@@ -442,6 +455,7 @@ impl AlmostThereApp {
             render_debug,
             page_loaded_at: std::time::Instant::now(),
             record_events: config.record_events,
+            event_trace: config.event_trace,
             recorded_event_count: 0,
         }
     }
@@ -791,14 +805,39 @@ impl AlmostThereApp {
         }
     }
 
+    fn trace_event(&self, phase: &str, cause: &str, consequence: &str) {
+        if !self.event_trace {
+            return;
+        }
+        let stack = std::backtrace::Backtrace::force_capture().to_string();
+        self.telemetry.emit(
+            "event.trace",
+            &[
+                ("phase", phase),
+                ("cause", cause),
+                ("consequence", consequence),
+                ("url", &self.document.source),
+                ("stack", &stack),
+            ],
+        );
+    }
+
     fn apply_script_effects(
         &mut self,
         effects: Vec<justbarelyscript::BrowserEffect>,
         ctx: &egui::Context,
     ) {
         if effects.is_empty() {
+            self.trace_event("script.effects", "apply_script_effects", "no effects");
             return;
         }
+
+        let effect_count = effects.len().to_string();
+        self.trace_event(
+            "script.effects",
+            "apply_script_effects",
+            &format!("applying {effect_count} effects"),
+        );
 
         // Snapshot live input values so the re-parse doesn't reset what the user typed.
         let live_input_values: std::collections::HashMap<String, String> = self
@@ -1901,6 +1940,7 @@ struct PageScript {
     byte_len: usize,
     deferred: bool,
     diagnostics: Vec<String>,
+    parse_context: Option<String>,
     program: Result<justbarelyscript::Program, justbarelyscript::JsError>,
 }
 
@@ -1985,11 +2025,17 @@ fn script_console_messages_from_html_with_source(
                         script.diagnostics.join(", ")
                     )
                 };
+                let context_suffix = script
+                    .parse_context
+                    .as_ref()
+                    .map(|context| format!(" Context: {context}"))
+                    .unwrap_or_default();
                 messages.push(console_error_message(format!(
-                    "{}: {}{}",
+                    "{}: {}{}{}",
                     script.label,
                     error.diagnostic_message(),
-                    diagnostic_suffix
+                    diagnostic_suffix,
+                    context_suffix
                 )));
             }
         }
@@ -2149,7 +2195,7 @@ fn live_js_debug_report(html: &str, source: Option<&str>) -> String {
                 skipped_or_failed += 1;
                 out.push_str(&format!(
                     "   status: not executed; {}\n",
-                    error.diagnostic_message()
+                    script_parse_reason(script, error)
                 ));
             }
         }
@@ -2606,6 +2652,7 @@ fn collect_page_scripts(html: &str, source: Option<&str>) -> Vec<PageScript> {
                     byte_len: inline_source.len(),
                     deferred: defer,
                     diagnostics,
+                    parse_context: None,
                     program: Err(synthetic_script_error(&format!(
                         "inline script skipped: {} bytes exceeds parser budget of {} bytes",
                         inline_source.len(),
@@ -2614,6 +2661,11 @@ fn collect_page_scripts(html: &str, source: Option<&str>) -> Vec<PageScript> {
                 }
             } else {
                 let diagnostics = script_construct_diagnostics(inline_source);
+                let program = justbarelyscript::parse_script(inline_source);
+                let parse_context = program
+                    .as_ref()
+                    .err()
+                    .and_then(|error| script_error_context(inline_source, error));
                 PageScript {
                     label,
                     kind: PageScriptKind::Inline,
@@ -2622,7 +2674,8 @@ fn collect_page_scripts(html: &str, source: Option<&str>) -> Vec<PageScript> {
                     byte_len: inline_source.len(),
                     deferred: defer,
                     diagnostics,
-                    program: justbarelyscript::parse_script(inline_source),
+                    parse_context,
+                    program,
                 }
             }
         };
@@ -2702,7 +2755,7 @@ fn emit_script_parse_telemetry(index: usize, script: &PageScript) {
         }
         Err(error) => {
             let constructs = script.diagnostics.join(", ");
-            let reason = error.diagnostic_message();
+            let reason = script_parse_reason(script, error);
             emit_global_telemetry(
                 "js.script.skipped",
                 &[
@@ -2718,6 +2771,41 @@ fn emit_script_parse_telemetry(index: usize, script: &PageScript) {
             );
         }
     }
+}
+
+fn script_parse_reason(script: &PageScript, error: &justbarelyscript::JsError) -> String {
+    let mut reason = error.diagnostic_message();
+    if let Some(context) = &script.parse_context {
+        reason.push_str("; context: ");
+        reason.push_str(context);
+    }
+    reason
+}
+
+fn script_error_context(source: &str, error: &justbarelyscript::JsError) -> Option<String> {
+    let span = error.span?;
+    let center = span.start.min(source.len());
+    let mut start = center.saturating_sub(120);
+    while start > 0 && !source.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (center + 120).min(source.len());
+    while end < source.len() && !source.is_char_boundary(end) {
+        end += 1;
+    }
+    let snippet = source.get(start..end)?.trim();
+    if snippet.is_empty() {
+        return None;
+    }
+    let mut context = String::new();
+    if start > 0 {
+        context.push_str("...");
+    }
+    context.push_str(snippet);
+    if end < source.len() {
+        context.push_str("...");
+    }
+    Some(context.replace(['\t', '\n', '\r'], " "))
 }
 
 fn page_script_kind_str(kind: PageScriptKind) -> &'static str {
@@ -2744,6 +2832,7 @@ fn load_external_page_script(
             byte_len: 0,
             deferred,
             diagnostics: Vec::new(),
+            parse_context: None,
             program: Err(synthetic_script_error(
                 "external script skipped: document source unavailable",
             )),
@@ -2761,6 +2850,7 @@ fn load_external_page_script(
             byte_len: 0,
             deferred,
             diagnostics: Vec::new(),
+            parse_context: None,
             program: Err(synthetic_script_error(
                 "external script blocked by document policy",
             )),
@@ -2779,6 +2869,7 @@ fn load_external_page_script(
                     byte_len: source.len(),
                     deferred,
                     diagnostics,
+                    parse_context: None,
                     program: Err(synthetic_script_error(&format!(
                         "external script skipped: {} bytes exceeds parser budget of {} bytes",
                         source.len(),
@@ -2788,6 +2879,10 @@ fn load_external_page_script(
             }
             let diagnostics = script_construct_diagnostics(&source);
             let program = justbarelyscript::parse_script(&source);
+            let parse_context = program
+                .as_ref()
+                .err()
+                .and_then(|error| script_error_context(&source, error));
             PageScript {
                 label,
                 kind: PageScriptKind::External,
@@ -2796,6 +2891,7 @@ fn load_external_page_script(
                 byte_len: source.len(),
                 deferred,
                 diagnostics,
+                parse_context,
                 program,
             }
         }
@@ -2807,6 +2903,7 @@ fn load_external_page_script(
             byte_len: 0,
             deferred,
             diagnostics: Vec::new(),
+            parse_context: None,
             program: Err(synthetic_script_error(&format!(
                 "external script load failed: {error}"
             ))),
@@ -3095,6 +3192,15 @@ fn set_element_attribute_by_id(html: &str, element_id: &str, name: &str, value: 
         sanitize_attr_name(name),
         encode_basic_attr(value)
     );
+    if let Some((attr_start, attr_end)) = find_attr_span_in_open_tag(open_tag, name) {
+        let mut output = String::with_capacity(html.len() + attr.len());
+        output.push_str(&html[..open_start + attr_start]);
+        output.push_str(&attr);
+        output.push_str(&html[open_start + attr_end..close_start]);
+        output.push_str(&html[close_start..close_end]);
+        output.push_str(&html[close_end..]);
+        return output;
+    }
     let mut output = String::with_capacity(html.len() + attr.len());
     output.push_str(&html[..open_start + insert_at]);
     output.push_str(&attr);
@@ -3102,6 +3208,58 @@ fn set_element_attribute_by_id(html: &str, element_id: &str, name: &str, value: 
     output.push_str(&html[close_start..close_end]);
     output.push_str(&html[close_end..]);
     output
+}
+
+fn find_attr_span_in_open_tag(open_tag: &str, name: &str) -> Option<(usize, usize)> {
+    let needle = name.to_ascii_lowercase();
+    let bytes = open_tag.as_bytes();
+    let mut pos = 1;
+    while pos < bytes.len() {
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= bytes.len() || bytes[pos] == b'>' || bytes[pos] == b'/' {
+            break;
+        }
+        let attr_start = pos;
+        while pos < bytes.len()
+            && !bytes[pos].is_ascii_whitespace()
+            && !matches!(bytes[pos], b'=' | b'>' | b'/')
+        {
+            pos += 1;
+        }
+        let attr_name = open_tag[attr_start..pos].to_ascii_lowercase();
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos < bytes.len() && bytes[pos] == b'=' {
+            pos += 1;
+            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            if pos < bytes.len() && (bytes[pos] == b'"' || bytes[pos] == b'\'') {
+                let quote = bytes[pos];
+                pos += 1;
+                while pos < bytes.len() && bytes[pos] != quote {
+                    pos += 1;
+                }
+                if pos < bytes.len() {
+                    pos += 1;
+                }
+            } else {
+                while pos < bytes.len()
+                    && !bytes[pos].is_ascii_whitespace()
+                    && !matches!(bytes[pos], b'>' | b'/')
+                {
+                    pos += 1;
+                }
+            }
+        }
+        if attr_name == needle {
+            return Some((attr_start.saturating_sub(1), pos));
+        }
+    }
+    None
 }
 
 fn find_element_range_by_id(html: &str, element_id: &str) -> Option<(usize, usize, usize, usize)> {
@@ -3538,6 +3696,11 @@ impl App for AlmostThereApp {
 
             // Apply events fired from the Events tab.
             for (id, event_type) in pending_debug_events {
+                self.trace_event(
+                    "debug.event",
+                    &format!("{event_type} on #{id}"),
+                    "checking registered listener",
+                );
                 if event_type == "input" {
                     let value = self
                         .render_debug
@@ -3554,7 +3717,18 @@ impl App for AlmostThereApp {
                 }
                 if self.script_state.has_listener(&id, event_type) {
                     let effects = self.script_state.fire_event(&id, event_type, None);
+                    self.trace_event(
+                        "debug.event",
+                        &format!("{event_type} on #{id}"),
+                        &format!("listener fired; effects={}", effects.len()),
+                    );
                     self.apply_script_effects(effects, ctx);
+                } else {
+                    self.trace_event(
+                        "debug.event",
+                        &format!("{event_type} on #{id}"),
+                        "no listener registered",
+                    );
                 }
             }
         }
@@ -3654,7 +3828,18 @@ impl App for AlmostThereApp {
                             .insert("value".to_owned(), input_change.value.clone());
                         if self.script_state.has_listener(id, "input") {
                             let effects = self.script_state.fire_event(id, "input", None);
+                            self.trace_event(
+                                "input.event",
+                                &format!("input on #{id}"),
+                                &format!("listener fired; effects={}", effects.len()),
+                            );
                             self.apply_script_effects(effects, ctx);
+                        } else {
+                            self.trace_event(
+                                "input.event",
+                                &format!("input on #{id}"),
+                                "value stored; no input listener",
+                            );
                         }
                     }
                 }
@@ -3671,7 +3856,18 @@ impl App for AlmostThereApp {
                     if let Some(url) =
                         form_get_url_for_inputs(&response.submitted_inputs, &self.document.source)
                     {
+                        self.trace_event(
+                            "form.submit",
+                            "native form submission",
+                            &format!("navigating to {url}"),
+                        );
                         self.open_link(&url, ctx);
+                    } else {
+                        self.trace_event(
+                            "form.submit",
+                            "native form submission",
+                            "no navigation URL produced",
+                        );
                     }
                 }
                 let hovered_element_id = response.hovered.as_ref().and_then(|t| match t {
@@ -3714,6 +3910,7 @@ impl App for AlmostThereApp {
                         HitTarget::Link { href } => {
                             self.telemetry
                                 .emit("hit_test.clicked", &[("target", "link"), ("href", &href)]);
+                            self.trace_event("click", &format!("link {href}"), "opening link");
                             self.open_link(&href, ctx);
                         }
                         HitTarget::Button { text, element_id } => {
@@ -3723,8 +3920,25 @@ impl App for AlmostThereApp {
                             if let Some(id) = element_id {
                                 if self.script_state.has_listener(&id, "click") {
                                     let effects = self.script_state.fire_event(&id, "click", None);
+                                    self.trace_event(
+                                        "click",
+                                        &format!("button #{id} {text}"),
+                                        &format!("listener fired; effects={}", effects.len()),
+                                    );
                                     self.apply_script_effects(effects, ctx);
+                                } else {
+                                    self.trace_event(
+                                        "click",
+                                        &format!("button #{id} {text}"),
+                                        "no click listener registered",
+                                    );
                                 }
+                            } else {
+                                self.trace_event(
+                                    "click",
+                                    &format!("button {text}"),
+                                    "no element id for script listener lookup",
+                                );
                             }
                         }
                         HitTarget::Input { label, element_id } => {
@@ -3735,8 +3949,25 @@ impl App for AlmostThereApp {
                             if let Some(id) = element_id {
                                 if self.script_state.has_listener(&id, "click") {
                                     let effects = self.script_state.fire_event(&id, "click", None);
+                                    self.trace_event(
+                                        "click",
+                                        &format!("input #{id} {label}"),
+                                        &format!("listener fired; effects={}", effects.len()),
+                                    );
                                     self.apply_script_effects(effects, ctx);
+                                } else {
+                                    self.trace_event(
+                                        "click",
+                                        &format!("input #{id} {label}"),
+                                        "no click listener registered",
+                                    );
                                 }
+                            } else {
+                                self.trace_event(
+                                    "click",
+                                    &format!("input {label}"),
+                                    "no element id for script listener lookup",
+                                );
                             }
                         }
                     }
@@ -3763,6 +3994,11 @@ impl App for AlmostThereApp {
                     for key in &key_presses {
                         for id in &keydown_ids {
                             let effects = self.script_state.fire_event(id, "keydown", Some(key));
+                            self.trace_event(
+                                "keydown",
+                                &format!("key {key} on #{id}"),
+                                &format!("listener fired; effects={}", effects.len()),
+                            );
                             self.apply_script_effects(effects, ctx);
                         }
                     }
@@ -5085,6 +5321,7 @@ struct CanvasLayoutCursor {
     list_depth: usize,
     list_stack: Vec<CanvasListContext>,
     form_stack: Vec<CanvasFormContext>,
+    form_actions_by_id: HashMap<String, Option<String>>,
     next_form_index: usize,
 }
 
@@ -6640,6 +6877,8 @@ fn render_graph_to_canvas_graph(
         viewport,
         objects: Vec::new(),
     };
+    let mut form_actions_by_id = HashMap::new();
+    collect_canvas_form_actions(&graph.root, &mut form_actions_by_id);
     let mut cursor = CanvasLayoutCursor {
         x: 0.0,
         y: 0.0,
@@ -6647,6 +6886,7 @@ fn render_graph_to_canvas_graph(
         list_depth: 0,
         list_stack: Vec::new(),
         form_stack: Vec::new(),
+        form_actions_by_id,
         next_form_index: 0,
     };
     layout_css_layout_tree(
@@ -6673,6 +6913,19 @@ fn render_graph_to_canvas_graph(
     }
     canvas_graph.viewport.y = cursor.y.max(layout_root.dimensions.content.height());
     canvas_graph
+}
+
+fn collect_canvas_form_actions(node: &RenderNode, forms: &mut HashMap<String, Option<String>>) {
+    if let RenderNodeKind::Element(element) = &node.kind {
+        if element.tag_name == "form" {
+            if let Some(id) = element.attr("id").or_else(|| element.attr("name")) {
+                forms.insert(id.to_owned(), element.attr("action").map(str::to_owned));
+            }
+        }
+    }
+    for child in &node.children {
+        collect_canvas_form_actions(child, forms);
+    }
 }
 
 fn apply_hydration_visibility_fallback(box_: &mut CssLayoutBox<'_>) {
@@ -7427,6 +7680,7 @@ fn push_canvas_graph_element(
                 } else {
                     value
                 };
+                let (form_id, form_action) = canvas_form_metadata_for_element(element, cursor);
                 graph.objects.push(CanvasObject::Input(CanvasInputObject {
                     label,
                     name: element.attr("name").map(str::to_owned),
@@ -7438,8 +7692,8 @@ fn push_canvas_graph_element(
                     ),
                     font_size: node.style.font_size,
                     color: node.style.color,
-                    form_id: current_canvas_form_id(cursor),
-                    form_action: current_canvas_form_action(cursor),
+                    form_id,
+                    form_action,
                     element_id: element.attr("id").map(str::to_owned),
                     kind,
                 }));
@@ -7617,6 +7871,20 @@ fn current_canvas_form_action(cursor: &CanvasLayoutCursor) -> Option<String> {
         .and_then(|form| form.action.clone())
 }
 
+fn canvas_form_metadata_for_element(
+    element: &DomElement,
+    cursor: &CanvasLayoutCursor,
+) -> (Option<String>, Option<String>) {
+    if let Some(form_id) = element.attr("form") {
+        let action = cursor.form_actions_by_id.get(form_id).cloned().flatten();
+        return (Some(form_id.to_owned()), action);
+    }
+    (
+        current_canvas_form_id(cursor),
+        current_canvas_form_action(cursor),
+    )
+}
+
 fn push_canvas_graph_button_hit_target(
     element: &DomElement,
     node: &RenderNode,
@@ -7624,12 +7892,13 @@ fn push_canvas_graph_button_hit_target(
     cursor: &CanvasLayoutCursor,
     graph: &mut CanvasGraph,
 ) {
+    let (form_id, form_action) = canvas_form_metadata_for_element(element, cursor);
     graph.objects.push(CanvasObject::Button(CanvasButtonObject {
         text: canvas_button_label(element, node),
         rect,
         button_type: element.attr("type").unwrap_or("submit").to_owned(),
-        form_id: current_canvas_form_id(cursor),
-        form_action: current_canvas_form_action(cursor),
+        form_id,
+        form_action,
         element_id: element.attr("id").map(str::to_owned),
     }));
 }
@@ -12135,6 +12404,77 @@ mod tests {
     }
 
     #[test]
+    fn textarea_search_form_carries_native_submit_metadata_without_button() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <body>
+                <form id="search-form" action="/search" method="GET" role="search">
+                  <textarea name="q" aria-label="Search the web..." rows="1">trees</textarea>
+                </form>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let input = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Input(input) if input.label == "Search the web..." => Some(input),
+                _ => None,
+            })
+            .expect("expected textarea input");
+
+        assert_eq!(input.name.as_deref(), Some("q"));
+        assert_eq!(input.value, "trees");
+        assert_eq!(input.form_id.as_deref(), Some("search-form"));
+        assert_eq!(input.form_action.as_deref(), Some("/search"));
+    }
+
+    #[test]
+    fn controls_can_submit_external_owner_form_by_form_attribute() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <body>
+                <form id="external-search" action="/search"></form>
+                <input form="external-search" name="q" aria-label="Query" value="trees">
+                <button form="external-search" type="submit" aria-label="Search"></button>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let input = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Input(input) if input.label == "Query" => Some(input),
+                _ => None,
+            })
+            .expect("expected external form input");
+        let button = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Button(button) if button.text == "Search" => Some(button),
+                _ => None,
+            })
+            .expect("expected external form submit button");
+
+        assert_eq!(input.form_id.as_deref(), Some("external-search"));
+        assert_eq!(input.form_action.as_deref(), Some("/search"));
+        assert_eq!(button.form_id.as_deref(), Some("external-search"));
+        assert_eq!(button.form_action.as_deref(), Some("/search"));
+    }
+
+    #[test]
     fn absolute_child_positions_from_padding_box_not_content_box() {
         let document = parse_html_document(
             r##"
@@ -12649,6 +12989,20 @@ mod tests {
             input_to_path("file:///tmp/test_basic_page.html#form-section"),
             PathBuf::from("/tmp/test_basic_page.html")
         );
+    }
+
+    #[test]
+    fn set_element_attribute_by_id_replaces_existing_attribute() {
+        let html = r#"<div id="box" class="old" data-state=idle>Text</div>"#;
+        let updated = set_element_attribute_by_id(html, "box", "class", "new");
+        assert!(updated.contains(r#"class="new""#));
+        assert!(!updated.contains(r#"class="old""#));
+        assert_eq!(updated.matches("class=").count(), 1);
+
+        let updated = set_element_attribute_by_id(&updated, "box", "data-state", "ready");
+        assert!(updated.contains(r#"data-state="ready""#));
+        assert!(!updated.contains("data-state=idle"));
+        assert_eq!(updated.matches("data-state").count(), 1);
     }
 
     #[test]

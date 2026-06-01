@@ -112,9 +112,15 @@ impl Parser {
             TokenKind::Export => self
                 .parse_export_declaration()
                 .map(Statement::ExportDeclaration),
-            TokenKind::Import => self
-                .parse_import_declaration()
-                .map(Statement::ImportDeclaration),
+            TokenKind::Import
+                if !matches!(
+                    self.peek_kind(),
+                    Some(TokenKind::LeftParen) | Some(TokenKind::Dot)
+                ) =>
+            {
+                self.parse_import_declaration()
+                    .map(Statement::ImportDeclaration)
+            }
             _ => {
                 let first = self.parse_expression(0)?;
                 // Labeled statement: `label: statement`.
@@ -1101,6 +1107,34 @@ impl Parser {
                 self.advance();
                 Ok(Expression::Super)
             }
+            TokenKind::Import => {
+                self.advance();
+                if self.eat(TokenKind::Dot) {
+                    let property = self.expect_identifier_or_keyword()?;
+                    if property == "meta" {
+                        Ok(Expression::Identifier("import.meta".to_owned()))
+                    } else {
+                        self.error("expected import.meta")
+                    }
+                } else if self.eat(TokenKind::LeftParen) {
+                    let mut arguments = Vec::new();
+                    if !self.at(TokenKind::RightParen) {
+                        loop {
+                            arguments.push(self.parse_argument()?);
+                            if !self.eat(TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(TokenKind::RightParen)?;
+                    Ok(Expression::Call {
+                        callee: Box::new(Expression::Identifier("import".to_owned())),
+                        arguments,
+                    })
+                } else {
+                    self.error("expected import(...) or import.meta")
+                }
+            }
 
             // Prefix ++ / -- (desugar to n = n ± 1)
             TokenKind::PlusPlus | TokenKind::MinusMinus => {
@@ -1848,6 +1882,7 @@ impl Parser {
             TokenKind::LeftBracket => {
                 self.advance();
                 let mut items = Vec::new();
+                let mut rest = None;
                 while !matches!(
                     self.current_kind(),
                     TokenKind::RightBracket | TokenKind::Eof
@@ -1855,6 +1890,10 @@ impl Parser {
                     if matches!(self.current_kind(), TokenKind::Comma) {
                         items.push(None);
                         self.advance();
+                    } else if self.eat(TokenKind::DotDotDot) {
+                        rest = Some(Box::new(self.parse_binding()?));
+                        self.eat(TokenKind::Comma);
+                        break;
                     } else {
                         let b = self.parse_binding()?;
                         items.push(Some(b));
@@ -1864,7 +1903,11 @@ impl Parser {
                     }
                 }
                 self.expect(TokenKind::RightBracket)?;
-                Ok(Binding::Array(items))
+                if let Some(rest) = rest {
+                    Ok(Binding::ArrayRest { items, rest })
+                } else {
+                    Ok(Binding::Array(items))
+                }
             }
             _ => Ok(Binding::Name(self.expect_identifier()?)),
         }
@@ -2274,6 +2317,22 @@ mod tests {
                     local: "Point".to_owned()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn parses_dynamic_import_and_import_meta_expressions() {
+        assert!(parse_script(r#"const m = await import("./dep.js");"#).is_ok());
+        assert!(parse_script(r#"import("./dep.js").then(m => m.run());"#).is_ok());
+        assert!(parse_script(r#"console.log(import.meta.url);"#).is_ok());
+        assert!(parse_script(r#"const base = new URL("./x.js", import.meta.url);"#).is_ok());
+    }
+
+    #[test]
+    fn parses_array_destructuring_rest_bindings() {
+        assert!(parse_script(r##"const [head, ...tail] = value.split("#");"##).is_ok());
+        assert!(
+            parse_script(r#"for (const [key, ...parts] of entries) { use(key, parts); }"#).is_ok()
         );
     }
 
