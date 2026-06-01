@@ -46,6 +46,10 @@ pub enum BrowserEffect {
         kind: String,
         detail: String,
     },
+    DynamicImportRequest {
+        url: String,
+        promise_id: u64,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -388,6 +392,8 @@ pub struct BrowserExecutionState {
     execution_deadline: Option<std::time::Instant>,
     array_method_overrides: HashMap<String, JsValue>,
     symbol_counter: u32,
+    pending_dynamic_imports: HashMap<u64, Rc<RefCell<PromiseState>>>,
+    next_dynamic_import_id: u64,
     /// When Some, we are inside a generator body running in "collection mode".
     /// Each `yield expr` pushes the value here instead of suspending.
     collecting_generator: Option<Vec<JsValue>>,
@@ -1631,7 +1637,8 @@ impl BrowserExecutionState {
 
         self.hoist_function_declarations(&program.body);
         let mut exports = HashMap::new();
-        for statement in &program.body {
+        let body_len = program.body.len();
+        for (i, statement) in program.body.iter().enumerate() {
             match statement {
                 Statement::ImportDeclaration(_) => {}
                 Statement::ExportDeclaration(decl) => {
@@ -1646,6 +1653,51 @@ impl BrowserExecutionState {
                         break;
                     }
                 }
+            }
+            // Top-level await: if a statement suspended an async context, save remaining
+            // module body statements as a continuation and let the microtask queue resume them.
+            if let Some(awaited) = self.pending_async_await.take() {
+                let remaining: Vec<Statement> = program.body[i + 1..body_len]
+                    .iter()
+                    .filter(|s| !matches!(s, Statement::ImportDeclaration(_)))
+                    .cloned()
+                    .collect();
+                if !remaining.is_empty() {
+                    let module_promise = Self::pending_promise();
+                    let id = self.next_async_continuation_id;
+                    self.next_async_continuation_id =
+                        self.next_async_continuation_id.saturating_add(1);
+                    let stack = self.stack.clone();
+                    self.async_continuations.insert(
+                        id,
+                        AsyncContinuation {
+                            body: remaining,
+                            index: 0,
+                            frames: Vec::new(),
+                            stack,
+                            promise: module_promise,
+                            pending_expression: None,
+                            pending_binding: None,
+                            pending_assignment: None,
+                            pending_if: None,
+                            pending_loop_header: None,
+                            pending_return: false,
+                        },
+                    );
+                    self.attach_promise_reaction(
+                        &awaited,
+                        PromiseReaction::AsyncContinuation { id },
+                    );
+                    self.trace_runtime(
+                        "async.module.suspended",
+                        format!(
+                            "top-level await in module {module_key}; \
+                             {remaining_count} statements deferred",
+                            remaining_count = body_len - i - 1
+                        ),
+                    );
+                }
+                break;
             }
         }
 
@@ -1927,6 +1979,36 @@ impl BrowserExecutionState {
                     reaction,
                     status: status.clone(),
                 });
+        }
+    }
+
+    pub fn reject_dynamic_import(&mut self, promise_id: u64, reason: &str) {
+        if let Some(ps) = self.pending_dynamic_imports.remove(&promise_id) {
+            self.settle_promise(
+                &ps,
+                PromiseStatus::Rejected(JsValue::String(reason.to_owned())),
+            );
+            self.drain_and_run_microtasks();
+        }
+    }
+
+    pub fn execute_and_fulfill_dynamic_import<F>(
+        &mut self,
+        program: &Program,
+        module_key: &str,
+        promise_id: u64,
+        cache: &mut ModuleExecutionCache,
+        mut loader: F,
+    ) where
+        F: FnMut(&str, &str) -> Option<(String, Program)>,
+    {
+        let exports =
+            self.execute_module_internal(program, module_key, &mut loader, &mut cache.exports);
+        self.drain_and_run_microtasks();
+        if let Some(ps) = self.pending_dynamic_imports.remove(&promise_id) {
+            let ns = JsValue::from_map(exports.into_iter());
+            self.settle_promise(&ps, PromiseStatus::Fulfilled(ns));
+            self.drain_and_run_microtasks();
         }
     }
 
@@ -3507,15 +3589,32 @@ impl BrowserExecutionState {
                     JsValue::Promise(promise) => match promise.borrow().status.clone() {
                         PromiseStatus::Fulfilled(value) => value,
                         PromiseStatus::Rejected(reason) => {
+                            self.trace_runtime(
+                                "async.await.rejected",
+                                format!("await {expr:?} → rejected"),
+                            );
                             self.early_exit = Some(EarlyExit::Throw(reason));
                             JsValue::Undefined
                         }
                         PromiseStatus::Pending => {
+                            self.trace_runtime(
+                                "async.await.suspended",
+                                format!("await {expr:?} → pending Promise; continuation saved"),
+                            );
                             self.pending_async_await = Some(Rc::clone(&promise));
                             JsValue::Undefined
                         }
                     },
-                    other => other,
+                    other => {
+                        self.trace_runtime(
+                            "async.await.non_promise",
+                            format!(
+                                "await {expr:?} → {} (not a Promise, resuming immediately)",
+                                Self::object_tag(&other)
+                            ),
+                        );
+                        other
+                    }
                 }
             }
             Expression::Yield(expr) => {
@@ -5402,6 +5501,11 @@ impl BrowserExecutionState {
             for arg in arguments {
                 self.execute_expression(arg);
             }
+            // Methods that callers commonly `await` should return a fulfilled Promise so
+            // the async continuation can proceed rather than hanging on a pending stub.
+            if Self::is_promise_returning_method_name(&method_name) {
+                return Self::new_promise(PromiseStatus::Fulfilled(JsValue::Undefined));
+            }
             return JsValue::Undefined;
         }
 
@@ -5511,6 +5615,35 @@ impl BrowserExecutionState {
         matches!(
             method_name,
             "getComponentVersion" | "getVariable" | "GetVariable" | "IsVersionSupported"
+        )
+    }
+
+    fn is_promise_returning_method_name(method_name: &str) -> bool {
+        matches!(
+            method_name,
+            "isReady"
+                | "ready"
+                | "mount"
+                | "whenReady"
+                | "onReady"
+                | "load"
+                | "loaded"
+                | "init"
+                | "initialize"
+                | "connect"
+                | "open"
+                | "close"
+                | "flush"
+                | "sync"
+                | "resolve"
+                | "when"
+                | "done"
+                | "settled"
+                | "completed"
+                | "wait"
+                | "waitForNavigation"
+                | "waitFor"
+                | "nextTick"
         )
     }
 
@@ -12260,10 +12393,20 @@ impl BrowserExecutionState {
                 self.promise_resolve_input(result)
             }
             "import" => {
-                // Minimal dynamic-import compatibility: return a fulfilled promise with an
-                // empty module namespace object. The browser module loader handles static
-                // imports; this keeps modern bundles parseable and safely resumable.
-                self.promise_resolve_input(JsValue::new_object())
+                let url = args
+                    .first()
+                    .and_then(|v| if let JsValue::String(s) = v { Some(s.clone()) } else { None })
+                    .unwrap_or_default();
+                self.trace_runtime("dynamic_import.requested", format!("import({url})"));
+                let promise_state = Self::pending_promise();
+                let id = self.next_dynamic_import_id;
+                self.next_dynamic_import_id += 1;
+                self.pending_dynamic_imports.insert(id, promise_state.clone());
+                self.effects.push(BrowserEffect::DynamicImportRequest {
+                    url,
+                    promise_id: id,
+                });
+                JsValue::Promise(promise_state)
             }
             "process.cwd" => JsValue::String(String::new()),
             "Array.isArray" => JsValue::Boolean(matches!(args.first(), Some(JsValue::Array(_)))),

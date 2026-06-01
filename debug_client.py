@@ -10,7 +10,9 @@ Connect while the browser is running with --debug-socket:
 """
 
 import argparse
+import datetime
 import json
+import os
 import socket
 import sys
 import time
@@ -139,10 +141,16 @@ def main() -> None:
     parser.add_argument("--no-color",action="store_true", help="Disable ANSI colours")
     parser.add_argument("--no-retry", action="store_true",
                         help="Exit instead of retrying when the browser is not running")
+    parser.add_argument("--out", default="appdata/debug_session.jsonl",
+                        help="Append all raw events to this file (deleted on startup)")
     args = parser.parse_args()
 
     if args.no_color or not sys.stdout.isatty():
         _USE_COLOR = False
+
+    if os.path.exists(args.out):
+        os.remove(args.out)
+        print(f"Cleared {args.out}")
 
     addr = (args.host, args.port)
     print(f"Connecting to {args.host}:{args.port}  (start browser with --debug-socket)")
@@ -153,10 +161,16 @@ def main() -> None:
             sock.settimeout(None)
             print(f"Connected. Streaming events — Ctrl-C to quit.\n{'─'*60}")
             buf = sock.makefile("r", encoding="utf-8", errors="replace")
+            out_f = open(args.out, "a", encoding="utf-8")
+            session_start = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+            out_f.write(f'{{"_client":"session_start","_wall":"{session_start}"}}\n')
+            out_f.flush()
             for raw_line in buf:
                 raw_line = raw_line.rstrip("\n")
                 if not raw_line:
                     continue
+                out_f.write(raw_line + "\n")
+                out_f.flush()
                 if args.filter and args.filter not in raw_line:
                     continue
                 if args.raw:
@@ -166,9 +180,11 @@ def main() -> None:
                     ev = json.loads(raw_line)
                     msg = fmt_event(ev)
                     if msg is not None:
-                        print(msg)
+                        ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                        print(f"{c(DIM)}{ts}{c(RESET)} {msg}")
                 except json.JSONDecodeError:
                     print(f"{c(RED)}[bad json]{c(RESET)} {raw_line}")
+            out_f.close()
             print("\nConnection closed by browser.")
         except ConnectionRefusedError:
             if args.no_retry:
@@ -178,8 +194,12 @@ def main() -> None:
             time.sleep(2)
             continue
         except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+            try: out_f.close()
+            except Exception: pass
             print(f"\nConnection lost: {exc}")
         except KeyboardInterrupt:
+            try: out_f.close()
+            except Exception: pass
             print("\nBye.")
             sys.exit(0)
 

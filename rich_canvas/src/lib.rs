@@ -954,6 +954,8 @@ pub enum HitTarget {
     Button {
         text: String,
         element_id: Option<String>,
+        button_type: String,
+        form_id: Option<String>,
     },
     Input {
         label: String,
@@ -1266,12 +1268,16 @@ fn paint_canvas_graph(
                     canvas_response.hovered = Some(HitTarget::Button {
                         text: button.text.clone(),
                         element_id: button.element_id.clone(),
+                        button_type: button.button_type.clone(),
+                        form_id: button.form_id.clone(),
                     });
                 }
                 if response.clicked() {
                     canvas_response.clicked = Some(HitTarget::Button {
                         text: button.text.clone(),
                         element_id: button.element_id.clone(),
+                        button_type: button.button_type.clone(),
+                        form_id: button.form_id.clone(),
                     });
                     if button.button_type.eq_ignore_ascii_case("submit") {
                         submitted_forms.push((button.form_id.clone(), button.form_action.clone()));
@@ -2045,12 +2051,16 @@ fn paint_block(
                 canvas_response.hovered = Some(HitTarget::Button {
                     text: text.clone(),
                     element_id: None,
+                    button_type: "button".to_owned(),
+                    form_id: None,
                 });
             }
             if response.clicked() {
                 canvas_response.clicked = Some(HitTarget::Button {
                     text: text.clone(),
                     element_id: None,
+                    button_type: "button".to_owned(),
+                    form_id: None,
                 });
             }
             ui.add_space(1.0 * font_scale);
@@ -2788,6 +2798,8 @@ fn paint_ecosia_hero(
         canvas_response.hovered = Some(HitTarget::Button {
             text: "Search".to_owned(),
             element_id: None,
+            button_type: "submit".to_owned(),
+            form_id: None,
         });
     }
     paint_search_icon(&painter, search_button_center, font_scale);
@@ -2795,6 +2807,8 @@ fn paint_ecosia_hero(
         canvas_response.clicked = Some(HitTarget::Button {
             text: "Search".to_owned(),
             element_id: None,
+            button_type: "submit".to_owned(),
+            form_id: None,
         });
     }
     let ai_width = 104.0 * font_scale;
@@ -2880,12 +2894,16 @@ fn paint_ecosia_hero(
         canvas_response.hovered = Some(HitTarget::Button {
             text: hero.ai_button_text.clone(),
             element_id: None,
+            button_type: "button".to_owned(),
+            form_id: None,
         });
     }
     if ai_response.clicked() {
         canvas_response.clicked = Some(HitTarget::Button {
             text: hero.ai_button_text.clone(),
             element_id: None,
+            button_type: "button".to_owned(),
+            form_id: None,
         });
     }
 

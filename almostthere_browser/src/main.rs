@@ -246,6 +246,7 @@ struct AlmostThereApp {
     current_html: String,
     live_html: String,
     script_state: justbarelyscript::BrowserExecutionState,
+    module_cache: justbarelyscript::ModuleExecutionCache,
     last_hovered_element_id: Option<String>,
     render_graph_debug_text: String,
     url_input: String,
@@ -442,6 +443,7 @@ impl AlmostThereApp {
             current_html,
             live_html,
             script_state,
+            module_cache: justbarelyscript::ModuleExecutionCache::default(),
             last_hovered_element_id: None,
             render_graph_debug_text,
             url_input: DEFAULT_URL.to_owned(),
@@ -533,6 +535,7 @@ impl AlmostThereApp {
                             "navigation.script_state.started",
                             &[("url", &source.source)],
                         );
+                        self.module_cache = justbarelyscript::ModuleExecutionCache::default();
                         self.script_state =
                             build_script_state_with_source(&source.html, Some(&source.source));
                         self.telemetry.emit(
@@ -857,6 +860,8 @@ impl AlmostThereApp {
             })
             .collect();
 
+        let mut deferred_dynamic_imports: Vec<(String, u64)> = Vec::new();
+
         for effect in effects {
             match effect {
                 justbarelyscript::BrowserEffect::SetTextContent { element_id, value } => {
@@ -903,7 +908,14 @@ impl AlmostThereApp {
                         ],
                     );
                 }
+                justbarelyscript::BrowserEffect::DynamicImportRequest { url, promise_id } => {
+                    deferred_dynamic_imports.push((url, promise_id));
+                }
             }
+        }
+
+        for (url, promise_id) in deferred_dynamic_imports {
+            self.resolve_dynamic_import(&url, promise_id, ctx);
         }
 
         self.document = parse_html_document_from_live_html(
@@ -924,6 +936,145 @@ impl AlmostThereApp {
         }
 
         ctx.request_repaint();
+    }
+
+    fn resolve_dynamic_import(&mut self, url: &str, promise_id: u64, ctx: &egui::Context) {
+        let resolved = resolve_resource_url(&self.document.source, url);
+        self.telemetry.emit(
+            "dynamic_import.started",
+            &[("url", &resolved), ("promise_id", &promise_id.to_string())],
+        );
+
+        let source_text = match read_script_resource(&resolved) {
+            Ok(s) => s,
+            Err(e) => {
+                self.telemetry.emit(
+                    "dynamic_import.failed",
+                    &[("url", &resolved), ("reason", "fetch"), ("detail", &e.to_string())],
+                );
+                self.script_state
+                    .reject_dynamic_import(promise_id, &format!("fetch error: {resolved}"));
+                let continuation_effects = self.script_state.drain_effects();
+                self.apply_dynamic_import_effects(continuation_effects, ctx);
+                return;
+            }
+        };
+
+        if source_text.len() > MAX_EXTERNAL_SCRIPT_PARSE_BYTES {
+            self.telemetry.emit(
+                "dynamic_import.failed",
+                &[("url", &resolved), ("reason", "too_large")],
+            );
+            self.script_state.reject_dynamic_import(
+                promise_id,
+                &format!("module too large: {resolved}"),
+            );
+            let continuation_effects = self.script_state.drain_effects();
+            self.apply_dynamic_import_effects(continuation_effects, ctx);
+            return;
+        }
+
+        let program = match justbarelyscript::parse_script(&source_text) {
+            Ok(p) => p,
+            Err(_) => {
+                self.telemetry.emit(
+                    "dynamic_import.failed",
+                    &[("url", &resolved), ("reason", "parse")],
+                );
+                self.script_state.reject_dynamic_import(
+                    promise_id,
+                    &format!("parse error: {resolved}"),
+                );
+                let continuation_effects = self.script_state.drain_effects();
+                self.apply_dynamic_import_effects(continuation_effects, ctx);
+                return;
+            }
+        };
+
+        let doc_source = self.document.source.clone();
+        let resolved_key = resolved.clone();
+        let loader = move |base: &str, specifier: &str| {
+            let base_url = if base == resolved_key { &resolved_key } else { base };
+            let dep_url = resolve_resource_url(base_url, specifier);
+            if !script_allowed_for_document(&doc_source, &dep_url) {
+                return None;
+            }
+            let dep_src = read_script_resource(&dep_url).ok()?;
+            if dep_src.len() > MAX_EXTERNAL_SCRIPT_PARSE_BYTES {
+                return None;
+            }
+            let dep_prog = justbarelyscript::parse_script(&dep_src).ok()?;
+            Some((dep_url, dep_prog))
+        };
+
+        self.script_state.execute_and_fulfill_dynamic_import(
+            &program,
+            &resolved,
+            promise_id,
+            &mut self.module_cache,
+            loader,
+        );
+        let module_effects = self.script_state.drain_effects();
+        self.apply_dynamic_import_effects(module_effects, ctx);
+
+        self.telemetry.emit(
+            "dynamic_import.completed",
+            &[("url", &resolved), ("promise_id", &promise_id.to_string())],
+        );
+    }
+
+    fn apply_dynamic_import_effects(
+        &mut self,
+        effects: Vec<justbarelyscript::BrowserEffect>,
+        ctx: &egui::Context,
+    ) {
+        for effect in effects {
+            match effect {
+                justbarelyscript::BrowserEffect::SetTextContent { element_id, value } => {
+                    self.live_html =
+                        set_element_text_content_by_id(&self.live_html, &element_id, &value);
+                }
+                justbarelyscript::BrowserEffect::SetAttribute { element_id, name, value } => {
+                    self.live_html =
+                        set_element_attribute_by_id(&self.live_html, &element_id, &name, &value);
+                }
+                justbarelyscript::BrowserEffect::SetInnerHtml { element_id, value } => {
+                    self.live_html =
+                        set_element_inner_html_by_id(&self.live_html, &element_id, &value);
+                }
+                justbarelyscript::BrowserEffect::AppendChild { parent_id, child } => {
+                    self.live_html = append_child_html_by_id(&self.live_html, &parent_id, &child);
+                }
+                justbarelyscript::BrowserEffect::ConsoleLog { level, text } => {
+                    self.console_messages
+                        .push(justbarelyscript::ConsoleMessage {
+                            level: match level.as_str() {
+                                "warn" => justbarelyscript::ConsoleLevel::Warn,
+                                "error" => justbarelyscript::ConsoleLevel::Error,
+                                "info" => justbarelyscript::ConsoleLevel::Info,
+                                _ => justbarelyscript::ConsoleLevel::Log,
+                            },
+                            text,
+                        });
+                }
+                justbarelyscript::BrowserEffect::NetworkRequest { method, url, body } => {
+                    self.perform_script_network_request(&method, &url, &body);
+                }
+                justbarelyscript::BrowserEffect::RuntimeTrace { kind, detail } => {
+                    self.telemetry.emit(
+                        "js.runtime.trace",
+                        &[
+                            ("kind", &kind),
+                            ("detail", &detail),
+                            ("url", &self.document.source),
+                        ],
+                    );
+                }
+                justbarelyscript::BrowserEffect::DynamicImportRequest { url, promise_id } => {
+                    self.resolve_dynamic_import(&url, promise_id, ctx);
+                }
+            }
+        }
     }
 
     fn perform_script_network_request(&mut self, method: &str, url: &str, body: &str) {
@@ -2234,6 +2385,7 @@ fn browser_effect_summary(effects: &[justbarelyscript::BrowserEffect]) -> String
             justbarelyscript::BrowserEffect::ConsoleLog { .. } => console += 1,
             justbarelyscript::BrowserEffect::NetworkRequest { .. } => network += 1,
             justbarelyscript::BrowserEffect::RuntimeTrace { .. } => trace += 1,
+            justbarelyscript::BrowserEffect::DynamicImportRequest { .. } => {}
         }
     }
     format!(
@@ -2509,6 +2661,7 @@ fn apply_safe_script_browser_effects_detailed(
                         ],
                     );
                 }
+                justbarelyscript::BrowserEffect::DynamicImportRequest { .. } => {}
             }
         }
     }
@@ -3048,52 +3201,41 @@ fn seed_script_dom_state_from_html(
     html: &str,
     state: &mut justbarelyscript::BrowserExecutionState,
 ) {
-    let mut offset = 0;
-    let mut remaining = html;
-    let mut generated_id = 0usize;
+    let dom = parse_dom_document(html);
+    seed_script_dom_state_from_nodes(&dom.children, state);
+}
 
-    while let Some(rel_open_start) = remaining.find('<') {
-        let open_start = offset + rel_open_start;
-        let after_open = &html[open_start..];
-        if after_open.starts_with("</") || after_open.starts_with("<!") {
-            offset = open_start + 1;
-            remaining = &html[offset..];
+fn seed_script_dom_state_from_nodes(
+    nodes: &[DomNode],
+    state: &mut justbarelyscript::BrowserExecutionState,
+) {
+    for node in nodes {
+        let DomNode::Element(element) = node else {
             continue;
-        }
-
-        let Some(open_end_rel) = after_open.find('>') else {
-            break;
         };
-        let open_end = open_start + open_end_rel + 1;
-        let open_tag = &html[open_start..open_end];
-        let real_id = extract_attr(open_tag, "id");
-        let id = real_id.clone().unwrap_or_else(|| {
-            generated_id += 1;
-            format!("__dom_seed_{generated_id}")
-        });
-
+        let id = element.effective_id();
         let mut attributes = std::collections::HashMap::new();
-        if let Some(real_id) = real_id {
-            attributes.insert("id".to_owned(), real_id);
+        if element.attr("id").is_some() {
+            attributes.insert("id".to_owned(), id.to_owned());
         }
-        if let Some(classes) = extract_attr(open_tag, "class") {
-            attributes.insert("class".to_owned(), classes);
+        if let Some(classes) = element.attr("class") {
+            attributes.insert("class".to_owned(), classes.to_owned());
         }
-
-        let text_content = tag_name(open_tag)
-            .and_then(|tag| {
-                let close = format!("</{tag}>");
-                let close_start = html[open_end..].find(&close)? + open_end;
-                Some(decode_basic_entities(&strip_tags(
-                    &html[open_end..close_start],
-                )))
-            })
-            .unwrap_or_default();
-
-        state.seed_existing_element(&id, text_content, attributes);
-        offset = open_end;
-        remaining = &html[offset..];
+        let text_content = dom_node_text_content(&element.children);
+        state.seed_existing_element(id, text_content, attributes);
+        seed_script_dom_state_from_nodes(&element.children, state);
     }
+}
+
+fn dom_node_text_content(nodes: &[DomNode]) -> String {
+    let mut out = String::new();
+    for node in nodes {
+        match node {
+            DomNode::Text(t) => out.push_str(&decode_basic_entities(t)),
+            DomNode::Element(e) => out.push_str(&dom_node_text_content(&e.children)),
+        }
+    }
+    out
 }
 
 fn append_child_html_by_id(
@@ -3913,7 +4055,7 @@ impl App for AlmostThereApp {
                             self.trace_event("click", &format!("link {href}"), "opening link");
                             self.open_link(&href, ctx);
                         }
-                        HitTarget::Button { text, element_id } => {
+                        HitTarget::Button { text, element_id, button_type, form_id } => {
                             self.telemetry
                                 .emit("hit_test.clicked", &[("target", "button"), ("text", &text)]);
                             self.status = format!("Clicked button {text}");
@@ -3926,6 +4068,34 @@ impl App for AlmostThereApp {
                                         &format!("listener fired; effects={}", effects.len()),
                                     );
                                     self.apply_script_effects(effects, ctx);
+                                } else if button_type.eq_ignore_ascii_case("submit") {
+                                    if let Some(ref fid) = form_id {
+                                        if self.script_state.has_listener(fid, "submit") {
+                                            let effects =
+                                                self.script_state.fire_event(fid, "submit", None);
+                                            self.trace_event(
+                                                "click",
+                                                &format!("button #{id} {text}"),
+                                                &format!(
+                                                    "no click listener; form submit fired; effects={}",
+                                                    effects.len()
+                                                ),
+                                            );
+                                            self.apply_script_effects(effects, ctx);
+                                        } else {
+                                            self.trace_event(
+                                                "click",
+                                                &format!("button #{id} {text}"),
+                                                "no click listener; submit button; native form submission",
+                                            );
+                                        }
+                                    } else {
+                                        self.trace_event(
+                                            "click",
+                                            &format!("button #{id} {text}"),
+                                            "no click listener; submit button; no form",
+                                        );
+                                    }
                                 } else {
                                     self.trace_event(
                                         "click",
@@ -4346,6 +4516,10 @@ struct DomElement {
     tag_name: String,
     attributes: Vec<DomAttribute>,
     children: Vec<DomNode>,
+    /// Stable handle assigned during parsing. Equal to the real `id` attribute when present,
+    /// otherwise `__dom_seed_N` (sequential document order). Used as the JS event listener key
+    /// so no-id elements can still have listeners looked up by the canvas hit-test layer.
+    dom_handle: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4406,6 +4580,12 @@ impl DomElement {
 
     fn has_attr(&self, name: &str) -> bool {
         self.attr(name).is_some()
+    }
+
+    /// Real `id` attribute if present, otherwise the generated `__dom_seed_N` handle.
+    /// Use this everywhere a stable per-element key is needed (event listeners, hit targets).
+    fn effective_id(&self) -> &str {
+        self.attr("id").unwrap_or(&self.dom_handle)
     }
 
     fn first_descendant_by_tag(&self, tag_name: &str) -> Option<&DomElement> {
@@ -4497,8 +4677,23 @@ fn dom_element_text_is_visible(element: &DomElement) -> bool {
 }
 
 fn parse_dom_document(html: &str) -> DomDocument {
-    let (children, _) = parse_dom_nodes(html, None);
+    let (mut children, _) = parse_dom_nodes(html, None);
+    let mut counter = 0usize;
+    assign_dom_handles(&mut children, &mut counter);
     DomDocument { children }
+}
+
+fn assign_dom_handles(nodes: &mut Vec<DomNode>, counter: &mut usize) {
+    for node in nodes {
+        if let DomNode::Element(element) = node {
+            *counter += 1;
+            element.dom_handle = element
+                .attr("id")
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("__dom_seed_{}", counter));
+            assign_dom_handles(&mut element.children, counter);
+        }
+    }
 }
 
 fn parse_dom_nodes<'a>(mut html: &'a str, closing_tag: Option<&str>) -> (Vec<DomNode>, &'a str) {
@@ -4555,6 +4750,7 @@ fn parse_dom_nodes<'a>(mut html: &'a str, closing_tag: Option<&str>) -> (Vec<Dom
             tag_name: tag_name.clone(),
             attributes: open_tag.attributes,
             children: Vec::new(),
+            dom_handle: String::new(), // filled by assign_dom_handles after full parse
         };
 
         if !open_tag.self_closing && !is_void_tag(&tag_name) {
@@ -5322,7 +5518,6 @@ struct CanvasLayoutCursor {
     list_stack: Vec<CanvasListContext>,
     form_stack: Vec<CanvasFormContext>,
     form_actions_by_id: HashMap<String, Option<String>>,
-    next_form_index: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -6887,7 +7082,6 @@ fn render_graph_to_canvas_graph(
         list_stack: Vec::new(),
         form_stack: Vec::new(),
         form_actions_by_id,
-        next_form_index: 0,
     };
     layout_css_layout_tree(
         &mut layout_root,
@@ -7316,11 +7510,7 @@ fn push_canvas_form_context_for_layout_box(
         .attr("id")
         .or_else(|| element.attr("name"))
         .map(str::to_owned)
-        .unwrap_or_else(|| {
-            let id = format!("form-{}", cursor.next_form_index);
-            cursor.next_form_index += 1;
-            id
-        });
+        .unwrap_or_else(|| element.dom_handle.clone());
     let action = element.attr("action").map(str::to_owned);
     cursor.form_stack.push(CanvasFormContext { id, action });
     true
@@ -7694,7 +7884,7 @@ fn push_canvas_graph_element(
                     color: node.style.color,
                     form_id,
                     form_action,
-                    element_id: element.attr("id").map(str::to_owned),
+                    element_id: Some(element.effective_id().to_owned()),
                     kind,
                 }));
             }
@@ -7850,11 +8040,7 @@ fn push_canvas_form_context_for_element(
         .attr("id")
         .or_else(|| element.attr("name"))
         .map(str::to_owned)
-        .unwrap_or_else(|| {
-            let id = format!("form-{}", cursor.next_form_index);
-            cursor.next_form_index += 1;
-            id
-        });
+        .unwrap_or_else(|| element.dom_handle.clone());
     let action = element.attr("action").map(str::to_owned);
     cursor.form_stack.push(CanvasFormContext { id, action });
     true
@@ -7899,7 +8085,7 @@ fn push_canvas_graph_button_hit_target(
         button_type: element.attr("type").unwrap_or("submit").to_owned(),
         form_id,
         form_action,
-        element_id: element.attr("id").map(str::to_owned),
+        element_id: Some(element.effective_id().to_owned()),
     }));
 }
 
