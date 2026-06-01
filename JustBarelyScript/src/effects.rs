@@ -50,6 +50,17 @@ pub enum BrowserEffect {
         url: String,
         promise_id: u64,
     },
+    ScriptLoadRequest {
+        element_ref: String,
+        url: String,
+        is_module: bool,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BrowserEventResult {
+    pub effects: Vec<BrowserEffect>,
+    pub default_prevented: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -67,9 +78,14 @@ pub struct DomExecutionState {
     pub inner_html_by_id: HashMap<String, String>,
     pub attributes_by_id: HashMap<String, HashMap<String, String>>,
     pub computed_styles_by_id: HashMap<String, HashMap<String, String>>,
+    parent_by_id: HashMap<String, String>,
+    child_ids_by_parent: HashMap<String, Vec<String>>,
+    tag_name_by_id: HashMap<String, String>,
     query_selector_all_by_class: HashMap<String, Vec<String>>,
     query_selector_by_id: HashMap<String, String>,
     query_selector_by_class: HashMap<String, String>,
+    query_selector_all_by_tag: HashMap<String, Vec<String>>,
+    query_selector_by_tag: HashMap<String, String>,
     created_elements: HashMap<String, DomElementSnapshot>,
     next_created_id: usize,
 }
@@ -98,6 +114,9 @@ pub struct JsFunction {
     pub instance_fields: Vec<ClassField>,
     /// Accessor properties installed directly on function objects, used by class statics.
     static_accessors: HashMap<String, Property>,
+    /// Module URL active when the function was created. Used by deferred callbacks
+    /// and async continuations for module-relative dynamic import() resolution.
+    module_base_url: Option<String>,
 }
 
 fn next_fn_id() -> u64 {
@@ -125,6 +144,7 @@ impl JsFunction {
             super_ctor: None,
             instance_fields: Vec::new(),
             static_accessors: HashMap::new(),
+            module_base_url: None,
             id: next_fn_id(),
         }
     }
@@ -133,8 +153,7 @@ impl JsFunction {
 #[derive(Clone, Debug, PartialEq)]
 struct PendingTimer {
     fires_at_ms: u64,
-    params: Vec<String>,
-    body: crate::ast::BlockStatement,
+    callback: JsFunction,
 }
 
 #[derive(Clone, Debug)]
@@ -394,6 +413,7 @@ pub struct BrowserExecutionState {
     symbol_counter: u32,
     pending_dynamic_imports: HashMap<u64, Rc<RefCell<PromiseState>>>,
     next_dynamic_import_id: u64,
+    current_module_url: Option<String>,
     /// When Some, we are inside a generator body running in "collection mode".
     /// Each `yield expr` pushes the value here instead of suspending.
     collecting_generator: Option<Vec<JsValue>>,
@@ -481,6 +501,7 @@ enum EnvKind {
 struct StackFrame {
     kind: EnvKind,
     locals: Rc<RefCell<HashMap<String, Slot>>>,
+    module_base_url: Option<String>,
 }
 
 impl Default for StackFrame {
@@ -488,6 +509,7 @@ impl Default for StackFrame {
         StackFrame {
             kind: EnvKind::Block,
             locals: Rc::new(RefCell::new(HashMap::new())),
+            module_base_url: None,
         }
     }
 }
@@ -497,18 +519,21 @@ impl StackFrame {
         StackFrame {
             kind: EnvKind::Function,
             locals: Rc::new(RefCell::new(HashMap::new())),
+            module_base_url: None,
         }
     }
     fn global_scope() -> Self {
         StackFrame {
             kind: EnvKind::Global,
             locals: Rc::new(RefCell::new(HashMap::new())),
+            module_base_url: None,
         }
     }
     fn block_scope() -> Self {
         StackFrame {
             kind: EnvKind::Block,
             locals: Rc::new(RefCell::new(HashMap::new())),
+            module_base_url: None,
         }
     }
     /// True for environments where `var` declarations land (function and global).
@@ -527,9 +552,27 @@ impl PartialEq for StackFrame {
 struct EventHandler {
     element_id: String,
     event_type: String,
-    params: Vec<String>,
-    body: BlockStatement,
-    captured: Vec<StackFrame>,
+    callback: JsFunction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectorCombinator {
+    Descendant,
+    Child,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SimpleSelector {
+    tag: Option<String>,
+    id: Option<String>,
+    classes: Vec<String>,
+    attrs: Vec<(String, Option<String>)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelectorPart {
+    combinator: Option<SelectorCombinator>,
+    simple: SimpleSelector,
 }
 
 // ─── ECMAScript Property Descriptor (ECMA-262 §6.2.6) ────────────────────────
@@ -956,6 +999,9 @@ pub fn collect_browser_effects(program: &Program) -> Vec<BrowserEffect> {
 }
 
 impl BrowserExecutionState {
+    const MAX_MICROTASK_DRAIN: usize = 1024;
+    const MAX_POST_SCRIPT_TIMER_DRAIN: usize = 64;
+
     // ── Core object model helpers ─────────────────────────────────────────────
 
     /// `[[Get]]` — walks the prototype chain and invokes accessor getters.
@@ -1159,9 +1205,45 @@ impl BrowserExecutionState {
         text_content: String,
         attributes: HashMap<String, String>,
     ) {
+        self.seed_existing_element_with_metadata(id, text_content, attributes, None, None);
+    }
+
+    pub fn seed_existing_element_with_metadata(
+        &mut self,
+        id: &str,
+        text_content: String,
+        attributes: HashMap<String, String>,
+        tag_name: Option<&str>,
+        parent_id: Option<&str>,
+    ) {
         self.dom
             .text_content_by_id
             .insert(id.to_owned(), text_content);
+        if let Some(parent_id) = parent_id.filter(|parent_id| !parent_id.is_empty()) {
+            self.dom
+                .parent_by_id
+                .insert(id.to_owned(), parent_id.to_owned());
+            self.dom
+                .child_ids_by_parent
+                .entry(parent_id.to_owned())
+                .or_default()
+                .push(id.to_owned());
+        }
+        if let Some(tag_name) = tag_name.filter(|tag_name| !tag_name.is_empty()) {
+            let tag_name = tag_name.to_ascii_lowercase();
+            self.dom
+                .tag_name_by_id
+                .insert(id.to_owned(), tag_name.clone());
+            self.dom
+                .query_selector_by_tag
+                .entry(tag_name.clone())
+                .or_insert_with(|| id.to_owned());
+            self.dom
+                .query_selector_all_by_tag
+                .entry(tag_name)
+                .or_default()
+                .push(id.to_owned());
+        }
         self.dom
             .query_selector_by_id
             .entry(id.to_owned())
@@ -1283,6 +1365,30 @@ impl BrowserExecutionState {
         );
         self.globals
             .insert("Symbol".into(), JsValue::HostFunction("Symbol".into()));
+        self.globals.insert(
+            "requestAnimationFrame".into(),
+            JsValue::HostFunction("requestAnimationFrame".into()),
+        );
+        self.globals.insert(
+            "cancelAnimationFrame".into(),
+            JsValue::HostFunction("cancelAnimationFrame".into()),
+        );
+        self.globals.insert(
+            "queueMicrotask".into(),
+            JsValue::HostFunction("queueMicrotask".into()),
+        );
+        self.globals.insert(
+            "matchMedia".into(),
+            JsValue::HostFunction("matchMedia".into()),
+        );
+        self.globals.insert(
+            "MediaQueryList".into(),
+            JsValue::HostFunction("MediaQueryList".into()),
+        );
+        for name in ["MutationObserver", "IntersectionObserver", "ResizeObserver"] {
+            self.globals
+                .insert(name.into(), JsValue::HostFunction(name.into()));
+        }
         self.globals
             .insert("escape".into(), JsValue::HostFunction("escape".into()));
         self.globals
@@ -1531,6 +1637,215 @@ impl BrowserExecutionState {
             .insert("__location__".into(), JsValue::Object(rc));
     }
 
+    fn current_location_href(&self) -> Option<String> {
+        match self.globals.get("location") {
+            Some(JsValue::Object(rc)) => match rc.borrow().get_own_data("href") {
+                Some(JsValue::String(href)) => Some(href),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn current_import_base_url(&self) -> Option<String> {
+        self.stack
+            .iter()
+            .rev()
+            .find_map(|frame| frame.module_base_url.clone())
+            .or_else(|| self.current_module_url.clone())
+            .clone()
+            .or_else(|| self.current_location_href())
+    }
+
+    fn stamp_function_module_base(&self, func: &mut JsFunction) {
+        if func.module_base_url.is_none() {
+            func.module_base_url = self.current_module_url.clone();
+        }
+    }
+
+    fn url_object(href: String) -> JsValue {
+        let rc = JsObject::new();
+        {
+            let mut obj = rc.borrow_mut();
+            obj.class_name = Some("URL".to_owned());
+            obj.set("href", JsValue::String(href.clone()));
+            if let Some((protocol, rest)) = href.split_once("://") {
+                let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+                let host = &rest[..host_end];
+                let after_host = &rest[host_end..];
+                let (pathname, search, hash) = Self::split_url_path_query_hash(after_host);
+                obj.set("protocol", JsValue::String(format!("{protocol}:")));
+                obj.set("host", JsValue::String(host.to_owned()));
+                obj.set(
+                    "hostname",
+                    JsValue::String(host.split(':').next().unwrap_or("").to_owned()),
+                );
+                obj.set(
+                    "port",
+                    JsValue::String(host.split(':').nth(1).unwrap_or("").to_owned()),
+                );
+                obj.set("pathname", JsValue::String(pathname));
+                obj.set("search", JsValue::String(search));
+                obj.set("hash", JsValue::String(hash));
+                obj.set("origin", JsValue::String(format!("{protocol}://{host}")));
+            } else {
+                let (pathname, search, hash) = Self::split_url_path_query_hash(&href);
+                obj.set("protocol", JsValue::String(String::new()));
+                obj.set("host", JsValue::String(String::new()));
+                obj.set("hostname", JsValue::String(String::new()));
+                obj.set("port", JsValue::String(String::new()));
+                obj.set("pathname", JsValue::String(pathname));
+                obj.set("search", JsValue::String(search));
+                obj.set("hash", JsValue::String(hash));
+                obj.set("origin", JsValue::String("null".to_owned()));
+            }
+        }
+        JsValue::Object(rc)
+    }
+
+    fn split_url_path_query_hash(input: &str) -> (String, String, String) {
+        let path = if input.is_empty() { "/" } else { input };
+        if let Some((before_hash, hash_rest)) = path.split_once('#') {
+            if let Some((pathname, query_rest)) = before_hash.split_once('?') {
+                (
+                    Self::non_empty_pathname(pathname),
+                    format!("?{query_rest}"),
+                    format!("#{hash_rest}"),
+                )
+            } else {
+                (
+                    Self::non_empty_pathname(before_hash),
+                    String::new(),
+                    format!("#{hash_rest}"),
+                )
+            }
+        } else if let Some((pathname, query_rest)) = path.split_once('?') {
+            (
+                Self::non_empty_pathname(pathname),
+                format!("?{query_rest}"),
+                String::new(),
+            )
+        } else {
+            (Self::non_empty_pathname(path), String::new(), String::new())
+        }
+    }
+
+    fn non_empty_pathname(pathname: &str) -> String {
+        if pathname.is_empty() {
+            "/".to_owned()
+        } else {
+            pathname.to_owned()
+        }
+    }
+
+    fn resolve_url_like(specifier: &str, base: &str) -> String {
+        if specifier.is_empty()
+            || Self::has_url_scheme(specifier)
+            || specifier.starts_with("data:")
+            || specifier.starts_with("blob:")
+        {
+            return specifier.to_owned();
+        }
+        if base.is_empty() {
+            return specifier.to_owned();
+        }
+
+        if specifier.starts_with('?') || specifier.starts_with('#') {
+            return format!("{}{}", Self::strip_query_hash(base), specifier);
+        }
+
+        if let Some(protocol_relative) = specifier.strip_prefix("//") {
+            if let Some((protocol, _)) = base.split_once("://") {
+                return format!("{protocol}://{protocol_relative}");
+            }
+            return specifier.to_owned();
+        }
+
+        if let Some((scheme, rest)) = base.split_once("://") {
+            let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            let host = &rest[..host_end];
+            let base_path = Self::strip_query_hash(&rest[host_end..]);
+            let resolved_path = if specifier.starts_with('/') {
+                Self::normalize_path(specifier)
+            } else {
+                let dir = Self::base_directory(&base_path);
+                Self::normalize_path(&format!("{dir}{specifier}"))
+            };
+            return format!("{scheme}://{host}{resolved_path}");
+        }
+
+        if specifier.starts_with('/') {
+            Self::normalize_path(specifier)
+        } else {
+            let base_path = Self::strip_query_hash(base);
+            let dir = Self::base_directory(&base_path);
+            Self::normalize_path(&format!("{dir}{specifier}"))
+        }
+    }
+
+    fn has_url_scheme(value: &str) -> bool {
+        let Some(colon) = value.find(':') else {
+            return false;
+        };
+        let scheme = &value[..colon];
+        !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+            && scheme
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphabetic())
+    }
+
+    fn strip_query_hash(value: &str) -> String {
+        let end = value.find(['?', '#']).unwrap_or(value.len());
+        value[..end].to_owned()
+    }
+
+    fn base_directory(path: &str) -> String {
+        if path.is_empty() || path.ends_with('/') {
+            path.to_owned()
+        } else if let Some(index) = path.rfind('/') {
+            path[..index + 1].to_owned()
+        } else {
+            String::new()
+        }
+    }
+
+    fn normalize_path(path_with_suffix: &str) -> String {
+        let suffix_start = path_with_suffix
+            .find(['?', '#'])
+            .unwrap_or(path_with_suffix.len());
+        let path = &path_with_suffix[..suffix_start];
+        let suffix = &path_with_suffix[suffix_start..];
+        let absolute = path.starts_with('/');
+        let trailing_slash = path.ends_with('/');
+        let mut parts = Vec::new();
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+        let mut normalized = if absolute {
+            format!("/{}", parts.join("/"))
+        } else {
+            parts.join("/")
+        };
+        if normalized.is_empty() && absolute {
+            normalized.push('/');
+        }
+        if trailing_slash && !normalized.ends_with('/') {
+            normalized.push('/');
+        }
+        normalized.push_str(suffix);
+        normalized
+    }
+
     pub fn execute_program(&mut self, program: &Program) {
         self.ensure_global_frame();
         self.hoist_function_declarations(&program.body);
@@ -1583,6 +1898,7 @@ impl BrowserExecutionState {
             return exports.clone();
         }
 
+        let previous_module_url = self.current_module_url.replace(module_key.to_owned());
         let mut imported_modules: HashMap<String, HashMap<String, JsValue>> = HashMap::new();
         for statement in &program.body {
             let source = match statement {
@@ -1604,6 +1920,7 @@ impl BrowserExecutionState {
                 }
             }
         }
+        self.current_module_url = Some(module_key.to_owned());
 
         self.ensure_global_frame();
         for statement in &program.body {
@@ -1702,6 +2019,7 @@ impl BrowserExecutionState {
         }
 
         cache.insert(module_key.to_owned(), exports.clone());
+        self.current_module_url = previous_module_url;
         exports
     }
 
@@ -1731,6 +2049,7 @@ impl BrowserExecutionState {
                         );
                         func.is_async = func_decl.is_async;
                         func.is_generator = func_decl.is_generator;
+                        self.stamp_function_module_base(&mut func);
                         let value = JsValue::Function(func);
                         if !func_decl.name.is_empty() {
                             self.set_local(&func_decl.name, value.clone());
@@ -1815,7 +2134,12 @@ impl BrowserExecutionState {
     }
 
     fn drain_and_run_microtasks(&mut self) {
-        while !self.pending_microtasks.is_empty() {
+        self.drain_and_run_microtasks_bounded(Self::MAX_MICROTASK_DRAIN);
+    }
+
+    fn drain_and_run_microtasks_bounded(&mut self, max_tasks: usize) -> usize {
+        let mut drained = 0usize;
+        while !self.pending_microtasks.is_empty() && drained < max_tasks {
             let task = self.pending_microtasks.remove(0);
             match task {
                 PendingMicrotask::Function { callback, args } => {
@@ -1832,7 +2156,10 @@ impl BrowserExecutionState {
                     self.run_promise_reaction(reaction, status);
                 }
             }
+            self.finish_fault_boundary("microtask.exception", "microtask");
+            drained += 1;
         }
+        drained
     }
 
     fn function_from_expression(&mut self, expr: &Expression) -> Option<JsFunction> {
@@ -1842,9 +2169,98 @@ impl BrowserExecutionState {
         }
     }
 
+    fn function_from_value(value: JsValue) -> Option<JsFunction> {
+        match value {
+            JsValue::Function(func) => Some(func),
+            _ => None,
+        }
+    }
+
     fn enqueue_function_microtask(&mut self, callback: JsFunction, args: Vec<JsValue>) {
         self.pending_microtasks
             .push(PendingMicrotask::Function { callback, args });
+    }
+
+    fn register_event_handler(
+        &mut self,
+        element_id: String,
+        event_type: String,
+        callback: JsFunction,
+    ) {
+        self.event_handlers.push(EventHandler {
+            element_id,
+            event_type,
+            callback,
+        });
+    }
+
+    fn register_event_handler_value(
+        &mut self,
+        element_id: String,
+        event_type: String,
+        value: JsValue,
+    ) {
+        if let Some(callback) = Self::function_from_value(value) {
+            self.register_event_handler(element_id, event_type, callback);
+        } else {
+            self.trace_listener_registration_failure(
+                "property",
+                &element_id,
+                &event_type,
+                "callback_not_callable",
+                None,
+            );
+        }
+    }
+
+    fn trace_listener_registration_failure(
+        &mut self,
+        api: &str,
+        target: &str,
+        event_type: &str,
+        reason: &str,
+        callback: Option<&JsValue>,
+    ) {
+        let callback_tag = callback.map(Self::object_tag).unwrap_or("Missing");
+        self.trace_runtime(
+            "listener.registration.failed",
+            format!(
+                "api={api} target={target} event={event_type} reason={reason} callback_tag={callback_tag}"
+            ),
+        );
+    }
+
+    fn trace_dom_query_empty(&mut self, method: &str, root: &str, selector: &str) {
+        self.trace_runtime(
+            "dom.query.empty",
+            format!("method={method} root={root} selector={selector}"),
+        );
+    }
+
+    fn event_target_key_from_receiver(
+        receiver: &JsValue,
+        object_expr: Option<&Expression>,
+    ) -> Option<String> {
+        match receiver {
+            JsValue::ElementRef(element_ref) => {
+                Some(existing_id_from_ref(element_ref).unwrap_or_else(|| element_ref.clone()))
+            }
+            JsValue::DocumentRef => Some("document".to_owned()),
+            JsValue::WindowRef => Some("window".to_owned()),
+            _ => match object_expr {
+                Some(Expression::Identifier(name)) if name == "document" || name == "window" => {
+                    Some(name.clone())
+                }
+                _ => None,
+            },
+        }
+    }
+
+    fn event_type_from_handler_property(property: &str) -> Option<String> {
+        property
+            .strip_prefix("on")
+            .filter(|event_type| !event_type.is_empty())
+            .map(str::to_owned)
     }
 
     fn new_promise(status: PromiseStatus) -> JsValue {
@@ -2257,7 +2673,7 @@ impl BrowserExecutionState {
             JsValue::NodeList(ids) => Some(IteratorRecord::Indexed {
                 items: ids
                     .into_iter()
-                    .map(|id| JsValue::ElementRef(existing_element_ref(&id)))
+                    .map(|id| self.element_ref_for_key(&id))
                     .collect(),
                 index: 0,
             }),
@@ -2737,6 +3153,24 @@ impl BrowserExecutionState {
         }
     }
 
+    pub fn clear_uncaught_throw(&mut self) -> Option<String> {
+        self.take_uncaught_throw()
+    }
+
+    pub fn finish_fault_boundary(&mut self, kind: &str, detail_prefix: &str) -> Option<String> {
+        let message = self.take_uncaught_throw()?;
+        let detail = if detail_prefix.is_empty() {
+            message.clone()
+        } else {
+            format!("{detail_prefix}: {message}")
+        };
+        self.effects.push(BrowserEffect::RuntimeTrace {
+            kind: kind.to_owned(),
+            detail,
+        });
+        Some(message)
+    }
+
     fn format_thrown_value(val: &JsValue) -> String {
         match val {
             JsValue::String(s) => s.clone(),
@@ -2970,6 +3404,7 @@ impl BrowserExecutionState {
                 );
                 func.is_async = decl.is_async;
                 func.is_generator = decl.is_generator;
+                self.stamp_function_module_base(&mut func);
                 let name = decl.name.clone();
                 self.set_local(&name, JsValue::Function(func.clone()));
                 self.refresh_overrides_for_named_func(&name, JsValue::Function(func));
@@ -3252,6 +3687,7 @@ impl BrowserExecutionState {
                     );
                     func.is_async = decl.is_async;
                     func.is_generator = decl.is_generator;
+                    self.stamp_function_module_base(&mut func);
                     self.set_local(&decl.name, JsValue::Function(func));
                 }
                 Statement::Labeled(labeled) => {
@@ -3518,6 +3954,7 @@ impl BrowserExecutionState {
                 );
                 func.is_async = fe.is_async;
                 func.is_generator = fe.is_generator;
+                self.stamp_function_module_base(&mut func);
                 JsValue::Function(func)
             }
             Expression::ArrowFunction {
@@ -3528,6 +3965,7 @@ impl BrowserExecutionState {
                 let mut func =
                     JsFunction::plain(None, params.clone(), *body.clone(), self.stack.clone());
                 func.is_async = *is_async;
+                self.stamp_function_module_base(&mut func);
                 JsValue::Function(func)
             }
             Expression::TemplateLiteral(parts) => {
@@ -3815,6 +4253,9 @@ impl BrowserExecutionState {
                             obj.set("[[PrimitiveValue]]", prim_val);
                         }
                         JsValue::Object(rc)
+                    } else if fn_name == "URL" {
+                        let args = self.eval_args(arguments);
+                        self.call_host_function("URL", JsValue::Undefined, args)
                     } else {
                         JsValue::HostObject(fn_name)
                     }
@@ -4042,11 +4483,10 @@ impl BrowserExecutionState {
                 .get(1)
                 .map(|v| Self::value_to_number(v).max(0.0) as u64)
                 .unwrap_or(0);
-            if let Some(Expression::Function(func)) = arguments.first() {
+            if let Some(callback) = args.first().cloned().and_then(Self::function_from_value) {
                 self.pending_timers.push(PendingTimer {
                     fires_at_ms: self.current_time_ms + delay_ms,
-                    params: func.params.iter().map(|p| p.name().to_owned()).collect(),
-                    body: func.body.clone(),
+                    callback,
                 });
             }
             return JsValue::Undefined;
@@ -4234,6 +4674,17 @@ impl BrowserExecutionState {
                     let id = args.first().map(Self::value_to_string).unwrap_or_default();
                     return JsValue::ElementRef(existing_element_ref(&id));
                 }
+                "getElementsByTagName" if method.receiver == MethodReceiver::Document => {
+                    let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                        return JsValue::Undefined;
+                    };
+                    let tag = args.first().map(Self::value_to_string).unwrap_or_default();
+                    let ids = self.get_elements_by_tag_name_ids(&tag);
+                    if ids.is_empty() {
+                        self.trace_dom_query_empty("getElementsByTagName", "document", &tag);
+                    }
+                    return JsValue::NodeList(ids);
+                }
                 "querySelector" if method.receiver == MethodReceiver::Document => {
                     let selector = arguments
                         .first()
@@ -4241,8 +4692,9 @@ impl BrowserExecutionState {
                         .map(|value| Self::value_to_string(&value))
                         .unwrap_or_default();
                     if let Some(id) = self.query_selector_first_id(&selector) {
-                        return JsValue::ElementRef(existing_element_ref(&id));
+                        return self.element_ref_for_key(&id);
                     }
+                    self.trace_dom_query_empty("querySelector", "document", &selector);
                     return JsValue::Undefined;
                 }
                 "querySelectorAll" if method.receiver == MethodReceiver::Document => {
@@ -4251,7 +4703,11 @@ impl BrowserExecutionState {
                         .map(|argument| self.execute_expression(argument))
                         .map(|value| Self::value_to_string(&value))
                         .unwrap_or_default();
-                    return JsValue::NodeList(self.query_selector_all_ids(&selector));
+                    let ids = self.query_selector_all_ids(&selector);
+                    if ids.is_empty() {
+                        self.trace_dom_query_empty("querySelectorAll", "document", &selector);
+                    }
+                    return JsValue::NodeList(ids);
                 }
                 "appendChild" => {
                     let parent = self.execute_expression(&method.object);
@@ -4323,11 +4779,9 @@ impl BrowserExecutionState {
                 }
                 "addEventListener" | "attachEvent" | "detachEvent" => {
                     let receiver = self.execute_expression(&method.object);
-                    let mut event_type = arguments
-                        .first()
-                        .map(|a| self.execute_expression(a))
-                        .map(|v| Self::value_to_string(&v))
-                        .unwrap_or_default();
+                    let args = self.eval_args(arguments);
+                    let mut event_type =
+                        args.first().map(Self::value_to_string).unwrap_or_default();
                     if method.name == "detachEvent" {
                         return JsValue::Undefined;
                     }
@@ -4336,37 +4790,58 @@ impl BrowserExecutionState {
                     }
                     // DOM is already parsed and page is loaded by the time scripts run, so
                     // DOMContentLoaded and load fire as immediate microtasks.
-                    let is_document =
-                        matches!(&method.object, Expression::Identifier(n) if n == "document");
+                    let is_document = matches!(&method.object, Expression::Identifier(n) if n == "document")
+                        || matches!(receiver, JsValue::DocumentRef);
                     let is_window = matches!(&method.object, Expression::Identifier(n) if n == "window")
                         || matches!(receiver, JsValue::WindowRef);
                     if (is_document && event_type == "DOMContentLoaded")
                         || (is_window && (event_type == "load" || event_type == "DOMContentLoaded"))
                     {
-                        if let Some(callback) = arguments
-                            .get(1)
-                            .and_then(|arg| self.function_from_expression(arg))
+                        if let Some(callback) =
+                            args.get(1).cloned().and_then(Self::function_from_value)
                         {
                             self.enqueue_function_microtask(callback, Vec::new());
+                        } else {
+                            self.trace_listener_registration_failure(
+                                &method.name,
+                                if is_document { "document" } else { "window" },
+                                &event_type,
+                                "callback_not_callable",
+                                args.get(1),
+                            );
                         }
                         return JsValue::Undefined;
                     }
-                    if let JsValue::ElementRef(element_ref) = receiver {
-                        if let Some(element_id) = existing_id_from_ref(&element_ref) {
-                            if let Some(Expression::Function(func)) = arguments.get(1) {
-                                self.event_handlers.push(EventHandler {
-                                    element_id,
-                                    event_type,
-                                    params: func
-                                        .params
-                                        .iter()
-                                        .map(|p| p.name().to_owned())
-                                        .collect(),
-                                    body: func.body.clone(),
-                                    captured: self.stack.clone(),
-                                });
-                            }
+                    if let Some(element_id) =
+                        Self::event_target_key_from_receiver(&receiver, Some(&method.object))
+                    {
+                        if let Some(callback) =
+                            args.get(1).cloned().and_then(Self::function_from_value)
+                        {
+                            self.register_event_handler(element_id, event_type, callback);
+                        } else {
+                            self.trace_listener_registration_failure(
+                                &method.name,
+                                &element_id,
+                                &event_type,
+                                "callback_not_callable",
+                                args.get(1),
+                            );
                         }
+                    } else {
+                        if let JsValue::Object(rc) = &receiver
+                            && let Some(JsValue::HostFunction(host_name)) =
+                                rc.borrow().get_own_data(&method.name)
+                        {
+                            return self.call_host_function(&host_name, receiver.clone(), args);
+                        }
+                        self.trace_listener_registration_failure(
+                            &method.name,
+                            &format!("receiver_tag={}", Self::object_tag(&receiver)),
+                            &event_type,
+                            "unresolvable_target",
+                            args.get(1),
+                        );
                     }
                     return JsValue::Undefined;
                 }
@@ -4762,22 +5237,42 @@ impl BrowserExecutionState {
                         let tag = arguments
                             .first()
                             .map(|argument| self.execute_expression(argument))
-                            .map(|value| Self::value_to_string(&value).to_ascii_lowercase())
+                            .map(|value| Self::value_to_string(&value))
                             .unwrap_or_default();
-                        let ids = match tag.as_str() {
-                            "body" => vec![existing_element_ref("body")],
-                            "head" => vec![existing_element_ref("head")],
-                            "html" => vec![existing_element_ref("html")],
-                            _ => Vec::new(),
-                        };
-                        return JsValue::Array(ids.into_iter().map(JsValue::ElementRef).collect());
+                        let ids = self.get_elements_by_tag_name_ids(&tag);
+                        if ids.is_empty() {
+                            self.trace_dom_query_empty("getElementsByTagName", "document", &tag);
+                        }
+                        return JsValue::NodeList(ids);
+                    }
+                    "querySelector" => {
+                        let selector = arguments
+                            .first()
+                            .map(|argument| self.execute_expression(argument))
+                            .map(|value| Self::value_to_string(&value))
+                            .unwrap_or_default();
+                        if let Some(id) = self.query_selector_first_id(&selector) {
+                            return self.element_ref_for_key(&id);
+                        }
+                        self.trace_dom_query_empty("querySelector", "document", &selector);
+                        return JsValue::Null;
+                    }
+                    "querySelectorAll" => {
+                        let selector = arguments
+                            .first()
+                            .map(|argument| self.execute_expression(argument))
+                            .map(|value| Self::value_to_string(&value))
+                            .unwrap_or_default();
+                        let ids = self.query_selector_all_ids(&selector);
+                        if ids.is_empty() {
+                            self.trace_dom_query_empty("querySelectorAll", "document", &selector);
+                        }
+                        return JsValue::NodeList(ids);
                     }
                     "addEventListener" | "attachEvent" | "detachEvent" => {
-                        let mut event_type = arguments
-                            .first()
-                            .map(|a| self.execute_expression(a))
-                            .map(|v| Self::value_to_string(&v))
-                            .unwrap_or_default();
+                        let args = self.eval_args(arguments);
+                        let mut event_type =
+                            args.first().map(Self::value_to_string).unwrap_or_default();
                         if method_name == "detachEvent" {
                             return JsValue::Undefined;
                         }
@@ -4785,12 +5280,35 @@ impl BrowserExecutionState {
                             event_type = stripped.to_owned();
                         }
                         if event_type == "DOMContentLoaded" {
-                            if let Some(callback) = arguments
-                                .get(1)
-                                .and_then(|arg| self.function_from_expression(arg))
+                            if let Some(callback) =
+                                args.get(1).cloned().and_then(Self::function_from_value)
                             {
                                 self.enqueue_function_microtask(callback, Vec::new());
+                            } else {
+                                self.trace_listener_registration_failure(
+                                    &method_name,
+                                    "document",
+                                    &event_type,
+                                    "callback_not_callable",
+                                    args.get(1),
+                                );
                             }
+                        } else if let Some(callback) =
+                            args.get(1).cloned().and_then(Self::function_from_value)
+                        {
+                            self.register_event_handler(
+                                "document".to_owned(),
+                                event_type,
+                                callback,
+                            );
+                        } else {
+                            self.trace_listener_registration_failure(
+                                &method_name,
+                                "document",
+                                &event_type,
+                                "callback_not_callable",
+                                args.get(1),
+                            );
                         }
                         return JsValue::Undefined;
                     }
@@ -4813,6 +5331,18 @@ impl BrowserExecutionState {
                         return Self::fulfilled_promise(JsValue::Undefined);
                     }
                     _ => {}
+                }
+            }
+
+            if matches!(receiver, JsValue::WindowRef) {
+                let method_value = self
+                    .globals
+                    .get(&method_name)
+                    .cloned()
+                    .unwrap_or_else(|| Self::window_fallback_property(&method_name));
+                if Self::is_callable_value(&method_value) {
+                    let args = self.eval_args(arguments);
+                    return self.call_value(method_value, JsValue::WindowRef, args);
                 }
             }
 
@@ -5018,20 +5548,42 @@ impl BrowserExecutionState {
                     method_name.as_str(),
                     "matches" | "webkitMatchesSelector" | "mozMatchesSelector"
                 ) {
-                    for arg in arguments {
-                        self.execute_expression(arg);
+                    let selector = arguments
+                        .first()
+                        .map(|arg| Self::value_to_string(&self.execute_expression(arg)))
+                        .unwrap_or_default();
+                    if let JsValue::ElementRef(element_ref) = receiver {
+                        return JsValue::Boolean(
+                            self.element_matches_selector(&element_ref, &selector),
+                        );
                     }
                     return JsValue::Boolean(false);
                 }
                 if matches!(method_name.as_str(), "closest") {
-                    for arg in arguments {
-                        self.execute_expression(arg);
+                    let selector = arguments
+                        .first()
+                        .map(|arg| Self::value_to_string(&self.execute_expression(arg)))
+                        .unwrap_or_default();
+                    if let JsValue::ElementRef(element_ref) = receiver
+                        && let Some(key) = self.closest_matching_ancestor(&element_ref, &selector)
+                    {
+                        return if key.starts_with("created:") {
+                            JsValue::ElementRef(key)
+                        } else {
+                            JsValue::ElementRef(existing_element_ref(&key))
+                        };
                     }
                     return JsValue::Null;
                 }
                 if matches!(method_name.as_str(), "contains") {
-                    for arg in arguments {
-                        self.execute_expression(arg);
+                    let child = arguments
+                        .first()
+                        .map(|arg| self.execute_expression(arg))
+                        .unwrap_or(JsValue::Undefined);
+                    if let (JsValue::ElementRef(parent_ref), JsValue::ElementRef(child_ref)) =
+                        (receiver, child)
+                    {
+                        return JsValue::Boolean(self.element_contains(&parent_ref, &child_ref));
                     }
                     return JsValue::Boolean(false);
                 }
@@ -5053,23 +5605,43 @@ impl BrowserExecutionState {
                     return JsValue::Undefined;
                 }
                 if method_name == "querySelector" {
-                    for arg in arguments {
-                        self.execute_expression(arg);
+                    let selector = arguments
+                        .first()
+                        .map(|arg| Self::value_to_string(&self.execute_expression(arg)))
+                        .unwrap_or_default();
+                    if let Some(id) = self.scoped_query_selector_first_id(&element_ref, &selector) {
+                        return self.element_ref_for_key(&id);
                     }
+                    self.trace_dom_query_empty("querySelector", &element_ref, &selector);
                     return JsValue::Null;
                 }
                 if method_name == "querySelectorAll" {
-                    for arg in arguments {
-                        self.execute_expression(arg);
+                    let selector = arguments
+                        .first()
+                        .map(|arg| Self::value_to_string(&self.execute_expression(arg)))
+                        .unwrap_or_default();
+                    let ids = self.scoped_query_selector_all_ids(&element_ref, &selector);
+                    if ids.is_empty() {
+                        self.trace_dom_query_empty("querySelectorAll", &element_ref, &selector);
                     }
-                    return JsValue::Array(vec![]);
+                    return JsValue::NodeList(ids);
                 }
                 if method_name == "getElementsByTagName" || method_name == "getElementsByClassName"
                 {
-                    for arg in arguments {
-                        self.execute_expression(arg);
+                    let selector = arguments
+                        .first()
+                        .map(|arg| Self::value_to_string(&self.execute_expression(arg)))
+                        .unwrap_or_default();
+                    let css = if method_name == "getElementsByClassName" {
+                        format!(".{selector}")
+                    } else {
+                        selector
+                    };
+                    let ids = self.scoped_query_selector_all_ids(&element_ref, &css);
+                    if ids.is_empty() {
+                        self.trace_dom_query_empty(&method_name, &element_ref, &css);
                     }
-                    return JsValue::Array(vec![]);
+                    return JsValue::NodeList(ids);
                 }
                 if method_name == "focus" || method_name == "blur" || method_name == "click" {
                     for arg in arguments {
@@ -5111,6 +5683,32 @@ impl BrowserExecutionState {
                 }
             }
 
+            if let JsValue::NodeList(ids) = receiver.clone() {
+                if method_name == "forEach" {
+                    let cb = arguments.first().map(|arg| self.execute_expression(arg));
+                    if let Some(JsValue::Function(func)) = cb {
+                        let list = JsValue::NodeList(ids.clone());
+                        for (index, id) in ids.into_iter().enumerate() {
+                            if self.execution_budget_exhausted {
+                                break;
+                            }
+                            self.call_function(
+                                func.clone(),
+                                vec![
+                                    self.element_ref_for_key(&id),
+                                    JsValue::Number(index as f64),
+                                    list.clone(),
+                                ],
+                            );
+                            if self.early_exit.is_some() {
+                                break;
+                            }
+                        }
+                    }
+                    return JsValue::Undefined;
+                }
+            }
+
             if method_name == "item" {
                 let index = arguments
                     .first()
@@ -5123,7 +5721,7 @@ impl BrowserExecutionState {
                         JsValue::Array(items) => items.get(index).cloned().unwrap_or(JsValue::Null),
                         JsValue::NodeList(ids) => ids
                             .get(index)
-                            .map(|id| JsValue::ElementRef(existing_element_ref(id)))
+                            .map(|id| self.element_ref_for_key(id))
                             .unwrap_or(JsValue::Null),
                         _ => JsValue::Undefined,
                     };
@@ -5682,6 +6280,34 @@ impl BrowserExecutionState {
             process.set("cwd", JsValue::HostFunction("process.cwd".into()));
         }
         JsValue::Object(process_rc)
+    }
+
+    fn media_query_list_object(query: String) -> JsValue {
+        let proto = match Self::native_prototype_object("MediaQueryList") {
+            JsValue::Object(rc) => rc,
+            _ => JsObject::new(),
+        };
+        let rc = JsObject::with_proto(proto);
+        {
+            let mut obj = rc.borrow_mut();
+            obj.class_name = Some("MediaQueryList".to_owned());
+            obj.set("media", JsValue::String(query));
+            obj.set("matches", JsValue::Boolean(false));
+            obj.set("onchange", JsValue::Null);
+            for method in [
+                "addListener",
+                "removeListener",
+                "addEventListener",
+                "removeEventListener",
+                "dispatchEvent",
+            ] {
+                obj.set(
+                    method,
+                    JsValue::HostFunction(format!("MediaQueryList.{method}")),
+                );
+            }
+        }
+        JsValue::Object(rc)
     }
 
     fn storage_map(&self, kind: &StorageKind) -> &HashMap<String, String> {
@@ -6357,9 +6983,11 @@ impl BrowserExecutionState {
                 Some(JsValue::String(s)) => {
                     JsValue::Array(s.chars().map(|c| JsValue::String(c.to_string())).collect())
                 }
-                Some(JsValue::NodeList(ids)) => {
-                    JsValue::Array(ids.into_iter().map(JsValue::ElementRef).collect())
-                }
+                Some(JsValue::NodeList(ids)) => JsValue::Array(
+                    ids.into_iter()
+                        .map(|id| self.element_ref_for_key(&id))
+                        .collect(),
+                ),
                 _ => JsValue::Array(vec![]),
             },
             "of" => JsValue::Array(args),
@@ -7211,36 +7839,534 @@ impl BrowserExecutionState {
     }
 
     fn query_selector_first_id(&self, selector: &str) -> Option<String> {
-        if let Some(id) = selector.strip_prefix('#') {
-            self.dom.query_selector_by_id.get(id).cloned()
-        } else if let Some(class_name) = selector.strip_prefix('.') {
-            self.dom.query_selector_by_class.get(class_name).cloned()
-        } else {
-            None
-        }
+        self.query_selector_all_ids(selector).into_iter().next()
     }
 
     fn query_selector_all_ids(&self, selector: &str) -> Vec<String> {
-        if let Some(id) = selector.strip_prefix('#') {
-            self.dom
-                .query_selector_by_id
-                .get(id)
-                .cloned()
-                .into_iter()
-                .collect()
-        } else if let Some(class_name) = selector.strip_prefix('.') {
-            self.dom
-                .query_selector_all_by_class
-                .get(class_name)
-                .cloned()
-                .unwrap_or_default()
+        let groups = Self::parse_selector_groups(selector);
+        if groups.is_empty() {
+            return Vec::new();
+        }
+        let mut matched = Vec::new();
+        let mut seen = HashSet::new();
+        for id in self.all_known_element_ids() {
+            if groups
+                .iter()
+                .any(|parts| self.element_key_matches_selector_parts(&id, parts))
+                && seen.insert(id.clone())
+            {
+                matched.push(id);
+            }
+        }
+        matched
+    }
+
+    fn scoped_query_selector_first_id(&self, root_ref: &str, selector: &str) -> Option<String> {
+        self.scoped_query_selector_all_ids(root_ref, selector)
+            .into_iter()
+            .next()
+    }
+
+    fn scoped_query_selector_all_ids(&self, root_ref: &str, selector: &str) -> Vec<String> {
+        let root_key = existing_id_from_ref(root_ref).unwrap_or_else(|| root_ref.to_owned());
+        let groups = Self::parse_selector_groups(selector);
+        if groups.is_empty() {
+            return Vec::new();
+        }
+        let mut matched = Vec::new();
+        let mut seen = HashSet::new();
+        for id in self.descendant_element_ids(&root_key) {
+            if groups
+                .iter()
+                .any(|parts| self.element_key_matches_selector_parts(&id, parts))
+                && seen.insert(id.clone())
+            {
+                matched.push(id);
+            }
+        }
+        matched
+    }
+
+    fn parse_selector_groups(selector: &str) -> Vec<Vec<SelectorPart>> {
+        Self::split_selector_groups(selector)
+            .into_iter()
+            .filter_map(|group| Self::parse_selector_chain(&group))
+            .collect()
+    }
+
+    fn split_selector_groups(selector: &str) -> Vec<String> {
+        let mut groups = Vec::new();
+        let mut current = String::new();
+        let mut bracket_depth = 0usize;
+        let mut quote = None;
+        for ch in selector.chars() {
+            if let Some(q) = quote {
+                if ch == q {
+                    quote = None;
+                }
+                current.push(ch);
+                continue;
+            }
+            match ch {
+                '"' | '\'' => {
+                    quote = Some(ch);
+                    current.push(ch);
+                }
+                '[' => {
+                    bracket_depth += 1;
+                    current.push(ch);
+                }
+                ']' => {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                    current.push(ch);
+                }
+                ',' if bracket_depth == 0 => {
+                    if !current.trim().is_empty() {
+                        groups.push(current.trim().to_owned());
+                    }
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+        if !current.trim().is_empty() {
+            groups.push(current.trim().to_owned());
+        }
+        groups
+    }
+
+    fn parse_selector_chain(selector: &str) -> Option<Vec<SelectorPart>> {
+        let mut raw_parts: Vec<(Option<SelectorCombinator>, String)> = Vec::new();
+        let mut current = String::new();
+        let mut bracket_depth = 0usize;
+        let mut quote = None;
+        let mut pending = None;
+        let mut saw_space = false;
+        for ch in selector.chars() {
+            if let Some(q) = quote {
+                if ch == q {
+                    quote = None;
+                }
+                current.push(ch);
+                continue;
+            }
+            match ch {
+                '"' | '\'' => {
+                    quote = Some(ch);
+                    current.push(ch);
+                }
+                '[' => {
+                    bracket_depth += 1;
+                    current.push(ch);
+                    saw_space = false;
+                }
+                ']' => {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                    current.push(ch);
+                    saw_space = false;
+                }
+                '>' if bracket_depth == 0 => {
+                    if !current.trim().is_empty() {
+                        raw_parts.push((pending.take(), current.trim().to_owned()));
+                        current.clear();
+                    }
+                    pending = Some(SelectorCombinator::Child);
+                    saw_space = false;
+                }
+                ch if ch.is_whitespace() && bracket_depth == 0 => {
+                    if !current.trim().is_empty() {
+                        raw_parts.push((pending.take(), current.trim().to_owned()));
+                        current.clear();
+                    }
+                    if pending.is_none() {
+                        saw_space = true;
+                    }
+                }
+                _ => {
+                    if saw_space && pending.is_none() && !raw_parts.is_empty() {
+                        pending = Some(SelectorCombinator::Descendant);
+                    }
+                    saw_space = false;
+                    current.push(ch);
+                }
+            }
+        }
+        if !current.trim().is_empty() {
+            raw_parts.push((pending.take(), current.trim().to_owned()));
+        }
+
+        let mut parts = Vec::new();
+        for (index, (combinator, raw)) in raw_parts.into_iter().enumerate() {
+            let simple = Self::parse_simple_selector(&raw)?;
+            parts.push(SelectorPart {
+                combinator: if index == 0 { None } else { combinator },
+                simple,
+            });
+        }
+        if parts.is_empty() { None } else { Some(parts) }
+    }
+
+    fn parse_simple_selector(raw: &str) -> Option<SimpleSelector> {
+        let mut selector = SimpleSelector::default();
+        let mut chars = raw.char_indices().peekable();
+        let mut tag = String::new();
+        while let Some((_, ch)) = chars.peek().copied() {
+            if matches!(ch, '#' | '.' | '[' | ':') {
+                break;
+            }
+            tag.push(ch);
+            chars.next();
+        }
+        let tag = tag.trim();
+        if !tag.is_empty() && tag != "*" {
+            selector.tag = Some(tag.to_ascii_lowercase());
+        }
+        while let Some((_, ch)) = chars.next() {
+            match ch {
+                '#' => {
+                    let ident = Self::take_selector_ident(&mut chars);
+                    if !ident.is_empty() {
+                        selector.id = Some(ident);
+                    }
+                }
+                '.' => {
+                    let ident = Self::take_selector_ident(&mut chars);
+                    if !ident.is_empty() {
+                        selector.classes.push(ident);
+                    }
+                }
+                '[' => {
+                    let mut attr = String::new();
+                    let mut quote = None;
+                    for (_, attr_ch) in chars.by_ref() {
+                        if let Some(q) = quote {
+                            if attr_ch == q {
+                                quote = None;
+                            }
+                            attr.push(attr_ch);
+                            continue;
+                        }
+                        match attr_ch {
+                            '"' | '\'' => {
+                                quote = Some(attr_ch);
+                                attr.push(attr_ch);
+                            }
+                            ']' => break,
+                            _ => attr.push(attr_ch),
+                        }
+                    }
+                    if let Some(parsed) = Self::parse_selector_attr(&attr) {
+                        selector.attrs.push(parsed);
+                    }
+                }
+                ':' => break,
+                _ => {}
+            }
+        }
+        Some(selector)
+    }
+
+    fn take_selector_ident<I>(chars: &mut std::iter::Peekable<I>) -> String
+    where
+        I: Iterator<Item = (usize, char)>,
+    {
+        let mut ident = String::new();
+        while let Some((_, ch)) = chars.peek().copied() {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':') {
+                ident.push(ch);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        ident
+    }
+
+    fn parse_selector_attr(raw: &str) -> Option<(String, Option<String>)> {
+        let (name, value) = raw.split_once('=').map_or((raw, None), |(name, value)| {
+            (
+                name,
+                Some(value.trim().trim_matches(['"', '\'']).to_owned()),
+            )
+        });
+        let name = name.trim();
+        if name.is_empty() {
+            None
         } else {
-            Vec::new()
+            Some((name.to_owned(), value))
+        }
+    }
+
+    fn all_known_element_ids(&self) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut seen = HashSet::new();
+        for builtin in ["html", "head", "body"] {
+            ids.push(builtin.to_owned());
+            seen.insert(builtin.to_owned());
+        }
+        for root in ["html", "head", "body"] {
+            for id in self.descendant_element_ids(root) {
+                if seen.insert(id.clone()) {
+                    ids.push(id);
+                }
+            }
+        }
+        let mut tag_names: Vec<_> = self.dom.query_selector_all_by_tag.keys().cloned().collect();
+        tag_names.sort();
+        for tag_name in tag_names {
+            if let Some(tag_ids) = self.dom.query_selector_all_by_tag.get(&tag_name) {
+                for id in tag_ids {
+                    if seen.insert(id.clone()) {
+                        ids.push(id.clone());
+                    }
+                }
+            }
+        }
+        let mut remaining: Vec<String> = self
+            .dom
+            .tag_name_by_id
+            .keys()
+            .chain(self.dom.attributes_by_id.keys())
+            .chain(self.dom.text_content_by_id.keys())
+            .chain(self.dom.created_elements.keys())
+            .filter(|id| !seen.contains(*id))
+            .cloned()
+            .collect();
+        remaining.sort();
+        remaining.dedup();
+        ids.extend(remaining);
+        ids
+    }
+
+    fn descendant_element_ids(&self, root_key: &str) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut queue = self.child_element_ids(root_key);
+        let mut cursor = 0usize;
+        while let Some(id) = queue.get(cursor).cloned() {
+            cursor += 1;
+            if ids.contains(&id) {
+                continue;
+            }
+            ids.push(id);
+            queue.extend(self.child_element_ids(ids.last().expect("just pushed")));
+        }
+        ids
+    }
+
+    fn child_element_ids(&self, parent_key: &str) -> Vec<String> {
+        self.dom
+            .child_ids_by_parent
+            .get(parent_key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn sibling_element_id(&self, key: &str, next: bool) -> Option<String> {
+        let parent = self.dom.parent_by_id.get(key)?;
+        let siblings = self.dom.child_ids_by_parent.get(parent)?;
+        let index = siblings.iter().position(|id| id == key)?;
+        if next {
+            siblings.get(index + 1).cloned()
+        } else {
+            index
+                .checked_sub(1)
+                .and_then(|prev| siblings.get(prev).cloned())
+        }
+    }
+
+    fn element_ref_for_key(&self, key: &str) -> JsValue {
+        if key.starts_with("created:") {
+            JsValue::ElementRef(key.to_owned())
+        } else {
+            JsValue::ElementRef(existing_element_ref(key))
+        }
+    }
+
+    fn element_key_matches_selector_parts(&self, key: &str, parts: &[SelectorPart]) -> bool {
+        if parts.is_empty() || !self.element_key_matches_simple(key, &parts[parts.len() - 1].simple)
+        {
+            return false;
+        }
+        let mut current = key.to_owned();
+        for index in (1..parts.len()).rev() {
+            match parts[index].combinator {
+                Some(SelectorCombinator::Child) => {
+                    let Some(parent) = self.dom.parent_by_id.get(&current) else {
+                        return false;
+                    };
+                    if !self.element_key_matches_simple(parent, &parts[index - 1].simple) {
+                        return false;
+                    }
+                    current = parent.clone();
+                }
+                Some(SelectorCombinator::Descendant) | None => {
+                    let Some(parent) =
+                        self.find_matching_ancestor(&current, &parts[index - 1].simple)
+                    else {
+                        return false;
+                    };
+                    current = parent;
+                }
+            }
+        }
+        true
+    }
+
+    fn find_matching_ancestor(&self, key: &str, simple: &SimpleSelector) -> Option<String> {
+        let mut current = self.dom.parent_by_id.get(key)?.clone();
+        let mut visited = HashSet::new();
+        loop {
+            if self.element_key_matches_simple(&current, simple) {
+                return Some(current);
+            }
+            if !visited.insert(current.clone()) {
+                return None;
+            }
+            current = self.dom.parent_by_id.get(&current)?.clone();
+        }
+    }
+
+    fn element_key_matches_simple(&self, key: &str, selector: &SimpleSelector) -> bool {
+        if let Some(id) = &selector.id {
+            let attr_id = self.element_attribute_for_key(key, "id");
+            if key != id && attr_id.as_deref() != Some(id.as_str()) {
+                return false;
+            }
+        }
+        if let Some(tag) = &selector.tag
+            && self
+                .element_tag_for_key(key)
+                .map(|actual| actual != *tag)
+                .unwrap_or(true)
+        {
+            return false;
+        }
+        if !selector.classes.is_empty() {
+            let classes = self
+                .element_attribute_for_key(key, "class")
+                .unwrap_or_default();
+            for class_name in &selector.classes {
+                if !classes
+                    .split_ascii_whitespace()
+                    .any(|class| class == class_name)
+                {
+                    return false;
+                }
+            }
+        }
+        for (name, expected) in &selector.attrs {
+            let Some(actual) = self.element_attribute_for_key(key, name) else {
+                return false;
+            };
+            if let Some(expected) = expected
+                && actual != *expected
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn element_attribute_for_key(&self, key: &str, name: &str) -> Option<String> {
+        let element_ref = if key.starts_with("created:") {
+            key.to_owned()
+        } else {
+            existing_element_ref(key)
+        };
+        if name == "id" && !key.starts_with("created:") {
+            Some(key.to_owned()).or_else(|| self.get_element_attribute(&element_ref, name))
+        } else {
+            self.get_element_attribute(&element_ref, name)
+        }
+    }
+
+    fn element_tag_for_key(&self, key: &str) -> Option<String> {
+        self.dom
+            .tag_name_by_id
+            .get(key)
+            .cloned()
+            .or_else(|| match key {
+                "html" | "head" | "body" => Some(key.to_owned()),
+                _ => None,
+            })
+    }
+
+    fn get_elements_by_tag_name_ids(&self, tag_name: &str) -> Vec<String> {
+        let tag_name = tag_name.trim().to_ascii_lowercase();
+        if tag_name == "*" {
+            let mut ids: Vec<_> = self.dom.tag_name_by_id.keys().cloned().collect();
+            ids.sort();
+            return ids;
+        }
+
+        let ids = self
+            .dom
+            .query_selector_all_by_tag
+            .get(&tag_name)
+            .cloned()
+            .unwrap_or_default();
+        if !ids.is_empty() {
+            return ids;
+        }
+
+        match tag_name.as_str() {
+            "body" => vec!["body".to_owned()],
+            "head" => vec!["head".to_owned()],
+            "html" => vec!["html".to_owned()],
+            _ => Vec::new(),
+        }
+    }
+
+    fn element_matches_selector(&self, element_ref: &str, selector: &str) -> bool {
+        let key = existing_id_from_ref(element_ref).unwrap_or_else(|| element_ref.to_owned());
+        Self::parse_selector_groups(selector)
+            .iter()
+            .any(|parts| self.element_key_matches_selector_parts(&key, parts))
+    }
+
+    fn closest_matching_ancestor(&self, element_ref: &str, selector: &str) -> Option<String> {
+        let mut key = existing_id_from_ref(element_ref).unwrap_or_else(|| element_ref.to_owned());
+        let mut visited = HashSet::new();
+        loop {
+            let current_ref = if key.starts_with("created:") {
+                key.clone()
+            } else {
+                existing_element_ref(&key)
+            };
+            if self.element_matches_selector(&current_ref, selector) {
+                return Some(key);
+            }
+            if !visited.insert(key.clone()) {
+                return None;
+            }
+            key = self.dom.parent_by_id.get(&key)?.clone();
+        }
+    }
+
+    fn element_contains(&self, parent_ref: &str, child_ref: &str) -> bool {
+        let parent_key = existing_id_from_ref(parent_ref).unwrap_or_else(|| parent_ref.to_owned());
+        let mut child_key = existing_id_from_ref(child_ref).unwrap_or_else(|| child_ref.to_owned());
+        let mut visited = HashSet::new();
+        loop {
+            if child_key == parent_key {
+                return true;
+            }
+            if !visited.insert(child_key.clone()) {
+                return false;
+            }
+            let Some(next) = self.dom.parent_by_id.get(&child_key) else {
+                return false;
+            };
+            child_key = next.clone();
         }
     }
 
     fn assign_target(&mut self, target: &Expression, value: JsValue) {
         if let Some((element_id, property)) = document_get_element_member(target) {
+            if let Some(event_type) = Self::event_type_from_handler_property(&property) {
+                self.register_event_handler_value(element_id, event_type, value);
+                return;
+            }
             let element_ref = existing_element_ref(&element_id);
             self.assign_element_property(&element_ref, &property, value);
             return;
@@ -7323,7 +8449,47 @@ impl BrowserExecutionState {
             let receiver = self.execute_expression(object);
             match receiver {
                 JsValue::ElementRef(element_ref) => {
+                    if let Some(event_type) = Self::event_type_from_handler_property(&property) {
+                        let element_id = existing_id_from_ref(&element_ref)
+                            .unwrap_or_else(|| element_ref.clone());
+                        self.register_event_handler_value(element_id, event_type, value);
+                        return;
+                    }
                     self.assign_element_property(&element_ref, &property, value);
+                    return;
+                }
+                JsValue::DocumentRef => {
+                    if let Some(event_type) = Self::event_type_from_handler_property(&property) {
+                        if event_type == "DOMContentLoaded" {
+                            if let Some(callback) = Self::function_from_value(value) {
+                                self.enqueue_function_microtask(callback, Vec::new());
+                            }
+                        } else {
+                            self.register_event_handler_value(
+                                "document".to_owned(),
+                                event_type,
+                                value,
+                            );
+                        }
+                        return;
+                    }
+                }
+                JsValue::WindowRef => {
+                    if let Some(event_type) = Self::event_type_from_handler_property(&property) {
+                        if event_type == "load" || event_type == "DOMContentLoaded" {
+                            if let Some(callback) = Self::function_from_value(value) {
+                                self.enqueue_function_microtask(callback, Vec::new());
+                            }
+                        } else {
+                            self.register_event_handler_value(
+                                "window".to_owned(),
+                                event_type,
+                                value,
+                            );
+                        }
+                        return;
+                    }
+                    self.globals.insert(property, value);
                     return;
                 }
                 JsValue::StyleRef(element_id) => {
@@ -7510,6 +8676,7 @@ impl BrowserExecutionState {
                     self.stack.clone(),
                 );
                 mfunc.super_ctor = super_ctor_for_methods.clone().map(Box::new);
+                self.stamp_function_module_base(&mut mfunc);
                 let mval = JsValue::Function(mfunc);
                 match kind {
                     MethodKind::Get => proto.set_getter(method.name.clone(), mval),
@@ -7549,6 +8716,7 @@ impl BrowserExecutionState {
         ctor_func.default_derived_ctor = is_default_derived_ctor;
         ctor_func.super_ctor = super_ctor_val.map(Box::new);
         ctor_func.instance_fields = instance_fields;
+        self.stamp_function_module_base(&mut ctor_func);
         ctor_func
             .properties
             .insert("prototype".into(), JsValue::Object(Rc::clone(&proto_rc)));
@@ -7563,6 +8731,7 @@ impl BrowserExecutionState {
                 self.stack.clone(),
             );
             mfunc.super_ctor = super_ctor_for_methods.clone().map(Box::new);
+            self.stamp_function_module_base(&mut mfunc);
             let mval = JsValue::Function(mfunc);
             match kind {
                 MethodKind::Get => {
@@ -7664,6 +8833,12 @@ impl BrowserExecutionState {
     }
 
     fn assign_element_property(&mut self, element_ref: &str, property: &str, value: JsValue) {
+        if let Some(event_type) = property.strip_prefix("on") {
+            let element_id =
+                existing_id_from_ref(element_ref).unwrap_or_else(|| element_ref.to_owned());
+            self.register_event_handler_value(element_id, event_type.to_owned(), value);
+            return;
+        }
         let value = Self::value_to_string(&value);
         if dom_property_is_text_content(property) {
             self.set_element_text_content(element_ref, value);
@@ -7765,7 +8940,7 @@ impl BrowserExecutionState {
                         let idx = Self::value_to_number(&index);
                         if idx >= 0.0 && idx.fract() == 0.0 {
                             ids.get(idx as usize)
-                                .map(|id| JsValue::ElementRef(existing_element_ref(id)))
+                                .map(|id| self.element_ref_for_key(id))
                                 .unwrap_or(JsValue::Undefined)
                         } else {
                             JsValue::Undefined
@@ -8144,26 +9319,66 @@ impl BrowserExecutionState {
                             property.as_str(),
                             "parentNode" | "parentElement" | "offsetParent"
                         ) {
-                            return JsValue::Null;
+                            let key = existing_id_from_ref(&element_ref)
+                                .unwrap_or_else(|| element_ref.clone());
+                            return self
+                                .dom
+                                .parent_by_id
+                                .get(&key)
+                                .map(|parent| {
+                                    if parent.starts_with("created:") {
+                                        JsValue::ElementRef(parent.clone())
+                                    } else {
+                                        JsValue::ElementRef(existing_element_ref(parent))
+                                    }
+                                })
+                                .unwrap_or(JsValue::Null);
                         }
                         if matches!(
                             property.as_str(),
                             "children" | "childNodes" | "childElementCount"
                         ) {
-                            return JsValue::Array(vec![]);
+                            let key = existing_id_from_ref(&element_ref)
+                                .unwrap_or_else(|| element_ref.clone());
+                            let children = self.child_element_ids(&key);
+                            return if property == "childElementCount" {
+                                JsValue::Number(children.len() as f64)
+                            } else {
+                                JsValue::NodeList(children)
+                            };
                         }
                         if matches!(
                             property.as_str(),
-                            "firstChild"
-                                | "lastChild"
-                                | "firstElementChild"
-                                | "lastElementChild"
-                                | "nextSibling"
+                            "firstChild" | "lastChild" | "firstElementChild" | "lastElementChild"
+                        ) {
+                            let key = existing_id_from_ref(&element_ref)
+                                .unwrap_or_else(|| element_ref.clone());
+                            let children = self.child_element_ids(&key);
+                            let child = if matches!(
+                                property.as_str(),
+                                "firstChild" | "firstElementChild"
+                            ) {
+                                children.first()
+                            } else {
+                                children.last()
+                            };
+                            return child
+                                .map(|id| self.element_ref_for_key(id))
+                                .unwrap_or(JsValue::Null);
+                        }
+                        if matches!(
+                            property.as_str(),
+                            "nextSibling"
                                 | "previousSibling"
                                 | "nextElementSibling"
                                 | "previousElementSibling"
                         ) {
-                            return JsValue::Null;
+                            let key = existing_id_from_ref(&element_ref)
+                                .unwrap_or_else(|| element_ref.clone());
+                            return self
+                                .sibling_element_id(&key, property.starts_with("next"))
+                                .map(|id| self.element_ref_for_key(&id))
+                                .unwrap_or(JsValue::Null);
                         }
                         if property == "nodeType" {
                             return JsValue::Number(1.0);
@@ -8264,6 +9479,15 @@ impl BrowserExecutionState {
                     JsValue::StorageRef(kind) => {
                         if property == "length" {
                             JsValue::Number(self.storage_map(&kind).len() as f64)
+                        } else if matches!(
+                            property.as_str(),
+                            "getItem" | "setItem" | "removeItem" | "clear" | "key"
+                        ) {
+                            let storage_name = match kind {
+                                StorageKind::Local => "localStorage",
+                                StorageKind::Session => "sessionStorage",
+                            };
+                            JsValue::HostFunction(format!("{storage_name}.{property}"))
                         } else {
                             self.storage_map(&kind)
                                 .get(property.as_str())
@@ -8357,6 +9581,20 @@ impl BrowserExecutionState {
                     JsValue::NodeList(items) if property == "length" => {
                         JsValue::Number(items.len() as f64)
                     }
+                    JsValue::NodeList(items) => {
+                        if let Ok(index) = property.parse::<usize>() {
+                            items
+                                .get(index)
+                                .map(|id| self.element_ref_for_key(id))
+                                .unwrap_or(JsValue::Undefined)
+                        } else if matches!(property.as_str(), "item" | "forEach") {
+                            JsValue::HostFunction(format!("NodeList.prototype.{property}"))
+                        } else if property == "Symbol(Symbol.iterator)" {
+                            JsValue::HostFunction("Array.prototype.values".to_owned())
+                        } else {
+                            JsValue::Undefined
+                        }
+                    }
                     JsValue::Array(items) if property == "length" => {
                         JsValue::Number(items.len() as f64)
                     }
@@ -8421,10 +9659,22 @@ impl BrowserExecutionState {
         self.dom.created_elements.insert(
             element_ref.clone(),
             DomElementSnapshot {
-                tag_name,
+                tag_name: tag_name.clone(),
                 ..Default::default()
             },
         );
+        self.dom
+            .tag_name_by_id
+            .insert(element_ref.clone(), tag_name.to_ascii_lowercase());
+        self.dom
+            .query_selector_by_tag
+            .entry(tag_name.to_ascii_lowercase())
+            .or_insert_with(|| element_ref.clone());
+        self.dom
+            .query_selector_all_by_tag
+            .entry(tag_name.to_ascii_lowercase())
+            .or_default()
+            .push(element_ref.clone());
         JsValue::ElementRef(element_ref)
     }
 
@@ -8460,9 +9710,37 @@ impl BrowserExecutionState {
         let Some(child) = self.dom.created_elements.get(child_ref).cloned() else {
             return;
         };
+        let parent_key = existing_id_from_ref(parent_ref).unwrap_or_else(|| parent_ref.to_owned());
+        self.dom
+            .parent_by_id
+            .insert(child_ref.to_owned(), parent_key.clone());
+        let children = self
+            .dom
+            .child_ids_by_parent
+            .entry(parent_key.clone())
+            .or_default();
+        if !children.iter().any(|id| id == child_ref) {
+            children.push(child_ref.to_owned());
+        }
         if let Some(parent_id) = existing_id_from_ref(parent_ref) {
-            self.effects
-                .push(BrowserEffect::AppendChild { parent_id, child });
+            self.effects.push(BrowserEffect::AppendChild {
+                parent_id,
+                child: child.clone(),
+            });
+        }
+        if child.tag_name.eq_ignore_ascii_case("script")
+            && let Some(url) = child.attributes.get("src").filter(|url| !url.is_empty())
+        {
+            let is_module = child
+                .attributes
+                .get("type")
+                .map(|value| value.eq_ignore_ascii_case("module"))
+                .unwrap_or(false);
+            self.effects.push(BrowserEffect::ScriptLoadRequest {
+                element_ref: child_ref.to_owned(),
+                url: url.clone(),
+                is_module,
+            });
         }
     }
 
@@ -8521,7 +9799,10 @@ impl BrowserExecutionState {
 
     fn set_element_attribute(&mut self, element_ref: &str, name: &str, value: String) {
         if let Some(element) = self.dom.created_elements.get_mut(element_ref) {
-            element.attributes.insert(name.to_owned(), value);
+            element.attributes.insert(name.to_owned(), value.clone());
+            if name == "class" {
+                self.update_class_selector_index(element_ref, Some(&value));
+            }
         } else if let Some(element_id) = existing_id_from_ref(element_ref) {
             if name == "class" {
                 self.update_class_selector_index(&element_id, Some(&value));
@@ -8542,6 +9823,9 @@ impl BrowserExecutionState {
     fn remove_element_attribute(&mut self, element_ref: &str, name: &str) {
         if let Some(element) = self.dom.created_elements.get_mut(element_ref) {
             element.attributes.remove(name);
+            if name == "class" {
+                self.update_class_selector_index(element_ref, None);
+            }
         } else if let Some(element_id) = existing_id_from_ref(element_ref) {
             if name == "class" {
                 self.update_class_selector_index(&element_id, None);
@@ -8615,9 +9899,10 @@ impl BrowserExecutionState {
             "navigator" => JsValue::NavigatorRef,
             "globalThis" => JsValue::WindowRef,
             "import" => JsValue::HostFunction("import".into()),
-            "import.meta" => {
-                JsValue::from_map([("url".to_owned(), JsValue::String(String::new()))])
-            }
+            "import.meta" => JsValue::from_map([(
+                "url".to_owned(),
+                JsValue::String(self.current_import_base_url().unwrap_or_default()),
+            )]),
             "ActiveXObject" => JsValue::HostFunction("ActiveXObject".into()),
             // Built-in constructors exposed as HostFunctions so `instanceof` and
             // `.prototype` access work correctly.
@@ -8628,14 +9913,24 @@ impl BrowserExecutionState {
             | "JSON" | "Int8Array" | "Uint8Array" | "Uint8ClampedArray" | "Int16Array"
             | "Uint16Array" | "Int32Array" | "Uint32Array" | "Float32Array" | "Float64Array"
             | "BigInt64Array" | "BigUint64Array" | "ArrayBuffer" | "DataView"
-            | "SharedArrayBuffer" | "Atomics" | "WebAssembly" => {
+            | "SharedArrayBuffer" | "Atomics" | "WebAssembly" | "URL" | "MediaQueryList" => {
                 JsValue::HostFunction(name.to_owned())
             }
             "AudioContext"
             | "webkitAudioContext"
             | "OfflineAudioContext"
-            | "webkitOfflineAudioContext" => JsValue::HostFunction(name.to_owned()),
-            "escape" | "unescape" => JsValue::HostFunction(name.to_owned()),
+            | "webkitOfflineAudioContext"
+            | "MutationObserver"
+            | "IntersectionObserver"
+            | "ResizeObserver" => JsValue::HostFunction(name.to_owned()),
+            "requestAnimationFrame"
+            | "cancelAnimationFrame"
+            | "queueMicrotask"
+            | "matchMedia"
+            | "escape"
+            | "unescape" => JsValue::HostFunction(name.to_owned()),
+            "localStorage" => JsValue::StorageRef(StorageKind::Local),
+            "sessionStorage" => JsValue::StorageRef(StorageKind::Session),
             "process" => Self::browser_process_object(),
             _ => JsValue::Undefined,
         })
@@ -10515,10 +11810,19 @@ impl BrowserExecutionState {
         let super_ctor = func.super_ctor.clone();
         let instance_fields = func.instance_fields.clone();
         let default_derived_ctor = func.default_derived_ctor;
+        let function_module_base = func.module_base_url.clone();
         // Move captured frames directly — no clone needed since func is owned.
         let saved_stack = std::mem::replace(&mut self.stack, func.captured);
+        let saved_module_url = if let Some(module_base) = function_module_base {
+            Some(self.current_module_url.replace(module_base))
+        } else {
+            None
+        };
         self.ensure_global_frame();
         self.stack.push(StackFrame::function_scope());
+        if let Some(frame) = self.stack.last_mut() {
+            frame.module_base_url = func.module_base_url.clone();
+        }
         self.set_local("this", this_value);
         // Inject superclass constructor so `super(args)` can find it.
         if let Some(ctor) = super_ctor {
@@ -10570,6 +11874,9 @@ impl BrowserExecutionState {
         self.stack.pop();
         self.ensure_global_frame();
         let _ = std::mem::replace(&mut self.stack, saved_stack);
+        if let Some(previous) = saved_module_url {
+            self.current_module_url = previous;
+        }
         (result, this_after)
     }
 
@@ -10583,9 +11890,18 @@ impl BrowserExecutionState {
         let super_ctor = func.super_ctor.clone();
         let instance_fields = func.instance_fields.clone();
         let default_derived_ctor = func.default_derived_ctor;
+        let function_module_base = func.module_base_url.clone();
         let saved_stack = std::mem::replace(&mut self.stack, func.captured);
+        let saved_module_url = if let Some(module_base) = function_module_base {
+            Some(self.current_module_url.replace(module_base))
+        } else {
+            None
+        };
         self.ensure_global_frame();
         self.stack.push(StackFrame::function_scope());
+        if let Some(frame) = self.stack.last_mut() {
+            frame.module_base_url = func.module_base_url.clone();
+        }
         self.set_local("this", this_value.clone());
         if let Some(ctor) = super_ctor {
             self.set_local("__super_ctor__", *ctor);
@@ -10641,6 +11957,9 @@ impl BrowserExecutionState {
             },
         );
         self.resume_async_continuation(id, PromiseStatus::Fulfilled(JsValue::Undefined));
+        if let Some(previous) = saved_module_url {
+            self.current_module_url = previous;
+        }
         JsValue::Promise(promise)
     }
 
@@ -12284,6 +13603,28 @@ impl BrowserExecutionState {
 
     fn call_host_function(&mut self, name: &str, this_arg: JsValue, args: Vec<JsValue>) -> JsValue {
         match name {
+            "Event.preventDefault" => {
+                if let JsValue::Object(rc) = this_arg {
+                    rc.borrow_mut()
+                        .set("defaultPrevented", JsValue::Boolean(true));
+                }
+                JsValue::Undefined
+            }
+            "Event.stopPropagation" => {
+                if let JsValue::Object(rc) = this_arg {
+                    rc.borrow_mut()
+                        .set("__stopPropagation", JsValue::Boolean(true));
+                }
+                JsValue::Undefined
+            }
+            "Event.stopImmediatePropagation" => {
+                if let JsValue::Object(rc) = this_arg {
+                    let mut event = rc.borrow_mut();
+                    event.set("__stopPropagation", JsValue::Boolean(true));
+                    event.set("__stopImmediatePropagation", JsValue::Boolean(true));
+                }
+                JsValue::Undefined
+            }
             "PromiseCapability.resolve" => {
                 if let Some(JsValue::Promise(promise)) = args.first() {
                     let guard = args
@@ -12378,6 +13719,118 @@ impl BrowserExecutionState {
                 }
                 JsValue::Object(rc)
             }
+            "requestAnimationFrame" => {
+                if let Some(callback) = args.first().cloned().and_then(Self::function_from_value) {
+                    self.enqueue_function_microtask(
+                        callback,
+                        vec![JsValue::Number(self.current_time_ms as f64)],
+                    );
+                }
+                JsValue::Number(1.0)
+            }
+            "cancelAnimationFrame" => JsValue::Undefined,
+            "queueMicrotask" => {
+                if let Some(callback) = args.first().cloned().and_then(Self::function_from_value) {
+                    self.enqueue_function_microtask(callback, Vec::new());
+                }
+                JsValue::Undefined
+            }
+            "matchMedia" => {
+                let query = args.first().map(Self::value_to_string).unwrap_or_default();
+                Self::media_query_list_object(query)
+            }
+            "MediaQueryList.addListener"
+            | "MediaQueryList.removeListener"
+            | "MediaQueryList.addEventListener"
+            | "MediaQueryList.removeEventListener"
+            | "MediaQueryList.prototype.addListener"
+            | "MediaQueryList.prototype.removeListener"
+            | "MediaQueryList.prototype.addEventListener"
+            | "MediaQueryList.prototype.removeEventListener" => JsValue::Undefined,
+            "MediaQueryList.dispatchEvent" | "MediaQueryList.prototype.dispatchEvent" => {
+                JsValue::Boolean(true)
+            }
+            "MutationObserver.observe"
+            | "MutationObserver.unobserve"
+            | "MutationObserver.disconnect"
+            | "IntersectionObserver.observe"
+            | "IntersectionObserver.unobserve"
+            | "IntersectionObserver.disconnect"
+            | "ResizeObserver.observe"
+            | "ResizeObserver.unobserve"
+            | "ResizeObserver.disconnect"
+            | "MutationObserver.prototype.observe"
+            | "MutationObserver.prototype.unobserve"
+            | "MutationObserver.prototype.disconnect"
+            | "IntersectionObserver.prototype.observe"
+            | "IntersectionObserver.prototype.unobserve"
+            | "IntersectionObserver.prototype.disconnect"
+            | "ResizeObserver.prototype.observe"
+            | "ResizeObserver.prototype.unobserve"
+            | "ResizeObserver.prototype.disconnect" => JsValue::Undefined,
+            "MutationObserver.takeRecords"
+            | "IntersectionObserver.takeRecords"
+            | "ResizeObserver.takeRecords"
+            | "MutationObserver.prototype.takeRecords"
+            | "IntersectionObserver.prototype.takeRecords"
+            | "ResizeObserver.prototype.takeRecords" => JsValue::Array(vec![]),
+            "localStorage.setItem" | "sessionStorage.setItem" => {
+                let kind = if name.starts_with("localStorage") {
+                    StorageKind::Local
+                } else {
+                    StorageKind::Session
+                };
+                let key = args.first().map(Self::value_to_string).unwrap_or_default();
+                let value = args.get(1).map(Self::value_to_string).unwrap_or_default();
+                self.storage_map_mut(kind).insert(key, value);
+                JsValue::Undefined
+            }
+            "localStorage.getItem" | "sessionStorage.getItem" => {
+                let kind = if name.starts_with("localStorage") {
+                    StorageKind::Local
+                } else {
+                    StorageKind::Session
+                };
+                let key = args.first().map(Self::value_to_string).unwrap_or_default();
+                self.storage_map(&kind)
+                    .get(&key)
+                    .cloned()
+                    .map(JsValue::String)
+                    .unwrap_or(JsValue::Null)
+            }
+            "localStorage.removeItem" | "sessionStorage.removeItem" => {
+                let kind = if name.starts_with("localStorage") {
+                    StorageKind::Local
+                } else {
+                    StorageKind::Session
+                };
+                let key = args.first().map(Self::value_to_string).unwrap_or_default();
+                self.storage_map_mut(kind).remove(&key);
+                JsValue::Undefined
+            }
+            "localStorage.clear" | "sessionStorage.clear" => {
+                let kind = if name.starts_with("localStorage") {
+                    StorageKind::Local
+                } else {
+                    StorageKind::Session
+                };
+                self.storage_map_mut(kind).clear();
+                JsValue::Undefined
+            }
+            "localStorage.key" | "sessionStorage.key" => {
+                let kind = if name.starts_with("localStorage") {
+                    StorageKind::Local
+                } else {
+                    StorageKind::Session
+                };
+                let index = args.first().map(Self::value_to_number).unwrap_or(0.0) as usize;
+                self.storage_map(&kind)
+                    .keys()
+                    .nth(index)
+                    .cloned()
+                    .map(JsValue::String)
+                    .unwrap_or(JsValue::Null)
+            }
             "Promise.try" => {
                 let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
                 if !Self::is_callable_value(&callback) {
@@ -12393,20 +13846,39 @@ impl BrowserExecutionState {
                 self.promise_resolve_input(result)
             }
             "import" => {
-                let url = args
+                let specifier = args
                     .first()
-                    .and_then(|v| if let JsValue::String(s) = v { Some(s.clone()) } else { None })
+                    .and_then(|v| {
+                        if let JsValue::String(s) = v {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or_default();
+                let base = self.current_import_base_url().unwrap_or_default();
+                let url = Self::resolve_url_like(&specifier, &base);
                 self.trace_runtime("dynamic_import.requested", format!("import({url})"));
                 let promise_state = Self::pending_promise();
                 let id = self.next_dynamic_import_id;
                 self.next_dynamic_import_id += 1;
-                self.pending_dynamic_imports.insert(id, promise_state.clone());
+                self.pending_dynamic_imports
+                    .insert(id, promise_state.clone());
                 self.effects.push(BrowserEffect::DynamicImportRequest {
                     url,
                     promise_id: id,
                 });
                 JsValue::Promise(promise_state)
+            }
+            "URL" => {
+                let specifier = args.first().map(Self::value_to_string).unwrap_or_default();
+                let base = args
+                    .get(1)
+                    .map(Self::value_to_string)
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| self.current_import_base_url())
+                    .unwrap_or_default();
+                Self::url_object(Self::resolve_url_like(&specifier, &base))
             }
             "process.cwd" => JsValue::String(String::new()),
             "Array.isArray" => JsValue::Boolean(matches!(args.first(), Some(JsValue::Array(_)))),
@@ -13739,6 +15211,21 @@ impl BrowserExecutionState {
                 "size",
             ],
             "Promise" => &["constructor", "then", "catch", "finally"],
+            "MediaQueryList" => &[
+                "constructor",
+                "addListener",
+                "removeListener",
+                "addEventListener",
+                "removeEventListener",
+                "dispatchEvent",
+            ],
+            "MutationObserver" | "IntersectionObserver" | "ResizeObserver" => &[
+                "constructor",
+                "observe",
+                "unobserve",
+                "disconnect",
+                "takeRecords",
+            ],
             "Error" | "TypeError" | "RangeError" | "ReferenceError" | "SyntaxError"
             | "URIError" | "EvalError" | "AggregateError" => {
                 &["constructor", "toString", "name", "message", "stack"]
@@ -13869,11 +15356,30 @@ impl BrowserExecutionState {
 
     fn constructor_prototype_object(name: &str) -> Option<JsValue> {
         match name {
-            "Object" | "Array" | "String" | "Function" | "Number" | "Boolean" | "RegExp"
-            | "Map" | "Set" | "Promise" | "Date" | "Error" | "TypeError" | "RangeError"
-            | "ReferenceError" | "SyntaxError" | "URIError" | "EvalError" | "AggregateError" => {
-                Some(Self::native_prototype_object(name))
-            }
+            "Object"
+            | "Array"
+            | "String"
+            | "Function"
+            | "Number"
+            | "Boolean"
+            | "RegExp"
+            | "Map"
+            | "Set"
+            | "Promise"
+            | "Date"
+            | "Error"
+            | "TypeError"
+            | "RangeError"
+            | "ReferenceError"
+            | "SyntaxError"
+            | "URIError"
+            | "EvalError"
+            | "AggregateError"
+            | "URL"
+            | "MediaQueryList"
+            | "MutationObserver"
+            | "IntersectionObserver"
+            | "ResizeObserver" => Some(Self::native_prototype_object(name)),
             _ => None,
         }
     }
@@ -14319,6 +15825,9 @@ impl BrowserExecutionState {
                 | "Promise"
                 | "Proxy"
                 | "Date"
+                | "MutationObserver"
+                | "IntersectionObserver"
+                | "ResizeObserver"
                 | "Int8Array"
                 | "Uint8Array"
                 | "Uint8ClampedArray"
@@ -14335,6 +15844,7 @@ impl BrowserExecutionState {
                 | "SharedArrayBuffer"
                 | "AggregateError"
                 | "Symbol"
+                | "URL"
         )
     }
 
@@ -14433,6 +15943,20 @@ impl BrowserExecutionState {
             | "Promise.race"
             | "Promise.try"
             | "JSON.parse" => 1,
+            "matchMedia"
+            | "requestAnimationFrame"
+            | "cancelAnimationFrame"
+            | "queueMicrotask"
+            | "MediaQueryList.addListener"
+            | "MediaQueryList.removeListener"
+            | "MediaQueryList.dispatchEvent"
+            | "MediaQueryList.prototype.addListener"
+            | "MediaQueryList.prototype.removeListener"
+            | "MediaQueryList.prototype.dispatchEvent" => 1,
+            "MediaQueryList.addEventListener"
+            | "MediaQueryList.removeEventListener"
+            | "MediaQueryList.prototype.addEventListener"
+            | "MediaQueryList.prototype.removeEventListener" => 2,
             "Array" | "Object" | "Function" | "String" | "Number" | "Boolean" | "RegExp"
             | "Error" | "TypeError" | "RangeError" | "ReferenceError" | "SyntaxError"
             | "URIError" | "EvalError" => 1,
@@ -14539,6 +16063,14 @@ impl BrowserExecutionState {
                 | "performance"
                 | "localStorage"
                 | "sessionStorage"
+                | "requestAnimationFrame"
+                | "cancelAnimationFrame"
+                | "queueMicrotask"
+                | "MediaQueryList"
+                | "MutationObserver"
+                | "IntersectionObserver"
+                | "ResizeObserver"
+                | "matchMedia"
         )
     }
 
@@ -14546,6 +16078,16 @@ impl BrowserExecutionState {
         match property {
             "window" | "self" | "top" | "parent" | "frames" => JsValue::WindowRef,
             "length" | "innerWidth" | "innerHeight" | "scrollX" | "scrollY" => JsValue::Number(0.0),
+            "localStorage" => JsValue::StorageRef(StorageKind::Local),
+            "sessionStorage" => JsValue::StorageRef(StorageKind::Session),
+            "requestAnimationFrame"
+            | "cancelAnimationFrame"
+            | "queueMicrotask"
+            | "MediaQueryList"
+            | "MutationObserver"
+            | "IntersectionObserver"
+            | "ResizeObserver"
+            | "matchMedia" => JsValue::HostFunction(property.to_owned()),
             _ => JsValue::Undefined,
         }
     }
@@ -14581,6 +16123,17 @@ impl BrowserExecutionState {
                 _ => JsValue::Undefined,
             };
         }
+        if matches!(
+            name,
+            "MutationObserver" | "IntersectionObserver" | "ResizeObserver"
+        ) {
+            return match property {
+                "observe" | "unobserve" | "disconnect" | "takeRecords" => {
+                    JsValue::HostFunction(format!("{name}.{property}"))
+                }
+                _ => JsValue::Undefined,
+            };
+        }
         JsValue::Undefined
     }
 
@@ -14613,6 +16166,21 @@ impl BrowserExecutionState {
         if name == "AudioBuffer" {
             return match method_name {
                 "getChannelData" => JsValue::Array(vec![]),
+                _ => JsValue::Undefined,
+            };
+        }
+        if matches!(
+            name,
+            "MutationObserver" | "IntersectionObserver" | "ResizeObserver"
+        ) {
+            return match method_name {
+                "observe" | "unobserve" | "disconnect" | "takeRecords" => {
+                    if method_name == "takeRecords" {
+                        JsValue::Array(vec![])
+                    } else {
+                        JsValue::Undefined
+                    }
+                }
                 _ => JsValue::Undefined,
             };
         }
@@ -14760,63 +16328,208 @@ impl BrowserExecutionState {
         event_type: &str,
         key: Option<&str>,
     ) -> Vec<BrowserEffect> {
-        let matching_indices: Vec<usize> = self
-            .event_handlers
-            .iter()
-            .enumerate()
-            .filter(|(_, h)| h.element_id == element_id && h.event_type == event_type)
-            .map(|(i, _)| i)
-            .collect();
+        self.fire_event_with_result(element_id, event_type, key)
+            .effects
+    }
 
-        for idx in matching_indices {
-            let handler = self.event_handlers[idx].clone();
+    pub fn fire_event_with_result(
+        &mut self,
+        element_id: &str,
+        event_type: &str,
+        key: Option<&str>,
+    ) -> BrowserEventResult {
+        let propagation_path = self.event_propagation_path(element_id);
+        let event_target_ref = Self::event_key_to_element_ref(element_id);
+        let event_rc = self.make_event_object(event_type, event_target_ref, key);
 
-            // Swap in the handler's captured environment as the active stack.
-            let saved_stack = std::mem::replace(&mut self.stack, handler.captured.clone());
-            self.ensure_global_frame();
+        for current_target in propagation_path {
+            if Self::event_flag(&event_rc, "__stopPropagation") {
+                break;
+            }
+            let matching_indices: Vec<usize> = self
+                .event_handlers
+                .iter()
+                .enumerate()
+                .filter(|(_, h)| h.element_id == current_target && h.event_type == event_type)
+                .map(|(i, _)| i)
+                .collect();
 
-            // Push an invocation frame for parameters.
-            self.stack.push(StackFrame::function_scope());
-            if let Some(param_name) = handler.params.first() {
-                let event_rc = JsObject::new();
+            for idx in matching_indices {
+                if Self::event_flag(&event_rc, "__stopImmediatePropagation") {
+                    break;
+                }
+                let handler = self.event_handlers[idx].clone();
+
+                // Swap in the handler's captured environment as the active stack.
+                let saved_stack =
+                    std::mem::replace(&mut self.stack, handler.callback.captured.clone());
+                self.ensure_global_frame();
+
                 {
                     let mut event_obj = event_rc.borrow_mut();
-                    event_obj.set("type", JsValue::String(event_type.to_owned()));
-                    event_obj.set(
-                        "target",
-                        JsValue::ElementRef(existing_element_ref(element_id)),
-                    );
-                    if let Some(k) = key {
-                        event_obj.set("key", JsValue::String(k.to_owned()));
+                    event_obj.set("currentTarget", Self::event_target_value(&current_target));
+                }
+                // Push an invocation frame for parameters.
+                self.stack.push(StackFrame::function_scope());
+                self.set_local("this", Self::event_target_value(&current_target));
+                if let Some(param) = handler.callback.params.first() {
+                    let binding = param.binding.clone();
+                    self.execute_binding(&binding, JsValue::Object(event_rc.clone()));
+                }
+
+                match handler.callback.body.clone() {
+                    FunctionBody::Block(block) => {
+                        self.hoist_function_declarations(&block.body);
+                        self.hoist_tdz_bindings(&block.body);
+                        for stmt in &block.body {
+                            self.execute_statement(stmt);
+                            if self.early_exit.is_some() {
+                                break;
+                            }
+                        }
+                        if matches!(self.early_exit, Some(EarlyExit::Return(_))) {
+                            self.early_exit = None;
+                        }
+                    }
+                    FunctionBody::Expr(expr) => {
+                        self.execute_expression(&expr);
                     }
                 }
-                if let Some(frame) = self.stack.last() {
-                    frame
-                        .locals
-                        .borrow_mut()
-                        .insert(param_name.clone(), Slot::var(JsValue::Object(event_rc)));
+
+                if let Some(message) = self.take_uncaught_throw() {
+                    self.effects.push(BrowserEffect::RuntimeTrace {
+                        kind: "event.listener.exception".to_owned(),
+                        detail: format!("{event_type} listener on {current_target}: {message}"),
+                    });
                 }
+
+                self.stack.pop();
+                self.ensure_global_frame();
+                self.drain_and_run_microtasks();
+
+                // Save the (possibly mutated) captured environment back so closures persist state.
+                let updated_captured = std::mem::replace(&mut self.stack, saved_stack);
+                self.event_handlers[idx].callback.captured = updated_captured;
             }
-
-            // execute_block pushes/pops its own frame.
-            self.execute_block(&handler.body);
-
-            // Pop our invocation frame (execute_block already popped its own).
-            self.stack.pop();
-            self.ensure_global_frame();
-
-            // Save the (possibly mutated) captured environment back so closures persist state.
-            let updated_captured = std::mem::replace(&mut self.stack, saved_stack);
-            self.event_handlers[idx].captured = updated_captured;
         }
 
-        self.drain_effects()
+        BrowserEventResult {
+            effects: self.drain_effects(),
+            default_prevented: Self::event_flag(&event_rc, "defaultPrevented"),
+        }
+    }
+
+    fn event_propagation_path(&self, element_id: &str) -> Vec<String> {
+        if element_id == "window" {
+            return vec!["window".to_owned()];
+        }
+        if element_id == "document" {
+            return vec!["document".to_owned(), "window".to_owned()];
+        }
+        let mut path = Vec::new();
+        let mut current = element_id.to_owned();
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current.clone()) {
+                break;
+            }
+            path.push(current.clone());
+            let Some(parent) = self.dom.parent_by_id.get(&current) else {
+                break;
+            };
+            current = parent.clone();
+        }
+        path.push("document".to_owned());
+        path.push("window".to_owned());
+        path
+    }
+
+    fn event_key_to_element_ref(element_id: &str) -> String {
+        if element_id.starts_with("created:") {
+            element_id.to_owned()
+        } else {
+            existing_element_ref(element_id)
+        }
+    }
+
+    fn event_target_value(element_id: &str) -> JsValue {
+        match element_id {
+            "document" => JsValue::DocumentRef,
+            "window" => JsValue::WindowRef,
+            _ => JsValue::ElementRef(Self::event_key_to_element_ref(element_id)),
+        }
+    }
+
+    fn make_event_object(
+        &self,
+        event_type: &str,
+        target_ref: String,
+        key: Option<&str>,
+    ) -> Rc<RefCell<JsObject>> {
+        let event_rc = JsObject::new();
+        {
+            let this = JsValue::Object(event_rc.clone());
+            let mut event_obj = event_rc.borrow_mut();
+            event_obj.set("type", JsValue::String(event_type.to_owned()));
+            event_obj.set("target", JsValue::ElementRef(target_ref));
+            event_obj.set("currentTarget", JsValue::Undefined);
+            event_obj.set("defaultPrevented", JsValue::Boolean(false));
+            event_obj.set("bubbles", JsValue::Boolean(true));
+            event_obj.set("cancelable", JsValue::Boolean(true));
+            event_obj.set("__stopPropagation", JsValue::Boolean(false));
+            event_obj.set("__stopImmediatePropagation", JsValue::Boolean(false));
+            event_obj.set(
+                "preventDefault",
+                JsValue::BoundHostFunction {
+                    name: "Event.preventDefault".to_owned(),
+                    this_arg: Box::new(this.clone()),
+                    bound_args: Vec::new(),
+                },
+            );
+            event_obj.set(
+                "stopPropagation",
+                JsValue::BoundHostFunction {
+                    name: "Event.stopPropagation".to_owned(),
+                    this_arg: Box::new(this.clone()),
+                    bound_args: Vec::new(),
+                },
+            );
+            event_obj.set(
+                "stopImmediatePropagation",
+                JsValue::BoundHostFunction {
+                    name: "Event.stopImmediatePropagation".to_owned(),
+                    this_arg: Box::new(this),
+                    bound_args: Vec::new(),
+                },
+            );
+            if let Some(k) = key {
+                event_obj.set("key", JsValue::String(k.to_owned()));
+            }
+        }
+        event_rc
+    }
+
+    fn event_flag(event_rc: &Rc<RefCell<JsObject>>, property: &str) -> bool {
+        matches!(
+            event_rc.borrow().get_own_data(property),
+            Some(JsValue::Boolean(true))
+        )
     }
 
     pub fn has_listener(&self, element_id: &str, event_type: &str) -> bool {
         self.event_handlers
             .iter()
             .any(|h| h.element_id == element_id && h.event_type == event_type)
+    }
+
+    pub fn has_listener_for_event_target(&self, element_id: &str, event_type: &str) -> bool {
+        let propagation_path = self.event_propagation_path(element_id);
+        self.event_handlers.iter().any(|handler| {
+            handler.event_type == event_type
+                && propagation_path
+                    .iter()
+                    .any(|target| target == &handler.element_id)
+        })
     }
 
     pub fn all_element_ids_with_listener(&self, event_type: &str) -> Vec<String> {
@@ -14847,14 +16560,38 @@ impl BrowserExecutionState {
 
         for timer in due {
             // Run against the live stack so callbacks see variables updated by microtasks.
-            self.stack.push(StackFrame::function_scope());
-            self.execute_block(&timer.body);
-            self.stack.pop();
-            self.ensure_global_frame();
+            self.call_function(timer.callback, Vec::new());
+            self.finish_fault_boundary("timer.exception", "timer callback");
             self.drain_and_run_microtasks();
         }
 
         self.drain_effects()
+    }
+
+    pub fn drain_post_script_event_loop(&mut self) {
+        self.drain_and_run_microtasks_bounded(Self::MAX_MICROTASK_DRAIN);
+        self.drain_due_timers_bounded(self.current_time_ms, Self::MAX_POST_SCRIPT_TIMER_DRAIN);
+        self.drain_and_run_microtasks_bounded(Self::MAX_MICROTASK_DRAIN);
+    }
+
+    fn drain_due_timers_bounded(&mut self, elapsed_ms: u64, max_timers: usize) -> usize {
+        self.current_time_ms = elapsed_ms;
+        let mut drained = 0usize;
+        while drained < max_timers {
+            let Some(index) = self
+                .pending_timers
+                .iter()
+                .position(|timer| timer.fires_at_ms <= elapsed_ms)
+            else {
+                break;
+            };
+            let timer = self.pending_timers.remove(index);
+            self.call_function(timer.callback, Vec::new());
+            self.finish_fault_boundary("timer.exception", "timer callback");
+            self.drain_and_run_microtasks_bounded(Self::MAX_MICROTASK_DRAIN);
+            drained += 1;
+        }
+        drained
     }
 }
 
@@ -15563,6 +17300,95 @@ mod tests {
     }
 
     #[test]
+    fn hydration_browser_api_stubs_are_available_and_noop() {
+        let effects = run(r#"
+            var media = matchMedia("(min-width: 1px)");
+            media.addEventListener("change", function () {});
+            var mutation = new MutationObserver(function () {});
+            var intersection = new IntersectionObserver(function () {});
+            var resize = new ResizeObserver(function () {});
+            mutation.observe(document.body, {});
+            intersection.observe(document.body);
+            resize.observe(document.body);
+            document.getElementById("result").textContent =
+                typeof requestAnimationFrame + ":" +
+                typeof queueMicrotask + ":" +
+                media.media + ":" +
+                String(media.matches) + ":" +
+                typeof mutation.observe + ":" +
+                String(mutation.takeRecords().length) + ":" +
+                typeof intersection.disconnect + ":" +
+                typeof resize.unobserve;
+            "#);
+
+        assert_eq!(
+            effects,
+            vec![text(
+                "result",
+                "function:function:(min-width: 1px):false:function:0:function:function"
+            )]
+        );
+    }
+
+    #[test]
+    fn match_media_stub_supports_hydration_feature_checks() {
+        let effects = run(r#"
+            var media = window.matchMedia("(prefers-color-scheme: dark)");
+            var add = media.addEventListener;
+            var remove = media.removeEventListener;
+            var legacyAdd = media.addListener;
+            var legacyRemove = media.removeListener;
+            add("change", function () {});
+            remove("change", function () {});
+            legacyAdd(function () {});
+            legacyRemove(function () {});
+            media.onchange = function () {};
+            document.getElementById("result").textContent =
+                String("addEventListener" in media) + ":" +
+                String("removeEventListener" in media) + ":" +
+                String(media instanceof MediaQueryList) + ":" +
+                typeof Object.getPrototypeOf(media).addEventListener + ":" +
+                String(Object.getPrototypeOf(media).addEventListener.length) + ":" +
+                String(media.dispatchEvent({ type: "change" })) + ":" +
+                typeof media.onchange;
+            "#);
+
+        assert_eq!(
+            effects,
+            vec![text("result", "true:true:true:function:2:true:function")]
+        );
+    }
+
+    #[test]
+    fn queue_microtask_and_request_animation_frame_run_callbacks() {
+        let effects = run(r#"
+            var value = "";
+            queueMicrotask(function () { value += "micro"; });
+            requestAnimationFrame(function (time) { value += ":raf:" + String(time); });
+            queueMicrotask(function () {
+                document.getElementById("result").textContent = value;
+            });
+            "#);
+
+        assert_eq!(effects, vec![text("result", "micro:raf:0")]);
+    }
+
+    #[test]
+    fn storage_stubs_support_detached_methods() {
+        let effects = run(r#"
+            var set = localStorage.setItem;
+            var get = localStorage.getItem;
+            set("name", "Ada");
+            sessionStorage.setItem("name", "Grace");
+            document.getElementById("result").textContent =
+                get("name") + ":" + sessionStorage.getItem("name") + ":" +
+                String(localStorage.length) + ":" + String(sessionStorage.length);
+            "#);
+
+        assert_eq!(effects, vec![text("result", "Ada:Grace:1:1")]);
+    }
+
+    #[test]
     fn inner_html_assignment_is_dom_effect() {
         let program = crate::parse_script(
             r#"document.getElementById("root").innerHTML = "<span>Hello</span>";"#,
@@ -15597,6 +17423,121 @@ mod tests {
             vec![BrowserEffect::SetTextContent {
                 element_id: "result".to_owned(),
                 value: "Hello".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn compound_selectors_match_seeded_dom_metadata() {
+        let mut state = BrowserExecutionState::default();
+        state.seed_existing_element_with_metadata(
+            "root",
+            String::new(),
+            HashMap::from([
+                ("id".to_owned(), "root".to_owned()),
+                ("class".to_owned(), "app".to_owned()),
+            ]),
+            Some("div"),
+            Some("body"),
+        );
+        state.seed_existing_element_with_metadata(
+            "section",
+            String::new(),
+            HashMap::from([
+                ("id".to_owned(), "section".to_owned()),
+                ("class".to_owned(), "panel active".to_owned()),
+                ("data-route".to_owned(), "home".to_owned()),
+            ]),
+            Some("section"),
+            Some("root"),
+        );
+        state.seed_existing_element_with_metadata(
+            "go",
+            String::new(),
+            HashMap::from([
+                ("id".to_owned(), "go".to_owned()),
+                ("class".to_owned(), "cta primary".to_owned()),
+                ("type".to_owned(), "submit".to_owned()),
+            ]),
+            Some("button"),
+            Some("section"),
+        );
+        state.seed_existing_element_with_metadata(
+            "link",
+            String::new(),
+            HashMap::from([
+                ("id".to_owned(), "link".to_owned()),
+                ("class".to_owned(), "cta".to_owned()),
+                ("href".to_owned(), "/go".to_owned()),
+            ]),
+            Some("a"),
+            Some("section"),
+        );
+        let program = crate::parse_script(
+            r##"
+            let match = document.querySelector('div.app > section.panel[data-route="home"] button.cta.primary');
+            let all = document.querySelectorAll('section.panel [type="submit"], a[href="/go"]');
+            let scoped = document.getElementById("root").querySelectorAll(".cta");
+            document.getElementById("result").textContent =
+                match.id + ":" + String(all.length) + ":" + all[1].id + ":" + String(scoped.length);
+            "##,
+        )
+        .expect("script should parse");
+
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "go:2:link:2".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn children_collections_support_index_item_siblings_and_foreach() {
+        let mut state = BrowserExecutionState::default();
+        state.seed_existing_element_with_metadata(
+            "root",
+            String::new(),
+            HashMap::from([("id".to_owned(), "root".to_owned())]),
+            Some("ul"),
+            Some("body"),
+        );
+        for id in ["a", "b", "c"] {
+            state.seed_existing_element_with_metadata(
+                id,
+                String::new(),
+                HashMap::from([("id".to_owned(), id.to_owned())]),
+                Some("li"),
+                Some("root"),
+            );
+        }
+        let program = crate::parse_script(
+            r#"
+            let root = document.getElementById("root");
+            let seen = "";
+            root.children.forEach(function (el, index) {
+                seen = seen + String(index) + el.id;
+            });
+            document.getElementById("result").textContent =
+                String(root.childElementCount) + ":" +
+                root.firstElementChild.id + ":" +
+                root.children.item(1).id + ":" +
+                root.children[2].previousElementSibling.id + ":" +
+                seen;
+            "#,
+        )
+        .expect("script should parse");
+
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "3:a:b:b:0a1b2c".to_owned(),
             }]
         );
     }
@@ -15703,6 +17644,276 @@ mod tests {
     }
 
     #[test]
+    fn assignment_event_handlers_register_for_element_document_and_window() {
+        let program = crate::parse_script(
+            r#"
+            document.getElementById("button").onclick = function () {
+                document.getElementById("result").textContent = "clicked";
+            };
+            document.onkeydown = function () {};
+            window.onresize = function () {};
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert!(state.has_listener("button", "click"));
+        assert!(state.has_listener("document", "keydown"));
+        assert!(state.has_listener("window", "resize"));
+
+        let effects = state.fire_event("button", "click", None);
+        assert_eq!(
+            effects,
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "clicked".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn add_event_listener_accepts_callback_references_and_arrow_functions() {
+        let program = crate::parse_script(
+            r#"
+            let button = document.getElementById("button");
+            function clicked() {
+                document.getElementById("result").textContent = "reference";
+            }
+            button.addEventListener("click", clicked);
+            document.addEventListener("keydown", function () {});
+            window.addEventListener("resize", () => {});
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert!(state.has_listener("button", "click"));
+        assert!(state.has_listener("document", "keydown"));
+        assert!(state.has_listener("window", "resize"));
+
+        let effects = state.fire_event("button", "click", None);
+        assert_eq!(
+            effects,
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "reference".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn events_bubble_to_ancestors_document_and_window_with_current_target() {
+        let program = crate::parse_script(
+            r#"
+            document.getElementById("parent").addEventListener("click", function (event) {
+                document.getElementById("result").textContent =
+                    event.target.id + "/" + event.currentTarget.id;
+            });
+            document.addEventListener("click", function () {
+                document.getElementById("document").textContent = "doc";
+            });
+            window.addEventListener("click", function () {
+                document.getElementById("window").textContent = "win";
+            });
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.seed_existing_element_with_metadata(
+            "parent",
+            String::new(),
+            HashMap::from([("id".to_owned(), "parent".to_owned())]),
+            Some("div"),
+            None,
+        );
+        state.seed_existing_element_with_metadata(
+            "child",
+            String::new(),
+            HashMap::from([("id".to_owned(), "child".to_owned())]),
+            Some("button"),
+            Some("parent"),
+        );
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.fire_event("child", "click", None),
+            vec![
+                BrowserEffect::SetTextContent {
+                    element_id: "result".to_owned(),
+                    value: "child/parent".to_owned(),
+                },
+                BrowserEffect::SetTextContent {
+                    element_id: "document".to_owned(),
+                    value: "doc".to_owned(),
+                },
+                BrowserEffect::SetTextContent {
+                    element_id: "window".to_owned(),
+                    value: "win".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn stop_propagation_and_prevent_default_update_event_object() {
+        let program = crate::parse_script(
+            r#"
+            document.getElementById("child").addEventListener("click", function (event) {
+                event.preventDefault();
+                event.stopPropagation();
+                document.getElementById("result").textContent = String(event.defaultPrevented);
+            });
+            document.addEventListener("click", function () {
+                document.getElementById("document").textContent = "doc";
+            });
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.seed_existing_element_with_metadata(
+            "child",
+            String::new(),
+            HashMap::from([("id".to_owned(), "child".to_owned())]),
+            Some("button"),
+            Some("parent"),
+        );
+        state.execute_program(&program);
+        state.drain_effects();
+
+        let event_result = state.fire_event_with_result("child", "click", None);
+        assert!(event_result.default_prevented);
+        assert_eq!(
+            event_result.effects,
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "true".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn element_contains_uses_seeded_parent_chain() {
+        let program = crate::parse_script(
+            r#"
+            let parent = document.getElementById("parent");
+            let child = document.getElementById("child");
+            document.getElementById("result").textContent = String(parent.contains(child));
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.seed_existing_element_with_metadata(
+            "parent",
+            String::new(),
+            HashMap::from([("id".to_owned(), "parent".to_owned())]),
+            Some("div"),
+            None,
+        );
+        state.seed_existing_element_with_metadata(
+            "child",
+            String::new(),
+            HashMap::from([("id".to_owned(), "child".to_owned())]),
+            Some("button"),
+            Some("parent"),
+        );
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "true".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn created_script_append_requests_load_and_preserves_onload_handler() {
+        let program = crate::parse_script(
+            r#"
+            let script = document.createElement("script");
+            script.src = "./chunk.js";
+            script.onload = function () {
+                document.getElementById("result").textContent = "loaded";
+            };
+            document.body.appendChild(script);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert!(state.has_listener("created:1", "load"));
+        assert_eq!(
+            state.drain_effects(),
+            vec![
+                BrowserEffect::AppendChild {
+                    parent_id: "body".to_owned(),
+                    child: DomElementSnapshot {
+                        tag_name: "script".to_owned(),
+                        attributes: HashMap::from([("src".to_owned(), "./chunk.js".to_owned())]),
+                        ..Default::default()
+                    },
+                },
+                BrowserEffect::ScriptLoadRequest {
+                    element_ref: "created:1".to_owned(),
+                    url: "./chunk.js".to_owned(),
+                    is_module: false,
+                },
+            ]
+        );
+
+        assert_eq!(
+            state.fire_event("created:1", "load", None),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "loaded".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn post_script_event_loop_runs_due_timer_setup_before_interaction() {
+        let program = crate::parse_script(
+            r#"
+            Promise.resolve().then(function () {
+                setTimeout(function () {
+                    document.getElementById("button").onclick = function () {
+                        document.getElementById("result").textContent = "ready";
+                    };
+                }, 0);
+            });
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        assert!(!state.has_listener("button", "click"));
+
+        state.drain_post_script_event_loop();
+        assert!(state.has_listener("button", "click"));
+
+        let effects = state.fire_event("button", "click", None);
+        assert_eq!(
+            effects,
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "ready".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
     fn tag_name_collection_supports_indexing_and_item() {
         let effects = run(r#"
             let bodies = document.getElementsByTagName("body");
@@ -15713,6 +17924,46 @@ mod tests {
         assert_eq!(
             effects,
             vec![text("result", "1:[object Element]:[object Element]")]
+        );
+    }
+
+    #[test]
+    fn tag_name_collection_uses_seeded_dom_tag_index() {
+        let mut state = BrowserExecutionState::default();
+        state.seed_existing_element_with_metadata(
+            "script_a",
+            String::new(),
+            HashMap::from([("id".to_owned(), "script_a".to_owned())]),
+            Some("script"),
+            Some("head"),
+        );
+        state.seed_existing_element_with_metadata(
+            "script_b",
+            String::new(),
+            HashMap::from([("id".to_owned(), "script_b".to_owned())]),
+            Some("script"),
+            Some("body"),
+        );
+        let program = crate::parse_script(
+            r#"
+            let scripts = document.getElementsByTagName("script");
+            document.getElementById("result").textContent =
+                String(scripts.length) + ":" +
+                scripts[0].id + ":" +
+                scripts.item(1).id + ":" +
+                scripts["0"].parentNode.id;
+            "#,
+        )
+        .expect("script should parse");
+
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "2:script_a:script_b:".to_owned(),
+            }]
         );
     }
 
@@ -15986,6 +18237,75 @@ mod tests {
                     && detail.contains("property=toString")
                     && detail.contains("receiver_tag=Number")
                     && detail.contains("result_tag=Undefined")
+        )));
+    }
+
+    #[test]
+    fn listener_registration_failures_are_traced() {
+        let effects = run(r#"
+            document.addEventListener("click", null);
+            let missing;
+            missing.addEventListener("input", function () {});
+            document.getElementById("button").onclick = "not callable";
+            "#);
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            BrowserEffect::RuntimeTrace { kind, detail }
+                if kind == "listener.registration.failed"
+                    && detail.contains("api=addEventListener")
+                    && detail.contains("target=document")
+                    && detail.contains("event=click")
+                    && detail.contains("callback_not_callable")
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            BrowserEffect::RuntimeTrace { kind, detail }
+                if kind == "listener.registration.failed"
+                    && detail.contains("target=receiver_tag=Undefined")
+                    && detail.contains("event=input")
+                    && detail.contains("unresolvable_target")
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            BrowserEffect::RuntimeTrace { kind, detail }
+                if kind == "listener.registration.failed"
+                    && detail.contains("api=property")
+                    && detail.contains("target=button")
+                    && detail.contains("event=click")
+                    && detail.contains("callback_not_callable")
+        )));
+    }
+
+    #[test]
+    fn empty_and_unsupported_dom_queries_are_traced() {
+        let effects = run(r#"
+            document.querySelector(".missing");
+            document.querySelectorAll("[data-missing]");
+            document.getElementById("root").querySelector(".child");
+            "#);
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            BrowserEffect::RuntimeTrace { kind, detail }
+                if kind == "dom.query.empty"
+                    && detail.contains("method=querySelector")
+                    && detail.contains("root=document")
+                    && detail.contains("selector=.missing")
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            BrowserEffect::RuntimeTrace { kind, detail }
+                if kind == "dom.query.empty"
+                    && detail.contains("method=querySelectorAll")
+                    && detail.contains("selector=[data-missing]")
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            BrowserEffect::RuntimeTrace { kind, detail }
+                if kind == "dom.query.empty"
+                    && detail.contains("method=querySelector")
+                    && detail.contains("selector=.child")
         )));
     }
 
@@ -21105,6 +23425,134 @@ mod tests {
     }
 
     #[test]
+    fn import_meta_url_tracks_current_module_key() {
+        let entry = crate::parse_script(
+            r#"
+            import { depUrl } from "./dep.js";
+            document.getElementById("result").textContent = import.meta.url + "|" + depUrl;
+            "#,
+        )
+        .expect("entry module should parse");
+        let dep = crate::parse_script(r#"export const depUrl = import.meta.url;"#)
+            .expect("dependency module should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_module_program_with_loader(
+            &entry,
+            "https://example.test/app/entry.js",
+            |base, source| {
+                if base == "https://example.test/app/entry.js" && source == "./dep.js" {
+                    Some(("https://example.test/app/dep.js".to_owned(), dep.clone()))
+                } else {
+                    None
+                }
+            },
+        );
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "https://example.test/app/entry.js|https://example.test/app/dep.js"
+                    .to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn dynamic_import_request_resolves_against_import_meta_url() {
+        let entry = crate::parse_script(
+            r#"
+            import("./chunks/view.js");
+            "#,
+        )
+        .expect("entry module should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_module_program_with_loader(
+            &entry,
+            "https://example.test/app/entry.js",
+            |_base, _source| None,
+        );
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![
+                BrowserEffect::RuntimeTrace {
+                    kind: "dynamic_import.requested".to_owned(),
+                    detail: "import(https://example.test/app/chunks/view.js)".to_owned(),
+                },
+                BrowserEffect::DynamicImportRequest {
+                    url: "https://example.test/app/chunks/view.js".to_owned(),
+                    promise_id: 0,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn delayed_async_dynamic_import_keeps_defining_module_base() {
+        let entry = crate::parse_script(
+            r#"
+            let resolveLater;
+            async function loadLater() {
+                await new Promise(function (resolve) { resolveLater = resolve; });
+                import("./chunks/view.js");
+            }
+            loadLater();
+            setTimeout(function () { resolveLater(); }, 0);
+            "#,
+        )
+        .expect("entry module should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_module_program_with_loader(
+            &entry,
+            "https://example.test/app/entry.js",
+            |_base, _source| None,
+        );
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![
+                BrowserEffect::RuntimeTrace {
+                    kind: "dynamic_import.requested".to_owned(),
+                    detail: "import(https://example.test/app/chunks/view.js)".to_owned(),
+                },
+                BrowserEffect::DynamicImportRequest {
+                    url: "https://example.test/app/chunks/view.js".to_owned(),
+                    promise_id: 0,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn new_url_href_resolves_common_bundle_relative_paths() {
+        let program = crate::parse_script(
+            r##"
+            let a = new URL("./chunk.js", "https://example.test/app/entry.js").href;
+            let b = new URL("../asset.png?hash=1", a).href;
+            let c = new URL("#section", b).href;
+            document.getElementById("result").textContent = a + "|" + b + "|" + c;
+            "##,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "https://example.test/app/chunk.js|https://example.test/asset.png?hash=1|https://example.test/asset.png#section".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
     fn executes_es_module_re_export_sources() {
         let entry = crate::parse_script(
             r#"
@@ -22621,6 +25069,60 @@ mod tests {
         let _ = state.drain_effects(); // discard script_a effects (as the browser does)
         state.execute_program(&prog_b);
         state.drain_effects()
+    }
+
+    #[test]
+    fn t067h_uncaught_throw_does_not_poison_next_script_execution() {
+        let prog_a = crate::parse_script(r#"window.shared = "ok";"#).expect("parse script_a");
+        let prog_b = crate::parse_script(r#"throw "boom";"#).expect("parse script_b");
+        let prog_c = crate::parse_script(
+            r#"document.getElementById("app").textContent = window.shared + "/continued";"#,
+        )
+        .expect("parse script_c");
+        let mut state = BrowserExecutionState::default();
+
+        state.execute_program(&prog_a);
+        assert!(state.clear_uncaught_throw().is_none());
+        state.drain_effects();
+
+        state.execute_program(&prog_b);
+        assert_eq!(state.clear_uncaught_throw().as_deref(), Some("boom"));
+        state.drain_effects();
+
+        state.execute_program(&prog_c);
+        assert_eq!(state.drain_effects(), vec![text("app", "ok/continued")]);
+    }
+
+    #[test]
+    fn thrown_event_listener_does_not_block_later_listeners() {
+        let program = crate::parse_script(
+            r#"
+            var btn = document.getElementById("btn");
+            btn.addEventListener("click", function() { throw "bad listener"; });
+            btn.addEventListener("click", function() {
+                document.getElementById("app").textContent = "second listener ran";
+            });
+        "#,
+        )
+        .expect("parse script");
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        let effects = state.fire_event("btn", "click", None);
+
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                BrowserEffect::RuntimeTrace { kind, detail }
+                    if kind == "event.listener.exception" && detail.contains("bad listener")
+            )),
+            "thrown listener should be logged as a runtime trace: {effects:?}"
+        );
+        assert!(
+            effects.contains(&text("app", "second listener ran")),
+            "later listeners should still run after an earlier listener throws: {effects:?}"
+        );
     }
 
     #[test]

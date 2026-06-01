@@ -110,6 +110,7 @@ fn print_canvas_graph_summary(document: &BrowserDocument) {
             CanvasObject::Svg(_) => svgs += 1,
             CanvasObject::Media(_) => media += 1,
             CanvasObject::Button(_) => {}
+            CanvasObject::LinkHit(_) => {}
             CanvasObject::ClipStart(_) | CanvasObject::ClipEnd => {}
         }
     }

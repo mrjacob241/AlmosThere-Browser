@@ -186,6 +186,7 @@ pub struct CssBoxStyle {
     pub inset: Option<CssEdges>,
     pub inset_sides: CssInset,
     pub object_fit: Option<CssObjectFit>,
+    pub box_sizing_border_box: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -228,6 +229,7 @@ pub struct ResolvedBoxStyle {
     pub inset: Option<CssEdges>,
     pub inset_sides: CssInset,
     pub object_fit: CssObjectFit,
+    pub box_sizing_border_box: bool,
 }
 
 impl Default for ResolvedBoxStyle {
@@ -271,6 +273,7 @@ impl Default for ResolvedBoxStyle {
             inset: None,
             inset_sides: CssInset::default(),
             object_fit: CssObjectFit::Fill,
+            box_sizing_border_box: false,
         }
     }
 }
@@ -384,6 +387,7 @@ pub enum CanvasObject {
     Image(CanvasImageObject),
     Svg(CanvasSvgObject),
     Media(CanvasMediaObject),
+    LinkHit(CanvasLinkHitObject),
     ClipStart(CanvasClipObject),
     ClipEnd,
 }
@@ -407,6 +411,7 @@ pub struct CanvasTextObject {
     pub text_background: Color32,
     pub text_align: CssTextAlign,
     pub href: Option<String>,
+    pub element_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -425,13 +430,15 @@ pub struct CanvasButtonObject {
     pub button_type: String,
     pub form_id: Option<String>,
     pub form_action: Option<String>,
+    pub form_method: Option<String>,
     pub element_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum CanvasInputKind {
     #[default]
     Text,
+    Hidden,
     Password,
     TextArea,
     Checkbox,
@@ -452,8 +459,10 @@ pub struct CanvasInputObject {
     pub color: Color32,
     pub form_id: Option<String>,
     pub form_action: Option<String>,
+    pub form_method: Option<String>,
     pub element_id: Option<String>,
     pub kind: CanvasInputKind,
+    pub submit_on_enter: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -475,6 +484,13 @@ pub struct CanvasSvgObject {
 pub struct CanvasMediaObject {
     pub rect: Rect,
     pub label: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CanvasLinkHitObject {
+    pub rect: Rect,
+    pub href: String,
+    pub element_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -935,6 +951,7 @@ fn aspect_preserving_size(pixel_size: Vec2, requested_size: Vec2) -> Vec2 {
 pub struct InlineSpan {
     pub text: String,
     pub href: Option<String>,
+    pub element_id: Option<String>,
     pub strong: bool,
     pub emphasis: bool,
     pub underline: bool,
@@ -950,6 +967,7 @@ pub struct InlineSpan {
 pub enum HitTarget {
     Link {
         href: String,
+        element_id: Option<String>,
     },
     Button {
         text: String,
@@ -1004,7 +1022,9 @@ impl BrowserDocument {
 pub struct BrowserCanvasResponse {
     pub clicked: Option<HitTarget>,
     pub hovered: Option<HitTarget>,
+    pub focused: Option<HitTarget>,
     pub changed_inputs: Vec<InputChange>,
+    pub input_key_events: Vec<InputKeyEvent>,
     pub submitted_inputs: Vec<InputSubmit>,
 }
 
@@ -1014,6 +1034,15 @@ pub struct InputChange {
     pub value_len: usize,
     pub element_id: Option<String>,
     pub value: String,
+    pub kind: CanvasInputKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputKeyEvent {
+    pub label: String,
+    pub element_id: Option<String>,
+    pub key: String,
+    pub value: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1021,7 +1050,12 @@ pub struct InputSubmit {
     pub label: String,
     pub name: Option<String>,
     pub value: String,
+    pub form_id: Option<String>,
     pub form_action: Option<String>,
+    pub form_method: Option<String>,
+    pub element_id: Option<String>,
+    pub submitter_element_id: Option<String>,
+    pub kind: CanvasInputKind,
 }
 
 impl BrowserCanvas {
@@ -1083,7 +1117,7 @@ impl BrowserCanvas {
             });
         self.scroll_offset = output.state.offset;
         self.hovered_link_href = canvas_response.hovered.as_ref().and_then(|t| match t {
-            HitTarget::Link { href } => Some(href.clone()),
+            HitTarget::Link { href, .. } => Some(href.clone()),
             _ => None,
         });
 
@@ -1136,7 +1170,7 @@ impl BrowserCanvas {
             });
         self.scroll_offset = output.state.offset;
         self.hovered_link_href = canvas_response.hovered.as_ref().and_then(|t| match t {
-            HitTarget::Link { href } => Some(href.clone()),
+            HitTarget::Link { href, .. } => Some(href.clone()),
             _ => None,
         });
 
@@ -1167,8 +1201,14 @@ fn paint_canvas_graph(
     let graph_size = vec2(content_width.max(1.0), (graph.viewport.y * scale).max(1.0));
     let (canvas_rect, _) = ui.allocate_exact_size(graph_size, Sense::hover());
     let mut painter = ui.painter().with_clip_rect(canvas_rect);
+    let mut current_clip_rect = canvas_rect;
     let mut clip_stack = Vec::new();
-    let mut submitted_forms: Vec<(Option<String>, Option<String>)> = Vec::new();
+    let mut submitted_forms: Vec<(
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = Vec::new();
     let mut reset_forms: Vec<Option<String>> = Vec::new();
     // (name, element_id) of radio buttons clicked this frame — used to deselect group peers.
     let mut selected_radios: Vec<(Option<String>, Option<String>)> = Vec::new();
@@ -1181,10 +1221,12 @@ fn paint_canvas_graph(
                 let next = previous.intersect(rect);
                 clip_stack.push(previous);
                 painter = ui.painter().with_clip_rect(next);
+                current_clip_rect = next;
             }
             CanvasObject::ClipEnd => {
                 let previous = clip_stack.pop().unwrap_or(canvas_rect);
                 painter = ui.painter().with_clip_rect(previous);
+                current_clip_rect = previous;
             }
             CanvasObject::Text(text) => {
                 let rect = canvas_object_rect(canvas_rect.min, text.rect, scale);
@@ -1232,16 +1274,25 @@ fn paint_canvas_graph(
                 };
                 painter.add(TextShape::new(text_rect.left_top(), galley, text.color));
                 if let Some(href) = &text.href {
-                    let response = ui.interact(
-                        rect,
-                        ui.make_persistent_id(("canvas_graph_text", index)),
-                        Sense::click(),
-                    );
-                    if response.hovered() {
-                        canvas_response.hovered = Some(HitTarget::Link { href: href.clone() });
-                    }
-                    if response.clicked() {
-                        canvas_response.clicked = Some(HitTarget::Link { href: href.clone() });
+                    let hit_rect = text_rect.intersect(current_clip_rect);
+                    if hit_rect.is_positive() {
+                        let response = ui.interact(
+                            hit_rect,
+                            ui.make_persistent_id(("canvas_graph_text", index)),
+                            Sense::click(),
+                        );
+                        if response.hovered() {
+                            canvas_response.hovered = Some(HitTarget::Link {
+                                href: href.clone(),
+                                element_id: text.element_id.clone(),
+                            });
+                        }
+                        if response.clicked() {
+                            canvas_response.clicked = Some(HitTarget::Link {
+                                href: href.clone(),
+                                element_id: text.element_id.clone(),
+                            });
+                        }
                     }
                 }
             }
@@ -1257,13 +1308,17 @@ fn paint_canvas_graph(
             }
             CanvasObject::Button(button) => {
                 let rect = canvas_object_rect(canvas_rect.min, button.rect, scale);
-                let response = ui
-                    .interact(
-                        rect,
+                let hit_rect = rect.intersect(current_clip_rect);
+                let Some(response) = hit_rect.is_positive().then(|| {
+                    ui.interact(
+                        hit_rect,
                         ui.make_persistent_id(("canvas_graph_button", index)),
                         Sense::click(),
                     )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                }) else {
+                    continue;
+                };
                 if response.hovered() {
                     canvas_response.hovered = Some(HitTarget::Button {
                         text: button.text.clone(),
@@ -1280,7 +1335,12 @@ fn paint_canvas_graph(
                         form_id: button.form_id.clone(),
                     });
                     if button.button_type.eq_ignore_ascii_case("submit") {
-                        submitted_forms.push((button.form_id.clone(), button.form_action.clone()));
+                        submitted_forms.push((
+                            button.form_id.clone(),
+                            button.form_action.clone(),
+                            button.form_method.clone(),
+                            button.element_id.clone(),
+                        ));
                     } else if button.button_type.eq_ignore_ascii_case("reset") {
                         reset_forms.push(button.form_id.clone());
                     }
@@ -1304,6 +1364,7 @@ fn paint_canvas_graph(
                     );
                 } else {
                     match &input.kind {
+                        CanvasInputKind::Hidden => {}
                         CanvasInputKind::Checkbox => {
                             let mut checked = input.value == "true";
                             let response = ui.put(
@@ -1317,6 +1378,7 @@ fn paint_canvas_graph(
                                     value_len: input.value.len(),
                                     element_id: input.element_id.clone(),
                                     value: input.value.clone(),
+                                    kind: input.kind.clone(),
                                 });
                             }
                         }
@@ -1333,6 +1395,7 @@ fn paint_canvas_graph(
                                     value_len: input.value.len(),
                                     element_id: input.element_id.clone(),
                                     value: input.value.clone(),
+                                    kind: input.kind.clone(),
                                 });
                             }
                         }
@@ -1369,21 +1432,43 @@ fn paint_canvas_graph(
                                     value_len: selected.chars().count(),
                                     element_id: input.element_id.clone(),
                                     value: selected,
+                                    kind: input.kind.clone(),
                                 });
                             }
                         }
                         CanvasInputKind::TextArea => {
                             let mut value = input.value.clone();
-                            let response = ui.put(
-                                rect,
-                                egui::TextEdit::multiline(&mut value)
-                                    .hint_text(input.label.as_str())
-                                    .font(FontId::new(
-                                        input.font_size * scale,
-                                        browser_regular_family(),
-                                    ))
-                                    .text_color(input.color),
+                            let text_edit_id = canvas_graph_text_edit_id(
+                                "textarea",
+                                input.element_id.as_deref(),
+                                index,
                             );
+                            let response = if input.submit_on_enter {
+                                ui.put(
+                                    rect,
+                                    egui::TextEdit::singleline(&mut value)
+                                        .id(text_edit_id)
+                                        .hint_text(input.label.as_str())
+                                        .frame(false)
+                                        .font(FontId::new(
+                                            input.font_size * scale,
+                                            browser_regular_family(),
+                                        ))
+                                        .text_color(input.color),
+                                )
+                            } else {
+                                ui.put(
+                                    rect,
+                                    egui::TextEdit::multiline(&mut value)
+                                        .id(text_edit_id)
+                                        .hint_text(input.label.as_str())
+                                        .font(FontId::new(
+                                            input.font_size * scale,
+                                            browser_regular_family(),
+                                        ))
+                                        .text_color(input.color),
+                                )
+                            };
                             if response.hovered() {
                                 canvas_response.hovered = Some(HitTarget::Input {
                                     label: input.label.clone(),
@@ -1396,24 +1481,45 @@ fn paint_canvas_graph(
                                     label: input.label.clone(),
                                     value_len: value.chars().count(),
                                     element_id: input.element_id.clone(),
-                                    value,
+                                    value: value.clone(),
+                                    kind: input.kind.clone(),
                                 });
                             }
-                            if response.has_focus()
-                                && ui.input(|state| {
-                                    state.key_pressed(egui::Key::Enter) && !state.modifiers.shift
-                                })
-                            {
-                                submitted_forms
-                                    .push((input.form_id.clone(), input.form_action.clone()));
+                            if response.has_focus() {
+                                canvas_response.focused = Some(HitTarget::Input {
+                                    label: input.label.clone(),
+                                    element_id: input.element_id.clone(),
+                                });
+                                for key in pressed_key_names(ui) {
+                                    canvas_response.input_key_events.push(InputKeyEvent {
+                                        label: input.label.clone(),
+                                        element_id: input.element_id.clone(),
+                                        key,
+                                        value: value.clone(),
+                                    });
+                                }
+                            }
+                            if text_control_enter_submitted(ui, &response, false) {
+                                submitted_forms.push((
+                                    input.form_id.clone(),
+                                    input.form_action.clone(),
+                                    input.form_method.clone(),
+                                    input.element_id.clone(),
+                                ));
                             }
                         }
                         CanvasInputKind::Text | CanvasInputKind::Password => {
                             let password = matches!(input.kind, CanvasInputKind::Password);
                             let mut value = input.value.clone();
+                            let text_edit_id = canvas_graph_text_edit_id(
+                                "input",
+                                input.element_id.as_deref(),
+                                index,
+                            );
                             let response = ui.put(
                                 rect,
                                 egui::TextEdit::singleline(&mut value)
+                                    .id(text_edit_id)
                                     .hint_text(input.label.as_str())
                                     .frame(false)
                                     .password(password)
@@ -1436,13 +1542,30 @@ fn paint_canvas_graph(
                                     value_len: value.chars().count(),
                                     element_id: input.element_id.clone(),
                                     value: value.clone(),
+                                    kind: input.kind.clone(),
                                 });
                             }
-                            if response.has_focus()
-                                && ui.input(|state| state.key_pressed(egui::Key::Enter))
-                            {
-                                submitted_forms
-                                    .push((input.form_id.clone(), input.form_action.clone()));
+                            if response.has_focus() {
+                                canvas_response.focused = Some(HitTarget::Input {
+                                    label: input.label.clone(),
+                                    element_id: input.element_id.clone(),
+                                });
+                                for key in pressed_key_names(ui) {
+                                    canvas_response.input_key_events.push(InputKeyEvent {
+                                        label: input.label.clone(),
+                                        element_id: input.element_id.clone(),
+                                        key,
+                                        value: value.clone(),
+                                    });
+                                }
+                            }
+                            if text_control_enter_submitted(ui, &response, true) {
+                                submitted_forms.push((
+                                    input.form_id.clone(),
+                                    input.form_action.clone(),
+                                    input.form_method.clone(),
+                                    input.element_id.clone(),
+                                ));
                             }
                         }
                     }
@@ -1480,6 +1603,31 @@ fn paint_canvas_graph(
                     Color32::from_rgb(90, 100, 110),
                 );
             }
+            CanvasObject::LinkHit(link) => {
+                let rect = canvas_object_rect(canvas_rect.min, link.rect, scale);
+                let hit_rect = rect.intersect(current_clip_rect);
+                if hit_rect.is_positive() {
+                    let response = ui
+                        .interact(
+                            hit_rect,
+                            ui.make_persistent_id(("canvas_graph_link_hit", index)),
+                            Sense::click(),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if response.hovered() {
+                        canvas_response.hovered = Some(HitTarget::Link {
+                            href: link.href.clone(),
+                            element_id: link.element_id.clone(),
+                        });
+                    }
+                    if response.clicked() {
+                        canvas_response.clicked = Some(HitTarget::Link {
+                            href: link.href.clone(),
+                            element_id: link.element_id.clone(),
+                        });
+                    }
+                }
+            }
         }
     }
     for (name, element_id) in selected_radios {
@@ -1497,11 +1645,13 @@ fn paint_canvas_graph(
     for form_id in reset_forms {
         reset_inputs_for_form(&mut graph.objects, form_id.as_deref(), canvas_response);
     }
-    for (form_id, form_action) in submitted_forms {
+    for (form_id, form_action, form_method, submitter_element_id) in submitted_forms {
         push_submitted_inputs_for_form(
             &graph.objects,
             form_id.as_deref(),
             form_action.as_deref(),
+            form_method.as_deref(),
+            submitter_element_id.as_deref(),
             canvas_response,
         );
     }
@@ -1526,6 +1676,7 @@ fn reset_inputs_for_form(
                 value_len: input.value.chars().count(),
                 element_id: input.element_id.clone(),
                 value: input.value.clone(),
+                kind: input.kind.clone(),
             });
         }
     }
@@ -1535,6 +1686,8 @@ fn push_submitted_inputs_for_form(
     objects: &[CanvasObject],
     form_id: Option<&str>,
     form_action: Option<&str>,
+    form_method: Option<&str>,
+    submitter_element_id: Option<&str>,
     canvas_response: &mut BrowserCanvasResponse,
 ) {
     for object in objects {
@@ -1546,7 +1699,12 @@ fn push_submitted_inputs_for_form(
                 label: input.label.clone(),
                 name: input.name.clone(),
                 value: input.value.clone(),
+                form_id: input.form_id.clone(),
                 form_action: form_action.map(str::to_owned),
+                form_method: form_method.map(str::to_owned),
+                element_id: input.element_id.clone(),
+                submitter_element_id: submitter_element_id.map(str::to_owned),
+                kind: input.kind.clone(),
             });
         }
     }
@@ -1558,6 +1716,43 @@ fn canvas_input_belongs_to_form(input: &CanvasInputObject, form_id: Option<&str>
         (None, None) => true,
         _ => false,
     }
+}
+
+fn canvas_graph_text_edit_id(
+    kind: &'static str,
+    element_id: Option<&str>,
+    index: usize,
+) -> egui::Id {
+    match element_id {
+        Some(element_id) => egui::Id::new(("canvas_graph_text_edit", kind, element_id)),
+        None => egui::Id::new(("canvas_graph_text_edit", kind, index)),
+    }
+}
+
+fn text_control_enter_submitted(ui: &Ui, response: &egui::Response, allow_shift: bool) -> bool {
+    let enter_pressed = ui.input(|state| {
+        state.key_pressed(egui::Key::Enter) && (allow_shift || !state.modifiers.shift)
+    });
+    enter_pressed && (response.has_focus() || response.lost_focus())
+}
+
+fn pressed_key_names(ui: &Ui) -> Vec<String> {
+    ui.input(|state| {
+        state
+            .events
+            .iter()
+            .filter_map(|event| {
+                if let egui::Event::Key {
+                    key, pressed: true, ..
+                } = event
+                {
+                    Some(key.name().to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    })
 }
 
 fn cover_image_uv(source_size: Vec2, target_size: Vec2) -> Rect {
@@ -1876,10 +2071,16 @@ fn paint_block(
                     .underline(),
             );
             if response.hovered() {
-                canvas_response.hovered = Some(HitTarget::Link { href: href.clone() });
+                canvas_response.hovered = Some(HitTarget::Link {
+                    href: href.clone(),
+                    element_id: None,
+                });
             }
             if response.clicked() {
-                canvas_response.clicked = Some(HitTarget::Link { href: href.clone() });
+                canvas_response.clicked = Some(HitTarget::Link {
+                    href: href.clone(),
+                    element_id: None,
+                });
             }
             ui.add_space(16.0 * font_scale);
         }
@@ -1910,10 +2111,16 @@ fn paint_block(
                             .underline(),
                     );
                     if response.hovered() {
-                        canvas_response.hovered = Some(HitTarget::Link { href: href.clone() });
+                        canvas_response.hovered = Some(HitTarget::Link {
+                            href: href.clone(),
+                            element_id: None,
+                        });
                     }
                     if response.clicked() {
-                        canvas_response.clicked = Some(HitTarget::Link { href: href.clone() });
+                        canvas_response.clicked = Some(HitTarget::Link {
+                            href: href.clone(),
+                            element_id: None,
+                        });
                     }
                 } else {
                     ui.label(
@@ -2103,6 +2310,7 @@ fn paint_block(
                     value_len: value.chars().count(),
                     element_id: None,
                     value: value.clone(),
+                    kind: CanvasInputKind::Text,
                 });
             }
             ui.add_space(2.0 * font_scale);
@@ -2672,11 +2880,13 @@ fn paint_search_link(
     if response.hovered() {
         canvas_response.hovered = Some(HitTarget::Link {
             href: href.to_owned(),
+            element_id: None,
         });
     }
     if response.clicked() {
         canvas_response.clicked = Some(HitTarget::Link {
             href: href.to_owned(),
+            element_id: None,
         });
     }
 }
@@ -2810,6 +3020,7 @@ fn paint_ecosia_hero(
             button_type: "submit".to_owned(),
             form_id: None,
         });
+        push_ecosia_search_submit(&hero.search_value, canvas_response);
     }
     let ai_width = 104.0 * font_scale;
     let ai_rect = Rect::from_center_size(
@@ -2845,6 +3056,7 @@ fn paint_ecosia_hero(
             ui.put(
                 input_rect,
                 egui::TextEdit::singleline(&mut hero.search_value)
+                    .id(egui::Id::new("ecosia-hero-search-input"))
                     .font(FontId::new(19.0 * font_scale, browser_regular_family()))
                     .text_color(style.text_color)
                     .hint_text(
@@ -2870,7 +3082,25 @@ fn paint_ecosia_hero(
             value_len: hero.search_value.chars().count(),
             element_id: None,
             value: hero.search_value.clone(),
+            kind: CanvasInputKind::Text,
         });
+    }
+    if input_response.has_focus() {
+        canvas_response.focused = Some(HitTarget::Input {
+            label: "Search".to_owned(),
+            element_id: None,
+        });
+        for key in pressed_key_names(ui) {
+            canvas_response.input_key_events.push(InputKeyEvent {
+                label: "Search".to_owned(),
+                element_id: None,
+                key,
+                value: hero.search_value.clone(),
+            });
+        }
+    }
+    if text_control_enter_submitted(ui, &input_response, true) {
+        push_ecosia_search_submit(&hero.search_value, canvas_response);
     }
 
     let ai_response = ui.put(
@@ -2952,6 +3182,20 @@ fn paint_ecosia_hero(
         font_scale,
     );
     ui.advance_cursor_after_rect(rect);
+}
+
+fn push_ecosia_search_submit(value: &str, canvas_response: &mut BrowserCanvasResponse) {
+    canvas_response.submitted_inputs.push(InputSubmit {
+        label: "Search".to_owned(),
+        name: Some("q".to_owned()),
+        value: value.to_owned(),
+        form_id: None,
+        form_action: Some("/search".to_owned()),
+        form_method: Some("get".to_owned()),
+        element_id: None,
+        submitter_element_id: None,
+        kind: CanvasInputKind::Text,
+    });
 }
 
 fn paint_pill(
@@ -3060,10 +3304,16 @@ fn paint_inline_span(
         let response = paint_shifted_inline_span(ui, span, style, font_scale);
         if let Some(href) = &span.href {
             if response.hovered() {
-                canvas_response.hovered = Some(HitTarget::Link { href: href.clone() });
+                canvas_response.hovered = Some(HitTarget::Link {
+                    href: href.clone(),
+                    element_id: span.element_id.clone(),
+                });
             }
             if response.clicked() {
-                canvas_response.clicked = Some(HitTarget::Link { href: href.clone() });
+                canvas_response.clicked = Some(HitTarget::Link {
+                    href: href.clone(),
+                    element_id: span.element_id.clone(),
+                });
             }
         }
         return;
@@ -3107,10 +3357,16 @@ fn paint_inline_span(
     if let Some(href) = &span.href {
         let response = ui.link(rich);
         if response.hovered() {
-            canvas_response.hovered = Some(HitTarget::Link { href: href.clone() });
+            canvas_response.hovered = Some(HitTarget::Link {
+                href: href.clone(),
+                element_id: span.element_id.clone(),
+            });
         }
         if response.clicked() {
-            canvas_response.clicked = Some(HitTarget::Link { href: href.clone() });
+            canvas_response.clicked = Some(HitTarget::Link {
+                href: href.clone(),
+                element_id: span.element_id.clone(),
+            });
         }
     } else {
         ui.label(rich);
@@ -3742,6 +3998,11 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
     }
     if source.margin.is_some() {
         target.margin = source.margin;
+        target.margin_top = None;
+        target.margin_right = None;
+        target.margin_bottom = None;
+        target.margin_left = None;
+        target.margin_auto = source.margin_auto;
     }
     if source.margin_auto.top.is_some() {
         target.margin_auto.top = source.margin_auto.top;
@@ -3769,6 +4030,10 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
     }
     if source.padding.is_some() {
         target.padding = source.padding;
+        target.padding_top = None;
+        target.padding_right = None;
+        target.padding_bottom = None;
+        target.padding_left = None;
     }
     if source.padding_top.is_some() {
         target.padding_top = source.padding_top;
@@ -3883,6 +4148,9 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
     }
     if source.object_fit.is_some() {
         target.object_fit = source.object_fit;
+    }
+    if source.box_sizing_border_box.is_some() {
+        target.box_sizing_border_box = source.box_sizing_border_box;
     }
 }
 
@@ -4434,6 +4702,14 @@ fn parse_css_box_style_with_vars(
                 };
                 seen |= style.object_fit.is_some();
             }
+            "box-sizing" => {
+                style.box_sizing_border_box = match value {
+                    "border-box" => Some(true),
+                    "content-box" => Some(false),
+                    _ => None,
+                };
+                seen |= style.box_sizing_border_box.is_some();
+            }
             _ => {}
         }
     }
@@ -4448,7 +4724,7 @@ fn parse_display(value: &str) -> Option<CssDisplay> {
         "inline" => Some(CssDisplay::Inline),
         "inline-block" => Some(CssDisplay::InlineBlock),
         "contents" => Some(CssDisplay::Inline),
-        "inline-flex" => Some(CssDisplay::InlineBlock),
+        "inline-flex" => Some(CssDisplay::Flex),
         "flex" => Some(CssDisplay::Flex),
         "grid" | "inline-grid" => Some(CssDisplay::Grid),
         "table" => Some(CssDisplay::Table),
@@ -4659,9 +4935,7 @@ fn button_width_for_text(text: &str, style: &BrowserStyle, font_scale: f32) -> f
 }
 
 fn apply_color(value: &str, target: &mut Color32) {
-    if let Some(color) = parse_hex_color(value) {
-        *target = color;
-    } else if let Some(color) = parse_hsl_color(value) {
+    if let Some(color) = parse_color(value) {
         *target = color;
     } else if value.contains("var(--body-color)") {
         *target = Color32::from_rgb(27, 24, 24);
@@ -4699,7 +4973,10 @@ fn parse_padding_2(value: &str) -> Option<(f32, f32)> {
 fn parse_border(value: &str) -> Option<(f32, Color32)> {
     let values = split_css_value_list(value);
     let width = values.iter().find_map(|value| parse_px(value))?;
-    let color = values.iter().find_map(|value| parse_color(value))?;
+    let color = values
+        .iter()
+        .find_map(|value| parse_color(value))
+        .unwrap_or(Color32::TRANSPARENT);
     Some((width, color))
 }
 
@@ -4949,8 +5226,10 @@ mod tests {
             color: Color32::BLACK,
             form_id: form_id.map(str::to_owned),
             form_action: form_action.map(str::to_owned),
+            form_method: Some("get".to_owned()),
             element_id: None,
             kind: CanvasInputKind::Text,
+            submit_on_enter: false,
         })
     }
 
@@ -5025,7 +5304,14 @@ mod tests {
         ];
         let mut response = BrowserCanvasResponse::default();
 
-        push_submitted_inputs_for_form(&objects, Some("search"), Some("/search"), &mut response);
+        push_submitted_inputs_for_form(
+            &objects,
+            Some("search"),
+            Some("/search"),
+            Some("get"),
+            Some("query"),
+            &mut response,
+        );
 
         assert_eq!(response.submitted_inputs.len(), 2);
         assert_eq!(response.submitted_inputs[0].name.as_deref(), Some("q"));
@@ -5033,6 +5319,15 @@ mod tests {
         assert_eq!(
             response.submitted_inputs[0].form_action.as_deref(),
             Some("/search")
+        );
+        assert_eq!(
+            response.submitted_inputs[0].form_method.as_deref(),
+            Some("get")
+        );
+        assert_eq!(response.submitted_inputs[0].element_id.as_deref(), None);
+        assert_eq!(
+            response.submitted_inputs[0].submitter_element_id.as_deref(),
+            Some("query")
         );
         assert_eq!(response.submitted_inputs[1].name.as_deref(), Some("page"));
         assert_eq!(response.submitted_inputs[1].value, "1");
@@ -5064,6 +5359,37 @@ mod tests {
         assert_eq!(other.value, "kept");
         assert_eq!(response.changed_inputs.len(), 1);
         assert_eq!(response.changed_inputs[0].label, "Query");
+    }
+
+    #[test]
+    fn canvas_graph_text_edit_id_prefers_element_id_over_index() {
+        assert_eq!(
+            canvas_graph_text_edit_id("input", Some("search-box"), 1),
+            canvas_graph_text_edit_id("input", Some("search-box"), 99)
+        );
+        assert_ne!(
+            canvas_graph_text_edit_id("input", None, 1),
+            canvas_graph_text_edit_id("input", None, 99)
+        );
+        assert_ne!(
+            canvas_graph_text_edit_id("input", Some("search-box"), 1),
+            canvas_graph_text_edit_id("textarea", Some("search-box"), 1)
+        );
+    }
+
+    #[test]
+    fn ecosia_search_submit_uses_native_get_metadata() {
+        let mut response = BrowserCanvasResponse::default();
+
+        push_ecosia_search_submit("trees", &mut response);
+
+        assert_eq!(response.submitted_inputs.len(), 1);
+        let submit = &response.submitted_inputs[0];
+        assert_eq!(submit.name.as_deref(), Some("q"));
+        assert_eq!(submit.value, "trees");
+        assert_eq!(submit.form_action.as_deref(), Some("/search"));
+        assert_eq!(submit.form_method.as_deref(), Some("get"));
+        assert_eq!(submit.kind, CanvasInputKind::Text);
     }
 
     #[test]
@@ -5550,6 +5876,14 @@ mod tests {
     }
 
     #[test]
+    fn body_color_uses_general_color_parser() {
+        let style = parse_basic_css("body { color: rgb(255, 255, 255); background: blue; }");
+
+        assert_eq!(style.text_color, Color32::WHITE);
+        assert_eq!(style.page_background, Color32::BLUE);
+    }
+
+    #[test]
     fn parse_basic_css_carries_named_grid_areas() {
         let style = parse_basic_css(
             r#"
@@ -5777,6 +6111,43 @@ mod tests {
         assert_eq!(computed.margin_bottom, Some(12.8));
         assert_eq!(computed.padding_left, Some(32.0));
         assert_eq!(computed.padding_right, Some(16.0));
+    }
+
+    #[test]
+    fn later_box_edge_shorthand_clears_earlier_side_overrides() {
+        let style = parse_basic_css(
+            r#"
+            .box { margin-top: 20px; padding-left: 30px; }
+            .box { margin: 0; padding: 4px; }
+            "#,
+        );
+        let key = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["box".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &key);
+
+        assert_eq!(
+            computed.margin,
+            Some(CssEdges {
+                top: 0.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: 0.0
+            })
+        );
+        assert_eq!(computed.margin_top, None);
+        assert_eq!(
+            computed.padding,
+            Some(CssEdges {
+                top: 4.0,
+                right: 4.0,
+                bottom: 4.0,
+                left: 4.0
+            })
+        );
+        assert_eq!(computed.padding_left, None);
     }
 
     #[test]
