@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>63 - Float Left Thumbnail</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f7f8fa; font-family: system-ui, sans-serif; }
+.article { max-width: 860px; border: 1px solid rgba(20,30,40,.18); padding: 16px; background: #fff; }
+.thumb { float: left; width: 220px; height: 160px; margin: 0 18px 12px 0; background: #4dabf7; border: 1px solid rgba(20,30,40,.18); display: grid; place-items: center; font-weight: 700; }
+p { margin: 0 0 14px; min-height: 64px; background: #ffd43b; padding: 10px; }
+.label { position: fixed; right: 12px; bottom: 12px; background: rgba(255,255,255,.88); border: 1px solid rgba(20,30,40,.18); padding: 6px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<article class="article"><figure class="thumb">left float thumb</figure><p>Article text should begin to the right of the thumbnail.</p><p>More text should continue wrapping until the float is passed.</p><p>Later text can use the full line width.</p></article>
+<div class="label">63 / 82 - Float Left Thumbnail</div>
+</body>
+</html>

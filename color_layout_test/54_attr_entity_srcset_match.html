@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>54 - Attribute Entity Srcset Match</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f7f8fa; font-family: system-ui, sans-serif; }
+.row { display: flex; gap: 16px; align-items: stretch; }
+.box { width: 31%; min-height: 96px; border: 1px solid rgba(20,30,40,.18); display: grid; place-items: center; padding: 10px; font-weight: 700; background: #ffd43b; }
+source[srcset="/img.php?a=1&b=2 1x, /img.php?a=1&b=3 2x"] + img { outline: 8px solid #51cf66; background: #b2f2bb; }
+source[srcset="/img.php?a=1&amp;b=2 1x, /img.php?a=1&amp;b=3 2x"] + img { border: 8px solid #ff6b6b; }
+img { display: block; width: 100%; height: 96px; background: #4dabf7; }
+.label { position: fixed; right: 12px; bottom: 12px; background: rgba(255,255,255,.88); border: 1px solid rgba(20,30,40,.18); padding: 6px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="row">
+<picture class="box"><source srcset="/img.php?a=1&amp;b=2 1x, /img.php?a=1&amp;b=3 2x"><img alt="decoded srcset selector should outline green"></picture>
+<div class="box">control</div>
+<div class="box">control</div>
+</div>
+<div class="label">54 / 82 - Attribute Entity Srcset Match</div>
+</body>
+</html>

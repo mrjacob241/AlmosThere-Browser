@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>73 - Length Fit Content Tracks</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f7f8fa; font-family: system-ui, sans-serif; }
+.grid { display: grid; grid-template-columns: fit-content(220px) minmax(0, 1fr) fit-content(180px); gap: 16px; max-width: 980px; }
+.box { min-height: 132px; border: 1px solid rgba(20,30,40,.18); display: grid; place-items: center; padding: 10px; font-weight: 700; }
+.a { background: #ffd43b; } .b { background: #51cf66; } .c { background: #4dabf7; }
+.label { position: fixed; right: 12px; bottom: 12px; background: rgba(255,255,255,.88); border: 1px solid rgba(20,30,40,.18); padding: 6px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<main class="grid"><div class="box a">fit-content left</div><div class="box b">flexible middle should stay readable</div><div class="box c">fit-content right</div></main>
+<div class="label">73 / 82 - Length Fit Content Tracks</div>
+</body>
+</html>

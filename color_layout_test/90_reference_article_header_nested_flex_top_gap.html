@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>90 Header Nested Flex Top Gap</title>
+<style>
+html, body { margin: 0; padding: 0; }
+.page { min-height: 100vh; background: #d9dde3; }
+.topbar {
+  display: flex;
+  align-items: center;
+  min-height: 64px;
+  background: #d73027;
+}
+.brand { width: 180px; height: 32px; background: #4575b4; }
+.search { flex: 1; height: 32px; background: #1a9850; }
+.tools { width: 180px; height: 32px; background: #fdae61; }
+.article-title { height: 140px; background: #ffffbf; }
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="topbar">
+    <div class="brand"></div>
+    <form class="search"></form>
+    <nav class="tools"></nav>
+  </header>
+  <main class="article-title"></main>
+</div>
+</body>
+</html>

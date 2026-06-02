@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>65 - Hidden Display None Chrome</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f7f8fa; font-family: system-ui, sans-serif; }
+.chrome { display: none; }
+.content { min-height: 180px; background: #51cf66; border: 1px solid rgba(20,30,40,.18); display: grid; place-items: center; font-weight: 700; }
+.chrome, .button { min-height: 80px; background: #ff6b6b; border: 1px solid rgba(20,30,40,.18); display: grid; place-items: center; font-weight: 700; }
+.chrome { display: none; }
+.label { position: fixed; right: 12px; bottom: 12px; background: rgba(255,255,255,.88); border: 1px solid rgba(20,30,40,.18); padding: 6px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="chrome">hidden vector-like chrome must not consume layout</div>
+<main class="content">content starts at top</main>
+<div class="label">65 / 82 - Hidden Display None Chrome</div>
+</body>
+</html>

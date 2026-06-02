@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>95 - List Item Marker Control</title>
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body { background: #f7f8fa; font-family: Arial, sans-serif; color: #1f2933; }
+.shell { width: 520px; margin: 32px; padding: 24px; background: #fff; border: 1px solid #ced4da; }
+ul.prose {
+  display: block;
+  margin: 0;
+  padding: 0;
+  background: #e7f5ff;
+}
+ul.prose li {
+  display: list-item;
+  margin: 0 0 10px 0;
+  padding: 8px;
+  background: #ffd43b;
+}
+.label {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  padding: 6px 8px;
+  background: #fff;
+  border: 1px solid #c8c8c8;
+  font-size: 12px;
+}
+</style>
+</head>
+<body>
+<main class="shell">
+  <ul class="prose">
+    <li>Ordinary list item keeps marker behavior</li>
+    <li>Second ordinary list item keeps marker behavior</li>
+  </ul>
+</main>
+<div class="label">95 / control - list-item markers remain</div>
+</body>
+</html>

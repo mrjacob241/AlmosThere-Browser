@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>74 - Scoped Vars Component Width</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f7f8fa; font-family: system-ui, sans-serif; }
+.component { --rail: 240px; --gap: 20px; display: grid; grid-template-columns: minmax(0, 1fr) var(--rail); gap: var(--gap); max-width: 920px; }
+.box { min-height: 150px; border: 1px solid rgba(20,30,40,.18); display: grid; place-items: center; padding: 10px; font-weight: 700; }
+.main { background: #51cf66; } .rail { background: #ffd43b; }
+.label { position: fixed; right: 12px; bottom: 12px; background: rgba(255,255,255,.88); border: 1px solid rgba(20,30,40,.18); padding: 6px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<main class="component"><section class="box main">component-scoped main</section><aside class="box rail">component rail var</aside></main>
+<div class="label">74 / 82 - Scoped Vars Component Width</div>
+</body>
+</html>

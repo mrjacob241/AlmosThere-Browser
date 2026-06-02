@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>86 - Float Figure Long Caption Image Attr</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f7f8fa; font-family: system-ui, sans-serif; }
+.article { width: 820px; border: 1px solid rgba(20,30,40,.18); padding: 16px; background: #fff; }
+figure { float: right; display: table; margin: 0 0 14px 20px; padding: 0; border: 1px solid #c8ccd1; background: #ffd43b; }
+.image { display: inline-block; width: 250px; height: 180px; background: #748ffc; }
+figcaption { padding: 8px; border-top: 1px solid #c8ccd1; background: #ffe066; }
+p { margin: 0 0 14px; min-height: 78px; padding: 10px; background: #b2f2bb; }
+.label { position: fixed; right: 12px; bottom: 12px; background: rgba(255,255,255,.88); border: 1px solid rgba(20,30,40,.18); padding: 6px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<article class="article"><figure><span class="image"></span><figcaption>A deliberately long caption should wrap inside the thumbnail width instead of making the right float reserve the whole article column.</figcaption></figure><p>Green text block should remain wide beside the figure, not collapse into a vertical text strip.</p><p>After the figure height, content should naturally regain the full article width.</p></article>
+<div class="label">86 / 88 - Float Figure Long Caption Image Attr</div>
+</body>
+</html>

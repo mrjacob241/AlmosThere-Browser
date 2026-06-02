@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>96 - List Item Nested Flex Result</title>
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body { background: #f4f6f8; font-family: Arial, sans-serif; color: #17212b; }
+.shell { width: 640px; margin: 32px; padding: 24px; background: #ffffff; border: 1px solid #ced4da; }
+ul.results { margin: 0; padding-left: 28px; width: 560px; background: #e7f5ff; }
+li.result { display: list-item; margin: 0 0 14px 0; padding: 0; color: #17212b; background: #fff3bf; }
+.card {
+  display: flex;
+  gap: 16px;
+  width: 500px;
+  padding: 10px;
+  background: #d3f9d8;
+  border: 1px solid #8ce99a;
+}
+.title { width: 230px; min-height: 42px; background: #74c0fc; }
+.meta { width: 150px; min-height: 42px; background: #fcc2d7; }
+.action { width: 70px; min-height: 42px; background: #ffd43b; }
+.label {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  padding: 6px 8px;
+  background: #fff;
+  border: 1px solid #c8c8c8;
+  font-size: 12px;
+}
+</style>
+</head>
+<body>
+<main class="shell">
+  <ul class="results">
+    <li class="result">
+      <div class="card">
+        <div class="title">title column</div>
+        <div class="meta">meta column</div>
+        <div class="action">action</div>
+      </div>
+    </li>
+    <li class="result">
+      <div class="card">
+        <div class="title">second title</div>
+        <div class="meta">second meta</div>
+        <div class="action">open</div>
+      </div>
+    </li>
+  </ul>
+</main>
+<div class="label">96 / regression - list-item children keep computed flex positions</div>
+</body>
+</html>

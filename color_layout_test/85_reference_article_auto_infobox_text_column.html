@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>85 - Reference Article Auto Infobox Text Column</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f8f9fa; font-family: system-ui, sans-serif; }
+.page { width: 980px; display: grid; grid-template-columns: 176px minmax(0, 1fr); gap: 20px; }
+nav { min-height: 520px; background: #dee2e6; }
+main { background: #fff; border: 1px solid rgba(20,30,40,.18); padding: 18px; }
+.infobox { float: right; margin: 0 0 14px 20px; padding: 8px; background: #ffe066; border: 1px solid rgba(20,30,40,.22); }
+.infobox table { border-collapse: collapse; width: 220px; height: 220px; background: #91a7ff; }
+.lead { min-height: 92px; background: #b2f2bb; padding: 10px; margin: 0 0 14px; }
+.body { min-height: 128px; background: #99e9f2; padding: 10px; margin: 0 0 14px; }
+.label { position: fixed; right: 12px; bottom: 12px; background: rgba(255,255,255,.88); border: 1px solid rgba(20,30,40,.18); padding: 6px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="page"><nav></nav><main><aside class="infobox"><table><tr><td></td></tr></table></aside><p class="lead">Reference Article-like lead text should wrap beside the auto-width infobox with a normal readable column.</p><p class="body">Body text should continue horizontally and only expand below the float after the infobox height is passed.</p></main></div>
+<div class="label">85 / 85 - Reference Article Auto Infobox Text Column</div>
+</body>
+</html>

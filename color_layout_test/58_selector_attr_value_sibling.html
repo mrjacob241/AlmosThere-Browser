@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>58 - Selector Attribute Value Sibling</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f7f8fa; font-family: system-ui, sans-serif; }
+.box { min-height: 72px; border: 1px solid rgba(20,30,40,.18); display: grid; place-items: center; padding: 10px; font-weight: 700; background: #ffd43b; margin-bottom: 12px; }
+[aria-expanded="false"] ~ .menu { display: none; }
+[aria-expanded="true"] ~ .open-menu { background: #51cf66; }
+[aria-expanded="false"] ~ .closed-marker { background: #4dabf7; }
+.menu { background: #ff6b6b; }
+.label { position: fixed; right: 12px; bottom: 12px; background: rgba(255,255,255,.88); border: 1px solid rgba(20,30,40,.18); padding: 6px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<button class="box" aria-expanded="false">closed toggle</button>
+<div class="box menu">hidden menu via value-aware attr + sibling</div>
+<div class="box closed-marker">closed marker blue</div>
+<div class="label">58 / 82 - Selector Attribute Value Sibling</div>
+</body>
+</html>

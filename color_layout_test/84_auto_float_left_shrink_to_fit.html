@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>84 - Auto Float Left Shrink To Fit</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f7f8fa; font-family: system-ui, sans-serif; }
+.article { width: 760px; border: 1px solid rgba(20,30,40,.18); padding: 16px; background: #fff; }
+.float { float: left; margin: 0 18px 12px 0; padding: 10px; background: #ff8787; border: 1px solid rgba(20,30,40,.18); }
+.thumb { display: inline-block; width: 180px; height: 130px; background: #748ffc; }
+p { margin: 0 0 14px; min-height: 72px; background: #d8f5a2; padding: 10px; }
+.label { position: fixed; right: 12px; bottom: 12px; background: rgba(255,255,255,.88); border: 1px solid rgba(20,30,40,.18); padding: 6px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<article class="article"><figure class="float"><span class="thumb"></span></figure><p>Text should start to the right of an auto-width left float.</p><p>The green paragraph blocks should not collapse into a vertical strip.</p></article>
+<div class="label">84 / 85 - Auto Float Left Shrink To Fit</div>
+</body>
+</html>

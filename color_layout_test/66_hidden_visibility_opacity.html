@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>66 - Hidden Visibility Opacity</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f7f8fa; font-family: system-ui, sans-serif; }
+.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.box { min-height: 120px; border: 1px solid rgba(20,30,40,.18); display: grid; place-items: center; padding: 10px; font-weight: 700; background: #51cf66; }
+.hidden-visibility { visibility: hidden; background: #ff6b6b; }
+.hidden-opacity { opacity: 0; background: #ff6b6b; }
+.label { position: fixed; right: 12px; bottom: 12px; background: rgba(255,255,255,.88); border: 1px solid rgba(20,30,40,.18); padding: 6px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<main class="grid"><div class="box">visible left</div><div class="box hidden-visibility">invisible middle slot</div><div class="box hidden-opacity">transparent right slot</div></main>
+<div class="label">66 / 82 - Hidden Visibility Opacity</div>
+</body>
+</html>

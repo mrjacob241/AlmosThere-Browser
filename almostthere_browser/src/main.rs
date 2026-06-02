@@ -17,10 +17,10 @@ use rich_canvas::{
     BrowserCanvas, BrowserCanvasResponse, BrowserDocument, BrowserStyle, CanvasBlock,
     CanvasButtonObject, CanvasClipObject, CanvasGraph, CanvasImageObject, CanvasInputKind,
     CanvasInputObject, CanvasLinkHitObject, CanvasMediaObject, CanvasObject, CanvasRectObject,
-    CanvasSvgObject, CanvasTextObject, CssAlignItems, CssBoxStyle, CssDisplay, CssEdges,
-    CssFlexDirection, CssFlexWrap, CssJustifyContent, CssLength, CssObjectFit, CssPosition,
-    CssTextAlign, ElementStyleKey, HitTarget, ImageBlock, InlineSpan, ResolvedBoxStyle, SvgBlock,
-    SvgShape, computed_box_style, configure_browser_fonts,
+    CanvasSvgObject, CanvasTextObject, CssAlignItems, CssBoxStyle, CssClear, CssDisplay, CssEdges,
+    CssFlexDirection, CssFlexWrap, CssFloat, CssJustifyContent, CssLength, CssListStyleType,
+    CssObjectFit, CssPosition, CssTextAlign, ElementStyleKey, HitTarget, ImageBlock, InlineSpan,
+    ResolvedBoxStyle, SvgBlock, SvgShape, computed_box_style, configure_browser_fonts,
     parse_basic_css_for_viewport_with_root_classes, parse_inline_box_style, wrap_browser_textboxes,
 };
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
@@ -223,20 +223,23 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct AppConfig {
     record_events: bool,
     debug_socket: bool,
     event_trace: bool,
+    initial_url: Option<String>,
 }
 
 impl AppConfig {
     fn from_args() -> Self {
-        let args: Vec<String> = std::env::args().collect();
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let initial_url = args.iter().find(|arg| !arg.starts_with('-')).cloned();
         Self {
             record_events: args.iter().any(|a| a == "--record-events"),
             debug_socket: args.iter().any(|a| a == "--debug-socket"),
             event_trace: args.iter().any(|a| a == "--event-trace"),
+            initial_url,
         }
     }
 }
@@ -294,6 +297,13 @@ impl FocusedInputMetadata {
             submit_on_enter: input.submit_on_enter,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct ClickMissPointerEvent {
+    pos: egui::Pos2,
+    button: String,
+    modifiers: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -379,6 +389,11 @@ impl AlmostThereApp {
         if inserted_default_bookmark {
             let _ = save_bookmarks(&bookmarks);
         }
+        let initial_url = config
+            .initial_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or(DEFAULT_URL);
 
         let (
             document,
@@ -389,18 +404,17 @@ impl AlmostThereApp {
             console_messages,
             live_js_debug_text,
             status,
-        ) = match load_url_source(DEFAULT_URL) {
+        ) = match load_url_source(initial_url) {
             Ok(source) => {
-                let document =
-                    parse_html_document_with_text_metrics(&source.html, &source.source, None);
                 let live_html = apply_safe_script_browser_effects_with_source(
                     &remove_html_comments(&source.html),
                     Some(&source.source),
                 );
+                let document = parse_html_document_from_live_html(&live_html, &source.source, None);
                 let script_state =
                     build_script_state_with_source(&source.html, Some(&source.source));
                 let render_graph_debug_text =
-                    parse_render_graph_debug_dump(&source.html, &source.source);
+                    parse_render_graph_debug_dump_from_live_html(&live_html, &source.source);
                 let console_messages = script_console_messages_from_html_with_source(
                     &source.html,
                     Some(&source.source),
@@ -416,7 +430,7 @@ impl AlmostThereApp {
                 telemetry.emit(
                     "navigation.loaded",
                     &[
-                        ("url", DEFAULT_URL),
+                        ("url", &source.source),
                         ("title", &document.title),
                         ("blocks", &document.blocks.len().to_string()),
                     ],
@@ -429,21 +443,21 @@ impl AlmostThereApp {
                     render_graph_debug_text,
                     console_messages,
                     live_js_debug_text,
-                    format!("Loaded {DEFAULT_URL}"),
+                    format!("Loaded {}", source.source),
                 )
             }
             Err(error) => {
                 telemetry.emit(
                     "navigation.failed",
-                    &[("url", DEFAULT_URL), ("error", &error.to_string())],
+                    &[("url", initial_url), ("error", &error.to_string())],
                 );
                 let document = BrowserDocument {
                     title: "Load failed".to_owned(),
-                    source: DEFAULT_URL.to_owned(),
+                    source: initial_url.to_owned(),
                     style: Default::default(),
                     canvas_graph: CanvasGraph::default(),
                     blocks: vec![CanvasBlock::Paragraph {
-                        text: format!("Failed to load default page {DEFAULT_URL}: {error}"),
+                        text: format!("Failed to load page {initial_url}: {error}"),
                     }],
                 };
                 (
@@ -453,10 +467,10 @@ impl AlmostThereApp {
                     justbarelyscript::BrowserExecutionState::default(),
                     String::new(),
                     vec![console_error_message(format!(
-                        "Failed to load default page {DEFAULT_URL}: {error}"
+                        "Failed to load page {initial_url}: {error}"
                     ))],
                     String::new(),
-                    format!("Failed to load default page {DEFAULT_URL}: {error}"),
+                    format!("Failed to load page {initial_url}: {error}"),
                 )
             }
         };
@@ -467,6 +481,7 @@ impl AlmostThereApp {
             active_tab: DebugPanelTab::RenderGraph,
             event_staged_values: std::collections::HashMap::new(),
         };
+        let url_input = document.source.clone();
 
         Self {
             canvas: BrowserCanvas::new(),
@@ -479,7 +494,7 @@ impl AlmostThereApp {
             last_hovered_element_id: None,
             last_focused_input: None,
             render_graph_debug_text,
-            url_input: DEFAULT_URL.to_owned(),
+            url_input,
             bookmarks,
             console_messages,
             live_js_debug_text,
@@ -582,8 +597,10 @@ impl AlmostThereApp {
                             "navigation.render_graph.started",
                             &[("url", &source.source)],
                         );
-                        self.render_graph_debug_text =
-                            parse_render_graph_debug_dump(&source.html, &source.source);
+                        self.render_graph_debug_text = parse_render_graph_debug_dump_from_live_html(
+                            &self.live_html,
+                            &source.source,
+                        );
                         self.telemetry.emit(
                             "navigation.render_graph.completed",
                             &[
@@ -628,8 +645,8 @@ impl AlmostThereApp {
                             "navigation.canvas_graph.started",
                             &[("url", &source.source)],
                         );
-                        let document = parse_html_document_with_text_metrics(
-                            &source.html,
+                        let document = parse_html_document_from_live_html(
+                            &self.live_html,
                             &source.source,
                             Some(ctx),
                         );
@@ -895,6 +912,71 @@ impl AlmostThereApp {
             .entry(element_id.to_owned())
             .or_default()
             .insert("value".to_owned(), value.to_owned());
+    }
+
+    fn emit_click_miss_telemetry(
+        &self,
+        ctx: &egui::Context,
+        response: &BrowserCanvasResponse,
+        panel_rect: egui::Rect,
+    ) {
+        if response.clicked.is_some() {
+            return;
+        }
+
+        let click_misses: Vec<ClickMissPointerEvent> = ctx.input(|state| {
+            state
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    egui::Event::PointerButton {
+                        pos,
+                        button,
+                        pressed: false,
+                        modifiers,
+                    } if panel_rect.contains(*pos) => Some(ClickMissPointerEvent {
+                        pos: *pos,
+                        button: format!("{button:?}"),
+                        modifiers: format!("{modifiers:?}"),
+                    }),
+                    _ => None,
+                })
+                .collect()
+        });
+        if click_misses.is_empty() {
+            return;
+        }
+
+        let hovered_kind = hit_target_telemetry_kind(response.hovered.as_ref()).unwrap_or("");
+        let hovered_element_id =
+            hit_target_telemetry_element_id(response.hovered.as_ref()).unwrap_or("");
+        let hovered_label = hit_target_telemetry_label(response.hovered.as_ref());
+        for click in click_misses {
+            let panel_x = click.pos.x - panel_rect.left();
+            let panel_y = click.pos.y - panel_rect.top();
+            let document_x = panel_x + self.canvas.scroll_offset.x;
+            let document_y = panel_y + self.canvas.scroll_offset.y;
+            self.telemetry.emit(
+                "hit_test.click_missed",
+                &[
+                    ("url", &self.document.source),
+                    ("screen_x", &format!("{:.1}", click.pos.x)),
+                    ("screen_y", &format!("{:.1}", click.pos.y)),
+                    ("panel_x", &format!("{:.1}", panel_x)),
+                    ("panel_y", &format!("{:.1}", panel_y)),
+                    ("document_x", &format!("{:.1}", document_x)),
+                    ("document_y", &format!("{:.1}", document_y)),
+                    ("button", &click.button),
+                    ("modifiers", &click.modifiers),
+                    ("scroll_x", &format!("{:.1}", self.canvas.scroll_offset.x)),
+                    ("scroll_y", &format!("{:.1}", self.canvas.scroll_offset.y)),
+                    ("zoom", &format!("{:.2}", self.canvas.zoom)),
+                    ("hovered_target", hovered_kind),
+                    ("hovered_element_id", hovered_element_id),
+                    ("hovered_label", hovered_label.as_deref().unwrap_or("")),
+                ],
+            );
+        }
     }
 
     fn update_last_focused_input(&mut self, response: &BrowserCanvasResponse) {
@@ -2477,6 +2559,14 @@ const MAX_EXTERNAL_SCRIPT_PARSE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_SCRIPT_DIAGNOSTIC_BYTES: usize = MAX_EXTERNAL_SCRIPT_PARSE_BYTES;
 const LIVE_JS_DEBUG_STATEMENT_BUDGET: usize = 50_000;
 const MAX_INITIAL_DYNAMIC_IMPORT_DRAINS: usize = 64;
+const MAX_RENDER_GRAPH_DEBUG_NODES: usize = 2_500;
+const MAX_RENDER_GRAPH_DEBUG_BYTES: usize = 512 * 1024;
+const MAX_RENDER_GRAPH_DEBUG_INPUT_BYTES: usize = 150 * 1024;
+const MAX_RENDER_GRAPH_DEBUG_CSS_BYTES: usize = 200 * 1024;
+const MAX_STYLE_PARENT_CHAIN: usize = 24;
+const MAX_STYLE_PREVIOUS_SIBLING_CHAIN: usize = 12;
+const RENDER_GRAPH_CHILD_TRACE_THRESHOLD: usize = 80;
+const RENDER_GRAPH_CHILD_TRACE_INTERVAL: usize = 100;
 
 fn script_console_messages_from_html(html: &str) -> Vec<justbarelyscript::ConsoleMessage> {
     script_console_messages_from_html_with_source(html, None)
@@ -2893,6 +2983,7 @@ fn seed_script_computed_styles_from_html(
         if let Some(display) = computed.display {
             let display_str = match display {
                 CssDisplay::None => "none",
+                CssDisplay::Contents => "contents",
                 CssDisplay::Block => "block",
                 CssDisplay::Inline => "inline",
                 CssDisplay::InlineBlock => "inline-block",
@@ -2916,11 +3007,27 @@ fn parse_html_document_from_live_html(
     source: &str,
     text_metrics: Option<&egui::Context>,
 ) -> BrowserDocument {
-    let reveal_hydration_hidden_content =
-        page_has_unexecuted_hydration_script(live_html, Some(source));
+    emit_global_telemetry(
+        "document.parse_live.start",
+        &[
+            ("source", source),
+            ("html_bytes", &live_html.len().to_string()),
+        ],
+    );
+    let reveal_hydration_hidden_content = live_html.contains("__NEXT_DATA__")
+        || live_html.contains("data-reactroot")
+        || live_html.contains("data-hydrate")
+        || live_html.contains("ng-version");
+    emit_global_telemetry("document.stylesheets.start", &[("source", source)]);
     let css = collect_document_stylesheets(live_html, source).unwrap_or_default();
+    emit_global_telemetry(
+        "document.stylesheets.finish",
+        &[("source", source), ("css_bytes", &css.len().to_string())],
+    );
     let live_html = remove_non_visual_metadata_elements(live_html);
+    emit_global_telemetry("document.dom_parse.start", &[("source", source)]);
     let dom = parse_dom_document(&live_html);
+    emit_global_telemetry("document.dom_parse.finish", &[("source", source)]);
     let title = dom
         .first_descendant_by_tag("title")
         .map(DomElement::text_content)
@@ -2929,12 +3036,16 @@ fn parse_html_document_from_live_html(
         .trim()
         .to_owned();
     let root_classes = document_theme_root_classes(&dom, text_metrics);
+    emit_global_telemetry("document.css_parse.start", &[("source", source)]);
     let style = parse_basic_css_for_viewport_with_root_classes(
         &css,
         DEFAULT_LAYOUT_VIEWPORT_WIDTH,
         &root_classes,
     );
+    emit_global_telemetry("document.css_parse.finish", &[("source", source)]);
+    emit_global_telemetry("document.render_graph.start", &[("source", source)]);
     let render_graph = build_render_graph(&dom, &style);
+    emit_global_telemetry("document.render_graph.finish", &[("source", source)]);
     let canvas_graph = render_graph_to_canvas_graph(
         &render_graph,
         source,
@@ -2942,7 +3053,16 @@ fn parse_html_document_from_live_html(
         text_metrics,
         reveal_hydration_hidden_content,
     );
+    emit_global_telemetry("document.blocks.start", &[("source", source)]);
     let blocks = render_graph_to_blocks(&render_graph, source, style.image_height_auto);
+    emit_global_telemetry(
+        "document.parse_live.finish",
+        &[
+            ("source", source),
+            ("blocks", &blocks.len().to_string()),
+            ("canvas_objects", &canvas_graph.objects.len().to_string()),
+        ],
+    );
     BrowserDocument {
         title,
         source: source.to_owned(),
@@ -4761,7 +4881,8 @@ impl App for AlmostThereApp {
         egui::CentralPanel::default()
             .frame(central_frame)
             .show(ctx, |ui| {
-                let response = if self.render_debug.open {
+                let using_render_debug = self.render_debug.open;
+                let response = if using_render_debug {
                     ui.horizontal(|ui| {
                         ui.label("RenderGraph -> CanvasGraph");
                         ui.separator();
@@ -4825,6 +4946,9 @@ impl App for AlmostThereApp {
                     self.canvas.ui(ui, &mut self.document)
                 };
                 self.update_last_focused_input(&response);
+                if !using_render_debug {
+                    self.emit_click_miss_telemetry(ctx, &response, ui.max_rect());
+                }
                 for input_change in &response.changed_inputs {
                     self.telemetry.emit(
                         "input.changed",
@@ -5309,6 +5433,33 @@ enum LinkClickEventTarget {
     Unique(String),
     Missing,
     Ambiguous(usize),
+}
+
+fn hit_target_telemetry_kind(target: Option<&HitTarget>) -> Option<&'static str> {
+    match target {
+        Some(HitTarget::Link { .. }) => Some("link"),
+        Some(HitTarget::Button { .. }) => Some("button"),
+        Some(HitTarget::Input { .. }) => Some("input"),
+        None => None,
+    }
+}
+
+fn hit_target_telemetry_element_id(target: Option<&HitTarget>) -> Option<&str> {
+    match target {
+        Some(HitTarget::Link { element_id, .. })
+        | Some(HitTarget::Button { element_id, .. })
+        | Some(HitTarget::Input { element_id, .. }) => element_id.as_deref(),
+        None => None,
+    }
+}
+
+fn hit_target_telemetry_label(target: Option<&HitTarget>) -> Option<String> {
+    match target {
+        Some(HitTarget::Link { href, .. }) => Some(href.clone()),
+        Some(HitTarget::Button { text, .. }) => Some(text.clone()),
+        Some(HitTarget::Input { label, .. }) => Some(label.clone()),
+        None => None,
+    }
 }
 
 fn resolve_link_click_event_target_id(
@@ -6164,25 +6315,75 @@ fn parse_html_document_with_text_metrics(
 fn parse_render_graph_debug_dump(html: &str, source: &str) -> String {
     let html = remove_html_comments(html);
     let html = apply_safe_script_browser_effects_with_source(&html, Some(source));
+    parse_render_graph_debug_dump_from_live_html(&html, source)
+}
+
+fn parse_render_graph_debug_dump_from_live_html(live_html: &str, source: &str) -> String {
+    emit_global_telemetry(
+        "render_graph_debug.start",
+        &[
+            ("source", source),
+            ("html_bytes", &live_html.len().to_string()),
+        ],
+    );
+    let html = live_html;
+    emit_global_telemetry(
+        "render_graph_debug.stylesheets.start",
+        &[("source", source)],
+    );
     let css = collect_document_stylesheets(&html, source).unwrap_or_default();
+    emit_global_telemetry(
+        "render_graph_debug.stylesheets.finish",
+        &[("source", source), ("css_bytes", &css.len().to_string())],
+    );
+    if live_html.len() > MAX_RENDER_GRAPH_DEBUG_INPUT_BYTES
+        || css.len() > MAX_RENDER_GRAPH_DEBUG_CSS_BYTES
+    {
+        let reason = format!(
+            "render graph debug skipped: html_bytes={} css_bytes={} exceeds debug budget html<={} css<={}",
+            live_html.len(),
+            css.len(),
+            MAX_RENDER_GRAPH_DEBUG_INPUT_BYTES,
+            MAX_RENDER_GRAPH_DEBUG_CSS_BYTES
+        );
+        emit_global_telemetry(
+            "render_graph_debug.skipped",
+            &[("source", source), ("reason", &reason)],
+        );
+        emit_global_telemetry(
+            "render_graph_debug.finish",
+            &[("source", source), ("bytes", &reason.len().to_string())],
+        );
+        return reason;
+    }
     let html = remove_non_visual_metadata_elements(&html);
+    emit_global_telemetry("render_graph_debug.dom_parse.start", &[("source", source)]);
     let dom = parse_dom_document(&html);
+    emit_global_telemetry("render_graph_debug.dom_parse.finish", &[("source", source)]);
     let root_classes = document_theme_root_classes(&dom, None);
+    emit_global_telemetry("render_graph_debug.css_parse.start", &[("source", source)]);
     let style = parse_basic_css_for_viewport_with_root_classes(
         &css,
         DEFAULT_LAYOUT_VIEWPORT_WIDTH,
         &root_classes,
     );
+    emit_global_telemetry("render_graph_debug.css_parse.finish", &[("source", source)]);
+    emit_global_telemetry("render_graph_debug.build.start", &[("source", source)]);
     let render_graph = build_render_graph(&dom, &style);
-    render_graph_debug_string(&render_graph)
+    emit_global_telemetry("render_graph_debug.build.finish", &[("source", source)]);
+    let debug = render_graph_debug_string(&render_graph);
+    emit_global_telemetry(
+        "render_graph_debug.finish",
+        &[("source", source), ("bytes", &debug.len().to_string())],
+    );
+    debug
 }
 
 fn document_theme_root_classes(
     dom: &DomDocument,
-    text_metrics: Option<&egui::Context>,
+    _text_metrics: Option<&egui::Context>,
 ) -> Vec<String> {
-    let mut classes: Vec<String> = dom
-        .first_descendant_by_tag("html")
+    dom.first_descendant_by_tag("html")
         .and_then(|element| element.attr("class"))
         .map(|classes| {
             classes
@@ -6190,20 +6391,7 @@ fn document_theme_root_classes(
                 .map(str::to_owned)
                 .collect()
         })
-        .unwrap_or_default();
-    let has_explicit_theme = classes
-        .iter()
-        .any(|class| matches!(class.as_str(), "dark" | "light"));
-    if !has_explicit_theme {
-        if let Some(ctx) = text_metrics {
-            classes.push(if ctx.style().visuals.dark_mode {
-                "dark".to_owned()
-            } else {
-                "light".to_owned()
-            });
-        }
-    }
-    classes
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Debug)]
@@ -6226,7 +6414,9 @@ enum RenderNodeKind {
 }
 
 fn build_render_graph(dom: &DomDocument, document_style: &BrowserStyle) -> RenderGraph {
+    emit_global_telemetry("render_graph.build.start", &[("scope", "document")]);
     let root_style = root_resolved_style(document_style);
+    let mut stats = RenderGraphBuildStats::default();
     let root_children = dom
         .first_descendant_by_tag("body")
         .map(|body| {
@@ -6237,9 +6427,28 @@ fn build_render_graph(dom: &DomDocument, document_style: &BrowserStyle) -> Rende
                 None,
                 &root_style,
                 document_style,
+                &mut stats,
+                1,
             )]
         })
-        .unwrap_or_else(|| build_render_children(&dom.children, None, &root_style, document_style));
+        .unwrap_or_else(|| {
+            build_render_children(
+                &dom.children,
+                None,
+                &root_style,
+                document_style,
+                &mut stats,
+                1,
+            )
+        });
+    emit_global_telemetry(
+        "render_graph.build.finish",
+        &[
+            ("elements", &stats.elements.to_string()),
+            ("text_nodes", &stats.text_nodes.to_string()),
+            ("max_depth", &stats.max_depth.to_string()),
+        ],
+    );
 
     RenderGraph {
         root: RenderNode {
@@ -6250,28 +6459,51 @@ fn build_render_graph(dom: &DomDocument, document_style: &BrowserStyle) -> Rende
     }
 }
 
+#[derive(Default)]
+struct RenderGraphBuildStats {
+    elements: usize,
+    text_nodes: usize,
+    max_depth: usize,
+}
+
 fn build_render_node(
     node: &DomNode,
-    parent_element: Option<&DomElement>,
-    previous_element_sibling: Option<&DomElement>,
+    parent_key: Option<&ElementStyleKey>,
+    previous_element_sibling: Option<&ElementStyleKey>,
     child_index: Option<usize>,
     parent_style: &ResolvedBoxStyle,
     document_style: &BrowserStyle,
+    stats: &mut RenderGraphBuildStats,
+    depth: usize,
 ) -> Option<RenderNode> {
     match node {
-        DomNode::Text(text) => Some(RenderNode {
-            kind: RenderNodeKind::Text(text.clone()),
-            style: inherited_style_for_text(parent_style),
-            children: Vec::new(),
-        }),
-        DomNode::Element(element) => Some(build_render_element(
-            element,
-            parent_element,
-            previous_element_sibling,
-            child_index,
-            parent_style,
-            document_style,
-        )),
+        DomNode::Text(text) => {
+            stats.text_nodes += 1;
+            stats.max_depth = stats.max_depth.max(depth);
+            Some(RenderNode {
+                kind: RenderNodeKind::Text(text.clone()),
+                style: inherited_style_for_text(parent_style),
+                children: Vec::new(),
+            })
+        }
+        DomNode::Element(element) => {
+            if matches!(
+                element.tag_name.as_str(),
+                "script" | "style" | "template" | "noscript"
+            ) {
+                return None;
+            }
+            Some(build_render_element(
+                element,
+                parent_key,
+                previous_element_sibling,
+                child_index,
+                parent_style,
+                document_style,
+                stats,
+                depth,
+            ))
+        }
     }
 }
 
@@ -6286,27 +6518,67 @@ fn inherited_style_for_text(parent: &ResolvedBoxStyle) -> ResolvedBoxStyle {
         text_decoration_strikethrough: parent.text_decoration_strikethrough,
         text_background: parent.text_background,
         text_align: parent.text_align,
+        list_style_type: parent.list_style_type,
+        visibility_visible: parent.visibility_visible,
         ..ResolvedBoxStyle::default()
     }
 }
 
 fn build_render_element(
     element: &DomElement,
-    parent_element: Option<&DomElement>,
-    previous_element_sibling: Option<&DomElement>,
+    parent_key: Option<&ElementStyleKey>,
+    previous_element_sibling: Option<&ElementStyleKey>,
     child_index: Option<usize>,
     parent_style: &ResolvedBoxStyle,
     document_style: &BrowserStyle,
+    stats: &mut RenderGraphBuildStats,
+    depth: usize,
 ) -> RenderNode {
-    let style = compute_render_style(
-        element,
-        parent_element,
-        previous_element_sibling,
-        child_index,
-        parent_style,
+    stats.elements += 1;
+    stats.max_depth = stats.max_depth.max(depth);
+    if stats.elements % 500 == 0 {
+        emit_global_telemetry(
+            "render_graph.build.progress",
+            &[
+                ("elements", &stats.elements.to_string()),
+                ("text_nodes", &stats.text_nodes.to_string()),
+                ("depth", &depth.to_string()),
+                ("tag", &element.tag_name),
+            ],
+        );
+    }
+    let trace_style = stats.elements % 100 == 0;
+    if trace_style {
+        emit_global_telemetry(
+            "render_graph.style.start",
+            &[
+                ("elements", &stats.elements.to_string()),
+                ("depth", &depth.to_string()),
+                ("tag", &element.tag_name),
+            ],
+        );
+    }
+    let key =
+        element_style_key_with_context(element, parent_key, previous_element_sibling, child_index);
+    let style = compute_render_style(element, &key, parent_style, document_style);
+    if trace_style {
+        emit_global_telemetry(
+            "render_graph.style.finish",
+            &[
+                ("elements", &stats.elements.to_string()),
+                ("depth", &depth.to_string()),
+                ("tag", &element.tag_name),
+            ],
+        );
+    }
+    let children = build_render_children(
+        &element.children,
+        Some(&key),
+        &style,
         document_style,
+        stats,
+        depth + 1,
     );
-    let children = build_render_children(&element.children, Some(element), &style, document_style);
 
     RenderNode {
         kind: RenderNodeKind::Element(element.clone()),
@@ -6317,13 +6589,32 @@ fn build_render_element(
 
 fn build_render_children(
     children: &[DomNode],
-    parent_element: Option<&DomElement>,
+    parent_key: Option<&ElementStyleKey>,
     parent_style: &ResolvedBoxStyle,
     document_style: &BrowserStyle,
+    stats: &mut RenderGraphBuildStats,
+    depth: usize,
 ) -> Vec<RenderNode> {
     let mut out = Vec::new();
-    let mut previous_element_sibling = None;
+    let mut previous_element_sibling: Option<ElementStyleKey> = None;
     let mut child_index = 0usize;
+    let trace_children = children.len() >= RENDER_GRAPH_CHILD_TRACE_THRESHOLD;
+    if trace_children {
+        emit_global_telemetry(
+            "render_graph.children.start",
+            &[
+                (
+                    "parent",
+                    parent_key.map(|key| key.tag.as_str()).unwrap_or("document"),
+                ),
+                ("children", &children.len().to_string()),
+                ("depth", &depth.to_string()),
+                ("elements", &stats.elements.to_string()),
+                ("text_nodes", &stats.text_nodes.to_string()),
+            ],
+        );
+    }
+    let mut last_traced_child_index = 0usize;
     for child in children {
         let current_child_index = if matches!(child, DomNode::Element(_)) {
             child_index += 1;
@@ -6331,19 +6622,63 @@ fn build_render_children(
         } else {
             None
         };
+        if trace_children
+            && child_index > 0
+            && child_index != last_traced_child_index
+            && child_index % RENDER_GRAPH_CHILD_TRACE_INTERVAL == 0
+        {
+            last_traced_child_index = child_index;
+            emit_global_telemetry(
+                "render_graph.children.progress",
+                &[
+                    (
+                        "parent",
+                        parent_key.map(|key| key.tag.as_str()).unwrap_or("document"),
+                    ),
+                    ("child_index", &child_index.to_string()),
+                    ("children", &children.len().to_string()),
+                    ("depth", &depth.to_string()),
+                    ("elements", &stats.elements.to_string()),
+                    ("text_nodes", &stats.text_nodes.to_string()),
+                ],
+            );
+        }
         if let Some(node) = build_render_node(
             child,
-            parent_element,
-            previous_element_sibling,
+            parent_key,
+            previous_element_sibling.as_ref(),
             current_child_index,
             parent_style,
             document_style,
+            stats,
+            depth,
         ) {
             out.push(node);
         }
         if let DomNode::Element(element) = child {
-            previous_element_sibling = Some(element);
+            previous_element_sibling = Some(element_style_key_with_context(
+                element,
+                parent_key,
+                previous_element_sibling.as_ref(),
+                current_child_index,
+            ));
         }
+    }
+    if trace_children {
+        emit_global_telemetry(
+            "render_graph.children.finish",
+            &[
+                (
+                    "parent",
+                    parent_key.map(|key| key.tag.as_str()).unwrap_or("document"),
+                ),
+                ("rendered", &out.len().to_string()),
+                ("children", &children.len().to_string()),
+                ("depth", &depth.to_string()),
+                ("elements", &stats.elements.to_string()),
+                ("text_nodes", &stats.text_nodes.to_string()),
+            ],
+        );
     }
     out
 }
@@ -6359,25 +6694,18 @@ fn root_resolved_style(style: &BrowserStyle) -> ResolvedBoxStyle {
 
 fn compute_render_style(
     element: &DomElement,
-    parent_element: Option<&DomElement>,
-    previous_element_sibling: Option<&DomElement>,
-    child_index: Option<usize>,
+    key: &ElementStyleKey,
     parent: &ResolvedBoxStyle,
     document_style: &BrowserStyle,
 ) -> ResolvedBoxStyle {
     let mut out = inherited_style_for_element(element, parent, document_style);
-    let key = element_style_key_with_context(
-        element,
-        parent_element,
-        previous_element_sibling,
-        child_index,
-    );
-    let matched = computed_box_style(document_style, &key);
+    let matched = computed_box_style(document_style, key);
     apply_css_box_style(&mut out, &matched, parent, document_style);
     if let Some(inline) = element.attr("style").and_then(parse_inline_box_style) {
         apply_css_box_style(&mut out, &inline, parent, document_style);
     }
-    if (!dom_element_text_is_visible(element) && !dom_element_is_visual_replaced_content(element))
+    if (!dom_element_own_box_is_visible(element)
+        && !dom_element_is_visual_replaced_content(element))
         || matches!(
             element.tag_name.as_str(),
             "script" | "style" | "template" | "noscript"
@@ -6387,6 +6715,29 @@ fn compute_render_style(
     }
     normalize_heading_margins(&element.tag_name, &mut out);
     out
+}
+
+fn dom_element_own_box_is_visible(element: &DomElement) -> bool {
+    if element.has_attr("hidden") {
+        return false;
+    }
+    if element
+        .attr("aria-hidden")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        return false;
+    }
+    if element.attr("class").is_some_and(|classes| {
+        classes
+            .split_whitespace()
+            .any(|class| class == "sr-only" || class == "visually-hidden")
+    }) {
+        return false;
+    }
+    !element.attr("style").is_some_and(|style| {
+        let style = style.to_ascii_lowercase().replace(' ', "");
+        style.contains("display:none") || style.contains("visibility:hidden")
+    })
 }
 
 fn dom_element_is_visual_replaced_content(element: &DomElement) -> bool {
@@ -6426,10 +6777,15 @@ fn inherited_style_for_element(
         text_decoration_strikethrough: parent.text_decoration_strikethrough,
         text_background: parent.text_background,
         text_align: parent.text_align,
+        list_style_type: parent.list_style_type,
+        visibility_visible: parent.visibility_visible,
         ..ResolvedBoxStyle::default()
     };
 
     match element.tag_name.as_str() {
+        "ul" | "ol" | "li" if element_has_markerless_list_class(element) => {
+            style.list_style_type = CssListStyleType::None;
+        }
         "body" => {
             style.background = document_style.page_background;
             style.padding = CssEdges {
@@ -6498,6 +6854,15 @@ fn inherited_style_for_element(
                 left: 0.0,
             };
         }
+        "ul" | "ol" => {
+            style.margin = CssEdges {
+                top: style.font_size,
+                right: 0.0,
+                bottom: style.font_size,
+                left: 0.0,
+            };
+            style.padding.left = 40.0;
+        }
         "em" | "i" | "cite" | "dfn" | "var" => style.font_style_italic = true,
         "u" | "ins" => style.text_decoration_underline = true,
         "del" | "s" => style.text_decoration_strikethrough = true,
@@ -6565,6 +6930,24 @@ fn inherited_style_for_element(
     }
 
     style
+}
+
+fn element_has_markerless_list_class(element: &DomElement) -> bool {
+    element.attr("class").is_some_and(|classes| {
+        classes.split_whitespace().any(|class| {
+            matches!(
+                class.to_ascii_lowercase().as_str(),
+                "list--bare"
+                    | "list-bare"
+                    | "list-unstyled"
+                    | "unstyled-list"
+                    | "no-bullets"
+                    | "no-bullet"
+                    | "no-markers"
+                    | "no-marker"
+            )
+        })
+    })
 }
 
 fn default_display_for_tag(tag: &str) -> CssDisplay {
@@ -6658,9 +7041,12 @@ fn apply_css_box_style(
         target.width = resolve_css_width(width, parent_width);
     }
     if let Some(max_width) = source.max_width {
+        target.max_width_percent = match max_width {
+            CssLength::Percent(percent) => Some(percent),
+            _ => None,
+        };
         target.max_width = match max_width {
-            CssLength::Auto => None,
-            CssLength::Percent(percent) if percent >= 99.0 => None,
+            CssLength::Auto | CssLength::Percent(_) => None,
             _ => Some(resolve_css_length(max_width, parent_width)),
         };
     }
@@ -6699,6 +7085,9 @@ fn apply_css_box_style(
     }
     if let Some(text_align) = source.text_align {
         target.text_align = text_align;
+    }
+    if let Some(list_style_type) = source.list_style_type {
+        target.list_style_type = list_style_type;
     }
     if let Some(flex_grow) = source.flex_grow {
         target.flex_grow = flex_grow;
@@ -6748,6 +7137,12 @@ fn apply_css_box_style(
     if let Some(position) = source.position {
         target.position = position;
     }
+    if let Some(float) = source.float {
+        target.float = float;
+    }
+    if let Some(clear) = source.clear {
+        target.clear = clear;
+    }
     if let Some(z_index) = source.z_index {
         target.z_index = Some(z_index);
     }
@@ -6788,6 +7183,17 @@ fn resolve_css_length(length: CssLength, parent_width: f32) -> f32 {
         CssLength::Calc(expression) => resolve_css_length_expression(expression, parent_width),
         CssLength::Min(left, right) => resolve_css_length_expression(left, parent_width)
             .min(resolve_css_length_expression(right, parent_width)),
+        CssLength::Max(left, right) => resolve_css_length_expression(left, parent_width)
+            .max(resolve_css_length_expression(right, parent_width)),
+        CssLength::Clamp(min, preferred, max) => {
+            resolve_css_length_expression(preferred, parent_width).clamp(
+                resolve_css_length_expression(min, parent_width),
+                resolve_css_length_expression(max, parent_width),
+            )
+        }
+        CssLength::FitContent(limit) => {
+            resolve_css_length_expression(limit, parent_width).min(parent_width)
+        }
     }
 }
 
@@ -6895,6 +7301,14 @@ struct CssLayoutBox<'a> {
     children: Vec<CssLayoutBox<'a>>,
     dimensions: CssLayoutDimensions,
     text: Option<String>,
+    flags: CssLayoutSubtreeFlags,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CssLayoutSubtreeFlags {
+    contains_replaced_or_special: bool,
+    contains_text_form_control: bool,
+    contains_visual_replaced_content: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -6903,6 +7317,12 @@ struct CssLayoutDimensions {
     margin: CssEdges,
     border: CssEdges,
     padding: CssEdges,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CssActiveFloat {
+    side: CssFloat,
+    rect: egui::Rect,
 }
 
 impl Default for CssLayoutDimensions {
@@ -6917,6 +7337,7 @@ impl Default for CssLayoutDimensions {
 }
 
 fn build_css_layout_tree(root: &RenderNode) -> CssLayoutBox<'_> {
+    emit_global_telemetry("layout_tree.build.start", &[("root", "document")]);
     let mut root_box = CssLayoutBox {
         kind: CssLayoutKind::Document,
         node: Some(root),
@@ -6928,8 +7349,18 @@ fn build_css_layout_tree(root: &RenderNode) -> CssLayoutBox<'_> {
             .collect(),
         dimensions: CssLayoutDimensions::default(),
         text: None,
+        flags: CssLayoutSubtreeFlags::default(),
     };
     root_box.children = fix_css_anonymous_blocks(root_box.children, &root_box.style);
+    root_box.flags = css_layout_subtree_flags_for(root_box.kind, root_box.node, &root_box.children);
+    let stats = css_layout_tree_stats(&root_box);
+    emit_global_telemetry(
+        "layout_tree.build.finish",
+        &[
+            ("boxes", &stats.boxes.to_string()),
+            ("depth", &stats.max_depth.to_string()),
+        ],
+    );
     root_box
 }
 
@@ -6956,10 +7387,18 @@ fn build_css_layout_boxes(node: &RenderNode) -> Vec<CssLayoutBox<'_>> {
                     children: Vec::new(),
                     dimensions: CssLayoutDimensions::default(),
                     text: Some(text),
+                    flags: css_layout_subtree_flags_for(CssLayoutKind::Text, Some(node), &[]),
                 }]
             }
         }
         RenderNodeKind::Element(_) => {
+            if node.style.display == CssDisplay::Contents {
+                return node
+                    .children
+                    .iter()
+                    .flat_map(build_css_layout_boxes)
+                    .collect();
+            }
             let kind = css_layout_kind_from_display(node.style.display);
             let raw_children = node
                 .children
@@ -6973,6 +7412,7 @@ fn build_css_layout_boxes(node: &RenderNode) -> Vec<CssLayoutBox<'_>> {
             } else {
                 raw_children
             };
+            let flags = css_layout_subtree_flags_for(kind, Some(node), &children);
             vec![CssLayoutBox {
                 kind,
                 node: Some(node),
@@ -6980,6 +7420,7 @@ fn build_css_layout_boxes(node: &RenderNode) -> Vec<CssLayoutBox<'_>> {
                 children,
                 dimensions: CssLayoutDimensions::default(),
                 text: None,
+                flags,
             }]
         }
     }
@@ -6988,7 +7429,7 @@ fn build_css_layout_boxes(node: &RenderNode) -> Vec<CssLayoutBox<'_>> {
 fn css_layout_kind_from_display(display: CssDisplay) -> CssLayoutKind {
     match display {
         CssDisplay::Inline | CssDisplay::InlineBlock => CssLayoutKind::Inline,
-        CssDisplay::None => CssLayoutKind::Block,
+        CssDisplay::None | CssDisplay::Contents => CssLayoutKind::Block,
         CssDisplay::Block
         | CssDisplay::Flex
         | CssDisplay::Grid
@@ -7039,11 +7480,24 @@ fn flush_css_anonymous_inline_run<'a>(
     result.push(CssLayoutBox {
         kind: CssLayoutKind::AnonymousBlock,
         node: None,
-        style: parent_style.clone(),
-        children: std::mem::take(inline_run),
+        style: css_anonymous_block_style(parent_style),
+        children: {
+            let children = std::mem::take(inline_run);
+            children
+        },
         dimensions: CssLayoutDimensions::default(),
         text: None,
+        flags: CssLayoutSubtreeFlags::default(),
     });
+    if let Some(box_) = result.last_mut() {
+        box_.flags = css_layout_subtree_flags_for(box_.kind, box_.node, &box_.children);
+    }
+}
+
+fn css_anonymous_block_style(parent_style: &ResolvedBoxStyle) -> ResolvedBoxStyle {
+    let mut style = inherited_style_for_text(parent_style);
+    style.display = CssDisplay::Block;
+    style
 }
 
 fn css_layout_box_is_block_level(box_: &CssLayoutBox<'_>) -> bool {
@@ -7057,6 +7511,30 @@ fn css_layout_box_is_inline_level(box_: &CssLayoutBox<'_>) -> bool {
     matches!(box_.kind, CssLayoutKind::Inline | CssLayoutKind::Text)
 }
 
+fn css_layout_subtree_flags_for(
+    kind: CssLayoutKind,
+    node: Option<&RenderNode>,
+    children: &[CssLayoutBox<'_>],
+) -> CssLayoutSubtreeFlags {
+    let own_replaced_or_special = node.is_some_and(css_layout_node_is_replaced_or_special);
+    let own_text_form_control = node.is_some_and(css_layout_node_is_text_form_control);
+    let own_visual_replaced_content = node.is_some_and(css_layout_node_is_visual_replaced_content);
+    let mut flags = CssLayoutSubtreeFlags {
+        contains_replaced_or_special: own_replaced_or_special,
+        contains_text_form_control: own_text_form_control,
+        contains_visual_replaced_content: own_visual_replaced_content,
+    };
+    if kind == CssLayoutKind::Text {
+        return flags;
+    }
+    for child in children {
+        flags.contains_replaced_or_special |= child.flags.contains_replaced_or_special;
+        flags.contains_text_form_control |= child.flags.contains_text_form_control;
+        flags.contains_visual_replaced_content |= child.flags.contains_visual_replaced_content;
+    }
+    flags
+}
+
 fn layout_css_layout_tree(
     root: &mut CssLayoutBox<'_>,
     viewport_width: f32,
@@ -7065,6 +7543,14 @@ fn layout_css_layout_tree(
     image_height_auto: bool,
     text_metrics: Option<&egui::Context>,
 ) {
+    emit_global_telemetry(
+        "layout.pass.start",
+        &[
+            ("source", source),
+            ("viewport_width", &viewport_width.to_string()),
+            ("viewport_height", &viewport_height.to_string()),
+        ],
+    );
     root.dimensions.content = egui::Rect::from_min_size(
         egui::Pos2::ZERO,
         egui::vec2(viewport_width.max(1.0), viewport_height.max(1.0)),
@@ -7079,6 +7565,13 @@ fn layout_css_layout_tree(
         text_metrics,
         css_layout_viewport_rect(viewport_width, viewport_height),
     );
+    emit_global_telemetry(
+        "layout.pass.finish",
+        &[
+            ("source", source),
+            ("height", &root.dimensions.content.height().to_string()),
+        ],
+    );
 }
 
 fn layout_css_block_children(
@@ -7088,23 +7581,77 @@ fn layout_css_block_children(
     text_metrics: Option<&egui::Context>,
 ) -> f32 {
     let mut cursor_y = parent.dimensions.content.top();
+    let mut active_floats = Vec::new();
     for child in &mut parent.children {
         if css_layout_box_is_out_of_flow(child) {
             continue;
         }
+        if child.style.clear == CssClear::Both {
+            cursor_y = cursor_y.max(css_clearance_y(&active_floats));
+        }
+        active_floats.retain(|float_| float_.rect.bottom() > cursor_y);
+        let (left_float_offset, right_float_offset) =
+            css_float_offsets_at_y(&active_floats, parent.dimensions.content, cursor_y);
+        let available_x = parent.dimensions.content.left() + left_float_offset;
+        let available_width =
+            (parent.dimensions.content.width() - left_float_offset - right_float_offset).max(1.0);
         layout_css_box(
             child,
-            parent.dimensions.content.left(),
+            available_x,
             cursor_y,
-            parent.dimensions.content.width().max(1.0),
+            available_width,
             parent.dimensions.content.height().max(0.0),
             source,
             image_height_auto,
             text_metrics,
         );
-        cursor_y = css_margin_box(child).bottom();
+        if child.style.float != CssFloat::None {
+            if child.style.float == CssFloat::Right {
+                let margin_box = css_margin_box(child);
+                let target_right = parent.dimensions.content.right() - right_float_offset;
+                translate_css_layout_box(child, egui::vec2(target_right - margin_box.right(), 0.0));
+            }
+            active_floats.push(CssActiveFloat {
+                side: child.style.float,
+                rect: css_margin_box(child),
+            });
+        } else {
+            cursor_y = css_margin_box(child).bottom();
+        }
     }
-    (cursor_y - parent.dimensions.content.top()).max(0.0)
+    let float_bottom = css_clearance_y(&active_floats);
+    (cursor_y.max(float_bottom) - parent.dimensions.content.top()).max(0.0)
+}
+
+fn css_clearance_y(active_floats: &[CssActiveFloat]) -> f32 {
+    active_floats
+        .iter()
+        .map(|float_| float_.rect.bottom())
+        .fold(0.0, f32::max)
+}
+
+fn css_float_offsets_at_y(
+    active_floats: &[CssActiveFloat],
+    content: egui::Rect,
+    y: f32,
+) -> (f32, f32) {
+    let mut left_offset: f32 = 0.0;
+    let mut right_offset: f32 = 0.0;
+    for float_ in active_floats {
+        if float_.rect.bottom() <= y || float_.rect.top() > y {
+            continue;
+        }
+        match float_.side {
+            CssFloat::Left => {
+                left_offset = left_offset.max(float_.rect.right() - content.left());
+            }
+            CssFloat::Right => {
+                right_offset = right_offset.max(content.right() - float_.rect.left());
+            }
+            CssFloat::None => {}
+        }
+    }
+    (left_offset.max(0.0), right_offset.max(0.0))
 }
 
 fn layout_css_box(
@@ -7148,26 +7695,46 @@ fn layout_css_box(
             (declared - horizontal_non_content).max(1.0)
         }
     });
-    let mut content_width =
-        if let Some(width) = percent_width.or(box_.style.width).or(box_.style.max_width) {
-            if box_.style.box_sizing_border_box {
-                (width - border_padding).max(1.0)
-            } else {
-                width
-            }
-        } else if matches!(box_.kind, CssLayoutKind::Inline)
-            && (box_.style.flex_grow > 0.0 || css_layout_box_contains_text_form_control(box_))
-        {
-            (containing_width - horizontal_non_content).max(1.0)
-        } else if matches!(box_.kind, CssLayoutKind::Inline) {
-            css_layout_preferred_content_width(box_, text_metrics)
+    let explicit_width = percent_width.or(box_.style.width);
+    let mut content_width = if let Some(width) = explicit_width {
+        if box_.style.box_sizing_border_box {
+            (width - border_padding).max(1.0)
         } else {
-            (containing_width - horizontal_non_content).max(1.0)
+            width
         }
-        .min(containing_width)
-        .max(css_used_content_min_width(&box_.style, 1.0));
+    } else if matches!(box_.kind, CssLayoutKind::Inline)
+        && (box_.style.flex_grow > 0.0 || css_layout_box_contains_text_form_control(box_))
+    {
+        (containing_width - horizontal_non_content).max(1.0)
+    } else if css_layout_inline_box_should_layout_block_children(box_) {
+        (containing_width - horizontal_non_content).max(1.0)
+    } else if matches!(box_.kind, CssLayoutKind::Inline) {
+        css_layout_preferred_content_width(box_, text_metrics)
+    } else if css_layout_box_uses_shrink_to_fit_width(box_) {
+        css_layout_shrink_to_fit_content_width(
+            box_,
+            containing_width,
+            horizontal_non_content,
+            source,
+            image_height_auto,
+            text_metrics,
+        )
+    } else {
+        (containing_width - horizontal_non_content).max(1.0)
+    }
+    .min(containing_width)
+    .max(css_used_content_min_width(&box_.style, 1.0));
+    if let Some(max_width) = css_style_max_width_for_containing(&box_.style, containing_width) {
+        let max_content_width = if box_.style.box_sizing_border_box {
+            (max_width - border_padding).max(1.0)
+        } else {
+            max_width.max(1.0)
+        };
+        content_width = content_width.min(max_content_width).max(1.0);
+    }
     if box_.style.width.is_none()
         && box_.style.max_width.is_none()
+        && box_.style.max_width_percent.is_none()
         && let Some(node) = box_.node
         && let RenderNodeKind::Element(element) = &node.kind
         && element.tag_name == "svg"
@@ -7184,7 +7751,7 @@ fn layout_css_box(
         + box_.dimensions.border.left
         + box_.dimensions.padding.left;
     if box_.style.width.is_none()
-        && box_.style.max_width.is_some()
+        && (box_.style.max_width.is_some() || box_.style.max_width_percent.is_some())
         && content_width + horizontal_non_content < containing_width
     {
         content_x += ((containing_width - content_width - horizontal_non_content) * 0.5).max(0.0);
@@ -7245,13 +7812,19 @@ fn layout_css_box(
                         image_height_auto,
                         text_metrics,
                     )
+                } else if css_layout_inline_box_should_layout_block_children(box_) {
+                    layout_css_block_children(box_, source, image_height_auto, text_metrics)
                 } else {
                     measure_css_inline_children_height(&box_.children, content_width, text_metrics)
                         .max((box_.style.font_size * 1.35).max(1.0))
                 }
             } else {
-                measure_css_inline_children_height(&box_.children, content_width, text_metrics)
-                    .max((box_.style.font_size * 1.35).max(1.0))
+                if css_layout_inline_box_should_layout_block_children(box_) {
+                    layout_css_block_children(box_, source, image_height_auto, text_metrics)
+                } else {
+                    measure_css_inline_children_height(&box_.children, content_width, text_metrics)
+                        .max((box_.style.font_size * 1.35).max(1.0))
+                }
             }
         }
         CssLayoutKind::Block => {
@@ -7276,6 +7849,10 @@ fn layout_css_box(
                     && !box_
                         .children
                         .iter()
+                        .any(css_layout_inline_box_should_layout_block_children)
+                    && !box_
+                        .children
+                        .iter()
                         .any(css_layout_box_contains_replaced_or_special)
                 {
                     measure_css_inline_children_height(&box_.children, content_width, text_metrics)
@@ -7288,12 +7865,16 @@ fn layout_css_box(
         }
     };
 
+    let inline_visual_height =
+        css_layout_inline_flow_visual_height(box_, content_width, text_metrics)
+            .unwrap_or(intrinsic_height);
     let content_height = css_resolve_used_height(
         intrinsic_height,
         &box_.style,
         containing_height,
         content_width,
-    );
+    )
+    .max(inline_visual_height);
     box_.dimensions.content.max.y = box_.dimensions.content.min.y + content_height.max(0.0);
     if box_.node.is_some_and(css_layout_node_is_button) {
         center_css_button_children(box_);
@@ -7308,6 +7889,30 @@ fn layout_css_box(
             DEFAULT_LAYOUT_VIEWPORT_HEIGHT,
         ),
     );
+}
+
+fn css_layout_inline_flow_visual_height(
+    box_: &CssLayoutBox<'_>,
+    content_width: f32,
+    text_metrics: Option<&egui::Context>,
+) -> Option<f32> {
+    if box_.kind == CssLayoutKind::Text {
+        return Some((box_.style.font_size * 1.35).max(1.0));
+    }
+    if box_.children.is_empty()
+        || !box_.children.iter().all(css_layout_box_is_inline_level)
+        || box_
+            .children
+            .iter()
+            .any(css_layout_box_contains_replaced_or_special)
+    {
+        return None;
+    }
+    Some(measure_css_inline_children_height(
+        &box_.children,
+        content_width,
+        text_metrics,
+    ))
 }
 
 fn layout_css_inline_visual_children(
@@ -7555,7 +8160,7 @@ fn layout_css_flex_children(
                 child
                     .style
                     .width
-                    .or(child.style.max_width)
+                    .or_else(|| css_style_max_width_for_containing(&child.style, content.width()))
                     .unwrap_or(content.width())
                     .min(content.width())
                     .max(css_flex_item_min_width(child))
@@ -7564,6 +8169,11 @@ fn layout_css_flex_children(
     };
 
     let mut item_sizes = Vec::with_capacity(child_count);
+    let flex_child_containing_height = if is_row {
+        css_declared_box_height(&container.style, content.width()).unwrap_or(0.0)
+    } else {
+        content.height().max(0.0)
+    };
     for (index, item_width) in flow_indices.iter().zip(item_widths) {
         let child = &mut container.children[*index];
         layout_css_box(
@@ -7571,7 +8181,7 @@ fn layout_css_flex_children(
             0.0,
             0.0,
             item_width.max(1.0),
-            content.height().max(0.0),
+            flex_child_containing_height,
             source,
             image_height_auto,
             text_metrics,
@@ -7589,7 +8199,7 @@ fn layout_css_flex_children(
         .map(|size| if is_row { size.y } else { size.x })
         .fold(0.0, f32::max);
     let available_cross = if is_row {
-        css_definite_box_height(&container.style, content.width())
+        css_declared_box_height(&container.style, content.width())
             .unwrap_or(cross_size)
             .max(cross_size)
     } else {
@@ -7598,7 +8208,7 @@ fn layout_css_flex_children(
     let available_main = if is_row {
         content.width()
     } else {
-        css_definite_box_height(&container.style, content.width())
+        css_declared_box_height(&container.style, content.width())
             .unwrap_or(total_main)
             .max(total_main)
     };
@@ -7775,6 +8385,8 @@ fn layout_css_wrapped_row_flex_children(
     }
 
     let mut item_sizes = vec![egui::Vec2::ZERO; child_count];
+    let flex_child_containing_height =
+        css_declared_box_height(&container.style, content.width()).unwrap_or(0.0);
     for (slot, index) in flow_indices.iter().enumerate() {
         let child = &mut container.children[*index];
         layout_css_box(
@@ -7782,7 +8394,7 @@ fn layout_css_wrapped_row_flex_children(
             0.0,
             0.0,
             base_widths[slot].max(1.0),
-            content.height().max(0.0),
+            flex_child_containing_height,
             source,
             image_height_auto,
             text_metrics,
@@ -7966,6 +8578,7 @@ fn css_flex_item_effective_grow(child: &CssLayoutBox<'_>) -> f32 {
     }
     if child.style.width.is_none()
         && child.style.max_width.is_none()
+        && child.style.max_width_percent.is_none()
         && css_layout_box_contains_text_form_control(child)
     {
         1.0
@@ -7998,7 +8611,11 @@ fn css_flex_item_base_width(
     available_width: f32,
     text_metrics: Option<&egui::Context>,
 ) -> f32 {
-    if let Some(width) = child.style.width.or(child.style.max_width) {
+    if let Some(width) = child
+        .style
+        .width
+        .or_else(|| css_style_max_width_for_containing(&child.style, available_width))
+    {
         return width.min(available_width).max(1.0);
     }
 
@@ -8013,6 +8630,107 @@ fn css_flex_item_base_width(
     (content_width + horizontal_non_content)
         .min(available_width)
         .max(1.0)
+}
+
+fn css_layout_box_uses_shrink_to_fit_width(box_: &CssLayoutBox<'_>) -> bool {
+    box_.style.width.is_none()
+        && box_.style.width_percent.is_none()
+        && box_.style.max_width.is_none()
+        && box_.style.max_width_percent.is_none()
+        && (box_.style.float != CssFloat::None
+            || matches!(
+                box_.style.position,
+                CssPosition::Absolute | CssPosition::Fixed
+            ))
+}
+
+fn css_layout_inline_box_contains_block_level_child(box_: &CssLayoutBox<'_>) -> bool {
+    matches!(box_.kind, CssLayoutKind::Inline)
+        && box_.children.iter().any(css_layout_box_is_block_level)
+}
+
+fn css_layout_inline_box_should_layout_block_children(box_: &CssLayoutBox<'_>) -> bool {
+    if !css_layout_inline_box_contains_block_level_child(box_) {
+        return false;
+    }
+    let Some(node) = box_.node else {
+        return false;
+    };
+    let RenderNodeKind::Element(element) = &node.kind else {
+        return false;
+    };
+    element.tag_name == "a" || matches!(box_.style.display, CssDisplay::InlineBlock)
+}
+
+fn css_layout_shrink_to_fit_content_width(
+    box_: &CssLayoutBox<'_>,
+    containing_width: f32,
+    horizontal_non_content: f32,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    let available = (containing_width - horizontal_non_content).max(1.0);
+    let preferred =
+        css_layout_preferred_visual_replaced_outer_width(box_, source, image_height_auto)
+            .unwrap_or_else(|| css_layout_preferred_content_width(box_, text_metrics));
+    preferred
+        .min(available)
+        .max(css_used_content_min_width(&box_.style, 1.0))
+        .max(1.0)
+}
+
+fn css_layout_preferred_visual_replaced_outer_width(
+    box_: &CssLayoutBox<'_>,
+    source: &str,
+    image_height_auto: bool,
+) -> Option<f32> {
+    let own = css_layout_visual_replaced_content_width(box_, source, image_height_auto);
+    box_.children
+        .iter()
+        .filter_map(|child| {
+            css_layout_preferred_visual_replaced_outer_width(child, source, image_height_auto).map(
+                |width| {
+                    width
+                        + child.style.margin.left
+                        + child.style.margin.right
+                        + child.style.border_width * 2.0
+                        + child.style.padding.left
+                        + child.style.padding.right
+                },
+            )
+        })
+        .chain(own)
+        .reduce(f32::max)
+}
+
+fn css_layout_visual_replaced_content_width(
+    box_: &CssLayoutBox<'_>,
+    source: &str,
+    image_height_auto: bool,
+) -> Option<f32> {
+    let node = box_.node?;
+    if !css_layout_node_is_visual_replaced_content(node) {
+        return None;
+    }
+    if let Some(width) = box_.style.width.or(box_.style.max_width) {
+        return Some(width.max(1.0));
+    }
+    let RenderNodeKind::Element(element) = &node.kind else {
+        return None;
+    };
+    if element.tag_name == "svg" {
+        return Some(svg_size_from_dom_element(element).0.max(1.0));
+    }
+    if let Some(size) = requested_image_size_from_dom(element) {
+        return Some(size.x.max(1.0));
+    }
+    let block = replaced_content_from_dom_element(element, source, image_height_auto);
+    Some(
+        replaced_content_size(&block, 1.0, box_.style.font_size)
+            .x
+            .max(1.0),
+    )
 }
 
 fn css_layout_preferred_content_width(
@@ -8034,6 +8752,18 @@ fn css_layout_preferred_content_width(
                     return width
                         .max(css_used_content_min_width(&box_.style, 1.0))
                         .max(1.0);
+                }
+                if let Some(node) = box_.node
+                    && let RenderNodeKind::Element(element) = &node.kind
+                {
+                    if element.tag_name == "svg" {
+                        return svg_size_from_dom_element(element).0.max(1.0);
+                    }
+                    if css_layout_node_is_visual_replaced_content(node)
+                        && let Some(size) = requested_image_size_from_dom(element)
+                    {
+                        return size.x.max(1.0);
+                    }
                 }
                 let text_width = if let Some(node) = box_.node {
                     if let RenderNodeKind::Element(element) = &node.kind {
@@ -8116,6 +8846,45 @@ fn css_used_content_min_width(style: &ResolvedBoxStyle, default: f32) -> f32 {
     }
 }
 
+fn css_declared_box_height(style: &ResolvedBoxStyle, containing_width: f32) -> Option<f32> {
+    let vertical_border_padding = css_style_vertical_border_padding(style);
+    style
+        .height
+        .and_then(|height| match height {
+            CssLength::Px(px) => Some(px),
+            CssLength::Vh(vh) => Some(DEFAULT_LAYOUT_VIEWPORT_HEIGHT * vh / 100.0),
+            CssLength::Vw(vw) => Some(DEFAULT_LAYOUT_VIEWPORT_WIDTH * vw / 100.0),
+            CssLength::Calc(expression) => {
+                Some(resolve_css_length_expression(expression, containing_width))
+            }
+            CssLength::Min(left, right) => Some(
+                resolve_css_length_expression(left, containing_width)
+                    .min(resolve_css_length_expression(right, containing_width)),
+            ),
+            CssLength::Max(left, right) => Some(
+                resolve_css_length_expression(left, containing_width)
+                    .max(resolve_css_length_expression(right, containing_width)),
+            ),
+            CssLength::Clamp(min, preferred, max) => Some(
+                resolve_css_length_expression(preferred, containing_width).clamp(
+                    resolve_css_length_expression(min, containing_width),
+                    resolve_css_length_expression(max, containing_width),
+                ),
+            ),
+            CssLength::FitContent(limit) => {
+                Some(resolve_css_length_expression(limit, containing_width))
+            }
+            CssLength::Auto | CssLength::Percent(_) | CssLength::Fr(_) => None,
+        })
+        .map(|height| {
+            css_used_content_box_extent(
+                height,
+                vertical_border_padding,
+                style.box_sizing_border_box,
+            )
+        })
+}
+
 fn css_definite_box_height(style: &ResolvedBoxStyle, containing_width: f32) -> Option<f32> {
     let vertical_border_padding = css_style_vertical_border_padding(style);
     [style.height, style.min_height]
@@ -8132,6 +8901,19 @@ fn css_definite_box_height(style: &ResolvedBoxStyle, containing_width: f32) -> O
                 resolve_css_length_expression(left, containing_width)
                     .min(resolve_css_length_expression(right, containing_width)),
             ),
+            CssLength::Max(left, right) => Some(
+                resolve_css_length_expression(left, containing_width)
+                    .max(resolve_css_length_expression(right, containing_width)),
+            ),
+            CssLength::Clamp(min, preferred, max) => Some(
+                resolve_css_length_expression(preferred, containing_width).clamp(
+                    resolve_css_length_expression(min, containing_width),
+                    resolve_css_length_expression(max, containing_width),
+                ),
+            ),
+            CssLength::FitContent(limit) => {
+                Some(resolve_css_length_expression(limit, containing_width))
+            }
             CssLength::Auto | CssLength::Percent(_) | CssLength::Fr(_) => None,
         })
         .map(|height| {
@@ -8201,6 +8983,15 @@ fn apply_css_layout_transform(box_: &mut CssLayoutBox<'_>) {
         CssLength::Calc(expression) => resolve_css_length_expression(expression, reference_width),
         CssLength::Min(left, right) => resolve_css_length_expression(left, reference_width)
             .min(resolve_css_length_expression(right, reference_width)),
+        CssLength::Max(left, right) => resolve_css_length_expression(left, reference_width)
+            .max(resolve_css_length_expression(right, reference_width)),
+        CssLength::Clamp(min, preferred, max) => {
+            resolve_css_length_expression(preferred, reference_width).clamp(
+                resolve_css_length_expression(min, reference_width),
+                resolve_css_length_expression(max, reference_width),
+            )
+        }
+        CssLength::FitContent(limit) => resolve_css_length_expression(limit, reference_width),
     };
     translate_css_layout_box(box_, egui::vec2(delta_x, 0.0));
 }
@@ -8419,7 +9210,7 @@ fn css_grid_item_used_width(style: &ResolvedBoxStyle, track_width: f32) -> f32 {
     let min_width = style.min_width.unwrap_or(1.0).max(0.0);
     let mut width = style.width.unwrap_or(track_width).min(track_width);
     if style.width.is_none()
-        && let Some(max_width) = style.max_width
+        && let Some(max_width) = css_style_max_width_for_containing(style, track_width)
     {
         width = width.min(max_width.max(min_width));
     }
@@ -8491,6 +9282,17 @@ fn resolve_css_grid_track_min_width(length: CssLength, containing_width: f32) ->
         CssLength::Calc(expression) => resolve_css_length_expression(expression, containing_width),
         CssLength::Min(left, right) => resolve_css_length_expression(left, containing_width)
             .min(resolve_css_length_expression(right, containing_width)),
+        CssLength::Max(left, right) => resolve_css_length_expression(left, containing_width)
+            .max(resolve_css_length_expression(right, containing_width)),
+        CssLength::Clamp(min, preferred, max) => {
+            resolve_css_length_expression(preferred, containing_width).clamp(
+                resolve_css_length_expression(min, containing_width),
+                resolve_css_length_expression(max, containing_width),
+            )
+        }
+        CssLength::FitContent(limit) => {
+            resolve_css_length_expression(limit, containing_width).min(containing_width)
+        }
     }
 }
 
@@ -8807,7 +9609,7 @@ fn css_distribute_grid_fr_row_heights(
         if let Some(CssLength::Fr(fr)) = rows.get(row).copied()
             && fr > 0.0
         {
-            *height = remaining * fr / fr_total;
+            *height = (*height).max(remaining * fr / fr_total);
         }
     }
 }
@@ -8847,7 +9649,7 @@ fn css_seed_definite_grid_fr_row_heights(
         if let Some(CssLength::Fr(fr)) = rows.get(row).copied()
             && fr > 0.0
         {
-            *height = remaining * fr / fr_total;
+            *height = (*height).max(remaining * fr / fr_total);
         }
     }
 }
@@ -8899,7 +9701,7 @@ fn css_grid_row_is_fr(style: &ResolvedBoxStyle, row: usize) -> bool {
 }
 
 fn distribute_css_grid_item_height(
-    style: &ResolvedBoxStyle,
+    _style: &ResolvedBoxStyle,
     explicit_row_heights: &[Option<f32>],
     row_heights: &mut [f32],
     gap: f32,
@@ -8917,10 +9719,7 @@ fn distribute_css_grid_item_height(
         .sum::<f32>();
     let auto_rows = explicit_row_heights[bounds.0..=bounds.1]
         .iter()
-        .enumerate()
-        .filter(|(offset, height)| {
-            height.is_none() && !css_grid_row_is_fr(style, bounds.0 + *offset)
-        })
+        .filter(|height| height.is_none())
         .count();
     let item_height =
         (css_margin_box(child).height() - gap * row_span.saturating_sub(1) as f32).max(0.0);
@@ -8930,9 +9729,6 @@ fn distribute_css_grid_item_height(
     let auto_height = ((item_height - explicit_height).max(0.0)) / auto_rows as f32;
     for (offset, row_height) in row_heights[bounds.0..=bounds.1].iter_mut().enumerate() {
         if explicit_row_heights[bounds.0 + offset].is_none() {
-            if css_grid_row_is_fr(style, bounds.0 + offset) {
-                continue;
-            }
             *row_height = (*row_height).max(auto_height);
         }
     }
@@ -9057,6 +9853,17 @@ fn resolve_css_used_height_length(length: CssLength, percent_basis: f32) -> Opti
             resolve_css_length_expression(left, percent_basis)
                 .min(resolve_css_length_expression(right, percent_basis)),
         ),
+        CssLength::Max(left, right) => Some(
+            resolve_css_length_expression(left, percent_basis)
+                .max(resolve_css_length_expression(right, percent_basis)),
+        ),
+        CssLength::Clamp(min, preferred, max) => Some(
+            resolve_css_length_expression(preferred, percent_basis).clamp(
+                resolve_css_length_expression(min, percent_basis),
+                resolve_css_length_expression(max, percent_basis),
+            ),
+        ),
+        CssLength::FitContent(limit) => Some(resolve_css_length_expression(limit, percent_basis)),
         CssLength::Percent(percent) if percent_basis > 0.0 => Some(percent_basis * percent / 100.0),
         CssLength::Percent(_) => None,
     }
@@ -9217,6 +10024,14 @@ fn css_layout_node_is_replaced_or_special(node: &RenderNode) -> bool {
     )
 }
 
+fn css_layout_node_is_text_form_control(node: &RenderNode) -> bool {
+    matches!(
+        &node.kind,
+        RenderNodeKind::Element(element)
+            if matches!(element.tag_name.as_str(), "input" | "textarea" | "select")
+    )
+}
+
 fn estimate_special_css_box_height(
     node: &RenderNode,
     width: f32,
@@ -9232,11 +10047,16 @@ fn estimate_special_css_box_height(
             CanvasBlock::Image { image, .. } => image.size.y,
             _ => (node.style.font_size * 3.0).max(48.0),
         },
-        "table" => collect_table_rows(node)
+        "table" => collect_table_layout_rows(node)
             .iter()
             .map(|row| {
-                let columns = row.len().max(1) as f32;
-                table_row_height(row, (width / columns).max(24.0), 6.0, 5.0, text_metrics)
+                let columns = row
+                    .iter()
+                    .map(|cell| cell.column + cell.colspan)
+                    .max()
+                    .unwrap_or(0)
+                    .max(1) as f32;
+                table_layout_row_height(row, (width / columns).max(24.0), 6.0, 5.0, text_metrics)
             })
             .sum::<f32>()
             .max((node.style.font_size * 1.35).max(1.0)),
@@ -9304,6 +10124,7 @@ fn render_graph_to_canvas_graph(
     text_metrics: Option<&egui::Context>,
     reveal_hydration_hidden_content: bool,
 ) -> CanvasGraph {
+    emit_global_telemetry("canvas_graph.build.start", &[("source", source)]);
     let viewport = egui::vec2(
         graph
             .root
@@ -9328,6 +10149,7 @@ fn render_graph_to_canvas_graph(
         form_stack: Vec::new(),
         forms_by_id,
     };
+    emit_global_telemetry("canvas_graph.layout.start", &[("source", source)]);
     layout_css_layout_tree(
         &mut layout_root,
         viewport.x,
@@ -9336,10 +10158,21 @@ fn render_graph_to_canvas_graph(
         image_height_auto,
         text_metrics,
     );
+    emit_global_telemetry("canvas_graph.layout.finish", &[("source", source)]);
     if reveal_hydration_hidden_content {
+        emit_global_telemetry("canvas_graph.hydration_reveal.start", &[("source", source)]);
         apply_hydration_visibility_fallback(&mut layout_root);
+        emit_global_telemetry(
+            "canvas_graph.hydration_reveal.finish",
+            &[("source", source)],
+        );
     }
 
+    let top_level_children = layout_root.children.len().to_string();
+    emit_global_telemetry(
+        "canvas_graph.emit.start",
+        &[("source", source), ("children", &top_level_children)],
+    );
     for child in &layout_root.children {
         push_canvas_graph_layout_box(
             child,
@@ -9356,7 +10189,35 @@ fn render_graph_to_canvas_graph(
         .max(layout_root.dimensions.content.height())
         .max(canvas_graph_content_bottom(&canvas_graph))
         .max(DEFAULT_LAYOUT_VIEWPORT_HEIGHT);
+    emit_global_telemetry(
+        "canvas_graph.build.finish",
+        &[
+            ("source", source),
+            ("objects", &canvas_graph.objects.len().to_string()),
+            ("viewport_height", &canvas_graph.viewport.y.to_string()),
+        ],
+    );
     canvas_graph
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CssLayoutTreeStats {
+    boxes: usize,
+    max_depth: usize,
+}
+
+fn css_layout_tree_stats(root: &CssLayoutBox<'_>) -> CssLayoutTreeStats {
+    fn visit(box_: &CssLayoutBox<'_>, depth: usize, stats: &mut CssLayoutTreeStats) {
+        stats.boxes += 1;
+        stats.max_depth = stats.max_depth.max(depth);
+        for child in &box_.children {
+            visit(child, depth + 1, stats);
+        }
+    }
+
+    let mut stats = CssLayoutTreeStats::default();
+    visit(root, 1, &mut stats);
+    stats
 }
 
 fn canvas_graph_content_bottom(graph: &CanvasGraph) -> f32 {
@@ -9581,17 +10442,15 @@ fn push_canvas_graph_layout_box(
                             graph,
                         );
                     } else {
-                        for child in &node.children {
-                            push_canvas_graph_node(
-                                child,
-                                source,
-                                image_height_auto,
-                                text_metrics,
-                                href,
-                                cursor,
-                                graph,
-                            );
-                        }
+                        push_canvas_graph_layout_inline_block_children_normalized(
+                            box_,
+                            source,
+                            image_height_auto,
+                            text_metrics,
+                            href,
+                            cursor,
+                            graph,
+                        );
                     }
                     if clips_children {
                         graph.objects.push(CanvasObject::ClipEnd);
@@ -9634,41 +10493,46 @@ fn push_canvas_graph_layout_box(
                         cursor.y = css_margin_box(box_).bottom();
                         return;
                     }
-                    "li" => {
+                    "li" if box_.style.display == CssDisplay::ListItem => {
                         let previous_x = cursor.x;
                         let previous_y = cursor.y;
                         let previous_width = cursor.width;
                         cursor.x = box_.dimensions.content.left();
                         cursor.y = box_.dimensions.content.top();
                         cursor.width = box_.dimensions.content.width().max(1.0);
-                        push_canvas_graph_list_item(
-                            node,
-                            source,
-                            image_height_auto,
-                            text_metrics,
-                            href,
-                            cursor,
-                            graph,
-                        );
-                        for child in &box_.children {
-                            if let Some(child_node) = child.node {
-                                if matches!(
-                                    &child_node.kind,
-                                    RenderNodeKind::Element(element)
-                                        if element.tag_name == "ul" || element.tag_name == "ol"
-                                ) {
-                                    push_canvas_graph_layout_box(
-                                        child,
-                                        source,
-                                        image_height_auto,
-                                        text_metrics,
-                                        href,
-                                        cursor,
-                                        graph,
-                                    );
-                                }
-                            }
+
+                        push_canvas_graph_layout_box_background(box_, graph);
+                        let clips_children = push_canvas_graph_layout_clip_start(box_, graph);
+                        push_canvas_graph_layout_list_marker(box_, cursor, graph);
+                        if !box_.children.is_empty()
+                            && box_.children.iter().all(css_layout_box_is_inline_level)
+                            && !box_
+                                .children
+                                .iter()
+                                .any(css_layout_box_contains_replaced_or_special)
+                        {
+                            push_canvas_graph_layout_inline_children(
+                                &box_.children,
+                                text_metrics,
+                                href,
+                                cursor,
+                                graph,
+                            );
+                        } else {
+                            push_canvas_graph_layout_children_at_used_positions(
+                                &box_.children,
+                                source,
+                                image_height_auto,
+                                text_metrics,
+                                href,
+                                cursor,
+                                graph,
+                            );
                         }
+                        if clips_children {
+                            graph.objects.push(CanvasObject::ClipEnd);
+                        }
+
                         cursor.x = previous_x;
                         cursor.width = previous_width;
                         cursor.y = previous_y.max(css_margin_box(box_).bottom());
@@ -9791,10 +10655,17 @@ fn push_canvas_graph_layout_clip_start(box_: &CssLayoutBox<'_>, graph: &mut Canv
     if !box_.style.overflow_hidden && box_.style.border_radius == 0 {
         return false;
     }
+    let clip_rect = css_border_box(&box_.dimensions);
+    if box_.style.height.is_none()
+        && box_.style.min_height.is_none()
+        && (clip_rect.width() <= 1.0 || clip_rect.height() <= 1.0)
+    {
+        return false;
+    }
     graph
         .objects
         .push(CanvasObject::ClipStart(CanvasClipObject {
-            rect: css_border_box(&box_.dimensions),
+            rect: clip_rect,
             border_radius: box_.style.border_radius,
         }));
     true
@@ -9810,6 +10681,27 @@ fn push_canvas_graph_layout_box_background(box_: &CssLayoutBox<'_>, graph: &mut 
             border_radius: box_.style.border_radius,
         }));
     }
+}
+
+fn push_canvas_graph_layout_list_marker(
+    box_: &CssLayoutBox<'_>,
+    cursor: &mut CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    if box_.style.list_style_type == CssListStyleType::None {
+        let _ = next_canvas_list_marker(cursor);
+        return;
+    }
+    let line_height = (box_.style.font_size * 1.35).max(1.0);
+    let marker_width = 18.0;
+    let content = box_.dimensions.content;
+    let marker_left = content.left() - marker_width;
+    let marker_rect = egui::Rect::from_min_size(
+        egui::pos2(marker_left, content.top()),
+        egui::vec2(marker_width, line_height),
+    );
+    let marker = next_canvas_list_marker(cursor);
+    push_canvas_graph_text_object(marker, marker_rect, &box_.style, None, None, graph);
 }
 
 fn push_canvas_graph_layout_replaced_or_special(
@@ -9910,34 +10802,26 @@ fn push_canvas_graph_layout_replaced_or_special(
 }
 
 fn css_layout_box_contains_replaced_or_special(box_: &CssLayoutBox<'_>) -> bool {
-    box_.node
-        .is_some_and(css_layout_node_is_replaced_or_special)
-        || box_
-            .children
-            .iter()
-            .any(css_layout_box_contains_replaced_or_special)
+    box_.flags.contains_replaced_or_special
 }
 
 fn css_layout_box_contains_text_form_control(box_: &CssLayoutBox<'_>) -> bool {
-    box_.node.is_some_and(|node| {
-        matches!(
-            &node.kind,
-            RenderNodeKind::Element(element)
-                if matches!(element.tag_name.as_str(), "input" | "textarea" | "select")
-        )
-    }) || box_
-        .children
-        .iter()
-        .any(css_layout_box_contains_text_form_control)
+    box_.flags.contains_text_form_control
+}
+
+fn css_style_max_width_for_containing(
+    style: &ResolvedBoxStyle,
+    containing_width: f32,
+) -> Option<f32> {
+    style.max_width.or_else(|| {
+        style
+            .max_width_percent
+            .map(|percent| containing_width * percent / 100.0)
+    })
 }
 
 fn css_layout_box_contains_visual_replaced_content(box_: &CssLayoutBox<'_>) -> bool {
-    box_.node
-        .is_some_and(css_layout_node_is_visual_replaced_content)
-        || box_
-            .children
-            .iter()
-            .any(css_layout_box_contains_visual_replaced_content)
+    box_.flags.contains_visual_replaced_content
 }
 
 fn css_layout_node_is_visual_replaced_content(node: &RenderNode) -> bool {
@@ -9994,6 +10878,44 @@ fn push_canvas_graph_layout_children_at_used_positions(
     cursor.x = previous_x;
     cursor.y = previous_y;
     cursor.width = previous_width;
+}
+
+fn push_canvas_graph_layout_inline_block_children_normalized(
+    box_: &CssLayoutBox<'_>,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+    inherited_href: Option<&str>,
+    cursor: &mut CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    if box_.children.is_empty() {
+        return;
+    }
+    let mut children = box_.children.clone();
+    let first_min = children
+        .iter()
+        .map(css_margin_box)
+        .min_by(|a, b| {
+            a.top()
+                .total_cmp(&b.top())
+                .then_with(|| a.left().total_cmp(&b.left()))
+        })
+        .map(|rect| rect.min)
+        .unwrap_or(box_.dimensions.content.min);
+    let delta = box_.dimensions.content.min - first_min;
+    for child in &mut children {
+        translate_css_layout_box(child, delta);
+    }
+    push_canvas_graph_layout_children_at_used_positions(
+        &children,
+        source,
+        image_height_auto,
+        text_metrics,
+        inherited_href,
+        cursor,
+        graph,
+    );
 }
 
 fn push_canvas_graph_node(
@@ -10221,7 +11143,7 @@ fn push_canvas_graph_element(
         "table" => {
             push_canvas_graph_table(node, text_metrics, cursor, graph);
         }
-        "ul" | "ol" => {
+        "ul" | "ol" if node.style.display == CssDisplay::Block => {
             cursor.list_stack.push(CanvasListContext {
                 ordered: element.tag_name == "ol",
                 next_index: 1,
@@ -10263,7 +11185,7 @@ fn push_canvas_graph_element(
                 graph,
             );
         }
-        "li" => {
+        "li" if node.style.display == CssDisplay::ListItem => {
             push_canvas_graph_list_item(
                 node,
                 source,
@@ -10273,23 +11195,6 @@ fn push_canvas_graph_element(
                 cursor,
                 graph,
             );
-            for child in &node.children {
-                if let RenderNodeKind::Element(child_element) = &child.kind {
-                    if child_element.tag_name == "ul" || child_element.tag_name == "ol" {
-                        cursor.list_depth += 1;
-                        push_canvas_graph_node(
-                            child,
-                            source,
-                            image_height_auto,
-                            text_metrics,
-                            inherited_href,
-                            cursor,
-                            graph,
-                        );
-                        cursor.list_depth = cursor.list_depth.saturating_sub(1);
-                    }
-                }
-            }
         }
         _ => {
             push_canvas_graph_box_start(&node.style, cursor, graph);
@@ -10482,7 +11387,7 @@ fn push_canvas_graph_box_start(
             egui::vec2(
                 style
                     .width
-                    .or(style.max_width)
+                    .or_else(|| css_style_max_width_for_containing(style, cursor.width))
                     .unwrap_or(cursor.width)
                     .min(cursor.width)
                     .max(1.0),
@@ -10994,37 +11899,36 @@ fn push_canvas_graph_list_item(
     let previous_width = cursor.width;
     let depth_indent = cursor.list_depth as f32 * 22.0;
     let marker_width = 18.0;
-    let content_x = cursor.x + depth_indent + marker_width;
-    let content_width = (cursor.width - depth_indent - marker_width).max(1.0);
+    let paints_marker = node.style.list_style_type != CssListStyleType::None;
+    let content_x = if paints_marker {
+        cursor.x + depth_indent + marker_width
+    } else {
+        cursor.x + depth_indent
+    };
+    let content_width = if paints_marker {
+        (cursor.width - depth_indent - marker_width).max(1.0)
+    } else {
+        (cursor.width - depth_indent).max(1.0)
+    };
     let line_height = (node.style.font_size * 1.35).max(1.0);
 
-    let marker_rect = egui::Rect::from_min_size(
-        egui::pos2(cursor.x + depth_indent, cursor.y),
-        egui::vec2(marker_width, line_height),
-    );
     let marker = next_canvas_list_marker(cursor);
-    push_canvas_graph_text_object(marker, marker_rect, &node.style, None, None, graph);
+    if paints_marker {
+        let marker_rect = egui::Rect::from_min_size(
+            egui::pos2(cursor.x + depth_indent, cursor.y),
+            egui::vec2(marker_width, line_height),
+        );
+        push_canvas_graph_text_object(marker, marker_rect, &node.style, None, None, graph);
+    }
 
     cursor.x = content_x;
     cursor.width = content_width;
-    let inline_children: Vec<RenderNode> = node
-        .children
-        .iter()
-        .filter(|child| {
-            !matches!(
-                &child.kind,
-                RenderNodeKind::Element(element)
-                    if element.tag_name == "ul" || element.tag_name == "ol"
-            )
-        })
-        .cloned()
-        .collect();
-    if inline_children.is_empty() {
+    if node.children.is_empty() {
         cursor.y += line_height;
-    } else if children_are_inline_flow(&inline_children) {
-        push_canvas_graph_inline_children(&inline_children, text_metrics, href, cursor, graph);
+    } else if children_are_inline_flow(&node.children) {
+        push_canvas_graph_inline_children(&node.children, text_metrics, href, cursor, graph);
     } else {
-        for child in &inline_children {
+        for child in &node.children {
             push_canvas_graph_node(
                 child,
                 source,
@@ -11071,13 +11975,18 @@ fn push_canvas_graph_table(
     cursor: &mut CanvasLayoutCursor,
     graph: &mut CanvasGraph,
 ) {
-    let rows = collect_table_rows(node);
+    let rows = collect_table_layout_rows(node);
     if rows.is_empty() {
         return;
     }
 
     let table_width = cursor.width.max(1.0);
-    let column_count = rows.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    let column_count = rows
+        .iter()
+        .flat_map(|row| row.iter().map(|cell| cell.column + cell.colspan))
+        .max()
+        .unwrap_or(0)
+        .max(1);
     let cell_width = (table_width / column_count as f32).max(24.0);
     let cell_padding_x = 6.0;
     let cell_padding_y = 5.0;
@@ -11091,26 +12000,40 @@ fn push_canvas_graph_table(
     cursor.y += node.style.margin.top + node.style.padding.top;
 
     if let Some(caption) = table_caption_text(node) {
+        let previous_width = cursor.width;
+        cursor.width = table_width;
         push_canvas_graph_text(&caption, &node.style, text_metrics, None, cursor, graph);
+        cursor.width = previous_width;
         cursor.y += 4.0;
     }
 
+    let row_heights = rows
+        .iter()
+        .map(|row| {
+            table_layout_row_height(
+                row,
+                cell_width,
+                cell_padding_x,
+                cell_padding_y,
+                text_metrics,
+            )
+        })
+        .collect::<Vec<_>>();
+
     for (row_index, row) in rows.iter().enumerate() {
-        let row_height = table_row_height(
-            row,
-            cell_width,
-            cell_padding_x,
-            cell_padding_y,
-            text_metrics,
-        );
-        for column_index in 0..column_count {
-            let cell = row.get(column_index);
-            let cell_style = cell.map(|cell| &cell.style).unwrap_or(&node.style);
-            let is_header = cell.is_some_and(|cell| is_table_header_cell(cell));
+        let row_height = row_heights[row_index];
+        for cell in row {
+            let cell_style = &cell.node.style;
+            let is_header = is_table_header_cell(cell.node);
             let fill = table_cell_fill(cell_style, row_index, is_header);
+            let spanned_rows = cell.rowspan.min(row_heights.len() - row_index);
+            let cell_height = row_heights[row_index..row_index + spanned_rows]
+                .iter()
+                .sum::<f32>();
+            let spanned_width = cell_width * cell.colspan as f32;
             let rect = egui::Rect::from_min_size(
-                egui::pos2(cursor.x + column_index as f32 * cell_width, cursor.y),
-                egui::vec2(cell_width, row_height),
+                egui::pos2(cursor.x + cell.column as f32 * cell_width, cursor.y),
+                egui::vec2(spanned_width, cell_height),
             );
             graph.objects.push(CanvasObject::Rect(CanvasRectObject {
                 rect,
@@ -11120,14 +12043,11 @@ fn push_canvas_graph_table(
                 border_radius: 0,
             }));
 
-            let Some(cell) = cell else {
-                continue;
-            };
-            let text = render_node_text_content(cell);
-            let text_width = (cell_width - cell_padding_x * 2.0).max(1.0);
-            let line_height = (cell.style.font_size * 1.35).max(1.0);
+            let text = render_node_text_content(cell.node);
+            let text_width = (spanned_width - cell_padding_x * 2.0).max(1.0);
+            let line_height = (cell.node.style.font_size * 1.35).max(1.0);
             for (line_index, line) in
-                wrap_browser_textboxes(text_metrics, &text, text_width, &cell.style)
+                wrap_browser_textboxes(text_metrics, &text, text_width, &cell.node.style)
                     .into_iter()
                     .enumerate()
             {
@@ -11139,13 +12059,86 @@ fn push_canvas_graph_table(
                     ),
                     egui::vec2(text_width, line_height),
                 );
-                push_canvas_graph_text_object(line.text, text_rect, &cell.style, None, None, graph);
+                push_canvas_graph_text_object(
+                    line.text,
+                    text_rect,
+                    &cell.node.style,
+                    None,
+                    None,
+                    graph,
+                );
             }
         }
         cursor.y += row_height;
     }
 
     cursor.y += node.style.padding.bottom + node.style.margin.bottom;
+}
+
+#[derive(Clone, Copy)]
+struct TableLayoutCell<'a> {
+    node: &'a RenderNode,
+    column: usize,
+    colspan: usize,
+    rowspan: usize,
+}
+
+fn collect_table_layout_rows(node: &RenderNode) -> Vec<Vec<TableLayoutCell<'_>>> {
+    let raw_rows = collect_table_rows(node);
+    let mut rows = Vec::new();
+    let mut occupied = Vec::<usize>::new();
+
+    for raw_row in raw_rows {
+        let mut row = Vec::new();
+        let mut blocked = occupied
+            .iter()
+            .map(|remaining| *remaining > 0)
+            .collect::<Vec<_>>();
+        let mut rowspans = Vec::<(usize, usize, usize)>::new();
+
+        for cell in raw_row {
+            let colspan = table_cell_span(cell, "colspan");
+            let rowspan = table_cell_span(cell, "rowspan");
+            let mut column = 0usize;
+            while blocked.get(column).copied().unwrap_or(false) {
+                column += 1;
+            }
+            if blocked.len() < column + colspan {
+                blocked.resize(column + colspan, false);
+            }
+            for slot in &mut blocked[column..column + colspan] {
+                *slot = true;
+            }
+            row.push(TableLayoutCell {
+                node: cell,
+                column,
+                colspan,
+                rowspan,
+            });
+            if rowspan > 1 {
+                rowspans.push((column, colspan, rowspan - 1));
+            }
+        }
+
+        for remaining in &mut occupied {
+            *remaining = remaining.saturating_sub(1);
+        }
+        if occupied.len() < blocked.len() {
+            occupied.resize(blocked.len(), 0);
+        }
+        for (column, colspan, rowspan) in rowspans {
+            if occupied.len() < column + colspan {
+                occupied.resize(column + colspan, 0);
+            }
+            for slot in &mut occupied[column..column + colspan] {
+                *slot = (*slot).max(rowspan);
+            }
+        }
+
+        rows.push(row);
+    }
+
+    rows
 }
 
 fn collect_table_rows(node: &RenderNode) -> Vec<Vec<&RenderNode>> {
@@ -11194,8 +12187,8 @@ fn table_caption_text(node: &RenderNode) -> Option<String> {
     })
 }
 
-fn table_row_height(
-    row: &[&RenderNode],
+fn table_layout_row_height(
+    row: &[TableLayoutCell<'_>],
     cell_width: f32,
     padding_x: f32,
     padding_y: f32,
@@ -11203,22 +12196,34 @@ fn table_row_height(
 ) -> f32 {
     row.iter()
         .map(|cell| {
-            let text_width = (cell_width - padding_x * 2.0).max(1.0);
+            let text_width = (cell_width * cell.colspan as f32 - padding_x * 2.0).max(1.0);
             let lines = wrap_browser_textboxes(
                 text_metrics,
-                &render_node_text_content(cell),
+                &render_node_text_content(cell.node),
                 text_width,
-                &cell.style,
+                &cell.node.style,
             );
             let text_height = lines
                 .iter()
-                .map(|line| line.size.y.max((cell.style.font_size * 1.35).max(1.0)))
+                .map(|line| line.size.y.max((cell.node.style.font_size * 1.35).max(1.0)))
                 .sum::<f32>()
-                .max((cell.style.font_size * 1.35).max(1.0));
+                .max((cell.node.style.font_size * 1.35).max(1.0));
             padding_y * 2.0 + text_height
         })
         .fold(0.0, f32::max)
         .max(28.0)
+}
+
+fn table_cell_span(node: &RenderNode, attr: &str) -> usize {
+    match &node.kind {
+        RenderNodeKind::Element(element) => element
+            .attr(attr)
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1)
+            .min(100),
+        _ => 1,
+    }
 }
 
 fn is_table_header_cell(node: &RenderNode) -> bool {
@@ -11337,13 +12342,44 @@ fn push_canvas_graph_media(
 
 fn render_graph_debug_string(graph: &RenderGraph) -> String {
     let mut out = String::new();
-    push_render_node_debug(&graph.root, 0, &mut out);
+    let mut budget = RenderGraphDebugBudget {
+        visited_nodes: 0,
+        truncated: false,
+    };
+    push_render_node_debug(&graph.root, 0, &mut out, &mut budget);
+    if budget.truncated {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            out,
+            "... render graph debug truncated after {} nodes / {} bytes",
+            budget.visited_nodes,
+            out.len()
+        );
+    }
     out
 }
 
-fn push_render_node_debug(node: &RenderNode, depth: usize, out: &mut String) {
+struct RenderGraphDebugBudget {
+    visited_nodes: usize,
+    truncated: bool,
+}
+
+fn push_render_node_debug(
+    node: &RenderNode,
+    depth: usize,
+    out: &mut String,
+    budget: &mut RenderGraphDebugBudget,
+) {
     use std::fmt::Write as _;
 
+    if budget.truncated
+        || budget.visited_nodes >= MAX_RENDER_GRAPH_DEBUG_NODES
+        || out.len() >= MAX_RENDER_GRAPH_DEBUG_BYTES
+    {
+        budget.truncated = true;
+        return;
+    }
+    budget.visited_nodes += 1;
     let indent = "  ".repeat(depth);
     match &node.kind {
         RenderNodeKind::Document => {
@@ -11375,13 +12411,16 @@ fn push_render_node_debug(node: &RenderNode, depth: usize, out: &mut String) {
     }
 
     for child in &node.children {
-        push_render_node_debug(child, depth + 1, out);
+        push_render_node_debug(child, depth + 1, out, budget);
+        if budget.truncated {
+            break;
+        }
     }
 }
 
 fn resolved_style_debug(style: &ResolvedBoxStyle) -> String {
     format!(
-        "style(display={:?}, color={}, bg={}, margin={}, padding={}, border_width={:.1}, border_color={}, radius={:.1}, width={}, min_width={}, max_width={}, font_size={:.1}, bold={}, align={:?}, visible={}, opacity={:.2}, overflow_hidden={}, position={:?}, z_index={})",
+        "style(display={:?}, color={}, bg={}, margin={}, padding={}, border_width={:.1}, border_color={}, radius={:.1}, width={}, min_width={}, max_width={}, max_width_percent={}, height={}, min_height={}, font_size={:.1}, bold={}, align={:?}, visible={}, opacity={:.2}, overflow_hidden={}, position={:?}, z_index={})",
         style.display,
         color_debug(style.color),
         color_debug(style.background),
@@ -11393,6 +12432,9 @@ fn resolved_style_debug(style: &ResolvedBoxStyle) -> String {
         optional_f32_debug(style.width),
         optional_f32_debug(style.min_width),
         optional_f32_debug(style.max_width),
+        optional_f32_debug(style.max_width_percent),
+        optional_css_length_debug(style.height),
+        optional_css_length_debug(style.min_height),
         style.font_size,
         style.font_weight_bold,
         style.text_align,
@@ -11437,6 +12479,12 @@ fn color_debug(color: egui::Color32) -> String {
 fn optional_f32_debug(value: Option<f32>) -> String {
     value
         .map(|value| format!("{value:.1}"))
+        .unwrap_or_else(|| "auto".to_owned())
+}
+
+fn optional_css_length_debug(value: Option<CssLength>) -> String {
+    value
+        .map(|value| format!("{value:?}"))
         .unwrap_or_else(|| "auto".to_owned())
 }
 
@@ -12028,8 +13076,8 @@ fn element_style_key(element: &DomElement) -> ElementStyleKey {
 
 fn element_style_key_with_context(
     element: &DomElement,
-    parent: Option<&DomElement>,
-    previous_sibling: Option<&DomElement>,
+    parent: Option<&ElementStyleKey>,
+    previous_sibling: Option<&ElementStyleKey>,
     child_index: Option<usize>,
 ) -> ElementStyleKey {
     ElementStyleKey {
@@ -12044,12 +13092,69 @@ fn element_style_key_with_context(
         attributes: element
             .attributes
             .iter()
-            .map(|attribute| attribute.name.to_ascii_lowercase())
+            .map(|attribute| {
+                if attribute.value.is_empty() {
+                    attribute.name.to_ascii_lowercase()
+                } else {
+                    format!(
+                        "{}={}",
+                        attribute.name.to_ascii_lowercase(),
+                        attribute.value
+                    )
+                }
+            })
             .collect(),
         child_index,
-        parent: parent.map(|parent| Box::new(element_style_key(parent))),
-        previous_sibling: previous_sibling.map(|previous| Box::new(element_style_key(previous))),
+        parent: parent.map(|key| {
+            Box::new(clone_element_style_key_context(
+                key,
+                MAX_STYLE_PARENT_CHAIN,
+                0,
+            ))
+        }),
+        previous_sibling: previous_sibling.map(|key| {
+            Box::new(clone_element_style_key_context(
+                key,
+                1,
+                MAX_STYLE_PREVIOUS_SIBLING_CHAIN,
+            ))
+        }),
     }
+}
+
+fn clone_element_style_key_context(
+    key: &ElementStyleKey,
+    remaining_parents: usize,
+    remaining_previous_siblings: usize,
+) -> ElementStyleKey {
+    let mut cloned = ElementStyleKey {
+        tag: key.tag.clone(),
+        id: key.id.clone(),
+        classes: key.classes.clone(),
+        attributes: key.attributes.clone(),
+        child_index: key.child_index,
+        parent: None,
+        previous_sibling: None,
+    };
+    if remaining_parents > 0 {
+        cloned.parent = key.parent.as_ref().map(|parent| {
+            Box::new(clone_element_style_key_context(
+                parent,
+                remaining_parents - 1,
+                0,
+            ))
+        });
+    }
+    if remaining_previous_siblings > 0 {
+        cloned.previous_sibling = key.previous_sibling.as_ref().map(|previous| {
+            Box::new(clone_element_style_key_context(
+                previous,
+                0,
+                remaining_previous_siblings - 1,
+            ))
+        });
+    }
+    cloned
 }
 
 fn image_block_from_dom_element(
@@ -13774,7 +14879,7 @@ fn extract_attr(tag: &str, name: &str) -> Option<String> {
         };
 
         if attr_name.eq_ignore_ascii_case(name) {
-            return Some(value);
+            return Some(decode_basic_entities(&value));
         }
     }
 }
@@ -14361,6 +15466,7 @@ fn json_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rich_canvas::parse_basic_css_for_viewport;
 
     #[test]
     fn dom_parser_preserves_nested_elements_text_and_attributes() {
@@ -14772,12 +15878,78 @@ mod tests {
     }
 
     #[test]
+    fn canvas_graph_table_colspan_expands_cell_width() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <body style="padding: 0;">
+                <table>
+                  <tr><th colspan="2">Wide</th><th>Right</th></tr>
+                  <tr><td>Left</td><td>Middle</td><td>Tail</td></tr>
+                </table>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let wide = find_canvas_cell_rect(&document.canvas_graph, "Wide").expect("wide cell");
+        let right = find_canvas_cell_rect(&document.canvas_graph, "Right").expect("right cell");
+        let left = find_canvas_cell_rect(&document.canvas_graph, "Left").expect("left cell");
+        let middle = find_canvas_cell_rect(&document.canvas_graph, "Middle").expect("middle cell");
+
+        assert!(
+            wide.rect.width() > right.rect.width() * 1.8,
+            "expected colspan cell {:?} to be about two slots wide vs {:?}",
+            wide.rect,
+            right.rect
+        );
+        assert_eq!(wide.rect.left(), left.rect.left());
+        assert!(middle.rect.left() > left.rect.left());
+        assert!(right.rect.left() > middle.rect.left());
+    }
+
+    #[test]
+    fn canvas_graph_table_rowspan_reserves_following_row_slot() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <body style="padding: 0;">
+                <table>
+                  <tr><td rowspan="2">Tall</td><td>Top</td></tr>
+                  <tr><td>Bottom</td></tr>
+                </table>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let tall = find_canvas_cell_rect(&document.canvas_graph, "Tall").expect("tall cell");
+        let top = find_canvas_cell_rect(&document.canvas_graph, "Top").expect("top cell");
+        let bottom = find_canvas_cell_rect(&document.canvas_graph, "Bottom").expect("bottom cell");
+
+        assert!(
+            tall.rect.height() > top.rect.height() * 1.8,
+            "expected rowspan cell {:?} to span two row heights vs {:?}",
+            tall.rect,
+            top.rect
+        );
+        assert_eq!(top.rect.left(), bottom.rect.left());
+        assert!(top.rect.left() >= tall.rect.right());
+        assert!(bottom.rect.top() > top.rect.top());
+    }
+
+    #[test]
     fn canvas_graph_lays_out_nested_lists_with_real_child_widths() {
         let document = parse_html_document(
             r##"
             <html>
               <body>
-                <nav>
+                <style>
+                  .nav a { color: #a80000; }
+                </style>
+                <nav class="nav">
                   <ul>
                     <li>
                       <a href="#text">Text</a>
@@ -14798,8 +15970,121 @@ mod tests {
 
         assert_eq!(parent.href.as_deref(), Some("#text"));
         assert_eq!(child.href.as_deref(), Some("#headings"));
+        assert_eq!(parent.color, egui::Color32::from_rgb(0xa8, 0x00, 0x00));
+        assert_eq!(child.color, egui::Color32::from_rgb(0xa8, 0x00, 0x00));
         assert!(child.rect.width() > 40.0);
+        assert!(
+            parent.rect.left() >= 18.0,
+            "parent list link should stay inside the list column: {:?}",
+            parent.rect
+        );
+        assert!(
+            child.rect.left() > parent.rect.left(),
+            "nested list link should be indented from parent: parent={:?} child={:?}",
+            parent.rect,
+            child.rect
+        );
         assert!(child.rect.top() > parent.rect.top());
+    }
+
+    #[test]
+    fn linked_inline_block_heading_inside_anchor_renders() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .result { width: 654px; }
+                  .result__info { display: flex; min-width: 0; }
+                  .result-info__link {
+                    display: inline;
+                    max-width: 100%;
+                    overflow: hidden;
+                    color: #6c6c6c;
+                  }
+                  .result-source { display: block; max-width: 100%; overflow: hidden; }
+                  .result__title { overflow: hidden; }
+                  .result__link {
+                    display: inline;
+                    max-width: 100%;
+                    overflow: hidden;
+                    color: #1a0dab;
+                  }
+                  .result-title__heading {
+                    display: block;
+                    max-width: 100%;
+                    overflow: hidden;
+                    font-size: 20px;
+                    margin: 0;
+                  }
+                </style>
+              </head>
+              <body>
+                <article class="result">
+                  <div class="result__info">
+                    <a href="https://it.wikipedia.org/wiki/Hello_world" class="result-info__link">
+                      <div class="result-source">
+                        <span>https://it.wikipedia.org</span><span> › wiki › Hello_world</span>
+                      </div>
+                    </a>
+                  </div>
+                  <div class="result__title">
+                    <a href="https://it.wikipedia.org/wiki/Hello_world" class="result__link">
+                      <h2 class="result-title__heading">Hello world - Wikipedia</h2>
+                    </a>
+                  </div>
+                  <p>In informatica Hello world is a simple program.</p>
+                </article>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let title = find_canvas_text(&document.canvas_graph, "Hello world - Wikipedia")
+            .expect("expected linked block heading inside inline anchor to render");
+        let source = find_canvas_text(
+            &document.canvas_graph,
+            "https://it.wikipedia.org › wiki › Hello_world",
+        )
+        .expect("expected linked result source to render on a readable line");
+        let description = find_canvas_text(
+            &document.canvas_graph,
+            "In informatica Hello world is a simple program.",
+        )
+        .expect("expected following result description");
+
+        assert_eq!(
+            title.href.as_deref(),
+            Some("https://it.wikipedia.org/wiki/Hello_world")
+        );
+        assert_eq!(
+            source.href.as_deref(),
+            Some("https://it.wikipedia.org/wiki/Hello_world")
+        );
+        assert!(
+            source.rect.width() > 220.0,
+            "source should not collapse: {:?}",
+            source.rect
+        );
+        assert!(
+            title.rect.width() > 120.0,
+            "title should not collapse: {:?}",
+            title.rect
+        );
+        assert!(
+            title.rect.top() < description.rect.top(),
+            "title should render before description: title={:?} description={:?}",
+            title.rect,
+            description.rect
+        );
+        assert!(
+            title.rect.bottom() <= description.rect.top(),
+            "title should not overlap description: title={:?} description={:?}",
+            title.rect,
+            description.rect
+        );
     }
 
     #[test]
@@ -15470,12 +16755,24 @@ mod tests {
     }
 
     #[test]
-    fn document_without_explicit_theme_uses_context_dark_root_class() {
+    fn document_without_explicit_theme_does_not_invent_root_theme_class() {
         let ctx = egui::Context::default();
         ctx.set_visuals(egui::Visuals::dark());
         let dom = parse_dom_document("<html><body>Dark inferred</body></html>");
 
-        assert_eq!(document_theme_root_classes(&dom, Some(&ctx)), vec!["dark"]);
+        assert!(document_theme_root_classes(&dom, Some(&ctx)).is_empty());
+    }
+
+    #[test]
+    fn document_with_explicit_theme_preserves_root_theme_class() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::light());
+        let dom = parse_dom_document("<html class=\"dark app\"><body>Dark explicit</body></html>");
+
+        assert_eq!(
+            document_theme_root_classes(&dom, Some(&ctx)),
+            vec!["dark".to_owned(), "app".to_owned()]
+        );
     }
 
     #[test]
@@ -15514,6 +16811,407 @@ mod tests {
         assert!(placeholder.rect.left() > icon.rect.right());
         assert!(ai_chat.rect.left() > placeholder.rect.right());
         assert!((icon.rect.center().y - ai_chat.rect.center().y).abs() < 6.0);
+    }
+
+    #[test]
+    fn anonymous_inline_wrapper_does_not_inherit_parent_height() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; height: 100%; }
+                  .marker { width: 120px; height: 40px; background: #008000; }
+                </style>
+              </head>
+              <body>
+                Intro
+                <div class="marker">Block</div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let intro = find_canvas_text(&document.canvas_graph, "Intro").expect("expected intro text");
+        let marker =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 128, 0))
+                .expect("expected marker background");
+
+        assert!(intro.rect.top() < 4.0);
+        assert!(
+            marker.rect.top() < 60.0,
+            "anonymous inline wrapper should not reserve parent viewport height before block; got {:?}",
+            marker.rect
+        );
+    }
+
+    #[test]
+    fn flex_display_li_menu_items_do_not_render_list_markers_or_wrap_labels() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  ul.nav { display: flex; gap: 12px; margin: 0; padding: 0; width: 360px; }
+                  li.item { display: flex; height: 40px; }
+                  a.tab { display: flex; padding: 8px 4px; font-size: 14px; }
+                </style>
+              </head>
+              <body>
+                <ul class="nav">
+                  <li class="item"><a class="tab">Web</a></li>
+                  <li class="item"><a class="tab">Images</a></li>
+                  <li class="item"><a class="tab">News</a></li>
+                  <li class="item"><a class="tab">Videos</a></li>
+                </ul>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let web = find_canvas_text(&document.canvas_graph, "Web").expect("expected Web tab");
+        let images =
+            find_canvas_text(&document.canvas_graph, "Images").expect("expected Images tab");
+        let news = find_canvas_text(&document.canvas_graph, "News").expect("expected News tab");
+        let videos =
+            find_canvas_text(&document.canvas_graph, "Videos").expect("expected Videos tab");
+
+        assert!(
+            find_canvas_text(&document.canvas_graph, "•").is_none(),
+            "flex menu list items should not paint generated list markers"
+        );
+        assert!(
+            images.rect.width() > 35.0,
+            "Images wrapped: {:?}",
+            images.rect
+        );
+        assert!(news.rect.width() > 25.0, "News wrapped: {:?}", news.rect);
+        assert!(
+            videos.rect.width() > 35.0,
+            "Videos wrapped: {:?}",
+            videos.rect
+        );
+        assert!((web.rect.top() - images.rect.top()).abs() < 1.0);
+        assert!((images.rect.top() - news.rect.top()).abs() < 1.0);
+        assert!(images.rect.left() > web.rect.right());
+        assert!(news.rect.left() > images.rect.right());
+    }
+
+    #[test]
+    fn inherited_list_style_none_suppresses_list_item_markers() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  ul.nav { list-style: none; margin: 0; padding: 0; }
+                </style>
+              </head>
+              <body>
+                <ul class="nav">
+                  <li>Docs</li>
+                  <li>Examples</li>
+                </ul>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let docs = find_canvas_text(&document.canvas_graph, "Docs").expect("expected nav item");
+        let examples =
+            find_canvas_text(&document.canvas_graph, "Examples").expect("expected second nav item");
+
+        assert!(
+            find_canvas_text(&document.canvas_graph, "•").is_none(),
+            "list-style:none should not paint generated bullet markers"
+        );
+        assert!(
+            docs.rect.left() <= 1.0,
+            "nav item kept marker indent: {docs:?}"
+        );
+        assert!(
+            examples.rect.left() <= 1.0,
+            "second nav item kept marker indent: {examples:?}"
+        );
+    }
+
+    #[test]
+    fn markerless_list_utility_class_suppresses_list_item_markers() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <body>
+                <ul class="list list--bare">
+                  <li><label><input type="checkbox"> Choice A</label></li>
+                  <li><label><input type="checkbox"> Choice B</label></li>
+                </ul>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let choice_a =
+            find_canvas_text(&document.canvas_graph, "Choice A").expect("expected choice A");
+        let choice_b =
+            find_canvas_text(&document.canvas_graph, "Choice B").expect("expected choice B");
+
+        assert!(
+            find_canvas_text(&document.canvas_graph, "•").is_none(),
+            "markerless utility list should not paint generated bullet markers"
+        );
+        assert!(choice_a.rect.left() <= choice_b.rect.left() + 1.0);
+    }
+
+    #[test]
+    fn list_item_with_nested_flex_content_uses_layout_child_positions() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  ul { margin: 0; padding-left: 24px; width: 420px; }
+                  li.result { display: list-item; padding: 0; margin: 0 0 12px 0; color: #111111; }
+                  .card { display: flex; gap: 16px; width: 360px; padding: 8px; background: #e6fff6; }
+                  .title { width: 180px; color: #111111; }
+                  .meta { width: 120px; color: #555555; }
+                </style>
+              </head>
+              <body>
+                <ul>
+                  <li class="result">
+                    <div class="card">
+                      <span class="title">Result title</span>
+                      <span class="meta">Result meta</span>
+                    </div>
+                  </li>
+                </ul>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let marker = find_canvas_text(&document.canvas_graph, "•").expect("expected marker");
+        let title =
+            find_canvas_text(&document.canvas_graph, "Result title").expect("expected title");
+        let meta = find_canvas_text(&document.canvas_graph, "Result meta").expect("expected meta");
+        let card = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(230, 255, 246),
+        )
+        .expect("expected card background");
+
+        assert!(marker.rect.right() <= card.rect.left() + 1.0);
+        assert!(title.rect.left() >= card.rect.left());
+        assert!(meta.rect.left() > title.rect.right());
+        assert!((title.rect.top() - meta.rect.top()).abs() < 1.0);
+    }
+
+    #[test]
+    fn fallback_list_item_renderer_paints_block_children_after_marker() {
+        let html = r#"
+        <html>
+          <head>
+            <style>
+              body { margin: 0; padding: 0; }
+              ul { margin: 0; padding-left: 24px; width: 420px; }
+              li.result { display: list-item; margin: 0 0 12px 0; }
+              .card { display: block; padding: 6px; }
+              .title { display: block; font-size: 18px; }
+              .snippet { display: block; font-size: 14px; }
+            </style>
+          </head>
+          <body>
+            <ul>
+              <li class="result">
+                <div class="card">
+                  <a class="title" href="/wiki">Hello World - Wikipedia</a>
+                  <div class="snippet">A starter article result snippet.</div>
+                </div>
+                <ul><li>Nested detail</li></ul>
+              </li>
+            </ul>
+          </body>
+        </html>
+        "#;
+        let css = collect_document_stylesheets(html, "https://example.test/").unwrap_or_default();
+        let dom = parse_dom_document(html);
+        let style = parse_basic_css_for_viewport(&css, DEFAULT_LAYOUT_VIEWPORT_WIDTH);
+        let graph = build_render_graph(&dom, &style);
+        let mut canvas_graph = CanvasGraph {
+            viewport: egui::vec2(
+                DEFAULT_LAYOUT_VIEWPORT_WIDTH,
+                DEFAULT_LAYOUT_VIEWPORT_HEIGHT,
+            ),
+            objects: Vec::new(),
+        };
+        let mut cursor = CanvasLayoutCursor {
+            x: 0.0,
+            y: 0.0,
+            width: DEFAULT_LAYOUT_VIEWPORT_WIDTH,
+            list_depth: 0,
+            list_stack: Vec::new(),
+            form_stack: Vec::new(),
+            forms_by_id: HashMap::new(),
+        };
+
+        for child in &graph.root.children {
+            push_canvas_graph_node(
+                child,
+                "https://example.test/",
+                style.image_height_auto,
+                None,
+                None,
+                &mut cursor,
+                &mut canvas_graph,
+            );
+        }
+
+        let marker = find_canvas_text(&canvas_graph, "•").expect("expected list marker");
+        let title = find_canvas_text(&canvas_graph, "Hello World - Wikipedia")
+            .expect("fallback li renderer dropped the result title");
+        let snippet = find_canvas_text(&canvas_graph, "A starter article result snippet.")
+            .expect("fallback li renderer dropped the result snippet");
+        let nested = find_canvas_text(&canvas_graph, "Nested detail")
+            .expect("fallback li renderer dropped the nested list item");
+
+        assert!(title.rect.left() > marker.rect.right());
+        assert!(snippet.rect.top() >= title.rect.bottom());
+        assert!(nested.rect.top() >= snippet.rect.bottom());
+    }
+
+    #[test]
+    fn block_flow_reserves_visible_inline_descendant_height() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { margin: 0; padding: 0; }
+                  .result { width: 640px; }
+                  .title-shell { display: block; height: 4px; }
+                  .title { font-size: 20px; color: #1a0dab; }
+                  .snippet { display: block; font-size: 14px; color: #333333; }
+                </style>
+              </head>
+              <body>
+                <div class="result">
+                  <div class="title-shell">
+                    <a class="title">Hello World - Wikipedia</a>
+                  </div>
+                  <div class="snippet">A normal result snippet follows the title.</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let title =
+            find_canvas_text(&document.canvas_graph, "Hello World - Wikipedia").expect("title");
+        let snippet = find_canvas_text(
+            &document.canvas_graph,
+            "A normal result snippet follows the title.",
+        )
+        .expect("snippet");
+
+        assert!(
+            snippet.rect.top() >= title.rect.bottom(),
+            "snippet overlapped title: title={:?} snippet={:?}",
+            title.rect,
+            snippet.rect
+        );
+    }
+
+    #[test]
+    fn flex_result_title_reserves_height_before_nested_flex_snippet() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { margin: 0; padding: 0; }
+                  .result { width: 760px; }
+                  .result__title {
+                    display: flex;
+                    position: relative;
+                    width: 760px;
+                  }
+                  .result__link {
+                    display: inline;
+                    color: #1a0dab;
+                  }
+                  .result-title__heading {
+                    display: block;
+                    overflow: hidden;
+                    font-size: 20px;
+                    margin: 0;
+                  }
+                  .result__columns {
+                    display: flex;
+                    padding-left: 4px;
+                    padding-right: 4px;
+                  }
+                  .result__columns-start {
+                    display: block;
+                    min-width: 0;
+                  }
+                  .result__description {
+                    display: flex;
+                  }
+                  .web-result__description {
+                    display: block;
+                    overflow: hidden;
+                    font-size: 14px;
+                    margin: 0;
+                  }
+                </style>
+              </head>
+              <body>
+                <article class="result">
+                  <div class="result__title">
+                    <a class="result__link" href="/result">
+                      <h2 class="result-title__heading">Hello World - Libri digitali - Raffaello Scuola</h2>
+                    </a>
+                  </div>
+                  <div class="result__columns">
+                    <div class="result__columns-start">
+                      <div class="result__description">
+                        <p class="web-result__description">Corso di lingua inglese per la Scuola Primaria.</p>
+                      </div>
+                    </div>
+                  </div>
+                </article>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let title = find_canvas_text(
+            &document.canvas_graph,
+            "Hello World - Libri digitali - Raffaello Scuola",
+        )
+        .expect("title");
+        let snippet = find_canvas_text(
+            &document.canvas_graph,
+            "Corso di lingua inglese per la Scuola Primaria.",
+        )
+        .expect("snippet");
+
+        assert!(
+            snippet.rect.top() >= title.rect.bottom(),
+            "snippet overlapped title: title={:?} snippet={:?}",
+            title.rect,
+            snippet.rect
+        );
     }
 
     #[test]
@@ -16160,6 +17858,328 @@ mod tests {
     }
 
     #[test]
+    fn display_contents_flattens_grid_items() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .grid { display: grid; grid-template-columns: 100px 100px 100px; gap: 10px; width: 320px; }
+                  .wrap { display: contents; background: #999999; }
+                  .a { height: 40px; background: #ff0000; }
+                  .b { height: 40px; background: #00ff00; }
+                  .c { height: 40px; background: #0000ff; }
+                </style>
+              </head>
+              <body>
+                <div class="grid">
+                  <div class="wrap"><div class="a"></div><div class="b"></div></div>
+                  <div class="c"></div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let red =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected first grid item");
+        let green =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected second grid item");
+        let blue =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 0, 255))
+                .expect("expected third grid item");
+
+        assert!((green.rect.left() - red.rect.right() - 10.0).abs() <= 1.0);
+        assert!((blue.rect.left() - green.rect.right() - 10.0).abs() <= 1.0);
+        assert_eq!(red.rect.top(), green.rect.top());
+        assert_eq!(green.rect.top(), blue.rect.top());
+    }
+
+    #[test]
+    fn display_contents_flattens_flex_items() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .row { display: flex; gap: 12px; width: 360px; }
+                  .wrap { display: contents; }
+                  .a { width: 70px; height: 30px; background: #ff0000; }
+                  .b { width: 80px; height: 30px; background: #00ff00; }
+                  .c { width: 90px; height: 30px; background: #0000ff; }
+                </style>
+              </head>
+              <body>
+                <div class="row">
+                  <div class="a"></div>
+                  <div class="wrap"><div class="b"></div><div class="c"></div></div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let red =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected first flex item");
+        let green =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected second flex item");
+        let blue =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 0, 255))
+                .expect("expected third flex item");
+
+        assert!((green.rect.left() - red.rect.right() - 12.0).abs() <= 1.0);
+        assert!((blue.rect.left() - green.rect.right() - 12.0).abs() <= 1.0);
+        assert_eq!(red.rect.top(), green.rect.top());
+        assert_eq!(green.rect.top(), blue.rect.top());
+    }
+
+    #[test]
+    fn nested_display_contents_keeps_descendants_as_grid_items() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  article { display: grid; grid-template-columns: 120px 180px; gap: 16px; width: 316px; }
+                  section, .inner { display: contents; }
+                  .lead { height: 50px; background: #ff0000; }
+                  .body { height: 50px; background: #00ff00; }
+                </style>
+              </head>
+              <body>
+                <article>
+                  <section><div class="inner"><div class="lead"></div><div class="body"></div></div></section>
+                </article>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let lead =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected lead item");
+        let body =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected body item");
+
+        assert!((body.rect.left() - lead.rect.right() - 16.0).abs() <= 1.0);
+        assert_eq!(lead.rect.top(), body.rect.top());
+    }
+
+    #[test]
+    fn float_right_reserves_inline_space_for_following_block() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .page { width: 400px; }
+                  .float { float: right; width: 120px; height: 80px; background: #ff0000; }
+                  .copy { height: 40px; background: #0000ff; }
+                </style>
+              </head>
+              <body>
+                <div class="page"><div class="float"></div><div class="copy"></div></div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let float =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected right float");
+        let copy =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 0, 255))
+                .expect("expected following block");
+
+        assert!(
+            copy.rect.right() <= float.rect.left() + 1.0,
+            "float {float:?} copy {copy:?}"
+        );
+        assert_eq!(float.rect.top(), copy.rect.top());
+        assert!((copy.rect.width() - 280.0).abs() <= 1.0, "copy {copy:?}");
+    }
+
+    #[test]
+    fn float_left_reserves_inline_space_for_following_block() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .page { width: 400px; }
+                  .float { float: left; width: 100px; height: 80px; background: #ff0000; }
+                  .copy { height: 40px; background: #0000ff; }
+                </style>
+              </head>
+              <body>
+                <div class="page"><div class="float"></div><div class="copy"></div></div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let float =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected left float");
+        let copy =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 0, 255))
+                .expect("expected following block");
+
+        assert!(
+            copy.rect.left() >= float.rect.right(),
+            "float {float:?} copy {copy:?}"
+        );
+        assert_eq!(float.rect.top(), copy.rect.top());
+        assert!((copy.rect.width() - 300.0).abs() <= 1.0, "copy {copy:?}");
+    }
+
+    #[test]
+    fn auto_width_float_shrinks_before_reserving_inline_space() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .page { width: 500px; }
+                  .float { float: right; margin-left: 16px; padding: 10px; background: #ff0000; }
+                  .chip { display: inline-block; width: 120px; height: 80px; background: #00ff00; }
+                  .copy { height: 40px; background: #0000ff; }
+                </style>
+              </head>
+              <body>
+                <div class="page">
+                  <aside class="float"><span class="chip"></span></aside>
+                  <div class="copy"></div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let float =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected auto-width right float");
+        let copy =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 0, 255))
+                .expect("expected following block");
+
+        assert!(
+            float.rect.width() < 180.0,
+            "auto float should shrink to content instead of filling the line: {float:?}"
+        );
+        assert!(
+            copy.rect.width() > 300.0,
+            "following content should keep a readable line width: float {float:?} copy {copy:?}"
+        );
+        assert_eq!(float.rect.top(), copy.rect.top());
+    }
+
+    #[test]
+    fn auto_width_figure_prefers_image_width_over_long_caption() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .page { width: 760px; }
+                  figure { float: right; display: table; margin: 0 0 12px 20px; padding: 0; border: 1px solid #c8ccd1; background: #ff0000; }
+                  img { display: inline-block; }
+                  figcaption { padding: 6px; border-top: 1px solid #c8ccd1; }
+                  .copy { height: 48px; background: #0000ff; }
+                </style>
+              </head>
+              <body>
+                <div class="page">
+                  <figure>
+                    <a><img width="250" height="224" alt=""></a>
+                    <figcaption>A deliberately long caption should wrap inside the thumbnail width instead of making the float reserve the whole article.</figcaption>
+                  </figure>
+                  <p class="copy"></p>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let figure =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected figure background");
+        let copy =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 0, 255))
+                .expect("expected following copy");
+
+        assert!(
+            figure.rect.width() <= 280.0,
+            "figure should be sized from the image/thumb width: {figure:?}"
+        );
+        assert!(
+            copy.rect.width() >= 450.0,
+            "copy should keep a readable line next to the figure: figure {figure:?} copy {copy:?}"
+        );
+    }
+
+    #[test]
+    fn clear_both_starts_after_active_floats() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .page { width: 400px; }
+                  .left { float: left; width: 100px; height: 80px; background: #ff0000; }
+                  .right { float: right; width: 120px; height: 60px; background: #00ff00; }
+                  .clear { clear: both; height: 30px; background: #0000ff; }
+                </style>
+              </head>
+              <body>
+                <div class="page"><div class="left"></div><div class="right"></div><div class="clear"></div></div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let left =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected left float");
+        let right =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected right float");
+        let cleared =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 0, 255))
+                .expect("expected cleared block");
+
+        assert!(
+            cleared.rect.top() >= left.rect.bottom(),
+            "left {left:?} clear {cleared:?}"
+        );
+        assert!(
+            cleared.rect.top() >= right.rect.bottom(),
+            "right {right:?} clear {cleared:?}"
+        );
+    }
+
+    #[test]
     fn fixed_center_overlay_honors_percent_inset_and_translate_x() {
         let document = parse_html_document(
             r#"
@@ -16421,6 +18441,53 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
 
         assert_eq!(left.rect.top(), right.rect.top());
         assert!(right.rect.left() > 410.0, "right rect was {:?}", right.rect);
+    }
+
+    #[test]
+    fn flex_row_min_height_does_not_center_auto_height_header_children() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .shell { min-height: 720px; }
+                  .header {
+                    display: flex;
+                    align-items: center;
+                    min-height: 360px;
+                    background: #eeeeee;
+                  }
+                  .item { width: 120px; height: 40px; background: #ff0000; }
+                  .content { height: 80px; background: #0000ff; }
+                </style>
+              </head>
+              <body>
+                <div class="shell">
+                  <div class="header"><div class="item"></div></div>
+                  <div class="content"></div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let item =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected flex item");
+        let content =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 0, 255))
+                .expect("expected following content");
+
+        assert!(
+            item.rect.top() <= 1.0,
+            "auto-height flex children should not be centered in min-height space: {item:?}"
+        );
+        assert!(
+            content.rect.top() >= 360.0,
+            "min-height should still reserve space after the header: {content:?}"
+        );
     }
 
     #[test]
@@ -17026,6 +19093,79 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
     }
 
     #[test]
+    fn named_grid_auto_height_fr_row_expands_before_footer() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  html, body { padding: 0; margin: 0; }
+                  .shell {
+                    display: grid;
+                    grid-template-areas:
+                      "head"
+                      "body"
+                      "foot";
+                    grid-template-rows: 56px 1fr auto;
+                    min-height: 100vh;
+                    width: 100vw;
+                  }
+                  .head { grid-area: head; height: 56px; background: #aa0000; }
+                  .article {
+                    grid-area: body;
+                    display: grid;
+                    gap: 16px;
+                    padding: 20px;
+                    background: #00aa00;
+                  }
+                  .lead { height: 120px; background: #ffff00; }
+                  .long { height: 300px; background: #0000aa; }
+                  .foot { grid-area: foot; height: 80px; background: #aa00aa; }
+                </style>
+              </head>
+              <body>
+                <div class="shell">
+                  <header class="head"></header>
+                  <main class="article">
+                    <section class="lead"></section>
+                    <section class="long"></section>
+                    <section class="long"></section>
+                    <section class="long"></section>
+                  </main>
+                  <footer class="foot"></footer>
+                </div>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let article = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x00, 0xaa, 0x00),
+        )
+        .expect("expected article background");
+        let footer = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0xaa, 0x00, 0xaa),
+        )
+        .expect("expected footer background");
+
+        assert!(
+            footer.rect.top() >= article.rect.bottom() - 1.0,
+            "footer should follow intrinsic fr-row content: article={:?} footer={:?}",
+            article.rect,
+            footer.rect
+        );
+        assert!(
+            document.canvas_graph.viewport.y >= footer.rect.bottom(),
+            "viewport should include expanded grid and footer: viewport={:?} footer={:?}",
+            document.canvas_graph.viewport,
+            footer.rect
+        );
+    }
+
+    #[test]
     fn nested_min_height_page_propagates_height_to_percent_child() {
         let document = parse_html_document(
             r##"
@@ -17117,7 +19257,7 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
             "got {panel_rect:?}"
         );
         assert!(
-            (panel_rect.height() - 425.0).abs() < 0.1,
+            (panel_rect.height() - (DEFAULT_LAYOUT_VIEWPORT_HEIGHT * 0.5 - 25.0)).abs() < 0.1,
             "got {panel_rect:?}"
         );
     }
@@ -18377,7 +20517,7 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
         let html = r#"
             <html>
               <body>
-                <img src="../V0/sample_docs/sample-image.jpg" alt="Sample image" width="64" height="32">
+                <img src="../sample_docs/sample-image.jpg" alt="Sample image" width="64" height="32">
               </body>
             </html>
         "#;
@@ -18475,7 +20615,7 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
             <html>
               <head><style>img { max-width: 100%; height: auto; display: block; }</style></head>
               <body>
-                <img src="../V0/sample_docs/sample-image.jpg" alt="Sample image" width="64" height="32">
+                <img src="../sample_docs/sample-image.jpg" alt="Sample image" width="64" height="32">
               </body>
             </html>
         "#;
@@ -18676,6 +20816,26 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
     }
 
     #[test]
+    fn attributes_decode_html_entities_before_resource_resolution() {
+        assert_eq!(
+            extract_attr(
+                r#"<link rel="stylesheet" href="/w/load.php?lang=it&amp;modules=skin&amp;only=styles">"#,
+                "href",
+            )
+            .as_deref(),
+            Some("/w/load.php?lang=it&modules=skin&only=styles")
+        );
+        assert_eq!(
+            extract_attr("<form action='/search?q=hello&amp;lang=it'>", "action",).as_deref(),
+            Some("/search?q=hello&lang=it")
+        );
+        assert_eq!(
+            extract_attr("<input value=Tom&amp;Jerry>", "value").as_deref(),
+            Some("Tom&Jerry")
+        );
+    }
+
+    #[test]
     fn local_documents_do_not_fetch_remote_subresources() {
         let html = r#"
             <html>
@@ -18804,6 +20964,25 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
             CanvasObject::Rect(rect) if rect.fill == fill => Some(rect),
             _ => None,
         })
+    }
+
+    fn find_canvas_cell_rect<'a>(
+        graph: &'a CanvasGraph,
+        text: &str,
+    ) -> Option<&'a CanvasRectObject> {
+        let text = find_canvas_text(graph, text)?;
+        graph
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                CanvasObject::Rect(rect) if rect.rect.contains_rect(text.rect) => Some(rect),
+                _ => None,
+            })
+            .min_by(|left, right| {
+                (left.rect.width() * left.rect.height())
+                    .partial_cmp(&(right.rect.width() * right.rect.height()))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     }
 
     fn find_canvas_input<'a>(graph: &'a CanvasGraph, label: &str) -> Option<&'a CanvasInputObject> {

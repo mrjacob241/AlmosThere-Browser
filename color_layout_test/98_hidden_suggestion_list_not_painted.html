@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>98 - Hidden Suggestion List Not Painted</title>
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body { background: #f4f6f8; font-family: Arial, sans-serif; color: #17212b; }
+.search-shell { width: 620px; margin: 32px; padding: 18px; background: #ffffff; border: 1px solid #ced4da; }
+.search-row { display: flex; gap: 10px; width: 560px; padding: 10px; background: #d0ebff; }
+.input { flex: 1 1 auto; min-width: 0; height: 42px; background: #b2f2bb; }
+.button { width: 92px; height: 42px; background: #ffd43b; }
+ul.suggestions {
+  display: none;
+  margin: 8px 0 0;
+  padding: 0;
+  width: 460px;
+  background: #ff8787;
+}
+ul.suggestions li {
+  display: list-item;
+  height: 32px;
+  background: #e599f7;
+}
+.below { width: 560px; height: 70px; margin-top: 12px; background: #74c0fc; }
+.label {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  padding: 6px 8px;
+  background: #fff;
+  border: 1px solid #c8c8c8;
+  font-size: 12px;
+}
+</style>
+</head>
+<body>
+<main class="search-shell">
+  <div class="search-row">
+    <div class="input">input</div>
+    <div class="button">button</div>
+  </div>
+  <ul class="suggestions">
+    <li>hidden suggestion one</li>
+    <li>hidden suggestion two</li>
+    <li>hidden suggestion three</li>
+  </ul>
+  <div class="below">visible content begins directly below search row</div>
+</main>
+<div class="label">98 / regression - hidden list overlays do not paint or reserve space</div>
+</body>
+</html>

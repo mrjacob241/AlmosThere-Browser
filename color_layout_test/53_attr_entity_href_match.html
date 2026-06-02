@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>53 - Attribute Entity Href Match</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f7f8fa; font-family: system-ui, sans-serif; }
+.box { min-height: 72px; border: 1px solid rgba(20,30,40,.18); display: grid; place-items: center; padding: 10px; font-weight: 700; }
+.grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+a[href="/load.php?lang=it&modules=skin&only=styles"] { background: #51cf66; }
+a[href="/load.php?lang=it&amp;modules=skin&amp;only=styles"] { border: 6px solid #ff6b6b; }
+.plain { background: #ffd43b; }
+.label { position: fixed; right: 12px; bottom: 12px; background: rgba(255,255,255,.88); border: 1px solid rgba(20,30,40,.18); padding: 6px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<main class="grid">
+<a class="box" href="/load.php?lang=it&amp;modules=skin&amp;only=styles">decoded href should be green</a>
+<a class="box plain" href="/load.php?lang=it&modules=skin&only=styles">literal href control</a>
+<div class="box plain">unstyled control</div>
+</main>
+<div class="label">53 / 82 - Attribute Entity Href Match</div>
+</body>
+</html>

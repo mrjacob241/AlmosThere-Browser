@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>88 - Replaced Child Controls Float Caption Width</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f7f8fa; font-family: system-ui, sans-serif; }
+.article { width: 780px; border: 1px solid rgba(20,30,40,.18); padding: 16px; background: #fff; }
+.float { float: right; display: table; margin-left: 18px; padding: 8px; background: #ff8787; border: 1px solid rgba(20,30,40,.18); }
+.media { display: inline-block; width: 220px; height: 150px; background: #4dabf7; }
+.caption { display: block; padding-top: 8px; background: #ffc9c9; }
+.copy { min-height: 86px; margin: 0 0 14px; padding: 10px; background: #d8f5a2; }
+.label { position: fixed; right: 12px; bottom: 12px; background: rgba(255,255,255,.88); border: 1px solid rgba(20,30,40,.18); padding: 6px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<article class="article"><aside class="float"><span class="media"></span><span class="caption">Long caption text must wrap to the media width instead of determining a much larger float width.</span></aside><div class="copy">The following copy should keep a normal wide column beside the floated media box.</div><div class="copy">This catches any generic shrink-to-fit regression for visual replaced descendants.</div></article>
+<div class="label">88 / 88 - Replaced Child Controls Float Caption Width</div>
+</body>
+</html>

@@ -126,11 +126,16 @@ pub struct CssSelector {
     pub id: Option<String>,
     pub classes: Vec<String>,
     pub attributes: Vec<String>,
+    pub attribute_selectors: Vec<CssAttributeSelector>,
     pub nth_child: Option<CssNthChild>,
+    pub not_selectors: Vec<SimpleCssSelector>,
+    pub is_selectors: Vec<SimpleCssSelector>,
+    pub where_selectors: Vec<SimpleCssSelector>,
     pub ancestor: Option<SimpleCssSelector>,
     pub parent: Option<SimpleCssSelector>,
     pub previous_sibling: Option<SimpleCssSelector>,
     pub requires_previous_sibling: bool,
+    pub general_previous_sibling: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -139,7 +144,28 @@ pub struct SimpleCssSelector {
     pub id: Option<String>,
     pub classes: Vec<String>,
     pub attributes: Vec<String>,
+    pub attribute_selectors: Vec<CssAttributeSelector>,
     pub nth_child: Option<CssNthChild>,
+    pub not_selectors: Vec<SimpleCssSelector>,
+    pub is_selectors: Vec<SimpleCssSelector>,
+    pub where_selectors: Vec<SimpleCssSelector>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CssAttributeSelector {
+    pub name: String,
+    pub operator: Option<CssAttributeOperator>,
+    pub value: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CssAttributeOperator {
+    Exact,
+    Includes,
+    DashMatch,
+    Prefix,
+    Suffix,
+    Substring,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,6 +205,7 @@ pub struct CssBoxStyle {
     pub text_decoration_strikethrough: Option<bool>,
     pub text_background: Option<Color32>,
     pub text_align: Option<CssTextAlign>,
+    pub list_style_type: Option<CssListStyleType>,
     pub flex_grow: Option<f32>,
     pub flex_direction: Option<CssFlexDirection>,
     pub flex_wrap: Option<CssFlexWrap>,
@@ -195,6 +222,8 @@ pub struct CssBoxStyle {
     pub opacity: Option<f32>,
     pub overflow_hidden: Option<bool>,
     pub position: Option<CssPosition>,
+    pub float: Option<CssFloat>,
+    pub clear: Option<CssClear>,
     pub z_index: Option<i32>,
     pub inset: Option<CssEdges>,
     pub inset_sides: CssInset,
@@ -217,6 +246,7 @@ pub struct ResolvedBoxStyle {
     pub width: Option<f32>,
     pub width_percent: Option<f32>,
     pub max_width: Option<f32>,
+    pub max_width_percent: Option<f32>,
     pub min_width: Option<f32>,
     pub height: Option<CssLength>,
     pub min_height: Option<CssLength>,
@@ -227,6 +257,7 @@ pub struct ResolvedBoxStyle {
     pub text_decoration_strikethrough: bool,
     pub text_background: Color32,
     pub text_align: CssTextAlign,
+    pub list_style_type: CssListStyleType,
     pub flex_grow: f32,
     pub flex_direction: CssFlexDirection,
     pub flex_wrap: CssFlexWrap,
@@ -243,6 +274,8 @@ pub struct ResolvedBoxStyle {
     pub opacity: f32,
     pub overflow_hidden: bool,
     pub position: CssPosition,
+    pub float: CssFloat,
+    pub clear: CssClear,
     pub z_index: Option<i32>,
     pub inset: Option<CssEdges>,
     pub inset_sides: CssInset,
@@ -266,6 +299,7 @@ impl Default for ResolvedBoxStyle {
             width: None,
             width_percent: None,
             max_width: None,
+            max_width_percent: None,
             min_width: None,
             height: None,
             min_height: None,
@@ -276,6 +310,7 @@ impl Default for ResolvedBoxStyle {
             text_decoration_strikethrough: false,
             text_background: Color32::TRANSPARENT,
             text_align: CssTextAlign::Left,
+            list_style_type: CssListStyleType::Disc,
             flex_grow: 0.0,
             flex_direction: CssFlexDirection::Row,
             flex_wrap: CssFlexWrap::NoWrap,
@@ -292,6 +327,8 @@ impl Default for ResolvedBoxStyle {
             opacity: 1.0,
             overflow_hidden: false,
             position: CssPosition::Static,
+            float: CssFloat::None,
+            clear: CssClear::None,
             z_index: None,
             inset: None,
             inset_sides: CssInset::default(),
@@ -305,6 +342,7 @@ impl Default for ResolvedBoxStyle {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CssDisplay {
     None,
+    Contents,
     Block,
     Inline,
     InlineBlock,
@@ -312,6 +350,29 @@ pub enum CssDisplay {
     Grid,
     Table,
     ListItem,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CssListStyleType {
+    None,
+    #[default]
+    Disc,
+    Decimal,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CssFloat {
+    #[default]
+    None,
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CssClear {
+    #[default]
+    None,
+    Both,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -361,6 +422,13 @@ pub enum CssLength {
     Vh(f32),
     Calc(CssLengthExpression),
     Min(CssLengthExpression, CssLengthExpression),
+    Max(CssLengthExpression, CssLengthExpression),
+    Clamp(
+        CssLengthExpression,
+        CssLengthExpression,
+        CssLengthExpression,
+    ),
+    FitContent(CssLengthExpression),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -2505,6 +2573,44 @@ fn css_length_px(length: CssLength, containing_width: f32) -> f32 {
             DEFAULT_VIEWPORT_WIDTH,
             DEFAULT_VIEWPORT_HEIGHT,
         )),
+        CssLength::Max(left, right) => css_length_expression_px(
+            left,
+            containing_width,
+            DEFAULT_VIEWPORT_WIDTH,
+            DEFAULT_VIEWPORT_HEIGHT,
+        )
+        .max(css_length_expression_px(
+            right,
+            containing_width,
+            DEFAULT_VIEWPORT_WIDTH,
+            DEFAULT_VIEWPORT_HEIGHT,
+        )),
+        CssLength::Clamp(min, preferred, max) => css_length_expression_px(
+            preferred,
+            containing_width,
+            DEFAULT_VIEWPORT_WIDTH,
+            DEFAULT_VIEWPORT_HEIGHT,
+        )
+        .clamp(
+            css_length_expression_px(
+                min,
+                containing_width,
+                DEFAULT_VIEWPORT_WIDTH,
+                DEFAULT_VIEWPORT_HEIGHT,
+            ),
+            css_length_expression_px(
+                max,
+                containing_width,
+                DEFAULT_VIEWPORT_WIDTH,
+                DEFAULT_VIEWPORT_HEIGHT,
+            ),
+        ),
+        CssLength::FitContent(limit) => css_length_expression_px(
+            limit,
+            containing_width,
+            DEFAULT_VIEWPORT_WIDTH,
+            DEFAULT_VIEWPORT_HEIGHT,
+        ),
     }
 }
 
@@ -3564,11 +3670,11 @@ fn parse_basic_css_inner(
         let Some((selectors, declarations)) = rule.split_once('{') else {
             continue;
         };
-        for selector in selectors.split(',').map(str::trim) {
+        for selector in split_css_selector_list(selectors) {
             let variables = style.css_variables.clone();
-            apply_css_rule(&mut style, selector, declarations, &variables);
+            apply_css_rule(&mut style, &selector, declarations, &variables);
             if let (Some(selector), Some(box_style)) = (
-                parse_css_selector(selector),
+                parse_css_selector(&selector),
                 parse_css_box_style_with_vars(declarations, &style.css_variables, viewport_width),
             ) {
                 style.block_rules.push(CssBlockRule {
@@ -3605,7 +3711,7 @@ fn collect_css_custom_properties(css: &str, root_classes: &[String]) -> HashMap<
 }
 
 fn selector_list_contains_root(selectors: &str, root_classes: &[String]) -> bool {
-    selectors.split(',').any(|selector| {
+    split_css_selector_list(selectors).iter().any(|selector| {
         let selector = selector.trim();
         if selector == ":root" || selector == "html" || selector == "body" {
             return true;
@@ -3898,7 +4004,7 @@ fn apply_css_rule(
             continue;
         };
         let property = property.trim();
-        let value = resolve_css_vars(value.trim(), variables);
+        let value = resolve_css_vars(value.trim(), &variables);
         let value = value.as_str();
         match (selector, property) {
             ("body", "color") => apply_color(value, &mut style.text_color),
@@ -3974,6 +4080,7 @@ pub fn computed_box_style(style: &BrowserStyle, key: &ElementStyleKey) -> CssBox
     let mut matches = style
         .block_rules
         .iter()
+        .filter(|rule| css_selector_fast_filter(&rule.selector, key))
         .filter(|rule| css_selector_matches(&rule.selector, key))
         .collect::<Vec<_>>();
     matches.sort_by_key(|rule| (css_selector_specificity(&rule.selector), rule.order));
@@ -3983,6 +4090,52 @@ pub fn computed_box_style(style: &BrowserStyle, key: &ElementStyleKey) -> CssBox
     }
 
     out
+}
+
+fn css_selector_fast_filter(selector: &CssSelector, key: &ElementStyleKey) -> bool {
+    if let Some(tag) = &selector.tag {
+        if !tag.eq_ignore_ascii_case(&key.tag) {
+            return false;
+        }
+    }
+    if let Some(id) = &selector.id {
+        if key.id.as_deref() != Some(id.as_str()) {
+            return false;
+        }
+    }
+    if let Some(nth_child) = selector.nth_child {
+        let Some(child_index) = key.child_index else {
+            return false;
+        };
+        if !nth_child_matches(nth_child, child_index) {
+            return false;
+        }
+    }
+    if selector
+        .classes
+        .iter()
+        .any(|class| !key.classes.iter().any(|key_class| key_class == class))
+    {
+        return false;
+    }
+    if selector.attributes.iter().any(|attribute| {
+        !key.attributes.iter().any(|key_attribute| {
+            key_attribute == attribute || key_attribute_attribute_name(key_attribute) == *attribute
+        })
+    }) {
+        return false;
+    }
+    if selector
+        .attribute_selectors
+        .iter()
+        .any(|attribute| !css_attribute_selector_matches(attribute, &key.attributes))
+    {
+        return false;
+    }
+    if selector.requires_previous_sibling && key.previous_sibling.is_none() {
+        return false;
+    }
+    true
 }
 
 pub fn parse_inline_box_style(declarations: &str) -> Option<CssBoxStyle> {
@@ -3995,7 +4148,11 @@ fn css_selector_matches(selector: &CssSelector, key: &ElementStyleKey) -> bool {
         id: selector.id.clone(),
         classes: selector.classes.clone(),
         attributes: selector.attributes.clone(),
+        attribute_selectors: selector.attribute_selectors.clone(),
         nth_child: selector.nth_child,
+        not_selectors: selector.not_selectors.clone(),
+        is_selectors: selector.is_selectors.clone(),
+        where_selectors: selector.where_selectors.clone(),
     };
     if !simple_css_selector_matches(&current, key) {
         return false;
@@ -4020,7 +4177,11 @@ fn css_selector_matches(selector: &CssSelector, key: &ElementStyleKey) -> bool {
         let Some(previous) = &key.previous_sibling else {
             return false;
         };
-        if !simple_css_selector_matches(previous_selector, previous) {
+        if selector.general_previous_sibling {
+            if !previous_sibling_chain_matches(previous_selector, previous) {
+                return false;
+            }
+        } else if !simple_css_selector_matches(previous_selector, previous) {
             return false;
         }
     }
@@ -4051,10 +4212,87 @@ fn simple_css_selector_matches(selector: &SimpleCssSelector, key: &ElementStyleK
         .iter()
         .all(|class| key.classes.iter().any(|key_class| key_class == class))
         && selector.attributes.iter().all(|attribute| {
-            key.attributes
-                .iter()
-                .any(|key_attribute| key_attribute == attribute)
+            key.attributes.iter().any(|key_attribute| {
+                key_attribute == attribute
+                    || key_attribute_attribute_name(key_attribute) == *attribute
+            })
         })
+        && selector
+            .attribute_selectors
+            .iter()
+            .all(|attribute| css_attribute_selector_matches(attribute, &key.attributes))
+        && selector
+            .not_selectors
+            .iter()
+            .all(|not_selector| !simple_css_selector_matches(not_selector, key))
+        && (selector.is_selectors.is_empty()
+            || selector
+                .is_selectors
+                .iter()
+                .any(|is_selector| simple_css_selector_matches(is_selector, key)))
+        && (selector.where_selectors.is_empty()
+            || selector
+                .where_selectors
+                .iter()
+                .any(|where_selector| simple_css_selector_matches(where_selector, key)))
+}
+
+fn previous_sibling_chain_matches(selector: &SimpleCssSelector, sibling: &ElementStyleKey) -> bool {
+    let mut current = Some(sibling);
+    while let Some(key) = current {
+        if simple_css_selector_matches(selector, key) {
+            return true;
+        }
+        current = key.previous_sibling.as_deref();
+    }
+    false
+}
+
+fn css_attribute_selector_matches(selector: &CssAttributeSelector, attributes: &[String]) -> bool {
+    attributes.iter().any(|attribute| {
+        let name = key_attribute_attribute_name(attribute);
+        if name != selector.name {
+            return false;
+        }
+        let Some(operator) = selector.operator else {
+            return true;
+        };
+        let Some(expected) = selector.value.as_deref() else {
+            return false;
+        };
+        let Some(actual) = key_attribute_value(attribute) else {
+            return false;
+        };
+        match operator {
+            CssAttributeOperator::Exact => actual == expected,
+            CssAttributeOperator::Includes => {
+                actual.split_whitespace().any(|part| part == expected)
+            }
+            CssAttributeOperator::DashMatch => {
+                actual == expected
+                    || actual
+                        .strip_prefix(expected)
+                        .is_some_and(|rest| rest.starts_with('-'))
+            }
+            CssAttributeOperator::Prefix => actual.starts_with(expected),
+            CssAttributeOperator::Suffix => actual.ends_with(expected),
+            CssAttributeOperator::Substring => actual.contains(expected),
+        }
+    })
+}
+
+fn key_attribute_attribute_name(attribute: &str) -> String {
+    attribute
+        .split_once('=')
+        .map(|(name, _)| name)
+        .unwrap_or(attribute)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn key_attribute_value(attribute: &str) -> Option<String> {
+    let (_, value) = attribute.split_once('=')?;
+    Some(unquote_css_attribute_value(value.trim()))
 }
 
 fn nth_child_matches(nth_child: CssNthChild, child_index: usize) -> bool {
@@ -4091,7 +4329,11 @@ fn css_selector_specificity(selector: &CssSelector) -> usize {
         id: selector.id.clone(),
         classes: selector.classes.clone(),
         attributes: selector.attributes.clone(),
+        attribute_selectors: selector.attribute_selectors.clone(),
         nth_child: selector.nth_child,
+        not_selectors: selector.not_selectors.clone(),
+        is_selectors: selector.is_selectors.clone(),
+        where_selectors: selector.where_selectors.clone(),
     };
     simple_css_selector_specificity(&current)
         + selector
@@ -4112,10 +4354,22 @@ fn css_selector_specificity(selector: &CssSelector) -> usize {
 }
 
 fn simple_css_selector_specificity(selector: &SimpleCssSelector) -> usize {
+    let attribute_count = if selector.attribute_selectors.is_empty() {
+        selector.attributes.len()
+    } else {
+        selector.attribute_selectors.len()
+    };
+    let pseudo_specificity = selector
+        .not_selectors
+        .iter()
+        .chain(selector.is_selectors.iter())
+        .map(simple_css_selector_specificity)
+        .max()
+        .unwrap_or_default();
     selector.id.iter().count() * 100
-        + (selector.classes.len() + selector.attributes.len() + selector.nth_child.iter().count())
-            * 10
+        + (selector.classes.len() + attribute_count + selector.nth_child.iter().count()) * 10
         + selector.tag.iter().count()
+        + pseudo_specificity
 }
 
 fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
@@ -4224,6 +4478,9 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
     if source.text_align.is_some() {
         target.text_align = source.text_align;
     }
+    if source.list_style_type.is_some() {
+        target.list_style_type = source.list_style_type;
+    }
     if source.flex_grow.is_some() {
         target.flex_grow = source.flex_grow;
     }
@@ -4272,6 +4529,12 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
     if source.position.is_some() {
         target.position = source.position;
     }
+    if source.float.is_some() {
+        target.float = source.float;
+    }
+    if source.clear.is_some() {
+        target.clear = source.clear;
+    }
     if source.z_index.is_some() {
         target.z_index = source.z_index;
     }
@@ -4318,11 +4581,37 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             id: right.id,
             classes: right.classes,
             attributes: right.attributes,
+            attribute_selectors: right.attribute_selectors,
             nth_child: right.nth_child,
+            not_selectors: right.not_selectors,
+            is_selectors: right.is_selectors,
+            where_selectors: right.where_selectors,
             ancestor: None,
             parent,
             previous_sibling: Some(previous_sibling),
             requires_previous_sibling: true,
+            general_previous_sibling: false,
+        });
+    }
+
+    if let Some((left, right)) = split_selector_once(&selector, '~') {
+        let right = parse_simple_css_selector(right)?;
+        let (parent, previous_sibling) = parse_previous_sibling_selector(left)?;
+        return Some(CssSelector {
+            tag: right.tag,
+            id: right.id,
+            classes: right.classes,
+            attributes: right.attributes,
+            attribute_selectors: right.attribute_selectors,
+            nth_child: right.nth_child,
+            not_selectors: right.not_selectors,
+            is_selectors: right.is_selectors,
+            where_selectors: right.where_selectors,
+            ancestor: None,
+            parent,
+            previous_sibling: Some(previous_sibling),
+            requires_previous_sibling: true,
+            general_previous_sibling: true,
         });
     }
 
@@ -4334,11 +4623,16 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             id: child.id,
             classes: child.classes,
             attributes: child.attributes,
+            attribute_selectors: child.attribute_selectors,
             nth_child: child.nth_child,
+            not_selectors: child.not_selectors,
+            is_selectors: child.is_selectors,
+            where_selectors: child.where_selectors,
             ancestor: None,
             parent: Some(parent),
             previous_sibling: None,
             requires_previous_sibling: false,
+            general_previous_sibling: false,
         });
     }
 
@@ -4351,11 +4645,16 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             id: descendant.id,
             classes: descendant.classes,
             attributes: descendant.attributes,
+            attribute_selectors: descendant.attribute_selectors,
             nth_child: descendant.nth_child,
+            not_selectors: descendant.not_selectors,
+            is_selectors: descendant.is_selectors,
+            where_selectors: descendant.where_selectors,
             ancestor: Some(ancestor),
             parent: None,
             previous_sibling: None,
             requires_previous_sibling: false,
+            general_previous_sibling: false,
         });
     }
 
@@ -4364,7 +4663,11 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
         && simple.id.is_none()
         && simple.classes.is_empty()
         && simple.attributes.is_empty()
+        && simple.attribute_selectors.is_empty()
         && simple.nth_child.is_none()
+        && simple.not_selectors.is_empty()
+        && simple.is_selectors.is_empty()
+        && simple.where_selectors.is_empty()
     {
         None
     } else {
@@ -4373,11 +4676,16 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             id: simple.id,
             classes: simple.classes,
             attributes: simple.attributes,
+            attribute_selectors: simple.attribute_selectors,
             nth_child: simple.nth_child,
+            not_selectors: simple.not_selectors,
+            is_selectors: simple.is_selectors,
+            where_selectors: simple.where_selectors,
             ancestor: None,
             parent: None,
             previous_sibling: None,
             requires_previous_sibling: false,
+            general_previous_sibling: false,
         })
     }
 }
@@ -4391,8 +4699,10 @@ fn split_descendant_selector(selector: &str) -> Option<(&str, &str)> {
     let ancestor = parts.pop()?;
     if find_top_level_char(ancestor, '>').is_some()
         || find_top_level_char(ancestor, '+').is_some()
+        || find_top_level_char(ancestor, '~').is_some()
         || find_top_level_char(descendant, '>').is_some()
         || find_top_level_char(descendant, '+').is_some()
+        || find_top_level_char(descendant, '~').is_some()
     {
         None
     } else {
@@ -4419,6 +4729,7 @@ fn parse_simple_css_selector(selector: &str) -> Option<SimpleCssSelector> {
         || selector_has_top_level_whitespace(selector)
         || find_top_level_char(selector, '>').is_some()
         || find_top_level_char(selector, '+').is_some()
+        || find_top_level_char(selector, '~').is_some()
     {
         return None;
     }
@@ -4426,8 +4737,13 @@ fn parse_simple_css_selector(selector: &str) -> Option<SimpleCssSelector> {
     let mut tag = None;
     let mut id = None;
     let mut classes = Vec::new();
-    let (selector, attributes) = strip_simple_selector_attributes(selector);
-    let (selector, nth_child) = strip_simple_selector_pseudo_classes(&selector)?;
+    let (selector, attribute_selectors) = strip_simple_selector_attributes(selector)?;
+    let attributes = attribute_selectors
+        .iter()
+        .filter(|attribute| attribute.operator.is_none())
+        .map(|attribute| attribute.name.clone())
+        .collect::<Vec<_>>();
+    let (selector, pseudo_classes) = strip_simple_selector_pseudo_classes(&selector)?;
     let mut token = String::new();
     let mut mode = 't';
     for ch in selector.chars().chain(std::iter::once('.')) {
@@ -4445,11 +4761,15 @@ fn parse_simple_css_selector(selector: &str) -> Option<SimpleCssSelector> {
         id,
         classes,
         attributes,
-        nth_child,
+        attribute_selectors,
+        nth_child: pseudo_classes.nth_child,
+        not_selectors: pseudo_classes.not_selectors,
+        is_selectors: pseudo_classes.is_selectors,
+        where_selectors: pseudo_classes.where_selectors,
     })
 }
 
-fn strip_simple_selector_attributes(selector: &str) -> (String, Vec<String>) {
+fn strip_simple_selector_attributes(selector: &str) -> Option<(String, Vec<CssAttributeSelector>)> {
     let mut simple = String::new();
     let mut attributes = Vec::new();
     let mut chars = selector.chars().peekable();
@@ -4465,29 +4785,53 @@ fn strip_simple_selector_attributes(selector: &str) -> (String, Vec<String>) {
             }
             raw.push(attr_ch);
         }
-        let name = raw
-            .split(['=', '~', '|', '^', '$', '*', ' '])
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        if !name.is_empty() {
-            attributes.push(name);
-        }
+        let attribute = parse_css_attribute_selector(&raw)?;
+        attributes.push(attribute);
     }
-    (simple, attributes)
+    Some((simple, attributes))
 }
 
-fn strip_simple_selector_pseudo_classes(selector: &str) -> Option<(String, Option<CssNthChild>)> {
+#[derive(Clone, Debug, Default)]
+struct CssSimplePseudoClasses {
+    nth_child: Option<CssNthChild>,
+    not_selectors: Vec<SimpleCssSelector>,
+    is_selectors: Vec<SimpleCssSelector>,
+    where_selectors: Vec<SimpleCssSelector>,
+}
+
+fn strip_simple_selector_pseudo_classes(
+    selector: &str,
+) -> Option<(String, CssSimplePseudoClasses)> {
     let mut simple = String::new();
-    let mut nth_child = None;
+    let mut pseudo_classes = CssSimplePseudoClasses::default();
     let mut index = 0usize;
     while index < selector.len() {
         let rest = &selector[index..];
         if rest.starts_with(":nth-child(") {
             let open_paren = index + ":nth-child".len();
             let end = find_function_end(selector, open_paren)?;
-            nth_child = Some(parse_nth_child_formula(&selector[open_paren + 1..end])?);
+            pseudo_classes.nth_child =
+                Some(parse_nth_child_formula(&selector[open_paren + 1..end])?);
+            index = end + 1;
+            continue;
+        }
+        if let Some((name, offset)) = [(":not", 4usize), (":is", 3usize), (":where", 6usize)]
+            .iter()
+            .find_map(|(name, len)| {
+                rest.starts_with(&format!("{name}("))
+                    .then_some((*name, *len))
+            })
+        {
+            let open_paren = index + offset;
+            let end = find_function_end(selector, open_paren)?;
+            let inner = &selector[open_paren + 1..end];
+            let selectors = parse_simple_selector_function_args(inner)?;
+            match name {
+                ":not" => pseudo_classes.not_selectors.extend(selectors),
+                ":is" => pseudo_classes.is_selectors.extend(selectors),
+                ":where" => pseudo_classes.where_selectors.extend(selectors),
+                _ => {}
+            }
             index = end + 1;
             continue;
         }
@@ -4499,7 +4843,63 @@ fn strip_simple_selector_pseudo_classes(selector: &str) -> Option<(String, Optio
         simple.push(ch);
         index += ch.len_utf8();
     }
-    Some((simple, nth_child))
+    Some((simple, pseudo_classes))
+}
+
+fn parse_simple_selector_function_args(inner: &str) -> Option<Vec<SimpleCssSelector>> {
+    let selectors = split_css_selector_list(inner);
+    if selectors.is_empty() {
+        return None;
+    }
+    selectors
+        .iter()
+        .map(|selector| parse_simple_css_selector(selector))
+        .collect()
+}
+
+fn parse_css_attribute_selector(raw: &str) -> Option<CssAttributeSelector> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    for (operator_text, operator) in [
+        ("~=", CssAttributeOperator::Includes),
+        ("|=", CssAttributeOperator::DashMatch),
+        ("^=", CssAttributeOperator::Prefix),
+        ("$=", CssAttributeOperator::Suffix),
+        ("*=", CssAttributeOperator::Substring),
+        ("=", CssAttributeOperator::Exact),
+    ] {
+        if let Some(index) = raw.find(operator_text) {
+            let name = raw[..index].trim().to_ascii_lowercase();
+            let value = unquote_css_attribute_value(raw[index + operator_text.len()..].trim());
+            return (!name.is_empty()).then_some(CssAttributeSelector {
+                name,
+                operator: Some(operator),
+                value: Some(value),
+            });
+        }
+    }
+
+    let name = raw.split_whitespace().next()?.trim().to_ascii_lowercase();
+    (!name.is_empty()).then_some(CssAttributeSelector {
+        name,
+        operator: None,
+        value: None,
+    })
+}
+
+fn unquote_css_attribute_value(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2 {
+        let mut chars = value.chars();
+        let first = chars.next().unwrap_or_default();
+        let last = value.chars().last().unwrap_or_default();
+        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+            return value[first.len_utf8()..value.len() - last.len_utf8()].to_owned();
+        }
+    }
+    value.to_owned()
 }
 
 fn parse_nth_child_formula(formula: &str) -> Option<CssNthChild> {
@@ -4541,11 +4941,9 @@ fn normalize_css_selector(selector: &str) -> Option<String> {
     if selector.is_empty() {
         return None;
     }
-    if selector.contains('~')
-        || selector.contains("::")
+    if selector.contains("::")
         || selector.contains(":before")
         || selector.contains(":after")
-        || selector.contains(":not(")
         || selector_contains_dynamic_pseudo_class(selector)
     {
         return None;
@@ -4584,11 +4982,40 @@ fn split_selector_once(selector: &str, combinator: char) -> Option<(&str, &str)>
         || right.is_empty()
         || find_top_level_char(right, '>').is_some()
         || find_top_level_char(right, '+').is_some()
+        || find_top_level_char(right, '~').is_some()
     {
         None
     } else {
         Some((left, right))
     }
+}
+
+fn split_css_selector_list(selectors: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut part_start = 0usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    for (index, ch) in selectors.char_indices() {
+        match ch {
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '(' if bracket_depth == 0 => paren_depth += 1,
+            ')' if bracket_depth == 0 => paren_depth = paren_depth.saturating_sub(1),
+            ',' if paren_depth == 0 && bracket_depth == 0 => {
+                let part = selectors[part_start..index].trim();
+                if !part.is_empty() {
+                    parts.push(part.to_owned());
+                }
+                part_start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let part = selectors[part_start..].trim();
+    if !part.is_empty() {
+        parts.push(part.to_owned());
+    }
+    parts
 }
 
 fn find_top_level_char(selector: &str, target: char) -> Option<usize> {
@@ -4688,18 +5115,30 @@ fn parse_css_box_style_with_vars(
 ) -> Option<CssBoxStyle> {
     let mut style = CssBoxStyle::default();
     let mut seen = false;
+    let variables = css_variables_for_declarations(declarations, variables);
 
     for declaration in declarations.split(';') {
         let Some((property, value)) = declaration.split_once(':') else {
             continue;
         };
         let property = property.trim();
-        let value = resolve_css_vars(value.trim(), variables);
+        if property.starts_with("--") {
+            continue;
+        }
+        let value = resolve_css_vars(value.trim(), &variables);
         let value = value.as_str();
         match property {
             "display" => {
                 style.display = parse_display(value);
                 seen |= style.display.is_some();
+            }
+            "float" => {
+                style.float = parse_float(value);
+                seen |= style.float.is_some();
+            }
+            "clear" => {
+                style.clear = parse_clear(value);
+                seen |= style.clear.is_some();
             }
             "color" => {
                 style.color = parse_color(value);
@@ -4854,6 +5293,10 @@ fn parse_css_box_style_with_vars(
                     _ => None,
                 };
                 seen |= style.text_align.is_some();
+            }
+            "list-style" | "list-style-type" => {
+                style.list_style_type = parse_list_style_type(value);
+                seen |= style.list_style_type.is_some();
             }
             "flex" | "flex-grow" => {
                 style.flex_grow = parse_flex_grow(value);
@@ -5037,18 +5480,65 @@ fn parse_css_box_style_with_vars(
     seen.then_some(style)
 }
 
+fn css_variables_for_declarations<'a>(
+    declarations: &str,
+    inherited: &'a HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut variables = inherited.clone();
+    for declaration in declarations.split(';') {
+        let Some((property, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        let property = property.trim();
+        if property.starts_with("--") {
+            let value = resolve_css_vars(value.trim(), &variables);
+            variables.insert(property.to_owned(), value);
+        }
+    }
+    variables
+}
+
 fn parse_display(value: &str) -> Option<CssDisplay> {
     match value.split_whitespace().next().unwrap_or(value) {
         "none" => Some(CssDisplay::None),
+        "contents" => Some(CssDisplay::Contents),
         "block" => Some(CssDisplay::Block),
         "inline" => Some(CssDisplay::Inline),
         "inline-block" => Some(CssDisplay::InlineBlock),
-        "contents" => Some(CssDisplay::Inline),
         "inline-flex" => Some(CssDisplay::Flex),
         "flex" => Some(CssDisplay::Flex),
         "grid" | "inline-grid" => Some(CssDisplay::Grid),
         "table" => Some(CssDisplay::Table),
         "list-item" => Some(CssDisplay::ListItem),
+        _ => None,
+    }
+}
+
+fn parse_list_style_type(value: &str) -> Option<CssListStyleType> {
+    for token in split_css_value_list(value) {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "none" => return Some(CssListStyleType::None),
+            "disc" | "circle" | "square" => return Some(CssListStyleType::Disc),
+            "decimal" | "decimal-leading-zero" => return Some(CssListStyleType::Decimal),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_float(value: &str) -> Option<CssFloat> {
+    match value.trim() {
+        "none" => Some(CssFloat::None),
+        "left" | "inline-start" => Some(CssFloat::Left),
+        "right" | "inline-end" => Some(CssFloat::Right),
+        _ => None,
+    }
+}
+
+fn parse_clear(value: &str) -> Option<CssClear> {
+    match value.trim() {
+        "none" => Some(CssClear::None),
+        "both" => Some(CssClear::Both),
         _ => None,
     }
 }
@@ -5507,6 +5997,8 @@ fn parse_css_length(value: &str) -> Option<CssLength> {
     let value = value.trim();
     if value.eq_ignore_ascii_case("auto") {
         Some(CssLength::Auto)
+    } else if value.eq_ignore_ascii_case("fit-content") {
+        Some(CssLength::Auto)
     } else if let Some(inner) = value
         .strip_prefix("min(")
         .and_then(|value| value.strip_suffix(')'))
@@ -5516,6 +6008,33 @@ fn parse_css_length(value: &str) -> Option<CssLength> {
             parse_css_length_expression(left.trim())?,
             parse_css_length_expression(right?.trim())?,
         ))
+    } else if let Some(inner) = value
+        .strip_prefix("max(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let (left, right) = split_css_function_args(inner);
+        Some(CssLength::Max(
+            parse_css_length_expression(left.trim())?,
+            parse_css_length_expression(right?.trim())?,
+        ))
+    } else if let Some(inner) = value
+        .strip_prefix("clamp(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let (min, rest) = split_css_function_args(inner);
+        let (preferred, max) = split_css_function_args(rest?.trim());
+        Some(CssLength::Clamp(
+            parse_css_length_expression(min.trim())?,
+            parse_css_length_expression(preferred.trim())?,
+            parse_css_length_expression(max?.trim())?,
+        ))
+    } else if let Some(inner) = value
+        .strip_prefix("fit-content(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        Some(CssLength::FitContent(parse_css_length_expression(
+            inner.trim(),
+        )?))
     } else if let Some(inner) = value
         .strip_prefix("calc(")
         .and_then(|value| value.strip_suffix(')'))
@@ -6650,7 +7169,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_basic_css_ignores_not_selectors_instead_of_broadening_them() {
+    fn parse_basic_css_matches_not_selectors_without_broadening_them() {
         let style = parse_basic_css(
             r#"
             .button__icon:not(.button__icon--with-text) { display: none; }
@@ -6671,11 +7190,133 @@ mod tests {
             ..ElementStyleKey::default()
         };
 
-        assert_eq!(computed_box_style(&style, &icon).display, None);
+        assert_eq!(
+            computed_box_style(&style, &icon).display,
+            Some(CssDisplay::None)
+        );
         assert_eq!(
             computed_box_style(&style, &icon_with_text).display,
             Some(CssDisplay::InlineBlock)
         );
+    }
+
+    #[test]
+    fn fixture_56_body_not_selector_applies_only_without_menu_state() {
+        let style = parse_basic_css(
+            r#"
+            body:not(.menu-open) .drawer { display: none; }
+            body:not(.menu-open) .content { background: #51cf66; }
+            .drawer { background: #ff6b6b; }
+            "#,
+        );
+        let closed_body = ElementStyleKey {
+            tag: "body".to_owned(),
+            ..ElementStyleKey::default()
+        };
+        let open_body = ElementStyleKey {
+            tag: "body".to_owned(),
+            classes: vec!["menu-open".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let drawer = |body: ElementStyleKey| ElementStyleKey {
+            tag: "aside".to_owned(),
+            classes: vec!["box".to_owned(), "drawer".to_owned()],
+            parent: Some(Box::new(body)),
+            ..ElementStyleKey::default()
+        };
+        let content = ElementStyleKey {
+            tag: "section".to_owned(),
+            classes: vec!["box".to_owned(), "content".to_owned()],
+            parent: Some(Box::new(closed_body.clone())),
+            ..ElementStyleKey::default()
+        };
+
+        assert_eq!(
+            computed_box_style(&style, &drawer(closed_body)).display,
+            Some(CssDisplay::None)
+        );
+        assert_eq!(computed_box_style(&style, &drawer(open_body)).display, None);
+        assert_eq!(
+            computed_box_style(&style, &content).background,
+            Some(Color32::from_rgb(0x51, 0xcf, 0x66))
+        );
+    }
+
+    #[test]
+    fn fixture_57_is_and_where_groups_match_parent_child_context() {
+        let style = parse_basic_css(
+            r#"
+            :is(header, main, aside) > :where(.primary, .secondary) { background: #51cf66; }
+            footer :is(.primary, .secondary) { background: #ff6b6b; }
+            "#,
+        );
+        let child = |parent_tag: &str, class_name: &str| ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["box".to_owned(), class_name.to_owned()],
+            parent: Some(Box::new(ElementStyleKey {
+                tag: parent_tag.to_owned(),
+                ..ElementStyleKey::default()
+            })),
+            ..ElementStyleKey::default()
+        };
+
+        assert_eq!(
+            computed_box_style(&style, &child("header", "primary")).background,
+            Some(Color32::from_rgb(0x51, 0xcf, 0x66))
+        );
+        assert_eq!(
+            computed_box_style(&style, &child("main", "secondary")).background,
+            Some(Color32::from_rgb(0x51, 0xcf, 0x66))
+        );
+        assert_eq!(
+            computed_box_style(&style, &child("footer", "primary")).background,
+            Some(Color32::from_rgb(0xff, 0x6b, 0x6b))
+        );
+    }
+
+    #[test]
+    fn fixture_58_value_aware_attributes_match_general_sibling_chain() {
+        let style = parse_basic_css(
+            r#"
+            [aria-expanded="false"] ~ .menu { display: none; }
+            [aria-expanded="true"] ~ .open-menu { background: #51cf66; }
+            [aria-expanded="false"] ~ .closed-marker { background: #4dabf7; }
+            .menu { background: #ff6b6b; }
+            "#,
+        );
+        let toggle = ElementStyleKey {
+            tag: "button".to_owned(),
+            attributes: vec!["aria-expanded=false".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let menu = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["box".to_owned(), "menu".to_owned()],
+            previous_sibling: Some(Box::new(toggle.clone())),
+            ..ElementStyleKey::default()
+        };
+        let marker = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["box".to_owned(), "closed-marker".to_owned()],
+            previous_sibling: Some(Box::new(menu.clone())),
+            ..ElementStyleKey::default()
+        };
+        let open_menu = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["box".to_owned(), "open-menu".to_owned()],
+            previous_sibling: Some(Box::new(toggle)),
+            ..ElementStyleKey::default()
+        };
+
+        assert_eq!(
+            computed_box_style(&style, &menu).display,
+            Some(CssDisplay::None)
+        );
+        assert_eq!(
+            computed_box_style(&style, &marker).background,
+            Some(Color32::from_rgb(0x4d, 0xab, 0xf7))
+        );
+        assert_eq!(computed_box_style(&style, &open_menu).background, None);
     }
 
     #[test]
@@ -6920,6 +7561,107 @@ mod tests {
     }
 
     #[test]
+    fn parse_basic_css_preserves_max_clamp_and_fit_content_lengths() {
+        let style = parse_basic_css(
+            ".hero { width: clamp(18rem, 60vw, 72rem); min-width: max(16rem, 50%); max-width: fit-content(44rem); }",
+        );
+        let hero = ElementStyleKey {
+            tag: "section".to_owned(),
+            classes: vec!["hero".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &hero);
+
+        assert_eq!(
+            computed.width,
+            Some(CssLength::Clamp(
+                CssLengthExpression {
+                    px: 288.0,
+                    ..CssLengthExpression::default()
+                },
+                CssLengthExpression {
+                    vw: 60.0,
+                    ..CssLengthExpression::default()
+                },
+                CssLengthExpression {
+                    px: 1152.0,
+                    ..CssLengthExpression::default()
+                },
+            ))
+        );
+        assert_eq!(
+            computed.min_width,
+            Some(CssLength::Max(
+                CssLengthExpression {
+                    px: 256.0,
+                    ..CssLengthExpression::default()
+                },
+                CssLengthExpression {
+                    percent: 50.0,
+                    ..CssLengthExpression::default()
+                },
+            ))
+        );
+        assert_eq!(
+            computed.max_width,
+            Some(CssLength::FitContent(CssLengthExpression {
+                px: 704.0,
+                ..CssLengthExpression::default()
+            }))
+        );
+    }
+
+    #[test]
+    fn css_length_px_evaluates_max_clamp_and_fit_content() {
+        assert_eq!(
+            css_length_px(
+                CssLength::Max(
+                    CssLengthExpression {
+                        px: 320.0,
+                        ..CssLengthExpression::default()
+                    },
+                    CssLengthExpression {
+                        percent: 50.0,
+                        ..CssLengthExpression::default()
+                    },
+                ),
+                900.0,
+            ),
+            450.0
+        );
+        assert_eq!(
+            css_length_px(
+                CssLength::Clamp(
+                    CssLengthExpression {
+                        px: 280.0,
+                        ..CssLengthExpression::default()
+                    },
+                    CssLengthExpression {
+                        percent: 75.0,
+                        ..CssLengthExpression::default()
+                    },
+                    CssLengthExpression {
+                        px: 560.0,
+                        ..CssLengthExpression::default()
+                    },
+                ),
+                1000.0,
+            ),
+            560.0
+        );
+        assert_eq!(
+            css_length_px(
+                CssLength::FitContent(CssLengthExpression {
+                    px: 384.0,
+                    ..CssLengthExpression::default()
+                }),
+                1000.0,
+            ),
+            384.0
+        );
+    }
+
+    #[test]
     fn body_color_uses_general_color_parser() {
         let style = parse_basic_css("body { color: rgb(255, 255, 255); background: blue; }");
 
@@ -7077,6 +7819,73 @@ mod tests {
         );
         assert_eq!(computed.color, Some(Color32::from_rgb(18, 52, 86)));
         assert_eq!(computed.width, Some(CssLength::Px(180.0)));
+    }
+
+    #[test]
+    fn css_custom_properties_resolve_nested_fallback_chains() {
+        let style = parse_basic_css(
+            r#"
+            :root {
+                --fallback-width: 22rem;
+            }
+            .card {
+                width: var(--missing-width, var(--also-missing, var(--fallback-width)));
+                color: var(--missing-color, var(--also-missing-color, #224466));
+            }
+            "#,
+        );
+        let key = ElementStyleKey {
+            tag: "section".to_owned(),
+            classes: vec!["card".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &key);
+
+        assert_eq!(computed.width, Some(CssLength::Px(352.0)));
+        assert_eq!(computed.color, Some(Color32::from_rgb(0x22, 0x44, 0x66)));
+    }
+
+    #[test]
+    fn css_custom_properties_resolve_from_scoped_declarations_in_same_rule() {
+        let style = parse_basic_css(
+            r#"
+            :root {
+                --panel-width: 20rem;
+                --panel-color: #111111;
+            }
+            .panel {
+                --panel-width: clamp(18rem, 50vw, 42rem);
+                --panel-color: #abcdef;
+                width: var(--panel-width);
+                color: var(--panel-color);
+            }
+            "#,
+        );
+        let key = ElementStyleKey {
+            tag: "section".to_owned(),
+            classes: vec!["panel".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &key);
+
+        assert_eq!(
+            computed.width,
+            Some(CssLength::Clamp(
+                CssLengthExpression {
+                    px: 288.0,
+                    ..CssLengthExpression::default()
+                },
+                CssLengthExpression {
+                    vw: 50.0,
+                    ..CssLengthExpression::default()
+                },
+                CssLengthExpression {
+                    px: 672.0,
+                    ..CssLengthExpression::default()
+                },
+            ))
+        );
+        assert_eq!(computed.color, Some(Color32::from_rgb(0xab, 0xcd, 0xef)));
     }
 
     #[test]

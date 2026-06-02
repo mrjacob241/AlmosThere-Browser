@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>67 - Hidden Overflow Clip</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f7f8fa; font-family: system-ui, sans-serif; }
+.clip { width: 320px; height: 120px; overflow: hidden; border: 4px solid #51cf66; background: #b2f2bb; position: relative; }
+.inside { width: 280px; height: 80px; margin: 20px; background: #4dabf7; display: grid; place-items: center; font-weight: 700; }
+.outside { position: absolute; left: 360px; top: 20px; width: 220px; height: 80px; background: #ff6b6b; display: grid; place-items: center; font-weight: 700; }
+.label { position: fixed; right: 12px; bottom: 12px; background: rgba(255,255,255,.88); border: 1px solid rgba(20,30,40,.18); padding: 6px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="clip"><div class="inside">visible inside clip</div><div class="outside">must be clipped</div></div>
+<div class="label">67 / 82 - Hidden Overflow Clip</div>
+</body>
+</html>

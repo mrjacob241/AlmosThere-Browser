@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>92 Float Figure Clear Footer Flow</title>
+<style>
+html, body { margin: 0; padding: 0; background: #d9dde3; }
+.page { width: 980px; margin: 0 auto; background: #eceff4; }
+.article { background: #1a9850; padding: 20px; }
+.thumb {
+  float: right;
+  display: table;
+  margin: 0 0 20px 24px;
+  background: #fdae61;
+}
+.image { width: 250px; height: 220px; background: #4575b4; }
+figcaption { width: 250px; min-height: 80px; background: #ffffbf; }
+.lead { min-height: 120px; background: #74add1; }
+.block { height: 260px; margin-top: 16px; background: #a6d96a; }
+.clear { clear: both; height: 40px; background: #f46d43; }
+.footer { height: 80px; background: #7b3294; }
+</style>
+</head>
+<body>
+<div class="page">
+  <main class="article">
+    <figure class="thumb"><div class="image"></div><figcaption></figcaption></figure>
+    <p class="lead"></p>
+    <section class="block"></section>
+    <section class="block"></section>
+    <section class="clear"></section>
+  </main>
+  <footer class="footer"></footer>
+</div>
+</body>
+</html>

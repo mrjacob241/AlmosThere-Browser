@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>91 Named Grid Fr Article Footer</title>
+<style>
+html, body { margin: 0; padding: 0; }
+.shell {
+  display: grid;
+  grid-template:
+    "head" 56px
+    "body" 1fr
+    "foot" auto / minmax(0, 1fr);
+  min-height: 100vh;
+}
+.head { grid-area: head; background: #d73027; }
+.article {
+  grid-area: body;
+  display: grid;
+  gap: 16px;
+  padding: 20px;
+  background: #1a9850;
+}
+.lead { height: 120px; background: #ffffbf; }
+.long { height: 300px; background: #4575b4; }
+.foot { grid-area: foot; height: 80px; background: #7b3294; }
+</style>
+</head>
+<body>
+<div class="shell">
+  <header class="head"></header>
+  <main class="article">
+    <section class="lead"></section>
+    <section class="long"></section>
+    <section class="long"></section>
+    <section class="long"></section>
+  </main>
+  <footer class="foot"></footer>
+</div>
+</body>
+</html>

@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>55 - Attribute Entity Form Action Match</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f7f8fa; font-family: system-ui, sans-serif; }
+.stack { display: grid; gap: 14px; max-width: 860px; }
+form, .box { min-height: 84px; border: 1px solid rgba(20,30,40,.18); display: grid; place-items: center; padding: 10px; font-weight: 700; background: #ffd43b; }
+form[action="/search?q=hello&lang=it"] { background: #51cf66; }
+form[action="/search?q=hello&amp;lang=it"] { border: 8px solid #ff6b6b; }
+.label { position: fixed; right: 12px; bottom: 12px; background: rgba(255,255,255,.88); border: 1px solid rgba(20,30,40,.18); padding: 6px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<main class="stack">
+<form action="/search?q=hello&amp;lang=it"><input name="q" value="hello"><button>decoded action should be green</button></form>
+<div class="box">control block</div>
+<div class="box">control block</div>
+</main>
+<div class="label">55 / 82 - Attribute Entity Form Action Match</div>
+</body>
+</html>

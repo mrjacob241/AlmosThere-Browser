@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>64 - Clear Both After Floats</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f7f8fa; font-family: system-ui, sans-serif; }
+.wrap { max-width: 900px; background: #fff; border: 1px solid rgba(20,30,40,.18); padding: 16px; }
+.left { float: left; width: 200px; height: 160px; background: #4dabf7; margin-right: 16px; }
+.right { float: right; width: 240px; height: 200px; background: #ffd43b; margin-left: 16px; }
+.box { min-height: 72px; border: 1px solid rgba(20,30,40,.18); display: grid; place-items: center; padding: 10px; font-weight: 700; background: #b2f2bb; margin-bottom: 12px; }
+.clear { clear: both; background: #51cf66; }
+.label { position: fixed; right: 12px; bottom: 12px; background: rgba(255,255,255,.88); border: 1px solid rgba(20,30,40,.18); padding: 6px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<main class="wrap"><div class="box left">left float</div><div class="box right">right float</div><div class="box">normal content between floats</div><div class="box clear">clear both starts below both floats</div></main>
+<div class="label">64 / 82 - Clear Both After Floats</div>
+</body>
+</html>

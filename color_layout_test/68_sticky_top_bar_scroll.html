@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>68 - Sticky Top Bar Scroll</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; background: #f7f8fa; font-family: system-ui, sans-serif; }
+.hero { height: 180px; background: #ffd43b; display: grid; place-items: center; font-weight: 700; }
+.sticky { position: sticky; top: 0; z-index: 2; height: 64px; background: #51cf66; border: 1px solid rgba(20,30,40,.18); display: grid; place-items: center; font-weight: 700; }
+.content { height: 900px; padding: 24px; background: linear-gradient(#b2f2bb, #4dabf7); }
+.label { position: fixed; right: 12px; bottom: 12px; background: rgba(255,255,255,.88); border: 1px solid rgba(20,30,40,.18); padding: 6px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="hero">hero before sticky</div><nav class="sticky">sticky top bar</nav><main class="content">long content</main>
+<div class="label">68 / 82 - Sticky Top Bar Scroll</div>
+</body>
+</html>

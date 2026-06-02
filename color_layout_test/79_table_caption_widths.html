@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>79 - Table Caption Widths</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f7f8fa; font-family: system-ui, sans-serif; }
+table { width: 880px; border-collapse: collapse; caption-side: top; }
+caption { height: 56px; background: #51cf66; display: table-caption; font-weight: 700; padding: 16px; }
+td { border: 2px solid rgba(20,30,40,.25); height: 72px; text-align: center; font-weight: 700; }
+.narrow { width: 120px; background: #ffd43b; } .wide { background: #4dabf7; }
+.label { position: fixed; right: 12px; bottom: 12px; background: rgba(255,255,255,.88); border: 1px solid rgba(20,30,40,.18); padding: 6px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<table><caption>caption should span table width</caption><tr><td class="narrow">120px</td><td class="wide">wide content column</td><td class="narrow">120px</td></tr></table>
+<div class="label">79 / 82 - Table Caption Widths</div>
+</body>
+</html>

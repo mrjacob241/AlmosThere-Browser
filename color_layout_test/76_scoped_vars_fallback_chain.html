@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>76 - Scoped Vars Fallback Chain</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f7f8fa; font-family: system-ui, sans-serif; }
+.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.box { min-height: 132px; border: 1px solid rgba(20,30,40,.18); display: grid; place-items: center; padding: 10px; font-weight: 700; background: var(--missing, var(--fallback-tone, #ffd43b)); }
+.one { --fallback-tone: #51cf66; }
+.two { --fallback-tone: #4dabf7; }
+.three { background: var(--missing, #f783ac); }
+.label { position: fixed; right: 12px; bottom: 12px; background: rgba(255,255,255,.88); border: 1px solid rgba(20,30,40,.18); padding: 6px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<main class="grid"><div class="box one">fallback chain green</div><div class="box two">fallback chain blue</div><div class="box three">direct fallback pink</div></main>
+<div class="label">76 / 82 - Scoped Vars Fallback Chain</div>
+</body>
+</html>
