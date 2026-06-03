@@ -40,6 +40,7 @@ const DEFAULT_LAYOUT_VIEWPORT_HEIGHT: f32 = 1800.0;
 const DEFAULT_BOOKMARK_TITLE: &str = "AlmostThere Sample Page";
 const DEFAULT_URL_BOOKMARK_TITLE: &str = "HTML5 Test Page";
 const LOCAL_BOOKMARK_TOKEN: &str = "[local]";
+const DEFAULT_EVENT_TRACE_ITEMS: &[&str] = &["Hello world - Wikipedia", "Wikipedia"];
 const SCRIPT_TEST_BOOKMARKS: &[(&str, &str)] = &[
     (
         "001 Basic Script Execution",
@@ -229,17 +230,58 @@ struct AppConfig {
     debug_socket: bool,
     event_trace: bool,
     initial_url: Option<String>,
+    trace_items: Vec<String>,
 }
 
 impl AppConfig {
     fn from_args() -> Self {
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let initial_url = args.iter().find(|arg| !arg.starts_with('-')).cloned();
+        Self::from_arg_values(args)
+    }
+
+    fn from_arg_values(args: Vec<String>) -> Self {
+        let mut record_events = false;
+        let mut debug_socket = false;
+        let mut event_trace = false;
+        let mut initial_url = None;
+        let mut trace_items = Vec::new();
+        let mut index = 0usize;
+        while index < args.len() {
+            let arg = &args[index];
+            if arg == "--record-events" {
+                record_events = true;
+            } else if arg == "--debug-socket" {
+                debug_socket = true;
+            } else if arg == "--event-trace" {
+                event_trace = true;
+            } else if arg == "--trace-item" || arg == "--track-item" {
+                if let Some(value) = args.get(index + 1) {
+                    trace_items.push(value.to_owned());
+                    index += 1;
+                }
+            } else if let Some(value) = arg.strip_prefix("--trace-item=") {
+                trace_items.push(value.to_owned());
+            } else if let Some(value) = arg.strip_prefix("--track-item=") {
+                trace_items.push(value.to_owned());
+            } else if !arg.starts_with('-') && initial_url.is_none() {
+                initial_url = Some(arg.to_owned());
+            }
+            index += 1;
+        }
+
+        if event_trace && trace_items.is_empty() {
+            trace_items = DEFAULT_EVENT_TRACE_ITEMS
+                .iter()
+                .map(|item| (*item).to_owned())
+                .collect();
+        }
+
         Self {
-            record_events: args.iter().any(|a| a == "--record-events"),
-            debug_socket: args.iter().any(|a| a == "--debug-socket"),
-            event_trace: args.iter().any(|a| a == "--event-trace"),
+            record_events,
+            debug_socket,
+            event_trace,
             initial_url,
+            trace_items,
         }
     }
 }
@@ -267,6 +309,7 @@ struct AlmostThereApp {
     page_loaded_at: std::time::Instant,
     record_events: bool,
     event_trace: bool,
+    trace_items: Vec<String>,
     recorded_event_count: u64,
 }
 
@@ -381,6 +424,10 @@ impl AlmostThereApp {
                 "event_trace.started",
                 &[("source", "cli"), ("flag", "--event-trace")],
             );
+            telemetry.emit(
+                "event_trace.pipeline_items.configured",
+                &[("items", &config.trace_items.join(" | "))],
+            );
         }
 
         let mut bookmarks = load_bookmarks().unwrap_or_default();
@@ -425,6 +472,15 @@ impl AlmostThereApp {
                         &telemetry,
                         &source.source,
                         &live_js_debug_text,
+                    );
+                }
+                if config.event_trace {
+                    write_pipeline_trace_artifacts(
+                        &telemetry,
+                        &source.html,
+                        &source.source,
+                        &config.trace_items,
+                        "initial_load",
                     );
                 }
                 telemetry.emit(
@@ -506,6 +562,7 @@ impl AlmostThereApp {
             page_loaded_at: std::time::Instant::now(),
             record_events: config.record_events,
             event_trace: config.event_trace,
+            trace_items: config.trace_items,
             recorded_event_count: 0,
         }
     }
@@ -661,6 +718,15 @@ impl AlmostThereApp {
                                 ),
                             ],
                         );
+                        if self.event_trace {
+                            write_pipeline_trace_artifacts(
+                                &self.telemetry,
+                                &source.html,
+                                &source.source,
+                                &self.trace_items,
+                                "navigation",
+                            );
+                        }
                         self.telemetry.emit(
                             "navigation.loaded",
                             &[
@@ -3014,10 +3080,8 @@ fn parse_html_document_from_live_html(
             ("html_bytes", &live_html.len().to_string()),
         ],
     );
-    let reveal_hydration_hidden_content = live_html.contains("__NEXT_DATA__")
-        || live_html.contains("data-reactroot")
-        || live_html.contains("data-hydrate")
-        || live_html.contains("ng-version");
+    let reveal_hydration_hidden_content =
+        page_has_unexecuted_hydration_script(live_html, Some(source));
     emit_global_telemetry("document.stylesheets.start", &[("source", source)]);
     let css = collect_document_stylesheets(live_html, source).unwrap_or_default();
     emit_global_telemetry(
@@ -5739,6 +5803,15 @@ fn load_render_graph_debug_dump(input: &str) -> io::Result<String> {
     ))
 }
 
+fn load_pipeline_trace(input: &str, needle: &str) -> io::Result<String> {
+    let source = load_url_source(input)?;
+    Ok(pipeline_trace_debug_dump(
+        &source.html,
+        &source.source,
+        needle,
+    ))
+}
+
 fn load_http_document(url: &str) -> io::Result<BrowserDocument> {
     load_http_document_with_text_metrics(url, None)
 }
@@ -6377,6 +6450,422 @@ fn parse_render_graph_debug_dump_from_live_html(live_html: &str, source: &str) -
         &[("source", source), ("bytes", &debug.len().to_string())],
     );
     debug
+}
+
+fn pipeline_trace_debug_dump(html: &str, source: &str, needle: &str) -> String {
+    use std::fmt::Write as _;
+
+    let needle = needle.trim();
+    let mut out = String::new();
+    let _ = writeln!(out, "# Pipeline Trace");
+    let _ = writeln!(out, "source: {source}");
+    let _ = writeln!(out, "needle: {needle:?}");
+    let _ = writeln!(out);
+
+    push_html_trace(html, needle, &mut out);
+
+    let html_no_comments = remove_html_comments(html);
+    let script_result = apply_safe_script_browser_effects_detailed(&html_no_comments, Some(source));
+    let reveal_hydration_hidden_content = script_result.hydration_failed;
+    let legacy_marker_reveal = html_no_comments.contains("__NEXT_DATA__")
+        || html_no_comments.contains("data-reactroot")
+        || html_no_comments.contains("data-hydrate")
+        || html_no_comments.contains("ng-version");
+    let _ = writeln!(out, "## Script/Hydration");
+    let _ = writeln!(
+        out,
+        "hydration_failed_reveal: {reveal_hydration_hidden_content}"
+    );
+    let _ = writeln!(
+        out,
+        "legacy_marker_only_reveal_would_have_been: {legacy_marker_reveal}"
+    );
+    let _ = writeln!(out);
+
+    let html_after_scripts = script_result.html;
+    let css = collect_document_stylesheets(&html_after_scripts, source).unwrap_or_default();
+    let html_visual = remove_non_visual_metadata_elements(&html_after_scripts);
+    let dom = parse_dom_document(&html_visual);
+    push_dom_trace(&dom, needle, &mut out);
+
+    let root_classes = document_theme_root_classes(&dom, None);
+    let style = parse_basic_css_for_viewport_with_root_classes(
+        &css,
+        DEFAULT_LAYOUT_VIEWPORT_WIDTH,
+        &root_classes,
+    );
+    let render_graph = build_render_graph(&dom, &style);
+    push_render_graph_trace(&render_graph, needle, &mut out);
+
+    let mut layout_root = build_css_layout_tree(&render_graph.root);
+    layout_css_layout_tree(
+        &mut layout_root,
+        DEFAULT_LAYOUT_VIEWPORT_WIDTH,
+        DEFAULT_LAYOUT_VIEWPORT_HEIGHT,
+        source,
+        style.image_height_auto,
+        None,
+    );
+    if reveal_hydration_hidden_content {
+        apply_hydration_visibility_fallback(&mut layout_root);
+    }
+    push_css_layout_trace(&layout_root, needle, &mut out);
+
+    let canvas_graph = render_graph_to_canvas_graph(
+        &render_graph,
+        source,
+        style.image_height_auto,
+        None,
+        reveal_hydration_hidden_content,
+    );
+    push_canvas_graph_trace(&canvas_graph, needle, &mut out);
+
+    out
+}
+
+fn trace_matches(value: &str, needle: &str) -> bool {
+    !needle.is_empty()
+        && value
+            .to_ascii_lowercase()
+            .contains(&needle.to_ascii_lowercase())
+}
+
+fn push_html_trace(html: &str, needle: &str, out: &mut String) {
+    use std::fmt::Write as _;
+
+    let _ = writeln!(out, "## HTML Occurrences");
+    let haystack = html.to_ascii_lowercase();
+    let needle_lower = needle.to_ascii_lowercase();
+    let mut offset = 0usize;
+    let mut count = 0usize;
+    while !needle_lower.is_empty() && count < 20 {
+        let Some(relative) = haystack[offset..].find(&needle_lower) else {
+            break;
+        };
+        let index = offset + relative;
+        let start = index.saturating_sub(180);
+        let end = (index + needle.len() + 180).min(html.len());
+        let snippet = html[start..end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = writeln!(out, "- byte={index}: {}", shorten_debug_text(&snippet));
+        offset = index + needle_lower.len();
+        count += 1;
+    }
+    if count == 0 {
+        let _ = writeln!(out, "no HTML occurrences");
+    }
+    let _ = writeln!(out);
+}
+
+fn push_dom_trace(dom: &DomDocument, needle: &str, out: &mut String) {
+    use std::fmt::Write as _;
+
+    let _ = writeln!(out, "## DOM Matches");
+    let mut count = 0usize;
+    let mut path = Vec::new();
+    for child in &dom.children {
+        push_dom_node_trace(child, needle, &mut path, &mut count, out);
+        if count >= 80 {
+            let _ = writeln!(out, "... truncated DOM matches");
+            break;
+        }
+    }
+    if count == 0 {
+        let _ = writeln!(out, "no DOM matches");
+    }
+    let _ = writeln!(out);
+}
+
+fn push_dom_node_trace(
+    node: &DomNode,
+    needle: &str,
+    path: &mut Vec<String>,
+    count: &mut usize,
+    out: &mut String,
+) {
+    use std::fmt::Write as _;
+
+    match node {
+        DomNode::Text(text) => {
+            if trace_matches(text, needle) {
+                *count += 1;
+                let _ = writeln!(
+                    out,
+                    "- text path={} text={:?}",
+                    path.join(" > "),
+                    shorten_debug_text(&decode_basic_entities(text))
+                );
+            }
+        }
+        DomNode::Element(element) => {
+            path.push(dom_trace_label(element));
+            let text = element.text_content();
+            let attrs = dom_trace_attr_text(element);
+            if trace_matches(&text, needle) || trace_matches(&attrs, needle) {
+                *count += 1;
+                let _ = writeln!(
+                    out,
+                    "- element path={} attrs={} text={:?}",
+                    path.join(" > "),
+                    attrs,
+                    shorten_debug_text(&text)
+                );
+            }
+            for child in &element.children {
+                push_dom_node_trace(child, needle, path, count, out);
+                if *count >= 80 {
+                    break;
+                }
+            }
+            path.pop();
+        }
+    }
+}
+
+fn dom_trace_label(element: &DomElement) -> String {
+    let mut label = element.tag_name.clone();
+    if let Some(id) = element.attr("id") {
+        label.push('#');
+        label.push_str(id);
+    }
+    if let Some(class) = element.attr("class") {
+        let classes = class
+            .split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(".");
+        if !classes.is_empty() {
+            label.push('.');
+            label.push_str(&classes);
+        }
+    }
+    if let Some(test_id) = element.attr("data-test-id") {
+        label.push_str("[data-test-id=");
+        label.push_str(test_id);
+        label.push(']');
+    }
+    label
+}
+
+fn dom_trace_attr_text(element: &DomElement) -> String {
+    element
+        .attributes
+        .iter()
+        .filter(|attr| {
+            matches!(
+                attr.name.as_str(),
+                "id" | "class" | "href" | "role" | "data-test-id" | "aria-label" | "style"
+            )
+        })
+        .map(|attr| format!("{}={}", attr.name, shorten_debug_text(&attr.value)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn push_render_graph_trace(graph: &RenderGraph, needle: &str, out: &mut String) {
+    use std::fmt::Write as _;
+
+    let _ = writeln!(out, "## RenderGraph Matches");
+    let mut count = 0usize;
+    let mut path = Vec::new();
+    push_render_node_trace(&graph.root, needle, &mut path, &mut count, out);
+    if count == 0 {
+        let _ = writeln!(out, "no RenderGraph matches");
+    }
+    let _ = writeln!(out);
+}
+
+fn push_render_node_trace(
+    node: &RenderNode,
+    needle: &str,
+    path: &mut Vec<String>,
+    count: &mut usize,
+    out: &mut String,
+) {
+    use std::fmt::Write as _;
+
+    if *count >= 80 {
+        return;
+    }
+    path.push(render_node_trace_label(node));
+    let text = render_node_text_content(node);
+    let attrs = render_node_attr_trace(node);
+    if trace_matches(&text, needle) || trace_matches(&attrs, needle) {
+        *count += 1;
+        let _ = writeln!(
+            out,
+            "- path={} attrs={} {} text={:?}",
+            path.join(" > "),
+            attrs,
+            resolved_style_debug(&node.style),
+            shorten_debug_text(&text)
+        );
+    }
+    for child in &node.children {
+        push_render_node_trace(child, needle, path, count, out);
+    }
+    path.pop();
+}
+
+fn render_node_trace_label(node: &RenderNode) -> String {
+    match &node.kind {
+        RenderNodeKind::Document => "document".to_owned(),
+        RenderNodeKind::Text(text) => format!("text({:?})", shorten_debug_text(text)),
+        RenderNodeKind::Element(element) => dom_trace_label(element),
+    }
+}
+
+fn render_node_attr_trace(node: &RenderNode) -> String {
+    match &node.kind {
+        RenderNodeKind::Element(element) => dom_trace_attr_text(element),
+        _ => String::new(),
+    }
+}
+
+fn push_css_layout_trace(root: &CssLayoutBox<'_>, needle: &str, out: &mut String) {
+    use std::fmt::Write as _;
+
+    let _ = writeln!(out, "## CSS Layout Matches");
+    let mut count = 0usize;
+    let mut path = Vec::new();
+    push_css_layout_box_trace(root, needle, &mut path, &mut count, out);
+    if count == 0 {
+        let _ = writeln!(out, "no CSS layout matches");
+    }
+    let _ = writeln!(out);
+}
+
+fn push_css_layout_box_trace(
+    box_: &CssLayoutBox<'_>,
+    needle: &str,
+    path: &mut Vec<String>,
+    count: &mut usize,
+    out: &mut String,
+) {
+    use std::fmt::Write as _;
+
+    if *count >= 100 {
+        return;
+    }
+    path.push(css_layout_trace_label(box_));
+    let text = css_layout_trace_text(box_);
+    let attrs = box_.node.map(render_node_attr_trace).unwrap_or_default();
+    if trace_matches(&text, needle) || trace_matches(&attrs, needle) {
+        *count += 1;
+        let rect = box_.dimensions.content;
+        let _ = writeln!(
+            out,
+            "- path={} kind={:?} rect=({:.1},{:.1}) {:.1}x{:.1} attrs={} {} text={:?}",
+            path.join(" > "),
+            box_.kind,
+            rect.left(),
+            rect.top(),
+            rect.width(),
+            rect.height(),
+            attrs,
+            resolved_style_debug(&box_.style),
+            shorten_debug_text(&text)
+        );
+    }
+    for child in &box_.children {
+        push_css_layout_box_trace(child, needle, path, count, out);
+    }
+    path.pop();
+}
+
+fn css_layout_trace_label(box_: &CssLayoutBox<'_>) -> String {
+    match box_.kind {
+        CssLayoutKind::Document => "layout-document".to_owned(),
+        CssLayoutKind::AnonymousBlock => "anonymous-block".to_owned(),
+        CssLayoutKind::Text => format!(
+            "text({:?})",
+            shorten_debug_text(box_.text.as_deref().unwrap_or_default())
+        ),
+        CssLayoutKind::Inline | CssLayoutKind::Block => box_
+            .node
+            .map(render_node_trace_label)
+            .unwrap_or_else(|| format!("{:?}", box_.kind)),
+    }
+}
+
+fn css_layout_trace_text(box_: &CssLayoutBox<'_>) -> String {
+    if let Some(text) = &box_.text {
+        return normalize_ws(&decode_basic_entities(text));
+    }
+    if let Some(node) = box_.node {
+        return render_node_text_content(node);
+    }
+    box_.children
+        .iter()
+        .map(css_layout_trace_text)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn push_canvas_graph_trace(graph: &CanvasGraph, needle: &str, out: &mut String) {
+    use std::fmt::Write as _;
+
+    let _ = writeln!(out, "## CanvasGraph Matches");
+    let mut count = 0usize;
+    for (index, object) in graph.objects.iter().enumerate() {
+        let Some((kind, text, href, rect)) = canvas_object_trace_fields(object) else {
+            continue;
+        };
+        let haystack = format!("{text} {href}");
+        if !trace_matches(&haystack, needle) {
+            continue;
+        }
+        count += 1;
+        let _ = writeln!(
+            out,
+            "- #{index:04} {kind} rect=({:.1},{:.1}) {:.1}x{:.1} href={} text={:?}",
+            rect.left(),
+            rect.top(),
+            rect.width(),
+            rect.height(),
+            href,
+            shorten_debug_text(&text)
+        );
+    }
+    if count == 0 {
+        let _ = writeln!(out, "no CanvasGraph matches");
+    }
+    let _ = writeln!(out);
+}
+
+fn canvas_object_trace_fields(
+    object: &CanvasObject,
+) -> Option<(&'static str, String, String, egui::Rect)> {
+    match object {
+        CanvasObject::Text(text) => Some((
+            "Text",
+            text.text.clone(),
+            text.href.clone().unwrap_or_default(),
+            text.rect,
+        )),
+        CanvasObject::Button(button) => {
+            Some(("Button", button.text.clone(), String::new(), button.rect))
+        }
+        CanvasObject::Input(input) => Some((
+            "Input",
+            format!("{} {}", input.label, input.value),
+            input.form_action.clone().unwrap_or_default(),
+            input.rect,
+        )),
+        CanvasObject::LinkHit(link) => {
+            Some(("LinkHit", String::new(), link.href.clone(), link.rect))
+        }
+        CanvasObject::Media(media) => {
+            Some(("Media", media.label.clone(), String::new(), media.rect))
+        }
+        CanvasObject::Image(image) => {
+            Some(("Image", image.alt.clone(), image.src.clone(), image.rect))
+        }
+        CanvasObject::Svg(svg) => Some(("Svg", String::new(), String::new(), svg.rect)),
+        CanvasObject::Rect(_) | CanvasObject::ClipStart(_) | CanvasObject::ClipEnd => None,
+    }
 }
 
 fn document_theme_root_classes(
@@ -10282,7 +10771,7 @@ fn css_layout_box_should_reveal_for_hydration_fallback(box_: &CssLayoutBox<'_>) 
 fn css_layout_box_has_meaningful_ssr_content(box_: &CssLayoutBox<'_>) -> bool {
     let text_len = css_layout_box_visible_text_len(box_);
     let link_count = css_layout_box_link_count(box_);
-    css_layout_box_contains_tag(box_, &["article", "main"]) || (text_len >= 24 && link_count > 0)
+    text_len >= 24 && link_count > 0 && css_layout_box_contains_tag(box_, &["article", "main"])
 }
 
 fn css_layout_box_visible_text_len(box_: &CssLayoutBox<'_>) -> usize {
@@ -15432,6 +15921,173 @@ fn write_recorded_live_js_debug_artifact(
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct PipelineTraceStageCounts {
+    html: usize,
+    dom: usize,
+    render: usize,
+    css: usize,
+    canvas: usize,
+}
+
+fn write_pipeline_trace_artifacts(
+    telemetry: &TelemetrySession,
+    html: &str,
+    source: &str,
+    needles: &[String],
+    context: &str,
+) {
+    if needles.is_empty() {
+        return;
+    }
+    let Some(sink) = telemetry.sink() else {
+        return;
+    };
+    let output_dir = sink.session_path.join("pipeline_traces");
+    if let Err(error) = fs::create_dir_all(&output_dir) {
+        telemetry.emit(
+            "pipeline_trace.artifact.failed",
+            &[
+                ("url", source),
+                ("context", context),
+                ("path", &output_dir.display().to_string()),
+                ("error", &error.to_string()),
+            ],
+        );
+        return;
+    }
+
+    for (index, needle) in needles.iter().enumerate() {
+        let needle = needle.trim();
+        if needle.is_empty() {
+            continue;
+        }
+
+        let dump = pipeline_trace_debug_dump(html, source, needle);
+        let counts = pipeline_trace_stage_counts(&dump);
+        let filename = format!(
+            "{}_{}_{}_{}.txt",
+            unix_ms(),
+            index,
+            trace_filename_slug(context),
+            trace_filename_slug(needle)
+        );
+        let output_path = output_dir.join(filename);
+        match fs::write(&output_path, &dump) {
+            Ok(()) => {
+                let line_count = dump.lines().count().to_string();
+                let byte_count = dump.len().to_string();
+                let html_matches = counts.html.to_string();
+                let dom_matches = counts.dom.to_string();
+                let render_matches = counts.render.to_string();
+                let css_matches = counts.css.to_string();
+                let canvas_matches = counts.canvas.to_string();
+                let preview = shorten_debug_text(&dump);
+                telemetry.emit(
+                    "pipeline_trace.artifact.written",
+                    &[
+                        ("url", source),
+                        ("context", context),
+                        ("needle", needle),
+                        ("path", &output_path.display().to_string()),
+                        ("bytes", &byte_count),
+                        ("lines", &line_count),
+                        ("html_matches", &html_matches),
+                        ("dom_matches", &dom_matches),
+                        ("render_matches", &render_matches),
+                        ("css_matches", &css_matches),
+                        ("canvas_matches", &canvas_matches),
+                        ("preview", &preview),
+                    ],
+                );
+            }
+            Err(error) => telemetry.emit(
+                "pipeline_trace.artifact.failed",
+                &[
+                    ("url", source),
+                    ("context", context),
+                    ("needle", needle),
+                    ("path", &output_path.display().to_string()),
+                    ("error", &error.to_string()),
+                ],
+            ),
+        }
+    }
+}
+
+fn pipeline_trace_stage_counts(dump: &str) -> PipelineTraceStageCounts {
+    let mut counts = PipelineTraceStageCounts::default();
+    let mut section = "";
+    for line in dump.lines() {
+        match line {
+            "## HTML Occurrences" => {
+                section = "html";
+                continue;
+            }
+            "## DOM Matches" => {
+                section = "dom";
+                continue;
+            }
+            "## RenderGraph Matches" => {
+                section = "render";
+                continue;
+            }
+            "## CSS Layout Matches" => {
+                section = "css";
+                continue;
+            }
+            "## CanvasGraph Matches" => {
+                section = "canvas";
+                continue;
+            }
+            line if line.starts_with("## ") => {
+                section = "";
+                continue;
+            }
+            _ => {}
+        }
+
+        let matched = line.starts_with("- ");
+        if !matched {
+            continue;
+        }
+        match section {
+            "html" => counts.html += 1,
+            "dom" => counts.dom += 1,
+            "render" => counts.render += 1,
+            "css" => counts.css += 1,
+            "canvas" => counts.canvas += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+fn trace_filename_slug(value: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            previous_dash = false;
+        } else if !previous_dash && !slug.is_empty() {
+            slug.push('-');
+            previous_dash = true;
+        }
+        if slug.len() >= 80 {
+            break;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "item".to_owned()
+    } else {
+        slug
+    }
+}
+
 impl Drop for TelemetrySession {
     fn drop(&mut self) {
         self.emit("session.ended", &[]);
@@ -15467,6 +16123,41 @@ fn json_escape(value: &str) -> String {
 mod tests {
     use super::*;
     use rich_canvas::parse_basic_css_for_viewport;
+
+    #[test]
+    fn event_trace_defaults_to_wikipedia_item_tracking_without_stealing_initial_url() {
+        let config = AppConfig::from_arg_values(vec![
+            "--debug-socket".to_owned(),
+            "--record-events".to_owned(),
+            "--event-trace".to_owned(),
+            "https://www.ecosia.org/search?method=index&q=hello+world".to_owned(),
+        ]);
+
+        assert!(config.debug_socket);
+        assert!(config.record_events);
+        assert!(config.event_trace);
+        assert_eq!(
+            config.initial_url.as_deref(),
+            Some("https://www.ecosia.org/search?method=index&q=hello+world")
+        );
+        assert!(config.trace_items.iter().any(|item| item == "Wikipedia"));
+    }
+
+    #[test]
+    fn explicit_trace_item_is_not_treated_as_initial_url() {
+        let config = AppConfig::from_arg_values(vec![
+            "--event-trace".to_owned(),
+            "--trace-item".to_owned(),
+            "Hello world - Wikipedia".to_owned(),
+            "https://example.test/page".to_owned(),
+        ]);
+
+        assert_eq!(
+            config.initial_url.as_deref(),
+            Some("https://example.test/page")
+        );
+        assert_eq!(config.trace_items, vec!["Hello world - Wikipedia"]);
+    }
 
     #[test]
     fn dom_parser_preserves_nested_elements_text_and_attributes() {
@@ -20799,6 +21490,74 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
             object,
             CanvasObject::Text(text)
                 if text.text.contains("Hidden menu link with enough text to look meaningful")
+        )));
+    }
+
+    #[test]
+    fn hydration_fallback_does_not_reveal_hidden_related_link_lists() {
+        let dir = std::env::temp_dir().join(format!(
+            "almostthere-hydration-related-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp script dir");
+        fs::write(dir.join("hydrate.js"), "function () {").expect("write hydration script");
+
+        let html = r#"
+            <style>
+              .result-wrapper { visibility: hidden; }
+              .related { visibility: hidden; }
+            </style>
+            <main>
+              <div class="result-wrapper">
+                <article>
+                  <a href="/result">Server rendered result title</a>
+                  <p>Server rendered result body that should remain available without hydration.</p>
+                </article>
+              </div>
+              <section class="related">
+                <h2>Searches related to server rendered result</h2>
+                <a href="/search?q=hidden">Hidden related link with enough text</a>
+              </section>
+            </main>
+            <script src="hydrate.js" type="module"></script>
+        "#;
+        let source = path_to_file_url(&dir.join("index.html"));
+        let document = parse_html_document(html, &source);
+
+        assert!(find_canvas_text(&document.canvas_graph, "Server rendered result title").is_some());
+        assert!(!document.canvas_graph.objects.iter().any(|object| matches!(
+            object,
+            CanvasObject::Text(text)
+                if text.text.contains("Hidden related link with enough text")
+        )));
+    }
+
+    #[test]
+    fn live_html_framework_marker_alone_does_not_reveal_hidden_link_modules() {
+        let html = r#"
+            <style>
+              .related { visibility: hidden; }
+            </style>
+            <main>
+              <p>Visible page text</p>
+              <section class="related">
+                <h2>Searches related to visible page text</h2>
+                <a href="/search?q=hidden">Hidden related link with enough text</a>
+              </section>
+            </main>
+            <script id="__NEXT_DATA__" type="application/json">{"props":{}}</script>
+        "#;
+        let document =
+            parse_html_document_from_live_html(html, "https://example.test/search", None);
+
+        assert!(find_canvas_text(&document.canvas_graph, "Visible page text").is_some());
+        assert!(!document.canvas_graph.objects.iter().any(|object| matches!(
+            object,
+            CanvasObject::Text(text)
+                if text.text.contains("Hidden related link with enough text")
         )));
     }
 
