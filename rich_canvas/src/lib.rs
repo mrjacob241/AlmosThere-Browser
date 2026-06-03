@@ -519,6 +519,7 @@ pub struct CanvasGraph {
 #[derive(Clone, Debug)]
 pub enum CanvasObject {
     Text(CanvasTextObject),
+    RichTextLine(CanvasRichTextLineObject),
     Rect(CanvasRectObject),
     Button(CanvasButtonObject),
     Input(CanvasInputObject),
@@ -531,6 +532,27 @@ pub enum CanvasObject {
 }
 
 #[derive(Clone, Debug)]
+pub struct CanvasRichTextLineObject {
+    pub rect: Rect,
+    pub spans: Vec<CanvasTextSpan>,
+    pub text_align: CssTextAlign,
+}
+
+#[derive(Clone, Debug)]
+pub struct CanvasTextSpan {
+    pub text: String,
+    pub color: Color32,
+    pub font_size: f32,
+    pub font_weight_bold: bool,
+    pub font_style_italic: bool,
+    pub text_decoration_underline: bool,
+    pub text_decoration_strikethrough: bool,
+    pub text_background: Color32,
+    pub href: Option<String>,
+    pub element_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct CanvasClipObject {
     pub rect: Rect,
     pub border_radius: u8,
@@ -540,6 +562,7 @@ pub struct CanvasClipObject {
 pub struct CanvasTextObject {
     pub text: String,
     pub rect: Rect,
+    pub text_inset_x: f32,
     pub color: Color32,
     pub font_size: f32,
     pub font_weight_bold: bool,
@@ -629,6 +652,7 @@ pub struct CanvasLinkHitObject {
     pub rect: Rect,
     pub href: String,
     pub element_id: Option<String>,
+    pub debug_visible: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1377,6 +1401,11 @@ fn paint_canvas_graph(
             }
             CanvasObject::Text(text) => {
                 let rect = canvas_object_rect(canvas_rect.min, text.rect, scale);
+                let text_inset_x = (text.text_inset_x * scale).max(0.0);
+                let paint_rect = Rect::from_min_size(
+                    Pos2::new(rect.left() + text_inset_x, rect.top()),
+                    vec2((rect.width() - text_inset_x * 2.0).max(1.0), rect.height()),
+                );
                 let family = if text.font_weight_bold {
                     browser_bold_family()
                 } else {
@@ -1406,28 +1435,28 @@ fn paint_canvas_graph(
                     } else {
                         Stroke::NONE
                     },
-                    line_height: Some(rect.height().max(font_size)),
+                    line_height: Some((font_size * 1.35).max(paint_rect.height()).max(1.0)),
                     ..Default::default()
                 };
                 let galley =
                     painter.layout_job(LayoutJob::simple_format(text.text.clone(), text_format));
-                let text_width = galley.size().x.min(rect.width()).max(1.0);
+                let text_width = galley.size().x.min(paint_rect.width()).max(1.0);
                 let text_rect = match text.text_align {
                     CssTextAlign::Left => {
-                        Rect::from_min_size(rect.min, vec2(text_width, rect.height()))
+                        Rect::from_min_size(paint_rect.min, vec2(text_width, paint_rect.height()))
                     }
                     CssTextAlign::Center => Rect::from_center_size(
-                        Pos2::new(rect.center().x, rect.center().y),
-                        vec2(text_width, rect.height()),
+                        Pos2::new(paint_rect.center().x, paint_rect.center().y),
+                        vec2(text_width, paint_rect.height()),
                     ),
                     CssTextAlign::Right => Rect::from_min_size(
-                        Pos2::new(rect.right() - text_width, rect.top()),
-                        vec2(text_width, rect.height()),
+                        Pos2::new(paint_rect.right() - text_width, paint_rect.top()),
+                        vec2(text_width, paint_rect.height()),
                     ),
                 };
                 painter.add(TextShape::new(text_rect.left_top(), galley, text_color));
                 if let Some(href) = &text.href {
-                    let hit_rect = text_rect.intersect(current_clip_rect);
+                    let hit_rect = rect.intersect(current_clip_rect);
                     if hit_rect.is_positive() {
                         let response = ui.interact(
                             hit_rect,
@@ -1448,6 +1477,64 @@ fn paint_canvas_graph(
                         }
                     }
                 }
+            }
+            CanvasObject::RichTextLine(line) => {
+                let rect = canvas_object_rect(canvas_rect.min, line.rect, scale);
+                let mut job = LayoutJob::default();
+                for span in &line.spans {
+                    let family = if span.font_weight_bold {
+                        browser_bold_family()
+                    } else {
+                        browser_regular_family()
+                    };
+                    let font_size = span.font_size * scale;
+                    let link_hovered = canvas_text_link_hovered(
+                        span.href.as_deref(),
+                        span.element_id.as_deref(),
+                        hovered_link_href,
+                        hovered_link_element_id,
+                    );
+                    let text_color = canvas_link_text_color(span.color, link_hovered);
+                    let stroke = Stroke::new((1.0 * scale).max(1.0), text_color);
+                    let text_format = TextFormat {
+                        font_id: FontId::new(font_size, family),
+                        color: text_color,
+                        background: span.text_background,
+                        italics: span.font_style_italic,
+                        underline: if span.text_decoration_underline || link_hovered {
+                            stroke
+                        } else {
+                            Stroke::NONE
+                        },
+                        strikethrough: if span.text_decoration_strikethrough {
+                            stroke
+                        } else {
+                            Stroke::NONE
+                        },
+                        line_height: Some((font_size * 1.35).max(rect.height()).max(1.0)),
+                        ..Default::default()
+                    };
+                    job.append(&span.text, 0.0, text_format);
+                }
+                job.wrap.max_width = f32::INFINITY;
+                job.wrap.max_rows = 1;
+                let galley = painter.layout_job(job);
+                let text_width = galley.size().x.min(rect.width()).max(1.0);
+                let text_height = galley.size().y.max(rect.height()).max(1.0);
+                let text_rect = match line.text_align {
+                    CssTextAlign::Left => {
+                        Rect::from_min_size(rect.min, vec2(text_width, text_height))
+                    }
+                    CssTextAlign::Center => Rect::from_center_size(
+                        Pos2::new(rect.center().x, rect.top() + text_height * 0.5),
+                        vec2(text_width, text_height),
+                    ),
+                    CssTextAlign::Right => Rect::from_min_size(
+                        Pos2::new(rect.right() - text_width, rect.top()),
+                        vec2(text_width, text_height),
+                    ),
+                };
+                painter.add(TextShape::new(text_rect.left_top(), galley, Color32::WHITE));
             }
             CanvasObject::Rect(rect_object) => {
                 let rect = canvas_object_rect(canvas_rect.min, rect_object.rect, scale);
@@ -1770,6 +1857,13 @@ fn paint_canvas_graph(
             }
             CanvasObject::LinkHit(link) => {
                 let rect = canvas_object_rect(canvas_rect.min, link.rect, scale);
+                if link.debug_visible {
+                    painter.rect_filled(
+                        rect.intersect(current_clip_rect),
+                        CornerRadius::ZERO,
+                        Color32::from_rgba_unmultiplied(255, 224, 64, 42),
+                    );
+                }
                 let hit_rect = rect.intersect(current_clip_rect);
                 if hit_rect.is_positive() {
                     let response = ui
@@ -2038,7 +2132,7 @@ pub fn configure_browser_fonts(ctx: &egui::Context) {
 }
 
 pub fn measure_browser_textbox(ctx: &egui::Context, text: &str, style: &ResolvedBoxStyle) -> Vec2 {
-    browser_text_galley(ctx, text, style).size()
+    browser_text_galley_no_wrap(ctx, text, style).size()
 }
 
 pub fn calculate_browser_font_size_lut(
@@ -2138,9 +2232,31 @@ fn measure_browser_textbox_with_lut(
         return size;
     }
 
-    let size = measure_browser_textbox(ctx, text, style);
+    let size = measure_browser_textbox_from_lut(ctx, lut, text, style);
     lut.insert_text_size(text, size);
     size
+}
+
+fn measure_browser_textbox_from_lut(
+    ctx: &egui::Context,
+    lut: &mut BrowserFontSizeLut,
+    text: &str,
+    style: &ResolvedBoxStyle,
+) -> Vec2 {
+    let mut width: f32 = 0.0;
+    let mut height = lut.line_height.max((style.font_size * 1.35).max(1.0));
+    for character in text.chars() {
+        let size = if let Some(size) = lut.glyph_size(character) {
+            size
+        } else {
+            let size = measure_browser_textbox(ctx, &character.to_string(), style);
+            lut.glyph_sizes.insert(character, size);
+            size
+        };
+        width += size.x.max(0.0) + browser_extra_word_spacing(character, style.font_size);
+        height = height.max(size.y);
+    }
+    vec2(width.max(1.0), height.max(1.0))
 }
 
 fn split_long_browser_word(
@@ -2173,11 +2289,18 @@ fn split_long_browser_word(
     lines
 }
 
-fn browser_text_galley(
+fn browser_text_galley_no_wrap(
     ctx: &egui::Context,
     text: &str,
     style: &ResolvedBoxStyle,
 ) -> std::sync::Arc<egui::Galley> {
+    let mut job = browser_text_layout_job(text, style);
+    job.wrap.max_width = f32::INFINITY;
+    job.wrap.max_rows = 1;
+    ctx.fonts_mut(|fonts| fonts.layout_job(job))
+}
+
+fn browser_text_layout_job(text: &str, style: &ResolvedBoxStyle) -> LayoutJob {
     let family = if style.font_weight_bold {
         browser_bold_family()
     } else {
@@ -2202,7 +2325,7 @@ fn browser_text_galley(
         line_height: Some((style.font_size * 1.35).max(1.0)),
         ..Default::default()
     };
-    ctx.fonts_mut(|fonts| fonts.layout_job(LayoutJob::simple_format(text.to_owned(), text_format)))
+    LayoutJob::simple_format(text.to_owned(), text_format)
 }
 
 fn wrap_browser_textboxes_estimated(
@@ -2254,7 +2377,35 @@ fn wrap_browser_textboxes_estimated(
 }
 
 fn estimated_browser_text_width(text: &str, font_size: f32) -> f32 {
-    text.chars().count() as f32 * font_size * 0.56
+    text.chars()
+        .map(|character| estimated_browser_glyph_width(character, font_size))
+        .sum::<f32>()
+        .max(1.0)
+}
+
+fn estimated_browser_glyph_width(character: char, font_size: f32) -> f32 {
+    let factor = match character {
+        ' ' | '\t' => 0.36,
+        'i' | 'l' | 'I' | '!' | '|' => 0.25,
+        'j' | 'f' | 'r' | 't' | '\'' | '"' | '`' => 0.32,
+        '.' | ',' | ':' | ';' => 0.28,
+        '(' | ')' | '[' | ']' | '{' | '}' => 0.34,
+        '-' | '_' | '/' | '\\' => 0.38,
+        'm' | 'w' | 'M' | 'W' => 0.82,
+        character if character.is_ascii_uppercase() => 0.64,
+        character if character.is_ascii_digit() => 0.56,
+        character if character.is_ascii_lowercase() => 0.50,
+        _ => 0.56,
+    };
+    font_size * factor
+}
+
+fn browser_extra_word_spacing(character: char, font_size: f32) -> f32 {
+    if character == ' ' || character == '\t' {
+        font_size * 0.08
+    } else {
+        0.0
+    }
 }
 
 fn paint_block(
@@ -7109,6 +7260,31 @@ mod tests {
             );
             assert!(lines.len() > 1);
             assert!(lines.iter().all(|line| line.size.x <= short.x + 1.0));
+        });
+    }
+
+    #[test]
+    fn browser_textbox_lut_uses_glyph_advances_for_inline_runs() {
+        let ctx = egui::Context::default();
+        configure_browser_fonts(&ctx);
+        let style = ResolvedBoxStyle {
+            font_size: 16.0,
+            ..ResolvedBoxStyle::default()
+        };
+
+        let _ = ctx.run(Default::default(), |_| {
+            let mut lut = calculate_browser_font_size_lut(&ctx, &style);
+            let text = "La frase viene stampata a video dal primo programma di esempio scritto in ";
+            let measured = measure_browser_textbox_with_lut(&ctx, &mut lut, text, &style);
+            let fixed_width_estimate = text.chars().count() as f32 * style.font_size * 0.56;
+
+            assert!(measured.x > 400.0);
+            assert!(
+                measured.x < fixed_width_estimate - 80.0,
+                "inline proportional text should use glyph advances, got {:.1} vs fixed {:.1}",
+                measured.x,
+                fixed_width_estimate
+            );
         });
     }
 

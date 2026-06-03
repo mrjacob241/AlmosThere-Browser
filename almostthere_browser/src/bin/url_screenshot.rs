@@ -105,6 +105,7 @@ fn print_canvas_graph_summary(document: &BrowserDocument) {
         match object {
             CanvasObject::Rect(_) => rects += 1,
             CanvasObject::Text(_) => texts += 1,
+            CanvasObject::RichTextLine(_) => texts += 1,
             CanvasObject::Input(_) => texts += 1,
             CanvasObject::Image(_) => images += 1,
             CanvasObject::Svg(_) => svgs += 1,

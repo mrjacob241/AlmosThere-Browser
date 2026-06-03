@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>118 - Reference Article Link Source Whitespace Punctuation</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 28px; background: #f8f9fa; color: #202122; font: 16px/1.55 Georgia, "Times New Roman", serif; }
+.page { width: 940px; margin: 0 auto; padding: 28px 34px; background: #fff; border: 1px solid #a2a9b1; }
+.line { background: #fff3bf; padding: 12px 14px; margin: 0 0 12px; }
+a { color: #0645ad; background: #91a7ff; text-decoration: underline; padding: 0; margin: 0; }
+.punct { background: #ff6b6b; }
+.label { position: fixed; right: 12px; bottom: 12px; padding: 6px 8px; background: rgba(255,255,255,.9); border: 1px solid #a2a9b1; font: 12px/1.2 system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<main class="page">
+<p class="line">The source has a newline after this link<a href="#">programmazione</a>
+<span class="punct">,</span> so Chrome shows at most one ordinary collapsed space before the comma.</p>
+<p class="line">The source has spaces around an inline anchor: before <a href="#">informatica</a> after. The blue link must not own either adjacent blank.</p>
+<p class="line">The source has split text nodes: word <span></span> <a href="#">istruzione</a> <span></span> <span class="punct">.</span> Extra empty spans must not add more spacing.</p>
+</main>
+<div class="label">118 - source whitespace punctuation</div>
+</body>
+</html>

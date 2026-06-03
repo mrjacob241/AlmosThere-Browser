@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>121 - Reference Article Sup Reference After Link</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 28px; background: #f8f9fa; color: #202122; font: 16px/1.55 Georgia, "Times New Roman", serif; }
+.page { width: 940px; margin: 0 auto; padding: 28px 34px; background: #fff; border: 1px solid #a2a9b1; }
+.line { background: #d0ebff; padding: 12px 14px; margin: 0 0 12px; }
+a { color: #0645ad; background: #91a7ff; text-decoration: underline; padding: 0; margin: 0; }
+sup.reference { background: #ff6b6b; font-size: 75%; line-height: 1; vertical-align: super; margin-left: 1px; }
+.after { background: #ffd43b; }
+.label { position: fixed; right: 12px; bottom: 12px; padding: 6px 8px; background: rgba(255,255,255,.9); border: 1px solid #a2a9b1; font: 12px/1.2 system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<main class="page">
+<p class="line">Reference after linked word: <a href="#">software</a><sup class="reference">[1]</sup><span class="after"> yellow text begins after the red reference.</span></p>
+<p class="line">Reference after normal word: algoritmo<sup class="reference">[2]</sup> then <a href="#">codice</a><sup class="reference">[3]</sup><span class="after"> yellow text.</span></p>
+<p class="line">Multiple references: <a href="#">compilatore</a><sup class="reference">[4]</sup><sup class="reference">[5]</sup><span class="after"> yellow text.</span></p>
+</main>
+<div class="label">121 - sup reference after link</div>
+</body>
+</html>

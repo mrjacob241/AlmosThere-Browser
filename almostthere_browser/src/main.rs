@@ -17,11 +17,12 @@ use rich_canvas::{
     BrowserCanvas, BrowserCanvasResponse, BrowserDocument, BrowserStyle, CanvasBlock,
     CanvasButtonObject, CanvasClipObject, CanvasGraph, CanvasImageObject, CanvasInputKind,
     CanvasInputObject, CanvasLinkHitObject, CanvasMediaObject, CanvasObject, CanvasRectObject,
-    CanvasSvgObject, CanvasTextObject, CssAlignItems, CssBoxStyle, CssClear, CssDisplay, CssEdges,
-    CssFlexDirection, CssFlexWrap, CssFloat, CssJustifyContent, CssLength, CssListStyleType,
-    CssObjectFit, CssPosition, CssTextAlign, ElementStyleKey, HitTarget, ImageBlock, InlineSpan,
-    ResolvedBoxStyle, SvgBlock, SvgShape, computed_box_style, configure_browser_fonts,
-    parse_basic_css_for_viewport_with_root_classes, parse_inline_box_style, wrap_browser_textboxes,
+    CanvasRichTextLineObject, CanvasSvgObject, CanvasTextObject, CanvasTextSpan, CssAlignItems,
+    CssBoxStyle, CssClear, CssDisplay, CssEdges, CssFlexDirection, CssFlexWrap, CssFloat,
+    CssJustifyContent, CssLength, CssListStyleType, CssObjectFit, CssPosition, CssTextAlign,
+    ElementStyleKey, HitTarget, ImageBlock, InlineSpan, ResolvedBoxStyle, SvgBlock, SvgShape,
+    computed_box_style, configure_browser_fonts, parse_basic_css_for_viewport_with_root_classes,
+    parse_inline_box_style, wrap_browser_textboxes,
 };
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
 
@@ -241,6 +242,7 @@ struct AppConfig {
     record_events: bool,
     debug_socket: bool,
     event_trace: bool,
+    debug_links: bool,
     initial_url: Option<String>,
     trace_items: Vec<String>,
 }
@@ -255,6 +257,7 @@ impl AppConfig {
         let mut record_events = false;
         let mut debug_socket = false;
         let mut event_trace = false;
+        let mut debug_links = false;
         let mut initial_url = None;
         let mut trace_items = Vec::new();
         let mut index = 0usize;
@@ -266,6 +269,8 @@ impl AppConfig {
                 debug_socket = true;
             } else if arg == "--event-trace" {
                 event_trace = true;
+            } else if arg == "--debug-links" {
+                debug_links = true;
             } else if arg == "--trace-item" || arg == "--track-item" {
                 if let Some(value) = args.get(index + 1) {
                     trace_items.push(value.to_owned());
@@ -292,6 +297,7 @@ impl AppConfig {
             record_events,
             debug_socket,
             event_trace,
+            debug_links,
             initial_url,
             trace_items,
         }
@@ -368,6 +374,7 @@ struct AlmostThereApp {
     page_loaded_at: std::time::Instant,
     record_events: bool,
     event_trace: bool,
+    debug_links: bool,
     trace_items: Vec<String>,
     recorded_event_count: u64,
 }
@@ -559,7 +566,7 @@ impl AlmostThereApp {
             .unwrap_or(DEFAULT_URL);
 
         let (
-            document,
+            mut document,
             current_html,
             live_html,
             script_state,
@@ -648,6 +655,8 @@ impl AlmostThereApp {
             }
         };
 
+        apply_debug_link_hits(&mut document.canvas_graph, config.debug_links);
+
         let render_debug = PageRenderDebugState {
             open: false,
             object_limit: document.canvas_graph.objects.len(),
@@ -680,6 +689,7 @@ impl AlmostThereApp {
             page_loaded_at: std::time::Instant::now(),
             record_events: config.record_events,
             event_trace: config.event_trace,
+            debug_links: config.debug_links,
             trace_items: config.trace_items,
             recorded_event_count: 0,
         }
@@ -851,7 +861,9 @@ impl AlmostThereApp {
         if let Err(error) = save_history(&self.history) {
             self.status = format!("History save failed: {error}");
         }
-        self.document = prepared.document;
+        let mut document = prepared.document;
+        apply_debug_link_hits(&mut document.canvas_graph, self.debug_links);
+        self.document = document;
         self.canvas.scroll_offset = egui::Vec2::ZERO;
         self.debug_canvas.scroll_offset = egui::Vec2::ZERO;
         self.render_debug.object_limit = self.document.canvas_graph.objects.len();
@@ -1540,6 +1552,7 @@ impl AlmostThereApp {
             &self.document.source.clone(),
             Some(ctx),
         );
+        apply_debug_link_hits(&mut self.document.canvas_graph, self.debug_links);
 
         // Restore live input values that the re-parse reset to their HTML attribute defaults.
         for obj in &mut self.document.canvas_graph.objects {
@@ -1789,6 +1802,7 @@ fn close_truncated_canvas_clips(objects: &mut Vec<CanvasObject>) {
                 open_clips = open_clips.saturating_sub(1);
             }
             CanvasObject::Text(_)
+            | CanvasObject::RichTextLine(_)
             | CanvasObject::Rect(_)
             | CanvasObject::Button(_)
             | CanvasObject::Input(_)
@@ -1799,6 +1813,14 @@ fn close_truncated_canvas_clips(objects: &mut Vec<CanvasObject>) {
         }
     }
     objects.extend((0..open_clips).map(|_| CanvasObject::ClipEnd));
+}
+
+fn apply_debug_link_hits(graph: &mut CanvasGraph, debug_links: bool) {
+    for object in &mut graph.objects {
+        if let CanvasObject::LinkHit(link) = object {
+            link.debug_visible = debug_links;
+        }
+    }
 }
 
 fn canvas_graph_debug_string(graph: &CanvasGraph) -> String {
@@ -1825,6 +1847,22 @@ fn canvas_graph_debug_string(graph: &CanvasGraph) -> String {
                     text.text_decoration_underline,
                     text.href.as_deref().unwrap_or(""),
                     shorten_debug_text(&text.text)
+                );
+            }
+            CanvasObject::RichTextLine(line) => {
+                let text = line
+                    .spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>();
+                let links = line.spans.iter().filter(|span| span.href.is_some()).count();
+                let _ = writeln!(
+                    out,
+                    "{index:04} RichTextLine rect={} spans={} links={} text=\"{}\"",
+                    rect_debug(line.rect),
+                    line.spans.len(),
+                    links,
+                    shorten_debug_text(&text)
                 );
             }
             CanvasObject::Rect(rect) => {
@@ -2405,6 +2443,9 @@ fn rasterize_canvas_graph_debug_frame(graph: &CanvasGraph) -> image::RgbaImage {
             CanvasObject::Svg(svg) => draw_canvas_svg(&mut image, svg, clip),
             CanvasObject::Media(media) => draw_canvas_media(&mut image, media, clip),
             CanvasObject::Text(text) => draw_canvas_text_placeholder(&mut image, text, clip),
+            CanvasObject::RichTextLine(line) => {
+                draw_canvas_rich_text_placeholder(&mut image, line, clip)
+            }
         }
     }
 
@@ -2559,7 +2600,21 @@ fn draw_canvas_text_placeholder(
     if text.text_background != egui::Color32::TRANSPARENT {
         draw_filled_rect(image, text.rect, text.text_background, clip);
     }
-    draw_text_marker(image, text.rect, text.font_size, clip);
+    draw_text_marker(
+        image,
+        text.rect
+            .shrink2(egui::vec2(text.text_inset_x.max(0.0), 0.0)),
+        text.font_size,
+        clip,
+    );
+}
+
+fn draw_canvas_rich_text_placeholder(
+    image: &mut image::RgbaImage,
+    line: &CanvasRichTextLineObject,
+    clip: egui::Rect,
+) {
+    draw_text_marker(image, line.rect, 14.0, clip);
 }
 
 fn draw_text_marker(
@@ -7828,6 +7883,19 @@ fn canvas_object_trace_fields(
             text.href.clone().unwrap_or_default(),
             text.rect,
         )),
+        CanvasObject::RichTextLine(line) => Some((
+            "RichTextLine",
+            line.spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            line.spans
+                .iter()
+                .filter_map(|span| span.href.as_deref())
+                .collect::<Vec<_>>()
+                .join(" "),
+            line.rect,
+        )),
         CanvasObject::Button(button) => {
             Some(("Button", button.text.clone(), String::new(), button.rect))
         }
@@ -8752,6 +8820,7 @@ struct CanvasInlineRun {
     style: ResolvedBoxStyle,
     href: Option<String>,
     element_id: Option<String>,
+    preserve_whitespace: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -8761,7 +8830,10 @@ struct CanvasLineFragment {
     href: Option<String>,
     element_id: Option<String>,
     size: egui::Vec2,
+    advance_x: f32,
     x_offset: f32,
+    text_inset_x: f32,
+    trailing_bearing_x: f32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -8832,7 +8904,7 @@ fn build_css_layout_tree(root: &RenderNode) -> CssLayoutBox<'_> {
         children: root
             .children
             .iter()
-            .flat_map(build_css_layout_boxes)
+            .flat_map(|child| build_css_layout_boxes_preserving_whitespace(child, false))
             .collect(),
         dimensions: CssLayoutDimensions::default(),
         text: None,
@@ -8852,6 +8924,13 @@ fn build_css_layout_tree(root: &RenderNode) -> CssLayoutBox<'_> {
 }
 
 fn build_css_layout_boxes(node: &RenderNode) -> Vec<CssLayoutBox<'_>> {
+    build_css_layout_boxes_preserving_whitespace(node, false)
+}
+
+fn build_css_layout_boxes_preserving_whitespace(
+    node: &RenderNode,
+    preserve_whitespace: bool,
+) -> Vec<CssLayoutBox<'_>> {
     if node.style.display == CssDisplay::None {
         return Vec::new();
     }
@@ -8864,7 +8943,9 @@ fn build_css_layout_boxes(node: &RenderNode) -> Vec<CssLayoutBox<'_>> {
             .collect(),
         RenderNodeKind::Text(text) => {
             let text = decode_basic_entities(text);
-            if normalize_ws(&text).is_empty() {
+            if (!preserve_whitespace && normalize_ws(&text).is_empty())
+                || (preserve_whitespace && text.is_empty())
+            {
                 Vec::new()
             } else {
                 vec![CssLayoutBox {
@@ -8883,14 +8964,20 @@ fn build_css_layout_boxes(node: &RenderNode) -> Vec<CssLayoutBox<'_>> {
                 return node
                     .children
                     .iter()
-                    .flat_map(build_css_layout_boxes)
+                    .flat_map(|child| {
+                        build_css_layout_boxes_preserving_whitespace(child, preserve_whitespace)
+                    })
                     .collect();
             }
+            let preserve_whitespace =
+                preserve_whitespace || css_layout_node_preserves_whitespace(node);
             let kind = css_layout_kind_from_display(node.style.display);
             let raw_children = node
                 .children
                 .iter()
-                .flat_map(build_css_layout_boxes)
+                .flat_map(|child| {
+                    build_css_layout_boxes_preserving_whitespace(child, preserve_whitespace)
+                })
                 .collect();
             let children = if matches!(node.style.display, CssDisplay::Flex | CssDisplay::Grid) {
                 raw_children
@@ -8923,6 +9010,17 @@ fn css_layout_kind_from_display(display: CssDisplay) -> CssLayoutKind {
         | CssDisplay::Table
         | CssDisplay::ListItem => CssLayoutKind::Block,
     }
+}
+
+fn css_layout_node_preserves_whitespace(node: &RenderNode) -> bool {
+    matches!(
+        &node.kind,
+        RenderNodeKind::Element(element) if element.tag_name == "pre"
+    )
+}
+
+fn css_layout_box_preserves_whitespace(box_: &CssLayoutBox<'_>) -> bool {
+    box_.node.is_some_and(css_layout_node_preserves_whitespace)
 }
 
 fn css_layout_box_is_block_container(kind: CssLayoutKind) -> bool {
@@ -9458,8 +9556,6 @@ fn css_layout_box_needs_inline_visual_layout(box_: &CssLayoutBox<'_>) -> bool {
                 || child.style.width_percent.is_some()
                 || child.style.height.is_some()
                 || child.style.min_height.is_some()
-                || child.style.background != egui::Color32::TRANSPARENT
-                || child.style.border_width > 0.0
                 || css_layout_box_needs_inline_visual_layout(child)
         })
 }
@@ -11912,7 +12008,7 @@ fn measure_css_inline_children_height(
     let mut runs = Vec::new();
     let mut pending_space = None;
     for child in children {
-        collect_canvas_layout_inline_runs(child, None, None, &mut pending_space, &mut runs);
+        collect_canvas_layout_inline_runs(child, None, None, &mut pending_space, &mut runs, false);
     }
     build_canvas_line_boxes(runs, text_metrics, width)
         .iter()
@@ -12163,6 +12259,7 @@ fn canvas_graph_content_bottom(graph: &CanvasGraph) -> f32 {
             CanvasObject::ClipStart(clip) => clip.rect.bottom(),
             CanvasObject::ClipEnd => 0.0,
             CanvasObject::Text(text) => text.rect.bottom(),
+            CanvasObject::RichTextLine(line) => line.rect.bottom(),
             CanvasObject::Rect(rect) => rect.rect.bottom(),
             CanvasObject::Button(button) => button.rect.bottom(),
             CanvasObject::Input(input) => input.rect.bottom(),
@@ -12315,6 +12412,7 @@ fn push_canvas_graph_layout_box(
                     &box_.children,
                     text_metrics,
                     inherited_href,
+                    css_layout_box_preserves_whitespace(box_),
                     cursor,
                     graph,
                 );
@@ -12374,6 +12472,7 @@ fn push_canvas_graph_layout_box(
                             &node.children,
                             text_metrics,
                             href,
+                            css_layout_node_preserves_whitespace(node),
                             cursor,
                             graph,
                         );
@@ -12462,6 +12561,7 @@ fn push_canvas_graph_layout_box(
                                 &box_.children,
                                 text_metrics,
                                 href,
+                                css_layout_box_preserves_whitespace(box_),
                                 cursor,
                                 graph,
                             );
@@ -12537,6 +12637,7 @@ fn push_canvas_graph_layout_box(
                                 &box_.children,
                                 text_metrics,
                                 href,
+                                css_layout_box_preserves_whitespace(box_),
                                 cursor,
                                 graph,
                             );
@@ -12645,7 +12746,7 @@ fn push_canvas_graph_layout_list_marker(
         egui::vec2(marker_width, line_height),
     );
     let marker = next_canvas_list_marker(cursor);
-    push_canvas_graph_text_object(marker, marker_rect, &box_.style, None, None, graph);
+    push_canvas_graph_text_object(marker, marker_rect, 0.0, &box_.style, None, None, graph);
 }
 
 fn push_canvas_graph_layout_replaced_or_special(
@@ -13157,6 +13258,7 @@ fn push_canvas_graph_element(
                     &node.children,
                     text_metrics,
                     href,
+                    css_layout_node_preserves_whitespace(node),
                     cursor,
                     graph,
                 );
@@ -13306,6 +13408,7 @@ fn push_canvas_graph_link_hit(
                 rect,
                 href: href.to_owned(),
                 element_id: element_id.map(str::to_owned),
+                debug_visible: false,
             }));
     }
 }
@@ -13375,7 +13478,7 @@ fn push_canvas_graph_text(
             egui::pos2(cursor.x, cursor.y),
             egui::vec2(line.size.x.min(cursor.width).max(1.0), line_height),
         );
-        push_canvas_graph_text_object(line.text, rect, style, href, None, graph);
+        push_canvas_graph_text_object(line.text, rect, 0.0, style, href, None, graph);
         cursor.y += line_height;
     }
 }
@@ -13383,6 +13486,7 @@ fn push_canvas_graph_text(
 fn push_canvas_graph_text_object(
     text: String,
     rect: egui::Rect,
+    text_inset_x: f32,
     style: &ResolvedBoxStyle,
     href: Option<&str>,
     element_id: Option<&str>,
@@ -13391,6 +13495,7 @@ fn push_canvas_graph_text_object(
     graph.objects.push(CanvasObject::Text(CanvasTextObject {
         text,
         rect,
+        text_inset_x,
         color: style.color,
         font_size: style.font_size,
         font_weight_bold: style.font_weight_bold,
@@ -13428,6 +13533,7 @@ fn push_canvas_graph_layout_inline_children(
     children: &[CssLayoutBox<'_>],
     text_metrics: Option<&egui::Context>,
     inherited_href: Option<&str>,
+    preserve_whitespace: bool,
     cursor: &mut CanvasLayoutCursor,
     graph: &mut CanvasGraph,
 ) {
@@ -13440,6 +13546,7 @@ fn push_canvas_graph_layout_inline_children(
             None,
             &mut pending_space,
             &mut runs,
+            preserve_whitespace,
         );
     }
     push_canvas_line_boxes(runs, text_metrics, cursor, graph);
@@ -13451,6 +13558,7 @@ fn collect_canvas_layout_inline_runs(
     inherited_link_element_id: Option<&str>,
     pending_space: &mut Option<CanvasInlineRun>,
     runs: &mut Vec<CanvasInlineRun>,
+    preserve_whitespace: bool,
 ) {
     if !css_style_paints(&box_.style) {
         return;
@@ -13461,6 +13569,19 @@ fn collect_canvas_layout_inline_runs(
             let Some(text) = &box_.text else {
                 return;
             };
+            if preserve_whitespace {
+                if !text.is_empty() {
+                    flush_canvas_pending_space(runs, pending_space);
+                    runs.push(CanvasInlineRun {
+                        text: text.clone(),
+                        style: box_.style.clone(),
+                        href: inherited_href.map(str::to_owned),
+                        element_id: inherited_link_element_id.map(str::to_owned),
+                        preserve_whitespace: true,
+                    });
+                }
+                return;
+            }
             let has_leading_space = text.chars().next().is_some_and(char::is_whitespace);
             let has_trailing_space = text.chars().last().is_some_and(char::is_whitespace);
             let text = normalize_ws(text);
@@ -13490,6 +13611,7 @@ fn collect_canvas_layout_inline_runs(
                 style: box_.style.clone(),
                 href: inherited_href.map(str::to_owned),
                 element_id: inherited_link_element_id.map(str::to_owned),
+                preserve_whitespace: false,
             });
             if has_trailing_space {
                 mark_canvas_pending_space(
@@ -13515,7 +13637,14 @@ fn collect_canvas_layout_inline_runs(
                         (inherited_href, inherited_link_element_id)
                     });
             for child in &box_.children {
-                collect_canvas_layout_inline_runs(child, href, element_id, pending_space, runs);
+                collect_canvas_layout_inline_runs(
+                    child,
+                    href,
+                    element_id,
+                    pending_space,
+                    runs,
+                    preserve_whitespace || css_layout_box_preserves_whitespace(box_),
+                );
             }
         }
         CssLayoutKind::AnonymousBlock | CssLayoutKind::Document | CssLayoutKind::Block => {
@@ -13526,6 +13655,7 @@ fn collect_canvas_layout_inline_runs(
                     inherited_link_element_id,
                     pending_space,
                     runs,
+                    preserve_whitespace || css_layout_box_preserves_whitespace(box_),
                 );
             }
         }
@@ -13536,13 +13666,21 @@ fn push_canvas_graph_inline_children(
     children: &[RenderNode],
     text_metrics: Option<&egui::Context>,
     inherited_href: Option<&str>,
+    preserve_whitespace: bool,
     cursor: &mut CanvasLayoutCursor,
     graph: &mut CanvasGraph,
 ) {
     let mut runs = Vec::new();
     let mut pending_space = None;
     for child in children {
-        collect_canvas_inline_runs(child, inherited_href, None, &mut pending_space, &mut runs);
+        collect_canvas_inline_runs(
+            child,
+            inherited_href,
+            None,
+            &mut pending_space,
+            &mut runs,
+            preserve_whitespace,
+        );
     }
     push_canvas_line_boxes(runs, text_metrics, cursor, graph);
 }
@@ -13553,6 +13691,7 @@ fn collect_canvas_inline_runs(
     inherited_link_element_id: Option<&str>,
     pending_space: &mut Option<CanvasInlineRun>,
     runs: &mut Vec<CanvasInlineRun>,
+    preserve_whitespace: bool,
 ) {
     if node.style.display == CssDisplay::None || !css_style_paints(&node.style) {
         return;
@@ -13561,6 +13700,19 @@ fn collect_canvas_inline_runs(
     match &node.kind {
         RenderNodeKind::Text(text) => {
             let decoded = decode_basic_entities(text);
+            if preserve_whitespace {
+                if !decoded.is_empty() {
+                    flush_canvas_pending_space(runs, pending_space);
+                    runs.push(CanvasInlineRun {
+                        text: decoded,
+                        style: node.style.clone(),
+                        href: inherited_href.map(str::to_owned),
+                        element_id: inherited_link_element_id.map(str::to_owned),
+                        preserve_whitespace: true,
+                    });
+                }
+                return;
+            }
             let has_leading_space = decoded.chars().next().is_some_and(char::is_whitespace);
             let has_trailing_space = decoded.chars().last().is_some_and(char::is_whitespace);
             let text = normalize_ws(&decoded);
@@ -13590,6 +13742,7 @@ fn collect_canvas_inline_runs(
                 style: node.style.clone(),
                 href: inherited_href.map(str::to_owned),
                 element_id: inherited_link_element_id.map(str::to_owned),
+                preserve_whitespace: false,
             });
             if has_trailing_space {
                 mark_canvas_pending_space(
@@ -13612,7 +13765,14 @@ fn collect_canvas_inline_runs(
 
             if is_inline_flow_node(node) {
                 for child in &node.children {
-                    collect_canvas_inline_runs(child, href, element_id, pending_space, runs);
+                    collect_canvas_inline_runs(
+                        child,
+                        href,
+                        element_id,
+                        pending_space,
+                        runs,
+                        preserve_whitespace || css_layout_node_preserves_whitespace(node),
+                    );
                 }
             }
         }
@@ -13624,6 +13784,7 @@ fn collect_canvas_inline_runs(
                     inherited_link_element_id,
                     pending_space,
                     runs,
+                    preserve_whitespace,
                 );
             }
         }
@@ -13641,6 +13802,7 @@ fn mark_canvas_pending_space(
         style: style.clone(),
         href: href.map(str::to_owned),
         element_id: element_id.map(str::to_owned),
+        preserve_whitespace: false,
     });
 }
 
@@ -13667,6 +13829,7 @@ fn push_canvas_inline_space_run(
             style: style.clone(),
             href: href.map(str::to_owned),
             element_id: element_id.map(str::to_owned),
+            preserve_whitespace: false,
         });
     }
 }
@@ -13689,22 +13852,67 @@ fn push_canvas_line_boxes(
     for mut line in line_boxes {
         coalesce_canvas_line_fragments(&mut line);
         let align_offset = line_align_offset(&line, cursor.width);
-        for fragment in line.fragments {
-            let rect = egui::Rect::from_min_size(
-                egui::pos2(cursor.x + align_offset + fragment.x_offset, cursor.y),
-                egui::vec2(fragment.size.x.max(1.0), line.height.max(1.0)),
-            );
-            push_canvas_graph_text_object(
-                fragment.text,
-                rect,
-                &fragment.style,
-                fragment.href.as_deref(),
-                fragment.element_id.as_deref(),
-                graph,
-            );
-        }
-        cursor.y += line.height.max(1.0);
+        let line_height = line.height.max(1.0);
+        push_canvas_graph_rich_text_line(line, align_offset, cursor, graph);
+        cursor.y += line_height;
     }
+}
+
+fn push_canvas_graph_rich_text_line(
+    line: CanvasLineBox,
+    align_offset: f32,
+    cursor: &CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    let line_height = line.height.max(1.0);
+    let line_left = cursor.x + align_offset;
+    let line_rect = egui::Rect::from_min_size(
+        egui::pos2(line_left, cursor.y),
+        egui::vec2(line.width.max(1.0), line_height),
+    );
+    let text_align = line
+        .fragments
+        .first()
+        .map(|fragment| fragment.style.text_align)
+        .unwrap_or(CssTextAlign::Left);
+    let mut spans = Vec::with_capacity(line.fragments.len());
+    let mut link_hits = Vec::new();
+
+    for fragment in line.fragments {
+        if let Some(href) = fragment.href.clone() {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(line_left + fragment.x_offset, cursor.y),
+                egui::vec2(fragment.advance_x.max(1.0), line_height),
+            );
+            link_hits.push(CanvasObject::LinkHit(CanvasLinkHitObject {
+                rect,
+                href,
+                element_id: fragment.element_id.clone(),
+                debug_visible: false,
+            }));
+        }
+        spans.push(CanvasTextSpan {
+            text: fragment.text,
+            color: fragment.style.color,
+            font_size: fragment.style.font_size,
+            font_weight_bold: fragment.style.font_weight_bold,
+            font_style_italic: fragment.style.font_style_italic,
+            text_decoration_underline: fragment.style.text_decoration_underline,
+            text_decoration_strikethrough: fragment.style.text_decoration_strikethrough,
+            text_background: fragment.style.text_background,
+            href: fragment.href,
+            element_id: fragment.element_id,
+        });
+    }
+
+    graph
+        .objects
+        .push(CanvasObject::RichTextLine(CanvasRichTextLineObject {
+            rect: line_rect,
+            spans,
+            text_align,
+        }));
+    graph.objects.extend(link_hits);
 }
 
 fn coalesce_canvas_line_fragments(line: &mut CanvasLineBox) {
@@ -13713,8 +13921,11 @@ fn coalesce_canvas_line_fragments(line: &mut CanvasLineBox) {
         if let Some(last) = coalesced.last_mut() {
             if canvas_line_fragments_can_merge(last, &fragment) {
                 last.text.push_str(&fragment.text);
-                last.size.x += fragment.size.x;
+                last.advance_x += fragment.advance_x;
+                last.size.x = last.advance_x + fragment.trailing_bearing_x;
                 last.size.y = last.size.y.max(fragment.size.y);
+                last.text_inset_x = last.text_inset_x.max(fragment.text_inset_x);
+                last.trailing_bearing_x = fragment.trailing_bearing_x;
                 continue;
             }
         }
@@ -13762,8 +13973,17 @@ fn push_line_run(
     text_metrics: Option<&egui::Context>,
     max_width: f32,
 ) {
+    if run.preserve_whitespace && run.text.contains('\n') {
+        push_preserved_newline_run(lines, current, run, text_metrics, max_width);
+        return;
+    }
+
     let text = if current.fragments.is_empty() {
-        run.text.trim_start().to_owned()
+        if run.preserve_whitespace {
+            run.text.clone()
+        } else {
+            run.text.trim_start().to_owned()
+        }
     } else {
         run.text.clone()
     };
@@ -13786,16 +14006,29 @@ fn push_line_run(
         return;
     }
 
-    lines.push(std::mem::take(current));
-    let text = text.trim_start().to_owned();
-    if text.is_empty() {
-        return;
-    }
-    let size = measure_canvas_text_run(text_metrics, &text, &run.style);
-    if size.x <= max_width {
-        push_line_fragment(current, run, text, size);
-    } else {
-        push_line_run_tokens(lines, current, run, text, text_metrics, max_width);
+    push_line_run_tokens(lines, current, run, text, text_metrics, max_width);
+}
+
+fn push_preserved_newline_run(
+    lines: &mut Vec<CanvasLineBox>,
+    current: &mut CanvasLineBox,
+    run: &CanvasInlineRun,
+    text_metrics: Option<&egui::Context>,
+    max_width: f32,
+) {
+    for segment in run.text.split_inclusive('\n') {
+        let text = segment.trim_end_matches('\n');
+        if !text.is_empty() {
+            let mut segment_run = run.clone();
+            segment_run.text = text.to_owned();
+            push_line_run(lines, current, &segment_run, text_metrics, max_width);
+        }
+        if segment.ends_with('\n') {
+            if current.fragments.is_empty() {
+                current.height = current.height.max((run.style.font_size * 1.35).max(1.0));
+            }
+            lines.push(std::mem::take(current));
+        }
     }
 }
 
@@ -13824,7 +14057,11 @@ fn push_line_token(
     max_width: f32,
 ) {
     let token = if current.fragments.is_empty() {
-        token.trim_start().to_owned()
+        if run.preserve_whitespace {
+            token
+        } else {
+            token.trim_start().to_owned()
+        }
     } else {
         token
     };
@@ -13839,7 +14076,11 @@ fn push_line_token(
             lines,
             current,
             run,
-            token.trim_start().to_owned(),
+            if run.preserve_whitespace {
+                token
+            } else {
+                token.trim_start().to_owned()
+            },
             text_metrics,
             max_width,
         );
@@ -13865,8 +14106,12 @@ fn push_line_fragment(
     line: &mut CanvasLineBox,
     run: &CanvasInlineRun,
     text: String,
-    size: egui::Vec2,
+    mut size: egui::Vec2,
 ) {
+    let text_inset_x = 0.0;
+    let trailing_bearing_x = link_text_trailing_bearing(run);
+    let advance_x = size.x.max(0.0);
+    size.x += trailing_bearing_x;
     let height = size.y.max((run.style.font_size * 1.35).max(1.0));
     line.fragments.push(CanvasLineFragment {
         text,
@@ -13874,10 +14119,18 @@ fn push_line_fragment(
         href: run.href.clone(),
         element_id: run.element_id.clone(),
         size,
+        advance_x,
         x_offset: line.width,
+        text_inset_x,
+        trailing_bearing_x,
     });
-    line.width += size.x;
+    line.width += advance_x;
     line.height = line.height.max(height);
+}
+
+fn link_text_trailing_bearing(run: &CanvasInlineRun) -> f32 {
+    let _ = run;
+    0.0
 }
 
 fn split_inline_run_tokens(text: &str) -> Vec<String> {
@@ -13892,7 +14145,7 @@ fn split_inline_run_tokens(text: &str) -> Vec<String> {
             }
             previous_was_space = true;
         } else {
-            if previous_was_space && !tokens.is_empty() {
+            if previous_was_space {
                 current.push(' ');
             }
             current.push(character);
@@ -13950,7 +14203,7 @@ fn push_canvas_graph_list_item(
             egui::pos2(cursor.x + depth_indent, cursor.y),
             egui::vec2(marker_width, line_height),
         );
-        push_canvas_graph_text_object(marker, marker_rect, &node.style, None, None, graph);
+        push_canvas_graph_text_object(marker, marker_rect, 0.0, &node.style, None, None, graph);
     }
 
     cursor.x = content_x;
@@ -13958,7 +14211,14 @@ fn push_canvas_graph_list_item(
     if node.children.is_empty() {
         cursor.y += line_height;
     } else if children_are_inline_flow(&node.children) {
-        push_canvas_graph_inline_children(&node.children, text_metrics, href, cursor, graph);
+        push_canvas_graph_inline_children(
+            &node.children,
+            text_metrics,
+            href,
+            css_layout_node_preserves_whitespace(node),
+            cursor,
+            graph,
+        );
     } else {
         for child in &node.children {
             push_canvas_graph_node(
@@ -14094,6 +14354,7 @@ fn push_canvas_graph_table(
                 push_canvas_graph_text_object(
                     line.text,
                     text_rect,
+                    0.0,
                     &cell.node.style,
                     None,
                     None,
@@ -17756,12 +18017,14 @@ mod tests {
     fn event_trace_defaults_to_wikipedia_item_tracking_without_stealing_initial_url() {
         let config = AppConfig::from_arg_values(vec![
             "--debug-socket".to_owned(),
+            "--debug-links".to_owned(),
             "--record-events".to_owned(),
             "--event-trace".to_owned(),
             "https://www.ecosia.org/search?method=index&q=hello+world".to_owned(),
         ]);
 
         assert!(config.debug_socket);
+        assert!(config.debug_links);
         assert!(config.record_events);
         assert!(config.event_trace);
         assert_eq!(
@@ -18196,6 +18459,272 @@ mod tests {
                 .is_some_and(|text| text.font_weight_bold)
         );
         assert!(find_canvas_text(&document.canvas_graph, "Cell B").is_some());
+    }
+
+    #[test]
+    fn inline_line_breaking_fills_remaining_width_across_runs() {
+        let style = ResolvedBoxStyle {
+            font_size: 10.0,
+            visibility_visible: true,
+            opacity: 1.0,
+            ..ResolvedBoxStyle::default()
+        };
+        let runs = vec![
+            CanvasInlineRun {
+                text: "link".to_owned(),
+                style: style.clone(),
+                href: Some("#link".to_owned()),
+                element_id: None,
+                preserve_whitespace: false,
+            },
+            CanvasInlineRun {
+                text: " alpha beta gamma".to_owned(),
+                style,
+                href: None,
+                element_id: None,
+                preserve_whitespace: false,
+            },
+        ];
+
+        let lines = build_canvas_line_boxes(runs, None, 95.0);
+        assert!(lines.len() >= 2);
+        let first_line_text = lines[0]
+            .fragments
+            .iter()
+            .map(|fragment| fragment.text.as_str())
+            .collect::<String>();
+        assert!(
+            first_line_text.contains("link alpha"),
+            "overflowing run should be tokenized into the remaining line, got {first_line_text:?}"
+        );
+    }
+
+    #[test]
+    fn linked_inline_fragments_advance_and_rect_use_measured_text_width() {
+        let style = ResolvedBoxStyle {
+            font_size: 10.0,
+            visibility_visible: true,
+            opacity: 1.0,
+            ..ResolvedBoxStyle::default()
+        };
+        let runs = vec![CanvasInlineRun {
+            text: "Link".to_owned(),
+            style: style.clone(),
+            href: Some("#link".to_owned()),
+            element_id: None,
+            preserve_whitespace: false,
+        }];
+
+        let lines = build_canvas_line_boxes(runs, None, 200.0);
+        assert_eq!(lines.len(), 1);
+        let fragment = &lines[0].fragments[0];
+        let raw_size = measure_canvas_text_run(None, "Link", &style);
+
+        assert_eq!(fragment.text_inset_x, 0.0);
+        assert_eq!(fragment.trailing_bearing_x, 0.0);
+        assert!(
+            (fragment.advance_x - raw_size.x).abs() < 0.5,
+            "linked inline flow should advance by measured glyph width, not link side bearing"
+        );
+        assert!(
+            (lines[0].width - raw_size.x).abs() < 0.5,
+            "line width should follow measured text flow"
+        );
+        assert!(
+            (fragment.size.x - raw_size.x).abs() < 0.5,
+            "linked inline fragment rect should match measured text width"
+        );
+    }
+
+    #[test]
+    fn inline_tag_parser_preserves_boundary_spaces_around_styled_tags() {
+        let spans = parse_inline_spans(
+            "Secondo il primo <i>Hello, world!</i> noto e in <a href=\"#c\">C</a> degli informatici",
+        );
+        let rendered = spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+
+        assert!(
+            rendered.contains("primo Hello, world! noto"),
+            "inline tag parser should keep spaces around emphasis tags, got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("in C degli"),
+            "inline tag parser should keep spaces around anchor tags, got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn canvas_inline_tag_boundaries_keep_space_and_non_overlapping_rects() {
+        let document = parse_html_document(
+            r##"<p>Secondo il primo <i>Hello, world!</i> noto e in <a href="#c">C</a> degli informatici.</p>"##,
+            "https://example.test/",
+        );
+        let rendered = canvas_graph_visible_text(&document.canvas_graph);
+
+        assert!(
+            rendered.contains("primo Hello, world! noto e in C degli informatici"),
+            "rich inline text should preserve tag-boundary spaces, got {rendered:?}"
+        );
+        assert!(document.canvas_graph.objects.iter().any(|object| matches!(
+            object,
+            CanvasObject::RichTextLine(line)
+                if line.spans.iter().any(|span| span.text == "Hello, world!" && span.font_style_italic)
+                    && line.spans.iter().any(|span| span.text == "C" && span.href.as_deref() == Some("#c"))
+        )));
+        let link_hit = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::LinkHit(link) if link.href == "#c" => Some(link),
+                _ => None,
+            })
+            .expect("expected transparent link hit box");
+        assert!(
+            link_hit.rect.width() > 0.0 && link_hit.rect.height() > 0.0,
+            "link hit should cover the linked span"
+        );
+        assert!(
+            !link_hit.debug_visible,
+            "link hit boxes should remain transparent unless --debug-links is enabled"
+        );
+    }
+
+    #[test]
+    fn debug_links_flag_marks_transparent_hitboxes_visible() {
+        let mut document = parse_html_document(
+            r##"<p>Before <a href="#target">target</a> after.</p>"##,
+            "https://example.test/",
+        );
+        let link_hit = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::LinkHit(link) if link.href == "#target" => Some(link),
+                _ => None,
+            })
+            .expect("link hit");
+        assert!(!link_hit.debug_visible);
+
+        apply_debug_link_hits(&mut document.canvas_graph, true);
+
+        let link_hit = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::LinkHit(link) if link.href == "#target" => Some(link),
+                _ => None,
+            })
+            .expect("link hit");
+        assert!(link_hit.debug_visible);
+    }
+
+    #[test]
+    fn preformatted_inline_layout_preserves_code_spacing() {
+        let document = parse_html_document(
+            r#"<pre><code>#include &lt;stdio.h&gt; int main(void) { return 0; }</code></pre>"#,
+            "about:test",
+        );
+        let rendered = canvas_graph_visible_text(&document.canvas_graph);
+
+        assert!(
+            rendered.contains("#include <stdio.h> int main"),
+            "pre/code text should preserve spacing, got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("return 0"),
+            "pre/code text should preserve internal spaces, got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn preformatted_colored_inline_code_preserves_tag_boundary_spaces() {
+        let document = parse_html_document(
+            r##"
+            <pre><code><span style="color:#aa6600">#include</span> <span style="color:#336699">&lt;stdio.h&gt;</span>
+<span style="color:#aa0066">int</span> <span style="color:#0033aa">main</span>(void) { return 0; }</code></pre>
+            "##,
+            "about:test",
+        );
+
+        let include_line = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::RichTextLine(line)
+                    if line.spans.iter().any(|span| span.text == "#include") =>
+                {
+                    Some(line)
+                }
+                _ => None,
+            })
+            .expect("line with #include");
+        let include_span = include_line
+            .spans
+            .iter()
+            .find(|span| span.text == "#include")
+            .expect("#include");
+        let header_span = include_line
+            .spans
+            .iter()
+            .find(|span| span.text == "<stdio.h>")
+            .expect("<stdio.h>");
+        let include_space = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::RichTextLine(line)
+                    if line.spans.iter().any(|span| span.text == "#include") =>
+                {
+                    line.spans.iter().find(|span| span.text == " ")
+                }
+                _ => None,
+            })
+            .expect("space after colored #include");
+        let int_line = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::RichTextLine(line)
+                    if line.spans.iter().any(|span| span.text == "int") =>
+                {
+                    Some(line)
+                }
+                _ => None,
+            })
+            .expect("line with int");
+        let int_keyword = int_line
+            .spans
+            .iter()
+            .find(|span| span.text == "int")
+            .expect("int");
+        let main = int_line
+            .spans
+            .iter()
+            .find(|span| span.text == "main")
+            .expect("main");
+
+        assert_eq!(
+            include_span.color,
+            egui::Color32::from_rgb(0xaa, 0x66, 0x00)
+        );
+        assert_eq!(header_span.color, egui::Color32::from_rgb(0x33, 0x66, 0x99));
+        assert_eq!(int_keyword.color, egui::Color32::from_rgb(0xaa, 0x00, 0x66));
+        assert_eq!(main.color, egui::Color32::from_rgb(0x00, 0x33, 0xaa));
+        assert_eq!(include_space.text, " ");
+        assert!(
+            int_line.rect.top() > include_line.rect.top(),
+            "preformatted newline should move colored code to the next line"
+        );
+        assert!(int_line.spans.iter().any(|span| span.text == " "));
     }
 
     #[test]
@@ -24974,6 +25503,28 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
             CanvasObject::Text(text) if text.text.contains(value) => Some(text),
             _ => None,
         })
+    }
+
+    fn canvas_graph_visible_text(graph: &CanvasGraph) -> String {
+        graph
+            .objects
+            .iter()
+            .filter_map(canvas_object_visible_text)
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    fn canvas_object_visible_text(object: &CanvasObject) -> Option<String> {
+        match object {
+            CanvasObject::Text(text) => Some(text.text.clone()),
+            CanvasObject::RichTextLine(line) => Some(
+                line.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>(),
+            ),
+            _ => None,
+        }
     }
 
     fn find_canvas_rect_by_fill(
