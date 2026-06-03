@@ -8597,6 +8597,12 @@ fn apply_css_box_style(
     if let Some(grid_area) = &source.grid_area {
         target.grid_area = Some(grid_area.clone());
     }
+    if source.grid_column_start.is_some() {
+        target.grid_column_start = source.grid_column_start;
+    }
+    if source.grid_column_end.is_some() {
+        target.grid_column_end = source.grid_column_end;
+    }
     if let Some(grid_column_span) = source.grid_column_span {
         target.grid_column_span = grid_column_span.max(1);
     }
@@ -9183,6 +9189,8 @@ fn layout_css_box(
         } else {
             width
         }
+    } else if css_layout_box_is_native_button(box_) {
+        css_layout_preferred_content_width(box_, text_metrics)
     } else if matches!(box_.kind, CssLayoutKind::Inline)
         && (box_.style.flex_grow > 0.0 || css_layout_box_contains_text_form_control(box_))
     {
@@ -9251,7 +9259,7 @@ fn layout_css_box(
             layout_css_block_children(box_, source, image_height_auto, text_metrics)
         }
         CssLayoutKind::AnonymousBlock => {
-            if css_layout_box_contains_visual_replaced_content(box_) {
+            if css_layout_box_needs_inline_visual_layout(box_) {
                 layout_css_inline_visual_children(
                     box_,
                     source,
@@ -9290,6 +9298,14 @@ fn layout_css_box(
                     )
                 } else if css_layout_inline_box_should_layout_block_children(box_) {
                     layout_css_block_children(box_, source, image_height_auto, text_metrics)
+                } else if css_layout_box_needs_inline_visual_layout(box_) {
+                    layout_css_inline_visual_children(
+                        box_,
+                        source,
+                        image_height_auto,
+                        text_metrics,
+                        content_width,
+                    )
                 } else {
                     measure_css_inline_children_height(&box_.children, content_width, text_metrics)
                         .max((box_.style.font_size * 1.35).max(1.0))
@@ -9297,6 +9313,14 @@ fn layout_css_box(
             } else {
                 if css_layout_inline_box_should_layout_block_children(box_) {
                     layout_css_block_children(box_, source, image_height_auto, text_metrics)
+                } else if css_layout_box_needs_inline_visual_layout(box_) {
+                    layout_css_inline_visual_children(
+                        box_,
+                        source,
+                        image_height_auto,
+                        text_metrics,
+                        content_width,
+                    )
                 } else {
                     measure_css_inline_children_height(&box_.children, content_width, text_metrics)
                         .max((box_.style.font_size * 1.35).max(1.0))
@@ -9322,14 +9346,7 @@ fn layout_css_box(
                     )
                 } else if !box_.children.is_empty()
                     && box_.children.iter().all(css_layout_box_is_inline_level)
-                    && !box_
-                        .children
-                        .iter()
-                        .any(css_layout_inline_box_should_layout_block_children)
-                    && !box_
-                        .children
-                        .iter()
-                        .any(css_layout_box_contains_replaced_or_special)
+                    && !css_layout_box_needs_inline_visual_layout(box_)
                 {
                     measure_css_inline_children_height(&box_.children, content_width, text_metrics)
                 } else {
@@ -9433,6 +9450,20 @@ fn css_layout_inline_flow_visual_height(
     ))
 }
 
+fn css_layout_box_needs_inline_visual_layout(box_: &CssLayoutBox<'_>) -> bool {
+    box_.flags.contains_visual_replaced_content
+        || box_.children.iter().any(|child| {
+            matches!(child.style.display, CssDisplay::InlineBlock)
+                || child.style.width.is_some()
+                || child.style.width_percent.is_some()
+                || child.style.height.is_some()
+                || child.style.min_height.is_some()
+                || child.style.background != egui::Color32::TRANSPARENT
+                || child.style.border_width > 0.0
+                || css_layout_box_needs_inline_visual_layout(child)
+        })
+}
+
 fn css_layout_visible_text_line_height(box_: &CssLayoutBox<'_>) -> f32 {
     let own = if box_.kind == CssLayoutKind::Text
         && box_
@@ -9526,6 +9557,12 @@ fn layout_css_inline_visual_box(
         return css_margin_box(box_).size();
     }
 
+    let explicit_content_width = css_layout_explicit_content_width_for_available(
+        &box_.style,
+        containing_width,
+        horizontal_non_content,
+    );
+
     if box_.kind == CssLayoutKind::Text {
         let text_width = box_
             .text
@@ -9543,7 +9580,7 @@ fn layout_css_inline_visual_box(
     }
 
     let mut child_x = content_x;
-    let mut content_width: f32 = 0.0;
+    let mut children_width: f32 = 0.0;
     let mut content_height: f32 = 0.0;
     for child in &mut box_.children {
         if css_layout_box_is_out_of_flow(child) {
@@ -9553,21 +9590,28 @@ fn layout_css_inline_visual_box(
             child,
             child_x,
             content_y,
-            (available_content_width - content_width).max(1.0),
+            (available_content_width - children_width).max(1.0),
             source,
             image_height_auto,
             text_metrics,
         );
         child_x += child_size.x;
-        content_width += child_size.x;
+        children_width += child_size.x;
         content_height = content_height.max(child_size.y);
     }
+    let content_width = explicit_content_width
+        .unwrap_or(children_width)
+        .min(available_content_width)
+        .max(1.0);
+    let content_height = css_resolve_used_height(content_height, &box_.style, 0.0, content_width)
+        .max(if box_.children.is_empty() {
+            0.0
+        } else {
+            content_height
+        });
     box_.dimensions.content = egui::Rect::from_min_size(
         egui::pos2(content_x, content_y),
-        egui::vec2(
-            content_width.max(1.0),
-            content_height.max((box_.style.font_size * 1.35).max(1.0)),
-        ),
+        egui::vec2(content_width, content_height.max(0.0)),
     );
     css_margin_box(box_).size()
 }
@@ -9601,6 +9645,14 @@ fn css_layout_node_is_button(node: &RenderNode) -> bool {
         &node.kind,
         RenderNodeKind::Element(element) if element.tag_name == "button"
     )
+}
+
+fn css_layout_box_is_native_button(box_: &CssLayoutBox<'_>) -> bool {
+    box_.style.width.is_none()
+        && box_.style.width_percent.is_none()
+        && box_.style.max_width.is_none()
+        && box_.style.max_width_percent.is_none()
+        && box_.node.is_some_and(css_layout_node_is_button)
 }
 
 fn center_css_button_children(box_: &mut CssLayoutBox<'_>) {
@@ -10176,6 +10228,34 @@ fn css_flex_item_base_width(
         .max(1.0)
 }
 
+fn css_layout_explicit_content_width_for_available(
+    style: &ResolvedBoxStyle,
+    containing_width: f32,
+    horizontal_non_content: f32,
+) -> Option<f32> {
+    let border_padding = css_style_horizontal_border_padding(style);
+    let width = style
+        .width
+        .or_else(|| {
+            style.width_percent.map(|percent| {
+                let declared = containing_width * percent / 100.0;
+                if style.box_sizing_border_box {
+                    (declared - border_padding).max(1.0)
+                } else {
+                    (declared - horizontal_non_content).max(1.0)
+                }
+            })
+        })
+        .or_else(|| css_style_max_width_for_containing(style, containing_width));
+    width.map(|width| {
+        if style.box_sizing_border_box {
+            (width - border_padding).max(1.0)
+        } else {
+            width.max(1.0)
+        }
+    })
+}
+
 fn css_layout_box_uses_shrink_to_fit_width(box_: &CssLayoutBox<'_>) -> bool {
     box_.style.width.is_none()
         && box_.style.width_percent.is_none()
@@ -10281,6 +10361,21 @@ fn css_layout_preferred_content_width(
     box_: &CssLayoutBox<'_>,
     text_metrics: Option<&egui::Context>,
 ) -> f32 {
+    if let Some(width) = box_
+        .style
+        .width
+        .or_else(|| box_.style.max_width)
+        .map(|width| {
+            if box_.style.box_sizing_border_box {
+                (width - css_style_horizontal_border_padding(&box_.style)).max(1.0)
+            } else {
+                width.max(1.0)
+            }
+        })
+    {
+        return width;
+    }
+
     match box_.kind {
         CssLayoutKind::Text => box_
             .text
@@ -10736,16 +10831,32 @@ fn css_grid_auto_placements(
         if css_layout_box_is_out_of_flow(child) {
             continue;
         }
-        let column_span = child.style.grid_column_span.max(1).min(columns);
+        let explicit_column = css_grid_explicit_column_placement(child, columns);
+        let column_span = explicit_column
+            .map(|(_, span)| span)
+            .unwrap_or(child.style.grid_column_span)
+            .max(1)
+            .min(columns);
         let row_span = child.style.grid_row_span.max(1);
-        let (row, column) = css_find_grid_auto_slot(
-            &mut occupied,
-            columns,
-            cursor_row,
-            cursor_column,
-            row_span,
-            column_span,
-        );
+        let (row, column) = if let Some((column, _)) = explicit_column {
+            css_find_grid_slot_in_column(
+                &mut occupied,
+                columns,
+                cursor_row,
+                column,
+                row_span,
+                column_span,
+            )
+        } else {
+            css_find_grid_auto_slot(
+                &mut occupied,
+                columns,
+                cursor_row,
+                cursor_column,
+                row_span,
+                column_span,
+            )
+        };
         css_mark_grid_auto_slot(&mut occupied, row, column, row_span, column_span, columns);
         placements[index] = Some(CssGridAutoPlacement {
             row,
@@ -10762,6 +10873,62 @@ fn css_grid_auto_placements(
     }
 
     placements
+}
+
+fn css_grid_explicit_column_placement(
+    child: &CssLayoutBox<'_>,
+    columns: usize,
+) -> Option<(usize, usize)> {
+    let columns = columns.max(1);
+    let start_line = child.style.grid_column_start?;
+    let start = css_grid_line_to_column_start(start_line, columns)?;
+    let span = if let Some(end_line) = child.style.grid_column_end {
+        let end = css_grid_line_to_column_end(end_line, columns)?;
+        end.saturating_sub(start).max(1)
+    } else {
+        child.style.grid_column_span.max(1)
+    };
+    let start = start.min(columns.saturating_sub(1));
+    let span = span.min(columns - start).max(1);
+    Some((start, span))
+}
+
+fn css_grid_line_to_column_start(line: i32, columns: usize) -> Option<usize> {
+    if line == 0 {
+        return None;
+    }
+    let grid_lines = columns as i32 + 1;
+    let resolved = if line > 0 {
+        line
+    } else {
+        grid_lines + line + 1
+    };
+    (1..=grid_lines)
+        .contains(&resolved)
+        .then_some((resolved - 1) as usize)
+}
+
+fn css_grid_line_to_column_end(line: i32, columns: usize) -> Option<usize> {
+    css_grid_line_to_column_start(line, columns)
+}
+
+fn css_find_grid_slot_in_column(
+    occupied: &mut Vec<Vec<bool>>,
+    columns: usize,
+    start_row: usize,
+    column: usize,
+    row_span: usize,
+    column_span: usize,
+) -> (usize, usize) {
+    let column = column.min(columns.saturating_sub(1));
+    let column_span = column_span.min(columns - column).max(1);
+    let mut row = start_row;
+    loop {
+        if css_grid_auto_slot_is_free(occupied, row, column, row_span, column_span, columns) {
+            return (row, column);
+        }
+        row += 1;
+    }
 }
 
 fn css_find_grid_auto_slot(
@@ -12133,12 +12300,7 @@ fn push_canvas_graph_layout_box(
             }
         }
         CssLayoutKind::AnonymousBlock => {
-            if !box_.children.is_empty()
-                && box_.children.iter().all(|c| {
-                    css_layout_box_contains_visual_replaced_content(c)
-                        || css_layout_box_contains_replaced_or_special(c)
-                })
-            {
+            if css_layout_box_needs_inline_visual_layout(box_) {
                 push_canvas_graph_layout_children_at_used_positions(
                     &box_.children,
                     source,
@@ -12203,7 +12365,11 @@ fn push_canvas_graph_layout_box(
                 } else {
                     push_canvas_graph_layout_box_background(box_, graph);
                     let clips_children = push_canvas_graph_layout_clip_start(box_, graph);
-                    if !node.children.is_empty() && children_are_inline_flow(&node.children) {
+                    if !matches!(box_.style.display, CssDisplay::InlineBlock)
+                        && !css_layout_box_needs_inline_visual_layout(box_)
+                        && !node.children.is_empty()
+                        && children_are_inline_flow(&node.children)
+                    {
                         push_canvas_graph_inline_children(
                             &node.children,
                             text_metrics,
@@ -12290,10 +12456,7 @@ fn push_canvas_graph_layout_box(
                         push_canvas_graph_layout_list_marker(box_, cursor, graph);
                         if !box_.children.is_empty()
                             && box_.children.iter().all(css_layout_box_is_inline_level)
-                            && !box_
-                                .children
-                                .iter()
-                                .any(css_layout_box_contains_replaced_or_special)
+                            && !css_layout_box_needs_inline_visual_layout(box_)
                         {
                             push_canvas_graph_layout_inline_children(
                                 &box_.children,
@@ -12368,10 +12531,7 @@ fn push_canvas_graph_layout_box(
                             cursor.y = css_margin_box(box_).bottom();
                         } else if !box_.children.is_empty()
                             && box_.children.iter().all(css_layout_box_is_inline_level)
-                            && !box_
-                                .children
-                                .iter()
-                                .any(css_layout_box_contains_replaced_or_special)
+                            && !css_layout_box_needs_inline_visual_layout(box_)
                         {
                             push_canvas_graph_layout_inline_children(
                                 &box_.children,
@@ -12602,10 +12762,6 @@ fn css_style_max_width_for_containing(
             .max_width_percent
             .map(|percent| containing_width * percent / 100.0)
     })
-}
-
-fn css_layout_box_contains_visual_replaced_content(box_: &CssLayoutBox<'_>) -> bool {
-    box_.flags.contains_visual_replaced_content
 }
 
 fn css_layout_node_is_visual_replaced_content(node: &RenderNode) -> bool {
@@ -19727,6 +19883,89 @@ mod tests {
     }
 
     #[test]
+    fn grid_column_one_to_negative_one_spans_explicit_grid_width() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .grid {
+                    display: grid;
+                    grid-template-columns: 120px 1fr;
+                    gap: 16px;
+                    width: 500px;
+                  }
+                  .wide {
+                    grid-column: 1 / -1;
+                    min-height: 80px;
+                    background: #51cf66;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="grid"><section class="wide">wide</section></div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let wide = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x51, 0xcf, 0x66),
+        )
+        .expect("expected full-width grid item");
+
+        assert!(
+            (wide.rect.width() - 500.0).abs() <= 1.0,
+            "grid-column: 1 / -1 should span all explicit columns: {wide:?}"
+        );
+    }
+
+    #[test]
+    fn standalone_button_uses_intrinsic_inline_block_width() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  button.box {
+                    min-height: 72px;
+                    border: 1px solid #222222;
+                    display: grid;
+                    place-items: center;
+                    padding: 10px;
+                    font-weight: 700;
+                    background: #ffd43b;
+                  }
+                </style>
+              </head>
+              <body>
+                <button class="box">closed toggle</button>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let button = find_canvas_button(&document.canvas_graph, "closed toggle")
+            .expect("expected button hit target");
+
+        assert!(
+            button.rect.width() < 220.0,
+            "button without author width should keep intrinsic width, not fill the containing block: {:?}",
+            button.rect
+        );
+        assert!(
+            button.rect.width() > 60.0,
+            "button should still reserve enough width for its label: {:?}",
+            button.rect
+        );
+    }
+
+    #[test]
     fn grid_without_explicit_columns_stacks_items_vertically() {
         let document = parse_html_document(
             r#"
@@ -20827,6 +21066,316 @@ mod tests {
         assert!(
             copy.rect.width() >= 450.0,
             "copy should keep a readable line next to the figure: figure {figure:?} copy {copy:?}"
+        );
+    }
+
+    #[test]
+    fn auto_size_compliance_normal_block_width_fills_but_height_uses_child() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .page { width: 400px; }
+                  .auto {
+                    background: #ff0000;
+                  }
+                  .child {
+                    width: 120px;
+                    height: 40px;
+                    background: #00ff00;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="page"><div class="auto"><div class="child"></div></div></div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let auto =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected auto-width block background");
+        let child =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected explicit child background");
+
+        assert!(
+            (auto.rect.width() - 400.0).abs() <= 1.0,
+            "normal block width:auto should fill its containing block, not shrink to child: auto={auto:?} child={child:?}"
+        );
+        assert!(
+            auto.rect.height() >= child.rect.height() - 1.0,
+            "normal block height:auto should include in-flow child height: auto={auto:?} child={child:?}"
+        );
+    }
+
+    #[test]
+    fn auto_size_compliance_inline_block_uses_explicit_child_size() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .auto {
+                    display: inline-block;
+                    padding: 10px;
+                    border: 1px solid #111111;
+                    background: #ff0000;
+                  }
+                  .child {
+                    display: inline-block;
+                    width: 120px;
+                    height: 40px;
+                    background: #00ff00;
+                  }
+                </style>
+              </head>
+              <body>
+                <span class="auto"><span class="child"></span></span>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let auto =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected inline-block background");
+        let child =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected explicit child background");
+
+        assert!(
+            (auto.rect.width() - 142.0).abs() <= 1.0,
+            "inline-block shrink-to-fit width should be child 120 + padding/border 22: auto={auto:?} child={child:?}"
+        );
+        assert!(
+            (auto.rect.height() - 62.0).abs() <= 1.0,
+            "inline-block auto height should include child 40 + padding/border 22: auto={auto:?} child={child:?}"
+        );
+    }
+
+    #[test]
+    fn auto_size_compliance_right_float_uses_explicit_child_size() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .page { width: 500px; }
+                  .float {
+                    float: right;
+                    margin-left: 16px;
+                    padding: 10px;
+                    border: 1px solid #111111;
+                    background: #ff0000;
+                  }
+                  .child {
+                    display: inline-block;
+                    width: 120px;
+                    height: 80px;
+                    background: #00ff00;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="page"><aside class="float"><span class="child"></span></aside></div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let float =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected right float background");
+        let child =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected explicit child background");
+
+        assert!(
+            (float.rect.width() - 142.0).abs() <= 1.0,
+            "right float width:auto should shrink-to-fit child 120 + padding/border 22: float={float:?} child={child:?}"
+        );
+        assert!(
+            (float.rect.height() - 102.0).abs() <= 1.0,
+            "right float auto height should include child 80 + padding/border 22: float={float:?} child={child:?}"
+        );
+        assert!(
+            (float.rect.right() - 500.0).abs() <= 1.0,
+            "right float should be placed against the containing block's right edge: float={float:?}"
+        );
+    }
+
+    #[test]
+    fn auto_size_compliance_left_float_uses_explicit_child_size() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .page { width: 500px; }
+                  .float {
+                    float: left;
+                    margin-right: 18px;
+                    padding: 10px;
+                    border: 1px solid #111111;
+                    background: #ff0000;
+                  }
+                  .child {
+                    display: inline-block;
+                    width: 180px;
+                    height: 130px;
+                    background: #00ff00;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="page"><figure class="float"><span class="child"></span></figure></div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let float =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected left float background");
+        let child =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected explicit child background");
+
+        assert!(
+            (float.rect.width() - 202.0).abs() <= 1.0,
+            "left float width:auto should shrink-to-fit child 180 + padding/border 22: float={float:?} child={child:?}"
+        );
+        assert!(
+            (float.rect.height() - 152.0).abs() <= 1.0,
+            "left float auto height should include child 130 + padding/border 22: float={float:?} child={child:?}"
+        );
+        assert!(
+            float.rect.left() <= 1.0,
+            "left float should be placed against the containing block's left edge: float={float:?}"
+        );
+    }
+
+    #[test]
+    fn auto_size_compliance_absolute_auto_width_uses_explicit_child_size() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .host {
+                    position: relative;
+                    width: 500px;
+                    height: 200px;
+                  }
+                  .auto {
+                    position: absolute;
+                    left: 0;
+                    top: 0;
+                    padding: 10px;
+                    border: 1px solid #111111;
+                    background: #ff0000;
+                  }
+                  .child {
+                    display: inline-block;
+                    width: 130px;
+                    height: 50px;
+                    background: #00ff00;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="host"><div class="auto"><span class="child"></span></div></div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let auto =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected abspos auto background");
+        let child =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected explicit child background");
+
+        assert!(
+            (auto.rect.width() - 152.0).abs() <= 1.0,
+            "absolute width:auto should shrink-to-fit child 130 + padding/border 22: auto={auto:?} child={child:?}"
+        );
+        assert!(
+            (auto.rect.height() - 72.0).abs() <= 1.0,
+            "absolute auto height should include child 50 + padding/border 22: auto={auto:?} child={child:?}"
+        );
+    }
+
+    #[test]
+    fn auto_size_compliance_flex_auto_item_base_uses_explicit_child_size() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .row {
+                    display: flex;
+                    gap: 12px;
+                    width: 500px;
+                  }
+                  .auto {
+                    padding: 10px;
+                    border: 1px solid #111111;
+                    background: #ff0000;
+                  }
+                  .child {
+                    display: inline-block;
+                    width: 140px;
+                    height: 40px;
+                    background: #00ff00;
+                  }
+                  .tail {
+                    width: 50px;
+                    height: 40px;
+                    background: #0000ff;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="row"><div class="auto"><span class="child"></span></div><div class="tail"></div></div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let auto =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected flex item background");
+        let child =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected explicit child background");
+        let tail =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 0, 255))
+                .expect("expected tail background");
+
+        assert!(
+            (auto.rect.width() - 162.0).abs() <= 1.0,
+            "flex auto item base should include child 140 + padding/border 22: auto={auto:?} child={child:?}"
+        );
+        assert!(
+            (tail.rect.left() - auto.rect.right() - 12.0).abs() <= 1.0,
+            "following flex item should be placed after the real auto item width: auto={auto:?} tail={tail:?}"
         );
     }
 

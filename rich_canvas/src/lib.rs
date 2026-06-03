@@ -221,6 +221,8 @@ pub struct CssBoxStyle {
     pub grid_auto_rows: Option<CssLength>,
     pub grid_template_areas: Option<Vec<Vec<String>>>,
     pub grid_area: Option<String>,
+    pub grid_column_start: Option<i32>,
+    pub grid_column_end: Option<i32>,
     pub grid_column_span: Option<usize>,
     pub grid_row_span: Option<usize>,
     pub gap: Option<f32>,
@@ -278,6 +280,8 @@ pub struct ResolvedBoxStyle {
     pub grid_auto_rows: Option<CssLength>,
     pub grid_template_areas: Option<Vec<Vec<String>>>,
     pub grid_area: Option<String>,
+    pub grid_column_start: Option<i32>,
+    pub grid_column_end: Option<i32>,
     pub grid_column_span: usize,
     pub grid_row_span: usize,
     pub gap: f32,
@@ -336,6 +340,8 @@ impl Default for ResolvedBoxStyle {
             grid_auto_rows: None,
             grid_template_areas: None,
             grid_area: None,
+            grid_column_start: None,
+            grid_column_end: None,
             grid_column_span: 1,
             grid_row_span: 1,
             gap: 0.0,
@@ -4634,6 +4640,12 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
     if source.grid_area.is_some() {
         target.grid_area = source.grid_area.clone();
     }
+    if source.grid_column_start.is_some() {
+        target.grid_column_start = source.grid_column_start;
+    }
+    if source.grid_column_end.is_some() {
+        target.grid_column_end = source.grid_column_end;
+    }
     if source.grid_column_span.is_some() {
         target.grid_column_span = Some(source.grid_column_span.unwrap_or(1).max(1));
     }
@@ -5596,9 +5608,25 @@ fn parse_css_box_style_with_vars(
                 style.grid_area = parse_grid_area(value);
                 seen |= style.grid_area.is_some();
             }
-            "grid-column" | "grid-column-end" => {
+            "grid-column" => {
+                let placement = parse_grid_column_placement(value);
+                style.grid_column_start = placement.start;
+                style.grid_column_end = placement.end;
+                style.grid_column_span = placement.span.or_else(|| parse_grid_line_span(value));
+                seen |= style.grid_column_start.is_some()
+                    || style.grid_column_end.is_some()
+                    || style.grid_column_span.is_some();
+            }
+            "grid-column-start" => {
+                style.grid_column_start = parse_grid_line_number(value);
+                seen |= style.grid_column_start.is_some();
+            }
+            "grid-column-end" => {
                 style.grid_column_span = parse_grid_line_span(value);
-                seen |= style.grid_column_span.is_some();
+                if style.grid_column_span.is_none() {
+                    style.grid_column_end = parse_grid_line_number(value);
+                }
+                seen |= style.grid_column_end.is_some() || style.grid_column_span.is_some();
             }
             "grid-row" | "grid-row-end" => {
                 style.grid_row_span = parse_grid_line_span(value);
@@ -6081,6 +6109,35 @@ fn parse_grid_line_span(value: &str) -> Option<usize> {
             .flatten()
             .filter(|span| *span > 0)
     })
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CssGridColumnPlacement {
+    start: Option<i32>,
+    end: Option<i32>,
+    span: Option<usize>,
+}
+
+fn parse_grid_column_placement(value: &str) -> CssGridColumnPlacement {
+    let Some((start, end)) = value.split_once('/') else {
+        return CssGridColumnPlacement {
+            span: parse_grid_line_span(value),
+            ..CssGridColumnPlacement::default()
+        };
+    };
+    CssGridColumnPlacement {
+        start: parse_grid_line_number(start),
+        end: parse_grid_line_number(end),
+        span: parse_grid_line_span(value),
+    }
+}
+
+fn parse_grid_line_number(value: &str) -> Option<i32> {
+    let token = split_css_value_list(value)
+        .into_iter()
+        .find(|token| !token.eq_ignore_ascii_case("auto") && !token.eq_ignore_ascii_case("span"))?;
+    let line = token.trim().parse::<i32>().ok()?;
+    (line != 0).then_some(line)
 }
 
 fn parse_grid_template_shorthand_columns(value: &str) -> Option<usize> {
@@ -7902,6 +7959,7 @@ mod tests {
     fn fixture_57_is_and_where_groups_match_parent_child_context() {
         let style = parse_basic_css(
             r#"
+            .box { background: #ffd43b; }
             :is(header, main, aside) > :where(.primary, .secondary) { background: #51cf66; }
             footer :is(.primary, .secondary) { background: #ff6b6b; }
             "#,
@@ -7918,16 +7976,62 @@ mod tests {
 
         assert_eq!(
             computed_box_style(&style, &child("header", "primary")).background,
-            Some(Color32::from_rgb(0x51, 0xcf, 0x66))
+            Some(Color32::from_rgb(0xff, 0xd4, 0x3b))
         );
         assert_eq!(
             computed_box_style(&style, &child("main", "secondary")).background,
-            Some(Color32::from_rgb(0x51, 0xcf, 0x66))
+            Some(Color32::from_rgb(0xff, 0xd4, 0x3b))
         );
         assert_eq!(
             computed_box_style(&style, &child("footer", "primary")).background,
             Some(Color32::from_rgb(0xff, 0x6b, 0x6b))
         );
+    }
+
+    #[test]
+    fn parse_basic_css_carries_numeric_grid_column_lines() {
+        let style = parse_basic_css(
+            r#"
+            .wide { grid-column: 1 / -1; }
+            .middle { grid-column: 2 / 4; }
+            .start { grid-column-start: 2; }
+            .end { grid-column-end: -1; }
+            "#,
+        );
+        let wide = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["wide".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let middle = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["middle".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let start = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["start".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let end = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["end".to_owned()],
+            ..ElementStyleKey::default()
+        };
+
+        let wide_style = computed_box_style(&style, &wide);
+        assert_eq!(wide_style.grid_column_start, Some(1));
+        assert_eq!(wide_style.grid_column_end, Some(-1));
+
+        let middle_style = computed_box_style(&style, &middle);
+        assert_eq!(middle_style.grid_column_start, Some(2));
+        assert_eq!(middle_style.grid_column_end, Some(4));
+
+        assert_eq!(
+            computed_box_style(&style, &start).grid_column_start,
+            Some(2)
+        );
+        assert_eq!(computed_box_style(&style, &end).grid_column_end, Some(-1));
     }
 
     #[test]
