@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>103 result stack multiple inline block anchors</title>
+<style>
+html, body { margin: 0; padding: 0; font-family: Arial, sans-serif; background: #f1f4ef; }
+.results { width: 820px; margin: 24px auto; background: #d8e2dc; padding: 16px; }
+.card { display: flex; flex-flow: column nowrap; width: 680px; margin-bottom: 16px; padding: 10px; background: #ffd6a5; }
+.source { display: flex; background: #bde0fe; }
+.source a { display: inline; overflow: hidden; color: #333; }
+.source span { display: block; font-size: 12px; line-height: 1.35; background: #caffbf; }
+.headline { display: flex; width: 680px; overflow: hidden; background: #9bf6ff; }
+.headline a { display: inline; max-width: 100%; overflow: hidden; color: #0b57d0; }
+.headline h2 { display: block; max-width: 100%; overflow: hidden; margin: 0; font-size: 20px; line-height: 1.35; background: #ffc6ff; }
+.summary { display: flex; background: #fdffb6; }
+.summary p { display: block; overflow: hidden; margin: 0; font-size: 14px; line-height: 1.35; background: #ffffff; }
+</style>
+</head>
+<body>
+<main class="results">
+  <article class="card">
+    <div class="source"><a href="#"><span>example.test › alpha</span></a></div>
+    <div class="headline"><a href="#"><h2>Alpha result with inline anchor and block heading</h2></a></div>
+    <div class="summary"><p>Alpha summary should occupy the yellow band below the pink heading.</p></div>
+  </article>
+  <article class="card">
+    <div class="source"><a href="#"><span>example.test › beta</span></a></div>
+    <div class="headline"><a href="#"><h2>Beta result uses the same collapsing wrapper structure</h2></a></div>
+    <div class="summary"><p>Beta summary should not be painted inside the headline row.</p></div>
+  </article>
+</main>
+</body>
+</html>

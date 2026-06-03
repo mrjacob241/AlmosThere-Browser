@@ -22,6 +22,7 @@ pub struct BrowserCanvas {
     pub zoom: f32,
     pub scroll_offset: Vec2,
     pub hovered_link_href: Option<String>,
+    pub hovered_link_element_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1180,6 +1181,7 @@ impl BrowserCanvas {
             zoom: 1.0,
             scroll_offset: Vec2::ZERO,
             hovered_link_href: None,
+            hovered_link_element_id: None,
         }
     }
 
@@ -1226,16 +1228,15 @@ impl BrowserCanvas {
                                 &mut canvas_response,
                                 false,
                                 self.hovered_link_href.as_deref(),
+                                self.hovered_link_element_id.as_deref(),
                             );
                         }
                     });
                 });
             });
         self.scroll_offset = output.state.offset;
-        self.hovered_link_href = canvas_response.hovered.as_ref().and_then(|t| match t {
-            HitTarget::Link { href, .. } => Some(href.clone()),
-            _ => None,
-        });
+        (self.hovered_link_href, self.hovered_link_element_id) =
+            hovered_link_identity(canvas_response.hovered.as_ref());
 
         canvas_response
     }
@@ -1280,17 +1281,23 @@ impl BrowserCanvas {
                             &mut canvas_response,
                             true,
                             self.hovered_link_href.as_deref(),
+                            self.hovered_link_element_id.as_deref(),
                         );
                     });
                 });
             });
         self.scroll_offset = output.state.offset;
-        self.hovered_link_href = canvas_response.hovered.as_ref().and_then(|t| match t {
-            HitTarget::Link { href, .. } => Some(href.clone()),
-            _ => None,
-        });
+        (self.hovered_link_href, self.hovered_link_element_id) =
+            hovered_link_identity(canvas_response.hovered.as_ref());
 
         canvas_response
+    }
+}
+
+fn hovered_link_identity(target: Option<&HitTarget>) -> (Option<String>, Option<String>) {
+    match target {
+        Some(HitTarget::Link { href, element_id }) => (Some(href.clone()), element_id.clone()),
+        _ => (None, None),
     }
 }
 
@@ -1311,6 +1318,7 @@ fn paint_canvas_graph(
     canvas_response: &mut BrowserCanvasResponse,
     read_only: bool,
     hovered_link_href: Option<&str>,
+    hovered_link_element_id: Option<&str>,
 ) {
     let graph_width = graph.viewport.x.max(1.0);
     let scale = (content_width / graph_width).max(0.1) * font_scale;
@@ -1326,6 +1334,8 @@ fn paint_canvas_graph(
         Option<String>,
     )> = Vec::new();
     let mut reset_forms: Vec<Option<String>> = Vec::new();
+    let editable_input_hit_rects =
+        editable_input_hit_rects(&graph.objects, canvas_rect.min, scale, current_clip_rect);
     // (name, element_id) of radio buttons clicked this frame — used to deselect group peers.
     let mut selected_radios: Vec<(Option<String>, Option<String>)> = Vec::new();
 
@@ -1352,11 +1362,17 @@ fn paint_canvas_graph(
                     browser_regular_family()
                 };
                 let font_size = text.font_size * scale;
-                let stroke = Stroke::new((1.0 * scale).max(1.0), text.color);
-                let link_hovered = text.href.is_some() && text.href.as_deref() == hovered_link_href;
+                let link_hovered = canvas_text_link_hovered(
+                    text.href.as_deref(),
+                    text.element_id.as_deref(),
+                    hovered_link_href,
+                    hovered_link_element_id,
+                );
+                let text_color = canvas_link_text_color(text.color, link_hovered);
+                let stroke = Stroke::new((1.0 * scale).max(1.0), text_color);
                 let text_format = TextFormat {
                     font_id: FontId::new(font_size, family),
-                    color: text.color,
+                    color: text_color,
                     background: text.text_background,
                     italics: text.font_style_italic,
                     underline: if text.text_decoration_underline || link_hovered {
@@ -1388,7 +1404,7 @@ fn paint_canvas_graph(
                         vec2(text_width, rect.height()),
                     ),
                 };
-                painter.add(TextShape::new(text_rect.left_top(), galley, text.color));
+                painter.add(TextShape::new(text_rect.left_top(), galley, text_color));
                 if let Some(href) = &text.href {
                     let hit_rect = text_rect.intersect(current_clip_rect);
                     if hit_rect.is_positive() {
@@ -1435,6 +1451,18 @@ fn paint_canvas_graph(
                 }) else {
                     continue;
                 };
+                let defer_to_input =
+                    ui.input(|input| input.pointer.hover_pos())
+                        .is_some_and(|pos| {
+                            button_hit_deferred_to_editable_input(
+                                hit_rect,
+                                pos,
+                                &editable_input_hit_rects,
+                            )
+                        });
+                if defer_to_input {
+                    continue;
+                }
                 if response.hovered() {
                     canvas_response.hovered = Some(HitTarget::Button {
                         text: button.text.clone(),
@@ -1832,6 +1860,74 @@ fn canvas_input_belongs_to_form(input: &CanvasInputObject, form_id: Option<&str>
         (None, None) => true,
         _ => false,
     }
+}
+
+fn editable_input_hit_rects(
+    objects: &[CanvasObject],
+    canvas_origin: Pos2,
+    scale: f32,
+    clip_rect: Rect,
+) -> Vec<Rect> {
+    objects
+        .iter()
+        .filter_map(|object| {
+            let CanvasObject::Input(input) = object else {
+                return None;
+            };
+            if !matches!(
+                input.kind,
+                CanvasInputKind::Text | CanvasInputKind::Password | CanvasInputKind::TextArea
+            ) {
+                return None;
+            }
+            let rect = canvas_object_rect(canvas_origin, input.rect, scale).intersect(clip_rect);
+            rect.is_positive().then_some(rect)
+        })
+        .collect()
+}
+
+fn button_hit_deferred_to_editable_input(
+    button_hit_rect: Rect,
+    pointer_pos: Pos2,
+    editable_input_hit_rects: &[Rect],
+) -> bool {
+    editable_input_hit_rects.iter().any(|input_rect| {
+        input_rect.contains(pointer_pos) && input_rect.intersect(button_hit_rect).is_positive()
+    })
+}
+
+fn canvas_link_text_color(base: Color32, hovered: bool) -> Color32 {
+    if hovered {
+        darken_link_color(base)
+    } else {
+        base
+    }
+}
+
+fn canvas_text_link_hovered(
+    text_href: Option<&str>,
+    text_element_id: Option<&str>,
+    hovered_href: Option<&str>,
+    hovered_element_id: Option<&str>,
+) -> bool {
+    let Some(text_href) = text_href else {
+        return false;
+    };
+    if let (Some(text_element_id), Some(hovered_element_id)) = (text_element_id, hovered_element_id)
+    {
+        return text_element_id == hovered_element_id;
+    }
+    Some(text_href) == hovered_href
+}
+
+fn darken_link_color(base: Color32) -> Color32 {
+    let darken = |channel: u8| ((channel as f32) * 0.58).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgba_premultiplied(
+        darken(base.r()),
+        darken(base.g()),
+        darken(base.b()),
+        base.a(),
+    )
 }
 
 fn canvas_graph_text_edit_id(
@@ -6628,6 +6724,75 @@ mod tests {
         assert_eq!(other.value, "kept");
         assert_eq!(response.changed_inputs.len(), 1);
         assert_eq!(response.changed_inputs[0].label, "Query");
+    }
+
+    #[test]
+    fn overlapping_submit_button_defers_to_editable_input_hit_area() {
+        let button = Rect::from_min_max(Pos2::new(20.0, 20.0), Pos2::new(320.0, 60.0));
+        let input = Rect::from_min_max(Pos2::new(32.0, 28.0), Pos2::new(240.0, 52.0));
+        let outside_input = Pos2::new(280.0, 40.0);
+        let inside_input = Pos2::new(100.0, 40.0);
+
+        assert!(button_hit_deferred_to_editable_input(
+            button,
+            inside_input,
+            &[input]
+        ));
+        assert!(!button_hit_deferred_to_editable_input(
+            button,
+            outside_input,
+            &[input]
+        ));
+    }
+
+    #[test]
+    fn canvas_link_text_color_keeps_unhovered_link_color() {
+        let link = Color32::from_rgb(26, 13, 171);
+
+        assert_eq!(canvas_link_text_color(link, false), link);
+    }
+
+    #[test]
+    fn canvas_link_text_color_darkens_hovered_link_color() {
+        let link = Color32::from_rgba_premultiplied(26, 13, 171, 230);
+        let hovered = canvas_link_text_color(link, true);
+
+        assert!(hovered.r() < link.r());
+        assert!(hovered.g() < link.g());
+        assert!(hovered.b() < link.b());
+        assert_eq!(hovered.a(), link.a());
+    }
+
+    #[test]
+    fn canvas_text_link_hover_uses_element_id_when_available() {
+        assert!(canvas_text_link_hovered(
+            Some("/result"),
+            Some("title-link"),
+            Some("/result"),
+            Some("title-link"),
+        ));
+        assert!(!canvas_text_link_hovered(
+            Some("/result"),
+            Some("source-link"),
+            Some("/result"),
+            Some("title-link"),
+        ));
+    }
+
+    #[test]
+    fn canvas_text_link_hover_falls_back_to_href_without_element_id() {
+        assert!(canvas_text_link_hovered(
+            Some("/result"),
+            None,
+            Some("/result"),
+            None,
+        ));
+        assert!(!canvas_text_link_hovered(
+            Some("/other"),
+            None,
+            Some("/result"),
+            None,
+        ));
     }
 
     #[test]

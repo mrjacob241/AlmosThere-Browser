@@ -364,6 +364,12 @@ struct PendingNavigation {
 struct LoadedPageSource {
     html: String,
     source: String,
+    image: Option<LoadedImageSource>,
+}
+
+struct LoadedImageSource {
+    bytes: Vec<u8>,
+    content_type: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -452,6 +458,57 @@ impl AlmostThereApp {
             live_js_debug_text,
             status,
         ) = match load_url_source(initial_url) {
+            Ok(source) if source.image.is_some() => {
+                match image_document_from_loaded_source(&source) {
+                    Ok(document) => {
+                        telemetry.emit(
+                            "navigation.loaded",
+                            &[
+                                ("url", &source.source),
+                                ("title", &document.title),
+                                ("blocks", &document.blocks.len().to_string()),
+                            ],
+                        );
+                        (
+                            document,
+                            String::new(),
+                            String::new(),
+                            justbarelyscript::BrowserExecutionState::default(),
+                            "Direct image response; HTML render graph not used.".to_owned(),
+                            Vec::new(),
+                            "Direct image response; JavaScript not used.".to_owned(),
+                            format!("Loaded image {}", source.source),
+                        )
+                    }
+                    Err(error) => {
+                        telemetry.emit(
+                            "navigation.failed",
+                            &[("url", initial_url), ("error", &error.to_string())],
+                        );
+                        let document = BrowserDocument {
+                            title: "Load failed".to_owned(),
+                            source: initial_url.to_owned(),
+                            style: Default::default(),
+                            canvas_graph: CanvasGraph::default(),
+                            blocks: vec![CanvasBlock::Paragraph {
+                                text: format!("Failed to load image {initial_url}: {error}"),
+                            }],
+                        };
+                        (
+                            document,
+                            String::new(),
+                            String::new(),
+                            justbarelyscript::BrowserExecutionState::default(),
+                            String::new(),
+                            vec![console_error_message(format!(
+                                "Failed to load image {initial_url}: {error}"
+                            ))],
+                            String::new(),
+                            format!("Failed to load image {initial_url}: {error}"),
+                        )
+                    }
+                }
+            }
             Ok(source) => {
                 let live_html = apply_safe_script_browser_effects_with_source(
                     &remove_html_comments(&source.html),
@@ -591,6 +648,23 @@ impl AlmostThereApp {
                         ("url", &thread_url),
                         ("final_url", &source.source),
                         ("html_bytes", &source.html.len().to_string()),
+                        (
+                            "body_bytes",
+                            &source
+                                .image
+                                .as_ref()
+                                .map(|image| image.bytes.len())
+                                .unwrap_or_else(|| source.html.len())
+                                .to_string(),
+                        ),
+                        (
+                            "content_kind",
+                            if source.image.is_some() {
+                                "image"
+                            } else {
+                                "html"
+                            },
+                        ),
                     ],
                 ),
                 Err(error) => emit_global_telemetry(
@@ -617,6 +691,69 @@ impl AlmostThereApp {
                 let pending = self.pending_navigation.take().expect("pending navigation");
                 match result {
                     Ok(source) => {
+                        if source.image.is_some() {
+                            match image_document_from_loaded_source(&source) {
+                                Ok(document) => {
+                                    self.current_html.clear();
+                                    self.live_html.clear();
+                                    self.script_state =
+                                        justbarelyscript::BrowserExecutionState::default();
+                                    self.module_cache =
+                                        justbarelyscript::ModuleExecutionCache::default();
+                                    self.render_graph_debug_text =
+                                        "Direct image response; HTML render graph not used."
+                                            .to_owned();
+                                    self.console_messages.clear();
+                                    self.live_js_debug_text =
+                                        "Direct image response; JavaScript not used.".to_owned();
+                                    self.page_loaded_at = std::time::Instant::now();
+                                    self.last_hovered_element_id = None;
+                                    self.last_focused_input = None;
+                                    self.telemetry.emit(
+                                        "navigation.canvas_graph.completed",
+                                        &[
+                                            ("url", &source.source),
+                                            ("blocks", &document.blocks.len().to_string()),
+                                            (
+                                                "canvas_objects",
+                                                &document.canvas_graph.objects.len().to_string(),
+                                            ),
+                                        ],
+                                    );
+                                    self.telemetry.emit(
+                                        "navigation.loaded",
+                                        &[
+                                            ("url", &pending.url),
+                                            ("title", &document.title),
+                                            ("blocks", &document.blocks.len().to_string()),
+                                        ],
+                                    );
+                                    self.url_input = document.source.clone();
+                                    self.status = format!("Loaded image {}", document.source);
+                                    self.document = document;
+                                    self.canvas.scroll_offset = egui::Vec2::ZERO;
+                                    self.debug_canvas.scroll_offset = egui::Vec2::ZERO;
+                                    self.render_debug.object_limit =
+                                        self.document.canvas_graph.objects.len();
+                                    if let Some(fragment) = pending.fragment {
+                                        self.scroll_to_fragment(&fragment);
+                                    }
+                                }
+                                Err(error) => {
+                                    self.telemetry.emit(
+                                        "navigation.failed",
+                                        &[("url", &pending.url), ("error", &error.to_string())],
+                                    );
+                                    self.status = format!("Load image failed: {error}");
+                                    self.console_messages.push(console_error_message(format!(
+                                        "Load image failed: {error}"
+                                    )));
+                                    self.live_js_debug_text.clear();
+                                }
+                            }
+                            ctx.request_repaint();
+                            return;
+                        }
                         self.telemetry.emit(
                             "navigation.scripts.started",
                             &[
@@ -3134,6 +3271,73 @@ fn parse_html_document_from_live_html(
         canvas_graph,
         blocks,
     }
+}
+
+fn image_document_from_loaded_source(source: &LoadedPageSource) -> io::Result<BrowserDocument> {
+    let image = source
+        .image
+        .as_ref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "loaded source is not image"))?;
+    image_document_from_bytes(&source.source, &image.bytes, &image.content_type)
+}
+
+fn image_document_from_bytes(
+    source: &str,
+    bytes: &[u8],
+    content_type: &str,
+) -> io::Result<BrowserDocument> {
+    let image =
+        ImageBlock::from_encoded_bytes_with_aspect(PathBuf::from(source), bytes, None, true)
+            .map_err(io::Error::other)?;
+    let viewport = egui::vec2(image.size.x.max(1.0), image.size.y.max(1.0));
+    let title = direct_image_title(source);
+    let image_object = CanvasImageObject {
+        rect: egui::Rect::from_min_size(egui::Pos2::ZERO, image.size),
+        src: source.to_owned(),
+        alt: title.clone(),
+        image: image.clone(),
+        object_fit: CssObjectFit::Contain,
+    };
+    let block = CanvasBlock::Image {
+        alt: title.clone(),
+        src: source.to_owned(),
+        image,
+    };
+    let mut style = BrowserStyle {
+        page_background: egui::Color32::BLACK,
+        ..Default::default()
+    };
+    style.image_height_auto = true;
+    emit_global_telemetry(
+        "document.image.finish",
+        &[
+            ("source", source),
+            ("content_type", content_type),
+            ("bytes", &bytes.len().to_string()),
+            ("width", &viewport.x.to_string()),
+            ("height", &viewport.y.to_string()),
+        ],
+    );
+    Ok(BrowserDocument {
+        title,
+        source: source.to_owned(),
+        style,
+        canvas_graph: CanvasGraph {
+            viewport,
+            objects: vec![CanvasObject::Image(image_object)],
+        },
+        blocks: vec![block],
+    })
+}
+
+fn direct_image_title(source: &str) -> String {
+    source
+        .split(['/', '\\'])
+        .next_back()
+        .and_then(|tail| tail.split(['?', '#']).next())
+        .filter(|tail| !tail.is_empty())
+        .unwrap_or("Image")
+        .to_owned()
 }
 
 fn apply_safe_script_browser_effects(html: &str) -> String {
@@ -5762,6 +5966,19 @@ fn load_url_document_with_optional_text_metrics(
     }
 
     let path = input_to_path(input);
+    if path_is_direct_image(&path) {
+        let source = LoadedPageSource {
+            html: String::new(),
+            source: path_to_file_url(&path),
+            image: Some(LoadedImageSource {
+                bytes: fs::read(&path)?,
+                content_type: image_content_type_from_path(&path)
+                    .unwrap_or("application/octet-stream")
+                    .to_owned(),
+            }),
+        };
+        return image_document_from_loaded_source(&source);
+    }
     load_html_document_with_text_metrics(&path, text_metrics)
 }
 
@@ -5771,18 +5988,87 @@ fn load_url_source(input: &str) -> io::Result<LoadedPageSource> {
         let response = http_client()?.get(input).send().map_err(io::Error::other)?;
         let final_url = response.url().to_string();
         let response = response.error_for_status().map_err(io::Error::other)?;
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        if response_content_is_image(&content_type, &final_url) {
+            let bytes = response.bytes().map_err(io::Error::other)?.to_vec();
+            return Ok(LoadedPageSource {
+                html: String::new(),
+                source: final_url,
+                image: Some(LoadedImageSource {
+                    bytes,
+                    content_type,
+                }),
+            });
+        }
         let html = response.text().map_err(io::Error::other)?;
         return Ok(LoadedPageSource {
             html,
             source: final_url,
+            image: None,
         });
     }
 
     let path = input_to_path(input);
+    if path_is_direct_image(&path) {
+        return Ok(LoadedPageSource {
+            html: String::new(),
+            source: path_to_file_url(&path),
+            image: Some(LoadedImageSource {
+                bytes: fs::read(&path)?,
+                content_type: image_content_type_from_path(&path)
+                    .unwrap_or("application/octet-stream")
+                    .to_owned(),
+            }),
+        });
+    }
     Ok(LoadedPageSource {
         html: fs::read_to_string(&path)?,
         source: path_to_file_url(&path),
+        image: None,
     })
+}
+
+fn response_content_is_image(content_type: &str, source: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().starts_with("image/"))
+        || path_is_direct_image(&input_to_path(source))
+}
+
+fn path_is_direct_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .is_some_and(|extension| {
+            matches!(
+                extension.as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "avif"
+            )
+        })
+}
+
+fn image_content_type_from_path(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => Some("image/png"),
+        Some("jpg" | "jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        Some("bmp") => Some("image/bmp"),
+        Some("ico") => Some("image/x-icon"),
+        Some("avif") => Some("image/avif"),
+        _ => None,
+    }
 }
 
 fn load_render_graph_debug_dump(input: &str) -> io::Result<String> {
@@ -5820,14 +6106,13 @@ fn load_http_document_with_text_metrics(
     url: &str,
     text_metrics: Option<&egui::Context>,
 ) -> io::Result<BrowserDocument> {
-    let response = http_client()?.get(url).send().map_err(io::Error::other)?;
-    let final_url = response.url().to_string();
-    let response = response.error_for_status().map_err(io::Error::other)?;
-    let html = response.text().map_err(io::Error::other)?;
-
+    let source = load_url_source(url)?;
+    if source.image.is_some() {
+        return image_document_from_loaded_source(&source);
+    }
     Ok(parse_html_document_with_text_metrics(
-        &html,
-        &final_url,
+        &source.html,
+        &source.source,
         text_metrics,
     ))
 }
@@ -8357,13 +8642,16 @@ fn layout_css_box(
     let inline_visual_height =
         css_layout_inline_flow_visual_height(box_, content_width, text_metrics)
             .unwrap_or(intrinsic_height);
-    let content_height = css_resolve_used_height(
+    let mut content_height = css_resolve_used_height(
         intrinsic_height,
         &box_.style,
         containing_height,
         content_width,
     )
     .max(inline_visual_height);
+    if box_.style.height.is_none() && content_height <= 0.5 {
+        content_height = content_height.max(css_layout_visible_text_line_height(box_));
+    }
     box_.dimensions.content.max.y = box_.dimensions.content.min.y + content_height.max(0.0);
     if box_.node.is_some_and(css_layout_node_is_button) {
         center_css_button_children(box_);
@@ -8402,6 +8690,24 @@ fn css_layout_inline_flow_visual_height(
         content_width,
         text_metrics,
     ))
+}
+
+fn css_layout_visible_text_line_height(box_: &CssLayoutBox<'_>) -> f32 {
+    let own = if box_.kind == CssLayoutKind::Text
+        && box_
+            .text
+            .as_deref()
+            .is_some_and(|text| !normalize_ws(text).is_empty())
+    {
+        (box_.style.font_size * 1.35).max(1.0)
+    } else {
+        0.0
+    };
+    box_.children
+        .iter()
+        .filter(|child| !css_layout_box_is_out_of_flow(child))
+        .map(css_layout_visible_text_line_height)
+        .fold(own, f32::max)
 }
 
 fn layout_css_inline_visual_children(
@@ -8532,6 +8838,9 @@ fn css_visual_replaced_content_size(
     image_height_auto: bool,
 ) -> Option<egui::Vec2> {
     let node = box_.node?;
+    if css_layout_node_is_hidden_input(node) {
+        return Some(egui::Vec2::ZERO);
+    }
     if !css_layout_node_is_visual_replaced_content(node) {
         return None;
     }
@@ -10513,6 +10822,17 @@ fn css_layout_node_is_replaced_or_special(node: &RenderNode) -> bool {
     )
 }
 
+fn css_layout_node_is_hidden_input(node: &RenderNode) -> bool {
+    matches!(
+        &node.kind,
+        RenderNodeKind::Element(element)
+            if element.tag_name == "input"
+                && element
+                    .attr("type")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("hidden"))
+    )
+}
+
 fn css_layout_node_is_text_form_control(node: &RenderNode) -> bool {
     matches!(
         &node.kind,
@@ -10532,6 +10852,13 @@ fn estimate_special_css_box_height(
         return (node.style.font_size * 1.35).max(1.0);
     };
     match element.tag_name.as_str() {
+        "input"
+            if element
+                .attr("type")
+                .is_some_and(|value| value.eq_ignore_ascii_case("hidden")) =>
+        {
+            0.0
+        }
         "img" => match image_block_from_dom_element(element, source, image_height_auto) {
             CanvasBlock::Image { image, .. } => image.size.y,
             _ => (node.style.font_size * 3.0).max(48.0),
@@ -11581,8 +11908,12 @@ fn push_canvas_graph_element(
                 };
                 let (form_id, form_action, form_method) =
                     canvas_form_metadata_for_element(element, cursor);
-                let submit_on_enter =
-                    textarea_submits_on_enter(element, &kind, form_action.as_deref());
+                let submit_on_enter = input_submits_on_enter(
+                    element,
+                    &kind,
+                    form_id.as_deref(),
+                    form_action.as_deref(),
+                );
                 graph.objects.push(CanvasObject::Input(CanvasInputObject {
                     label,
                     name: element.attr("name").map(str::to_owned),
@@ -11790,12 +12121,21 @@ fn canvas_form_metadata_for_element(
     )
 }
 
-fn textarea_submits_on_enter(
+fn input_submits_on_enter(
     element: &DomElement,
     kind: &CanvasInputKind,
+    form_id: Option<&str>,
     form_action: Option<&str>,
 ) -> bool {
-    if !matches!(kind, CanvasInputKind::TextArea) || form_action.is_none() {
+    let has_form_owner = form_id.is_some_and(|id| !id.is_empty())
+        || form_action.is_some_and(|action| !action.is_empty());
+    if !has_form_owner {
+        return false;
+    }
+    if matches!(kind, CanvasInputKind::Text | CanvasInputKind::Password) {
+        return true;
+    }
+    if !matches!(kind, CanvasInputKind::TextArea) {
         return false;
     }
     if element
@@ -13668,21 +14008,46 @@ fn replaced_content_from_dom_element(
         .or_else(|| element.attr("src"))
         .unwrap_or("image")
         .to_owned();
+    let requested_size = requested_image_size_from_dom(element);
     let Some(src) = element.attr("src").filter(|src| !src.is_empty()) else {
-        return CanvasBlock::Media { label };
+        return unavailable_image_block(label, "missing-image", requested_size);
     };
     let resolved = resolve_resource_url(source, src);
     if !resource_allowed_for_document(source, &resolved) {
-        return CanvasBlock::Media { label };
+        return unavailable_image_block(label, resolved, requested_size);
     }
-    let requested_size = requested_image_size_from_dom(element);
     match load_image_resource(&resolved, requested_size, image_height_auto) {
         Ok(image) => CanvasBlock::Image {
             alt: element.attr("alt").unwrap_or_default().to_owned(),
             src: resolved,
             image,
         },
-        Err(_) => CanvasBlock::Media { label },
+        Err(error) => {
+            emit_global_telemetry(
+                "document.image.load.failed",
+                &[
+                    ("document", source),
+                    ("src", src),
+                    ("resolved", &resolved),
+                    ("error", &error.to_string()),
+                ],
+            );
+            unavailable_image_block(label, resolved, requested_size)
+        }
+    }
+}
+
+fn unavailable_image_block(
+    alt: String,
+    src: impl Into<String>,
+    requested_size: Option<egui::Vec2>,
+) -> CanvasBlock {
+    let size = requested_size.unwrap_or_else(|| egui::vec2(160.0, 96.0));
+    let color_image = egui::ColorImage::new([1, 1], vec![egui::Color32::from_gray(0xd0)]);
+    CanvasBlock::Image {
+        alt,
+        src: src.into(),
+        image: ImageBlock::from_color_image(PathBuf::from("unavailable-image"), size, color_image),
     }
 }
 
@@ -15008,14 +15373,14 @@ fn media_label(open_tag: &str, fallback: &str) -> String {
 
 fn image_block_from_tag(open_tag: &str, state: &ParseState) -> CanvasBlock {
     let label = media_label(open_tag, "image");
+    let requested_size = requested_image_size(open_tag);
     let Some(src) = extract_attr(open_tag, "src").filter(|src| !src.is_empty()) else {
-        return CanvasBlock::Media { label };
+        return unavailable_image_block(label, "missing-image", requested_size);
     };
     let resolved = resolve_resource_url(&state.source, &src);
     if !resource_allowed_for_document(&state.source, &resolved) {
-        return CanvasBlock::Media { label };
+        return unavailable_image_block(label, resolved, requested_size);
     }
-    let requested_size = requested_image_size(open_tag);
 
     match load_image_resource(&resolved, requested_size, state.image_height_auto) {
         Ok(image) => CanvasBlock::Image {
@@ -15023,7 +15388,18 @@ fn image_block_from_tag(open_tag: &str, state: &ParseState) -> CanvasBlock {
             src: resolved,
             image,
         },
-        Err(_) => CanvasBlock::Media { label },
+        Err(error) => {
+            emit_global_telemetry(
+                "document.image.load.failed",
+                &[
+                    ("document", &state.source),
+                    ("src", &src),
+                    ("resolved", &resolved),
+                    ("error", &error.to_string()),
+                ],
+            );
+            unavailable_image_block(label, resolved, requested_size)
+        }
     }
 }
 
@@ -15140,7 +15516,31 @@ fn load_image_resource(
     requested_size: Option<egui::Vec2>,
     preserve_aspect: bool,
 ) -> io::Result<ImageBlock> {
-    let bytes = if url.starts_with("http://") || url.starts_with("https://") {
+    let bytes = load_image_resource_bytes(url)?;
+
+    ImageBlock::from_encoded_bytes_with_aspect(
+        PathBuf::from(url),
+        bytes.as_slice(),
+        requested_size,
+        preserve_aspect,
+    )
+    .map_err(io::Error::other)
+}
+
+fn load_image_resource_bytes(url: &str) -> io::Result<Arc<Vec<u8>>> {
+    let cache = IMAGE_RESOURCE_BYTES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.get(url).cloned()
+    {
+        emit_global_telemetry(
+            "document.image.resource.cache_hit",
+            &[("url", url), ("bytes", &cached.len().to_string())],
+        );
+        return Ok(cached);
+    }
+
+    emit_global_telemetry("document.image.resource.cache_miss", &[("url", url)]);
+    let loaded = if is_remote_url(url) {
         http_client()?
             .get(url)
             .send()
@@ -15148,19 +15548,16 @@ fn load_image_resource(
             .error_for_status()
             .map_err(io::Error::other)?
             .bytes()
-            .map_err(io::Error::other)?
-            .to_vec()
+            .map(|bytes| bytes.to_vec())
+            .map_err(io::Error::other)
     } else {
-        fs::read(input_to_path(url))?
-    };
-
-    ImageBlock::from_encoded_bytes_with_aspect(
-        PathBuf::from(url),
-        &bytes,
-        requested_size,
-        preserve_aspect,
-    )
-    .map_err(io::Error::other)
+        fs::read(input_to_path(url))
+    }?;
+    let loaded = Arc::new(loaded);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(url.to_owned(), Arc::clone(&loaded));
+    }
+    Ok(loaded)
 }
 
 fn parse_table(html: &str) -> Option<CanvasBlock> {
@@ -15682,6 +16079,7 @@ static GLOBAL_TELEMETRY: OnceLock<Mutex<Option<TelemetrySink>>> = OnceLock::new(
 static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 static SCRIPT_RESOURCE_CACHE: OnceLock<Mutex<HashMap<String, Result<String, String>>>> =
     OnceLock::new();
+static IMAGE_RESOURCE_BYTES_CACHE: OnceLock<Mutex<HashMap<String, Arc<Vec<u8>>>>> = OnceLock::new();
 static DEBUG_SERVER: OnceLock<DebugServer> = OnceLock::new();
 
 pub const DEBUG_PORT: u16 = 9876;
@@ -17082,9 +17480,82 @@ mod tests {
             .expect("expected form submit button");
 
         assert_eq!(input.form_id.as_deref(), Some("search-form"));
+        assert!(input.submit_on_enter);
         assert_eq!(button.form_id.as_deref(), Some("search-form"));
         assert_eq!(button.button_type, "submit");
         assert_eq!(button.form_method.as_deref(), Some("get"));
+    }
+
+    #[test]
+    fn hidden_form_controls_do_not_overlap_visible_search_controls() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <body>
+                <form id="searchform" action="/w/index.php" method="get">
+                  <input id="searchInput" name="search" aria-label="Cerca in Wikipedia" style="width: 220px">
+                  <input type="hidden" name="title" value="Speciale:Ricerca">
+                  <button type="submit" style="width: 72px">Ricerca</button>
+                </form>
+              </body>
+            </html>
+            "##,
+            "https://it.wikipedia.org/wiki/Hello_world",
+        );
+
+        let input = canvas_input_by_element_id(&document.canvas_graph, "searchInput")
+            .expect("expected visible search input");
+        let hidden = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Input(input) if input.name.as_deref() == Some("title") => Some(input),
+                _ => None,
+            })
+            .expect("expected hidden form input");
+        let button = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Button(button) if button.text == "Ricerca" => Some(button),
+                _ => None,
+            })
+            .expect("expected submit button");
+
+        assert_eq!(hidden.rect.size(), egui::Vec2::ZERO);
+        assert!(input.submit_on_enter);
+        assert!(
+            button.rect.left().max(input.rect.left())
+                >= button.rect.right().min(input.rect.right())
+                || button.rect.top().max(input.rect.top())
+                    >= button.rect.bottom().min(input.rect.bottom()),
+            "submit button should not cover the visible search input: input={:?} button={:?}",
+            input.rect,
+            button.rect
+        );
+    }
+
+    #[test]
+    fn direct_image_document_renders_single_image_object() {
+        let bytes = include_bytes!("../../panels_fig/sample_image.png");
+        let source = "https://upload.wikimedia.org/example/sample.png";
+        let document = image_document_from_bytes(source, bytes, "image/png")
+            .expect("expected direct image document");
+
+        assert_eq!(document.source, source);
+        assert_eq!(document.blocks.len(), 1);
+        assert_eq!(document.canvas_graph.objects.len(), 1);
+        match &document.canvas_graph.objects[0] {
+            CanvasObject::Image(image) => {
+                assert_eq!(image.src, source);
+                assert!(image.image.size.x > 0.0);
+                assert!(image.image.size.y > 0.0);
+                assert_eq!(document.canvas_graph.viewport, image.image.size);
+            }
+            other => panic!("expected direct image object, got {other:?}"),
+        }
     }
 
     #[test]
@@ -17894,6 +18365,86 @@ mod tests {
         let snippet = find_canvas_text(
             &document.canvas_graph,
             "Corso di lingua inglese per la Scuola Primaria.",
+        )
+        .expect("snippet");
+
+        assert!(
+            snippet.rect.top() >= title.rect.bottom(),
+            "snippet overlapped title: title={:?} snippet={:?}",
+            title.rect,
+            snippet.rect
+        );
+    }
+
+    #[test]
+    fn ecosia_result_header_reserves_flex_title_height_before_snippet() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { margin: 0; padding: 0; }
+                  .mainline__result { display: flex; width: 630px; padding: 12px; }
+                  .result__body { display: flex; flex-flow: column nowrap; min-width: 0; width: 760px; }
+                  .result__header { display: block; padding: 4px; }
+                  .result__info { display: flex; min-width: 0; }
+                  .result-info__link { display: inline; max-width: 100%; overflow: hidden; color: #333333; }
+                  .result-source { display: block; max-width: 100%; overflow: hidden; font-size: 12px; }
+                  .result__title { display: flex; position: relative; width: 760px; overflow: hidden; }
+                  .result__link { display: inline; max-width: 100%; overflow: hidden; color: #1a0dab; }
+                  .result-title__heading {
+                    display: block;
+                    max-width: 100%;
+                    overflow: hidden;
+                    font-size: 20px;
+                    margin: 0;
+                  }
+                  .result__columns { display: flex; padding-left: 4px; padding-right: 4px; }
+                  .result__columns-start { display: block; min-width: 0; }
+                  .result__description { display: flex; }
+                  .web-result__description {
+                    display: block;
+                    overflow: hidden;
+                    font-size: 14px;
+                    margin: 0;
+                  }
+                </style>
+              </head>
+              <body>
+                <article class="mainline__result">
+                  <div class="result__body">
+                    <div class="result__header">
+                      <div class="result__info">
+                        <a href="https://it.wikipedia.org/wiki/Hello_world" class="result-info__link">
+                          <div class="result-source">https://it.wikipedia.org › wiki › Hello_world</div>
+                        </a>
+                      </div>
+                      <div class="result__title">
+                        <a href="https://it.wikipedia.org/wiki/Hello_world" class="result__link">
+                          <h2 class="result-title__heading">Hello world - Wikipedia</h2>
+                        </a>
+                      </div>
+                    </div>
+                    <div class="result__columns">
+                      <div class="result__columns-start">
+                        <div class="result__description">
+                          <p class="web-result__description">In informatica Hello world is a simple program.</p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </article>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let title =
+            find_canvas_text(&document.canvas_graph, "Hello world - Wikipedia").expect("title");
+        let snippet = find_canvas_text(
+            &document.canvas_graph,
+            "In informatica Hello world is a simple program.",
         )
         .expect("snippet");
 
@@ -18903,6 +19454,51 @@ mod tests {
         assert!((overlay.rect.width() - 240.0).abs() <= 1.0);
         assert!((overlay.rect.left() - 520.0).abs() <= 1.0);
         assert!((overlay.rect.top() - 96.0).abs() <= 1.0);
+    }
+
+    #[test]
+    fn color_layout_inline_block_result_fixtures_do_not_overlap() {
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../color_layout_test");
+        let cases = [
+            (
+                "101_flex_flow_column_inline_block_title.html",
+                "Hello world - Wikipedia",
+                "Snippet must start below the green title block, never overlap it.",
+            ),
+            (
+                "102_ecosia_result_nested_columns_overlap.html",
+                "Hello world - Wikipedia",
+                "In informatica Hello world! should sit below the title band.",
+            ),
+            (
+                "103_result_stack_multiple_inline_block_anchors.html",
+                "Alpha result with inline anchor and block heading",
+                "Alpha summary should occupy the yellow band below the pink heading.",
+            ),
+            (
+                "103_result_stack_multiple_inline_block_anchors.html",
+                "Beta result uses the same collapsing wrapper structure",
+                "Beta summary should not be painted inside the headline row.",
+            ),
+        ];
+
+        for (fixture_name, title_text, snippet_text) in cases {
+            let fixture = fixture_dir.join(fixture_name);
+            let html = fs::read_to_string(&fixture)
+                .unwrap_or_else(|error| panic!("failed to read {}: {error}", fixture.display()));
+            let document = parse_html_document(&html, &path_to_file_url(&fixture));
+            let title = find_canvas_text(&document.canvas_graph, title_text)
+                .unwrap_or_else(|| panic!("missing title in {fixture_name}: {title_text}"));
+            let snippet = find_canvas_text(&document.canvas_graph, snippet_text)
+                .unwrap_or_else(|| panic!("missing snippet in {fixture_name}: {snippet_text}"));
+
+            assert!(
+                snippet.rect.top() >= title.rect.bottom(),
+                "{fixture_name} overlapped: title={:?} snippet={:?}",
+                title.rect,
+                snippet.rect
+            );
+        }
     }
 
     #[test]
@@ -21262,6 +21858,40 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
     }
 
     #[test]
+    fn wikipedia_protocol_relative_embedded_png_uses_resolved_resource_bytes() {
+        let resolved = "https://upload.wikimedia.org/wikipedia/commons/thumb/5/54/Hello_World_Perl_GTk2.png/250px-Hello_World_Perl_GTk2.png";
+        let cache = IMAGE_RESOURCE_BYTES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        cache.lock().expect("image cache lock").insert(
+            resolved.to_owned(),
+            Arc::new(include_bytes!("../../panels_fig/sample_image.png").to_vec()),
+        );
+        let html = r#"
+            <html>
+              <body>
+                <img
+                  class="mw-file-element"
+                  src="//upload.wikimedia.org/wikipedia/commons/thumb/5/54/Hello_World_Perl_GTk2.png/250px-Hello_World_Perl_GTk2.png"
+                  alt="Hello World Perl GTK2"
+                  width="250"
+                  height="224">
+              </body>
+            </html>
+        "#;
+        let document = parse_html_document(html, "https://it.wikipedia.org/wiki/Hello_world");
+
+        assert!(contains_block(&document.blocks, |block| matches!(
+            block,
+            CanvasBlock::Image { alt, src, image }
+                if alt == "Hello World Perl GTK2"
+                    && src == resolved
+                    && image.size == egui::vec2(250.0, 224.0)
+                    && image.color_image.size[0] > 1
+                    && image.color_image.size[1] > 1
+                    && image.path != PathBuf::from("unavailable-image")
+        )));
+    }
+
+    #[test]
     fn linked_inline_image_inside_block_gets_used_position() {
         let html = r#"
             <html>
@@ -21617,6 +22247,11 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
             rich_canvas::BrowserStyle::default().body_font_size
         );
         assert!(contains_block(&document.blocks, |block| matches!(
+            block,
+            CanvasBlock::Image { alt, image, .. }
+                if alt == "remote image" && image.size == egui::vec2(160.0, 96.0)
+        )));
+        assert!(!contains_block(&document.blocks, |block| matches!(
             block,
             CanvasBlock::Media { label } if label == "remote image"
         )));
