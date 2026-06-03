@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>105 - Search Fixture Inline Size Centering</title>
+<style>
+:root { --page: #f7f8fa; --line: rgba(20,30,40,.18); --blue: #4dabf7; --green: #51cf66; --cyan: #22b8cf; --muted: #5c6670; }
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body { font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: var(--page); color: #17212b; }
+.box { min-height: 72px; border: 1px solid var(--line); display: grid; place-items: center; padding: 10px; font-size: 13px; font-weight: 700; color: rgba(0,0,0,.74); text-align: center; }
+.label { position: fixed; right: 12px; bottom: 12px; padding: 6px 8px; background: rgba(255,255,255,.88); border: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+.app-content { inline-size: calc(100vw - 32px); max-inline-size: 960px; margin-inline: auto; margin-block-start: 24px; display: grid; gap: 16px; }
+.header { background: var(--blue); min-height: 88px; }
+.fixture-main { background: var(--green); min-height: 220px; }
+.footer { background: var(--cyan); min-height: 64px; }
+</style>
+</head>
+<body>
+<main class="app-content">
+  <header class="box header">inline-size plus max-inline-size</header>
+  <section class="box fixture-main">centered app content</section>
+  <footer class="box footer">footer line</footer>
+</main>
+<div class="label">105 - inline-size centering</div>
+</body>
+</html>

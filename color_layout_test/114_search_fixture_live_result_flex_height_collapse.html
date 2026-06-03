@@ -1,0 +1,176 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>114 Search Fixture live result flex height collapse</title>
+<style>
+html, body {
+  margin: 0;
+  padding: 0;
+  font-family: Arial, sans-serif;
+  background: #eef3f6;
+}
+.page {
+  width: 1280px;
+  min-height: 720px;
+  background: #f5f7fa;
+  padding: 32px 20px;
+}
+.layout {
+  display: flex;
+  flex-direction: column;
+  min-height: 620px;
+  background: #ffffff;
+  overflow: hidden;
+}
+.web {
+  display: grid;
+  grid-template-columns: 120px 654px 36px 320px;
+  grid-template-areas: "left main gap side";
+  padding-top: 4px;
+  background: #d7edf8;
+}
+.web__fixture-main {
+  grid-area: main;
+  display: flex;
+  flex-direction: column;
+  background: #b8e2ff;
+}
+.fixture_main__content {
+  display: block;
+  max-width: 654px;
+  background: #cae5b8;
+}
+.fixture_main__result-wrapper {
+  display: block;
+  background: #ffffff;
+}
+.fixture_main__result {
+  display: flex;
+  position: relative;
+  width: auto;
+  margin: 0 0 8px 0;
+  padding: 12px;
+  background: #ffc7c2;
+}
+.sample_item__body {
+  display: flex;
+  flex-flow: column nowrap;
+  min-width: 0;
+  width: 760px;
+  background: #fbe5a6;
+}
+.sample_item__header {
+  display: block;
+  padding: 4px;
+  background: #c7e8b4;
+}
+.sample_item__info {
+  display: flex;
+  min-width: 0;
+  background: #a9d6e5;
+}
+.fixture-source__link {
+  display: inline;
+  max-width: 100%;
+  overflow: hidden;
+  color: #333333;
+}
+.fixture-source-line {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  font-size: 12px;
+  line-height: 1.35;
+  background: #d2c6ff;
+}
+.sample_item__title {
+  display: flex;
+  position: relative;
+  width: 760px;
+  overflow: hidden;
+  background: #82cfd0;
+}
+.sample_item__link {
+  display: inline;
+  max-width: 100%;
+  overflow: hidden;
+  color: #1a0dab;
+}
+.fixture-title__heading {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  font-size: 20px;
+  line-height: 1.35;
+  margin: 0;
+  background: #91d18b;
+}
+.sample_item__columns {
+  display: flex;
+  padding-left: 4px;
+  padding-right: 4px;
+  background: #f3aac1;
+}
+.sample_item__columns-start {
+  display: block;
+  min-width: 0;
+  background: #ffdd75;
+}
+.sample_item__description {
+  display: flex;
+  background: #cbb6ff;
+}
+.fixture_snippet__description {
+  display: block;
+  overflow: hidden;
+  font-size: 14px;
+  line-height: 1.35;
+  margin: 0;
+  background: #ffffff;
+}
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="layout">
+    <main class="layout__content">
+      <div class="web">
+        <section class="fixture-main web__fixture-main" data-fixture-id="fixture-main">
+          <div class="fixture_main__content">
+            <div>
+              <div class="fixture_main__result-wrapper" data-fixture-id="fixture-main-result-web">
+                <article class="result fixture-snippet fixture_main__result" data-fixture-id="fixture-item">
+                  <div class="sample_item__body">
+                    <div class="sample_item__header">
+                      <div class="sample_item__info">
+                        <a class="fixture-source__link" href="https://example.test/reference/example">
+                          <div class="fixture-source-line">Reference Article https://example.test › wiki › Example_topic</div>
+                        </a>
+                      </div>
+                      <div class="sample_item__title">
+                        <a class="sample_item__link" href="https://example.test/reference/example">
+                          <h2 class="fixture-title__heading">Example topic - Reference Article live collapse target</h2>
+                        </a>
+                      </div>
+                    </div>
+                    <div class="sample_item__columns">
+                      <div class="sample_item__columns-start">
+                        <div class="sample_item__description">
+                          <p class="fixture_snippet__description">Live Search Fixture snippet line stays below the heading and keeps a real line box.</p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </article>
+              </div>
+            </div>
+          </div>
+        </section>
+        <aside class="web__sidebar"></aside>
+      </div>
+    </main>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>107 - Search Fixture Result Grid Logical Gutters</title>
+<style>
+:root { --page: #f7f8fa; --line: rgba(20,30,40,.18); --blue: #4dabf7; --green: #51cf66; --cyan: #22b8cf; --yellow: #ffd43b; --muted: #5c6670; --left-gutter: 96px; --main: 680px; --side: 260px; --gap: 24px; }
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body { font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: var(--page); color: #17212b; }
+.box { min-height: 72px; border: 1px solid var(--line); display: grid; place-items: center; padding: 10px; font-size: 13px; font-weight: 700; color: rgba(0,0,0,.74); text-align: center; }
+.label { position: fixed; right: 12px; bottom: 12px; padding: 6px 8px; background: rgba(255,255,255,.88); border: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+.search-page { display: grid; gap: 12px; margin-block-start: 24px; margin-inline: auto; inline-size: calc(var(--left-gutter) + var(--main) + var(--gap) + var(--side)); }
+.tabs { margin-inline-start: var(--left-gutter); inline-size: calc(var(--main) + var(--gap) + var(--side)); background: var(--blue); min-height: 64px; }
+.body-grid { display: grid; grid-template-columns: var(--left-gutter) minmax(0, var(--main)) var(--gap) minmax(0, var(--side)); }
+.gutter { min-height: 212px; }
+.gap-marker { min-height: 212px; }
+.results { display: grid; gap: 12px; }
+.result { background: var(--green); min-height: 100px; }
+.rail { background: var(--yellow); min-height: 212px; }
+.bottom { margin-inline-start: var(--left-gutter); inline-size: calc(var(--main) + var(--gap) + var(--side)); background: var(--cyan); min-height: 72px; }
+</style>
+</head>
+<body>
+<main class="search-page">
+  <nav class="box tabs">tabs should not start at the viewport edge</nav>
+  <div class="body-grid">
+    <div class="gutter"></div>
+    <section class="results"><article class="box result">result one</article><article class="box result">result two</article></section>
+    <div class="gap-marker"></div>
+    <aside class="box rail">knowledge rail</aside>
+  </div>
+  <section class="box bottom">related row</section>
+</main>
+<div class="label">107 - logical result grid gutters</div>
+</body>
+</html>

@@ -12,3 +12,4 @@ reqwest.workspace = true
 rich_canvas = { path = "../rich_canvas" }
 justbarelyscript = { path = "../JustBarelyScript" }
 tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
+winit.workspace = true

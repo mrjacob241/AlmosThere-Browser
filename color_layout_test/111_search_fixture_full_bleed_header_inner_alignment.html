@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>111 - Search Fixture Full Bleed Header Inner Alignment</title>
+<style>
+:root { --page: #f7f8fa; --line: rgba(20,30,40,.18); --blue: #4dabf7; --green: #51cf66; --yellow: #ffd43b; --cyan: #22b8cf; --muted: #5c6670; }
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body { font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: var(--page); color: #17212b; }
+.box { min-height: 64px; border: 1px solid var(--line); display: grid; place-items: center; padding: 10px; font-size: 13px; font-weight: 700; color: rgba(0,0,0,.74); text-align: center; }
+.label { position: fixed; right: 12px; bottom: 12px; padding: 6px 8px; background: rgba(255,255,255,.88); border: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+.topbar { background: #e8f5ec; padding-block: 16px; }
+.topbar-inner { inline-size: min(960px, calc(100vw - 32px)); margin-inline: auto; display: grid; grid-template-columns: 120px minmax(0, 1fr) 120px; gap: 12px; }
+.logo { background: var(--blue); }
+.search { background: var(--green); }
+.tools { background: var(--yellow); }
+.results { inline-size: min(960px, calc(100vw - 32px)); margin-inline: auto; margin-block-start: 20px; display: grid; gap: 12px; }
+.result { background: var(--cyan); min-height: 120px; }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="box logo">logo</div>
+    <div class="box search">search</div>
+    <div class="box tools">tools</div>
+  </div>
+</header>
+<main class="results">
+  <article class="box result">header inner and results should share the same left edge</article>
+  <article class="box result">second result</article>
+</main>
+<div class="label">111 - full bleed header inner alignment</div>
+</body>
+</html>

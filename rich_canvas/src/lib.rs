@@ -212,12 +212,17 @@ pub struct CssBoxStyle {
     pub flex_wrap: Option<CssFlexWrap>,
     pub justify_content: Option<CssJustifyContent>,
     pub align_items: Option<CssAlignItems>,
+    pub justify_items: Option<CssJustifyContent>,
+    pub align_content: Option<CssAlignItems>,
     pub grid_template_columns: Option<usize>,
     pub grid_template_column_tracks: Option<Vec<CssLength>>,
     pub grid_auto_repeat_min_column_width: Option<CssLength>,
     pub grid_template_rows: Option<Vec<CssLength>>,
+    pub grid_auto_rows: Option<CssLength>,
     pub grid_template_areas: Option<Vec<Vec<String>>>,
     pub grid_area: Option<String>,
+    pub grid_column_span: Option<usize>,
+    pub grid_row_span: Option<usize>,
     pub gap: Option<f32>,
     pub visibility_visible: Option<bool>,
     pub opacity: Option<f32>,
@@ -264,12 +269,17 @@ pub struct ResolvedBoxStyle {
     pub flex_wrap: CssFlexWrap,
     pub justify_content: CssJustifyContent,
     pub align_items: CssAlignItems,
+    pub justify_items: CssJustifyContent,
+    pub align_content: CssAlignItems,
     pub grid_template_columns: Option<usize>,
     pub grid_template_column_tracks: Option<Vec<CssLength>>,
     pub grid_auto_repeat_min_column_width: Option<CssLength>,
     pub grid_template_rows: Option<Vec<CssLength>>,
+    pub grid_auto_rows: Option<CssLength>,
     pub grid_template_areas: Option<Vec<Vec<String>>>,
     pub grid_area: Option<String>,
+    pub grid_column_span: usize,
+    pub grid_row_span: usize,
     pub gap: f32,
     pub visibility_visible: bool,
     pub opacity: f32,
@@ -317,12 +327,17 @@ impl Default for ResolvedBoxStyle {
             flex_wrap: CssFlexWrap::NoWrap,
             justify_content: CssJustifyContent::FlexStart,
             align_items: CssAlignItems::Stretch,
+            justify_items: CssJustifyContent::FlexStart,
+            align_content: CssAlignItems::Stretch,
             grid_template_columns: None,
             grid_template_column_tracks: None,
             grid_auto_repeat_min_column_width: None,
             grid_template_rows: None,
+            grid_auto_rows: None,
             grid_template_areas: None,
             grid_area: None,
+            grid_column_span: 1,
+            grid_row_span: 1,
             gap: 0.0,
             visibility_visible: true,
             opacity: 1.0,
@@ -4592,6 +4607,12 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
     if source.align_items.is_some() {
         target.align_items = source.align_items;
     }
+    if source.justify_items.is_some() {
+        target.justify_items = source.justify_items;
+    }
+    if source.align_content.is_some() {
+        target.align_content = source.align_content;
+    }
     if source.grid_template_columns.is_some() {
         target.grid_template_columns = source.grid_template_columns;
     }
@@ -4604,11 +4625,20 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
     if source.grid_template_rows.is_some() {
         target.grid_template_rows = source.grid_template_rows.clone();
     }
+    if source.grid_auto_rows.is_some() {
+        target.grid_auto_rows = source.grid_auto_rows;
+    }
     if source.grid_template_areas.is_some() {
         target.grid_template_areas = source.grid_template_areas.clone();
     }
     if source.grid_area.is_some() {
         target.grid_area = source.grid_area.clone();
+    }
+    if source.grid_column_span.is_some() {
+        target.grid_column_span = Some(source.grid_column_span.unwrap_or(1).max(1));
+    }
+    if source.grid_row_span.is_some() {
+        target.grid_row_span = Some(source.grid_row_span.unwrap_or(1).max(1));
     }
     if source.gap.is_some() {
         target.gap = source.gap;
@@ -5251,6 +5281,36 @@ fn parse_css_box_style_with_vars(
                     seen = true;
                 }
             }
+            "margin-inline" => {
+                if apply_logical_margin_pair(value, true, &mut style) {
+                    seen = true;
+                }
+            }
+            "margin-block" => {
+                if apply_logical_margin_pair(value, false, &mut style) {
+                    seen = true;
+                }
+            }
+            "margin-inline-start" => {
+                if apply_logical_margin_side(value, "left", &mut style) {
+                    seen = true;
+                }
+            }
+            "margin-inline-end" => {
+                if apply_logical_margin_side(value, "right", &mut style) {
+                    seen = true;
+                }
+            }
+            "margin-block-start" => {
+                if apply_logical_margin_side(value, "top", &mut style) {
+                    seen = true;
+                }
+            }
+            "margin-block-end" => {
+                if apply_logical_margin_side(value, "bottom", &mut style) {
+                    seen = true;
+                }
+            }
             "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
                 if value.eq_ignore_ascii_case("auto") {
                     match property {
@@ -5300,8 +5360,42 @@ fn parse_css_box_style_with_vars(
                 style.padding = parse_edges(value);
                 seen |= style.padding.is_some();
             }
+            "padding-inline" => {
+                if apply_logical_padding_pair(value, true, viewport_width, &mut style) {
+                    seen = true;
+                }
+            }
+            "padding-block" => {
+                if apply_logical_padding_pair(value, false, viewport_width, &mut style) {
+                    seen = true;
+                }
+            }
+            "padding-inline-start" => {
+                if let Some(px) = parse_spacing_px(value, viewport_width) {
+                    style.padding_left = Some(px);
+                    seen = true;
+                }
+            }
+            "padding-inline-end" => {
+                if let Some(px) = parse_spacing_px(value, viewport_width) {
+                    style.padding_right = Some(px);
+                    seen = true;
+                }
+            }
+            "padding-block-start" => {
+                if let Some(px) = parse_spacing_px(value, viewport_width) {
+                    style.padding_top = Some(px);
+                    seen = true;
+                }
+            }
+            "padding-block-end" => {
+                if let Some(px) = parse_spacing_px(value, viewport_width) {
+                    style.padding_bottom = Some(px);
+                    seen = true;
+                }
+            }
             "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => {
-                if let Some(px) = parse_px(value) {
+                if let Some(px) = parse_spacing_px(value, viewport_width) {
                     match property {
                         "padding-top" => style.padding_top = Some(px),
                         "padding-right" => style.padding_right = Some(px),
@@ -5332,23 +5426,23 @@ fn parse_css_box_style_with_vars(
                     parse_px(value).map(|px| px.round().clamp(0.0, u8::MAX as f32) as u8);
                 seen |= style.border_radius.is_some();
             }
-            "width" => {
+            "width" | "inline-size" => {
                 style.width = parse_css_length(value);
                 seen |= style.width.is_some();
             }
-            "max-width" => {
+            "max-width" | "max-inline-size" => {
                 style.max_width = parse_css_length(value);
                 seen |= style.max_width.is_some();
             }
-            "min-width" => {
+            "min-width" | "min-inline-size" => {
                 style.min_width = parse_css_length(value);
                 seen |= style.min_width.is_some();
             }
-            "height" => {
+            "height" | "block-size" => {
                 style.height = parse_css_length(value);
                 seen |= style.height.is_some();
             }
-            "min-height" => {
+            "min-height" | "min-block-size" => {
                 style.min_height = parse_css_length(value);
                 seen |= style.min_height.is_some();
             }
@@ -5446,6 +5540,26 @@ fn parse_css_box_style_with_vars(
                 };
                 seen |= style.align_items.is_some();
             }
+            "justify-items" => {
+                style.justify_items = match value {
+                    "center" => Some(CssJustifyContent::Center),
+                    "start" | "flex-start" | "left" | "normal" => {
+                        Some(CssJustifyContent::FlexStart)
+                    }
+                    "stretch" => Some(CssJustifyContent::FlexStart),
+                    _ => None,
+                };
+                seen |= style.justify_items.is_some();
+            }
+            "align-content" => {
+                style.align_content = match value {
+                    "center" => Some(CssAlignItems::Center),
+                    "start" | "flex-start" | "normal" => Some(CssAlignItems::FlexStart),
+                    "stretch" => Some(CssAlignItems::Stretch),
+                    _ => None,
+                };
+                seen |= style.align_content.is_some();
+            }
             "place-items" => {
                 let values = split_css_value_list(value);
                 if values
@@ -5453,7 +5567,7 @@ fn parse_css_box_style_with_vars(
                     .any(|value| value.trim().eq_ignore_ascii_case("center"))
                 {
                     style.align_items = Some(CssAlignItems::Center);
-                    style.justify_content = Some(CssJustifyContent::Center);
+                    style.justify_items = Some(CssJustifyContent::Center);
                     seen = true;
                 }
             }
@@ -5470,6 +5584,10 @@ fn parse_css_box_style_with_vars(
                 style.grid_template_rows = parse_grid_template_rows(value);
                 seen |= style.grid_template_rows.is_some();
             }
+            "grid-auto-rows" => {
+                style.grid_auto_rows = parse_grid_auto_rows(value);
+                seen |= style.grid_auto_rows.is_some();
+            }
             "grid-template-areas" => {
                 style.grid_template_areas = parse_grid_template_areas(value);
                 seen |= style.grid_template_areas.is_some();
@@ -5478,14 +5596,24 @@ fn parse_css_box_style_with_vars(
                 style.grid_area = parse_grid_area(value);
                 seen |= style.grid_area.is_some();
             }
+            "grid-column" | "grid-column-end" => {
+                style.grid_column_span = parse_grid_line_span(value);
+                seen |= style.grid_column_span.is_some();
+            }
+            "grid-row" | "grid-row-end" => {
+                style.grid_row_span = parse_grid_line_span(value);
+                seen |= style.grid_row_span.is_some();
+            }
             "grid-template" => {
                 style.grid_template_rows = parse_grid_template_shorthand_rows(value);
+                style.grid_template_areas = parse_grid_template_shorthand_areas(value);
                 style.grid_template_columns = parse_grid_template_shorthand_columns(value);
                 style.grid_template_column_tracks =
                     parse_grid_template_shorthand_column_tracks(value);
                 style.grid_auto_repeat_min_column_width =
                     parse_grid_template_shorthand_auto_repeat_min_column_width(value);
                 seen |= style.grid_template_rows.is_some()
+                    || style.grid_template_areas.is_some()
                     || style.grid_template_columns.is_some()
                     || style.grid_template_column_tracks.is_some()
                     || style.grid_auto_repeat_min_column_width.is_some();
@@ -5539,6 +5667,36 @@ fn parse_css_box_style_with_vars(
                     seen = true;
                 }
             }
+            "inset-inline" => {
+                if apply_logical_inset_pair(value, true, viewport_width, &mut style) {
+                    seen = true;
+                }
+            }
+            "inset-block" => {
+                if apply_logical_inset_pair(value, false, viewport_width, &mut style) {
+                    seen = true;
+                }
+            }
+            "inset-inline-start" => {
+                if apply_logical_inset_side(value, "left", viewport_width, &mut style) {
+                    seen = true;
+                }
+            }
+            "inset-inline-end" => {
+                if apply_logical_inset_side(value, "right", viewport_width, &mut style) {
+                    seen = true;
+                }
+            }
+            "inset-block-start" => {
+                if apply_logical_inset_side(value, "top", viewport_width, &mut style) {
+                    seen = true;
+                }
+            }
+            "inset-block-end" => {
+                if apply_logical_inset_side(value, "bottom", viewport_width, &mut style) {
+                    seen = true;
+                }
+            }
             "top" | "right" | "bottom" | "left" => {
                 let mut edges = style.inset.unwrap_or_default();
                 if let Some(px) = parse_inset_value(value, viewport_width) {
@@ -5574,6 +5732,128 @@ fn parse_css_box_style_with_vars(
     }
 
     seen.then_some(style)
+}
+
+fn apply_logical_margin_pair(value: &str, inline_axis: bool, style: &mut CssBoxStyle) -> bool {
+    let values = split_css_value_list(value);
+    let (start, end) = match values.as_slice() {
+        [both] => (both.as_str(), both.as_str()),
+        [start, end, ..] => (start.as_str(), end.as_str()),
+        _ => return false,
+    };
+    if inline_axis {
+        apply_logical_margin_side(start, "left", style)
+            & apply_logical_margin_side(end, "right", style)
+    } else {
+        apply_logical_margin_side(start, "top", style)
+            & apply_logical_margin_side(end, "bottom", style)
+    }
+}
+
+fn apply_logical_margin_side(value: &str, side: &str, style: &mut CssBoxStyle) -> bool {
+    let value = value.trim();
+    let (px, auto) = if value.eq_ignore_ascii_case("auto") {
+        (0.0, true)
+    } else if let Some(px) = parse_px(value) {
+        (px, false)
+    } else {
+        return false;
+    };
+    match side {
+        "top" => {
+            style.margin_top = Some(px);
+            style.margin_auto.top = Some(auto);
+        }
+        "right" => {
+            style.margin_right = Some(px);
+            style.margin_auto.right = Some(auto);
+        }
+        "bottom" => {
+            style.margin_bottom = Some(px);
+            style.margin_auto.bottom = Some(auto);
+        }
+        "left" => {
+            style.margin_left = Some(px);
+            style.margin_auto.left = Some(auto);
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn apply_logical_padding_pair(
+    value: &str,
+    inline_axis: bool,
+    viewport_width: Option<f32>,
+    style: &mut CssBoxStyle,
+) -> bool {
+    let values = split_css_value_list(value);
+    let (start, end) = match values.as_slice() {
+        [both] => (both.as_str(), both.as_str()),
+        [start, end, ..] => (start.as_str(), end.as_str()),
+        _ => return false,
+    };
+    let Some(start_px) = parse_spacing_px(start, viewport_width) else {
+        return false;
+    };
+    let Some(end_px) = parse_spacing_px(end, viewport_width) else {
+        return false;
+    };
+    if inline_axis {
+        style.padding_left = Some(start_px);
+        style.padding_right = Some(end_px);
+    } else {
+        style.padding_top = Some(start_px);
+        style.padding_bottom = Some(end_px);
+    }
+    true
+}
+
+fn parse_spacing_px(value: &str, viewport_width: Option<f32>) -> Option<f32> {
+    parse_px(value).or_else(|| {
+        parse_css_length(value)
+            .map(|length| css_length_px(length, viewport_width.unwrap_or(1280.0)))
+    })
+}
+
+fn apply_logical_inset_pair(
+    value: &str,
+    inline_axis: bool,
+    viewport_width: Option<f32>,
+    style: &mut CssBoxStyle,
+) -> bool {
+    let values = split_css_value_list(value);
+    let (start, end) = match values.as_slice() {
+        [both] => (both.as_str(), both.as_str()),
+        [start, end, ..] => (start.as_str(), end.as_str()),
+        _ => return false,
+    };
+    if inline_axis {
+        apply_logical_inset_side(start, "left", viewport_width, style)
+            & apply_logical_inset_side(end, "right", viewport_width, style)
+    } else {
+        apply_logical_inset_side(start, "top", viewport_width, style)
+            & apply_logical_inset_side(end, "bottom", viewport_width, style)
+    }
+}
+
+fn apply_logical_inset_side(
+    value: &str,
+    side: &str,
+    viewport_width: Option<f32>,
+    style: &mut CssBoxStyle,
+) -> bool {
+    if value.trim().eq_ignore_ascii_case("auto") {
+        return true;
+    }
+    let Some(px) = parse_inset_value(value, viewport_width) else {
+        return false;
+    };
+    let mut edges = style.inset.unwrap_or_default();
+    set_edge(&mut edges, side, px);
+    set_inset_side(&mut style.inset_sides, side, px);
+    style.inset = Some(edges);
+    true
 }
 
 fn css_variables_for_declarations<'a>(
@@ -5786,6 +6066,23 @@ fn parse_grid_template_rows(value: &str) -> Option<Vec<CssLength>> {
     (!rows.is_empty()).then_some(rows)
 }
 
+fn parse_grid_auto_rows(value: &str) -> Option<CssLength> {
+    split_css_value_list(value)
+        .into_iter()
+        .find_map(|token| parse_grid_template_track_size(&token))
+}
+
+fn parse_grid_line_span(value: &str) -> Option<usize> {
+    let tokens = split_css_value_list(value);
+    tokens.iter().enumerate().find_map(|(index, token)| {
+        token
+            .eq_ignore_ascii_case("span")
+            .then(|| tokens.get(index + 1)?.trim().parse::<usize>().ok())
+            .flatten()
+            .filter(|span| *span > 0)
+    })
+}
+
 fn parse_grid_template_shorthand_columns(value: &str) -> Option<usize> {
     let (_, columns) = value.rsplit_once('/')?;
     parse_grid_template_columns(columns)
@@ -5802,6 +6099,9 @@ fn parse_grid_template_shorthand_auto_repeat_min_column_width(value: &str) -> Op
 }
 
 fn parse_grid_template_shorthand_rows(value: &str) -> Option<Vec<CssLength>> {
+    if let Some((_, rows)) = parse_grid_template_shorthand_area_rows(value) {
+        return Some(rows);
+    }
     let (rows, _) = value.rsplit_once('/')?;
     let row_tracks = rows
         .lines()
@@ -5815,6 +6115,59 @@ fn parse_grid_template_shorthand_rows(value: &str) -> Option<Vec<CssLength>> {
         .flatten()
         .collect::<Vec<_>>();
     (!row_tracks.is_empty()).then_some(row_tracks)
+}
+
+fn parse_grid_template_shorthand_areas(value: &str) -> Option<Vec<Vec<String>>> {
+    parse_grid_template_shorthand_area_rows(value).map(|(areas, _)| areas)
+}
+
+fn parse_grid_template_shorthand_area_rows(
+    value: &str,
+) -> Option<(Vec<Vec<String>>, Vec<CssLength>)> {
+    let (rows, _) = value.rsplit_once('/')?;
+    let mut areas = Vec::new();
+    let mut row_tracks = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some((start, quote)) = find_next_css_quote(rows, cursor) {
+        let after_start = start + quote.len_utf8();
+        let Some(relative_end) = rows[after_start..].find(quote) else {
+            break;
+        };
+        let end = after_start + relative_end;
+        let area_row = rows[after_start..end]
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let has_area_row = !area_row.is_empty();
+        if has_area_row {
+            areas.push(area_row);
+        }
+
+        let after_end = end + quote.len_utf8();
+        let next_quote = find_next_css_quote(rows, after_end)
+            .map(|(index, _)| index)
+            .unwrap_or(rows.len());
+        let track_text = rows[after_end..next_quote].trim();
+        if let Some(tracks) = parse_grid_template_rows(track_text) {
+            row_tracks.extend(tracks);
+        } else if has_area_row {
+            row_tracks.push(CssLength::Auto);
+        }
+        cursor = next_quote;
+    }
+
+    if areas.is_empty() {
+        return None;
+    }
+    Some((areas, row_tracks))
+}
+
+fn find_next_css_quote(value: &str, start: usize) -> Option<(usize, char)> {
+    value
+        .char_indices()
+        .skip_while(|(index, _)| *index < start)
+        .find_map(|(index, ch)| matches!(ch, '\'' | '"').then_some((index, ch)))
 }
 
 fn parse_grid_template_repeat_tracks_with_auto(
@@ -6260,6 +6613,9 @@ fn scale_css_length_expression(
 
 fn parse_css_length_expression_factor(value: &str) -> Option<CssLengthExpression> {
     let value = value.trim();
+    if let Some(inner) = css_strip_wrapping_parens(value) {
+        return parse_css_length_expression(inner);
+    }
     if let Some(inner) = value
         .strip_prefix("calc(")
         .and_then(|value| value.strip_suffix(')'))
@@ -6288,6 +6644,25 @@ fn parse_css_length_expression_factor(value: &str) -> Option<CssLengthExpression
         px: parse_px(value)?,
         ..CssLengthExpression::default()
     })
+}
+
+fn css_strip_wrapping_parens(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let inner = value.strip_prefix('(')?.strip_suffix(')')?;
+    let mut depth = 0usize;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && index != value.len() - 1 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(inner.trim())
 }
 
 fn button_width_for_text(text: &str, style: &BrowserStyle, font_scale: f32) -> f32 {
@@ -6384,6 +6759,13 @@ fn parse_px(value: &str) -> Option<f32> {
         let (left, right) = split_css_function_args(inner);
         return Some(parse_px(left.trim())?.min(parse_px(right?.trim())?));
     }
+    if let Some(inner) = value
+        .strip_prefix("max(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let (left, right) = split_css_function_args(inner);
+        return Some(parse_px(left.trim())?.max(parse_px(right?.trim())?));
+    }
     if let Some(rem) = value.strip_suffix("rem") {
         return rem.trim().parse::<f32>().ok().map(|rem| rem * 16.0);
     }
@@ -6411,18 +6793,28 @@ fn parse_calc_length(value: &str) -> Option<f32> {
     let mut total = 0.0;
     let mut current = String::new();
     let mut sign = 1.0;
+    let mut depth = 0usize;
     let mut saw_term = false;
 
     for ch in value.chars().chain(std::iter::once('+')) {
-        if ch == '+' || ch == '-' {
-            if !current.trim().is_empty() {
-                total += sign * parse_calc_length_term(current.trim())?;
-                current.clear();
-                saw_term = true;
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
             }
-            sign = if ch == '-' { -1.0 } else { 1.0 };
-        } else {
-            current.push(ch);
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            '+' | '-' if depth == 0 => {
+                if !current.trim().is_empty() {
+                    total += sign * parse_calc_length_term(current.trim())?;
+                    current.clear();
+                    saw_term = true;
+                }
+                sign = if ch == '-' { -1.0 } else { 1.0 };
+            }
+            _ => current.push(ch),
         }
     }
 
@@ -6449,6 +6841,9 @@ fn parse_calc_length_term(value: &str) -> Option<f32> {
 }
 
 fn parse_calc_length_factor(value: &str) -> Option<f32> {
+    if let Some(inner) = css_strip_wrapping_parens(value) {
+        return parse_calc_length(inner);
+    }
     parse_px(value).or_else(|| value.parse::<f32>().ok())
 }
 
@@ -7226,6 +7621,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_basic_css_carries_grid_item_and_content_alignment() {
+        let style = parse_basic_css(
+            r#"
+            .grid {
+                display: grid;
+                place-items: center;
+                align-content: start;
+            }
+            "#,
+        );
+        let key = ElementStyleKey {
+            tag: "div".to_owned(),
+            id: None,
+            classes: vec!["grid".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &key);
+
+        assert_eq!(computed.display, Some(CssDisplay::Grid));
+        assert_eq!(computed.align_items, Some(CssAlignItems::Center));
+        assert_eq!(computed.justify_items, Some(CssJustifyContent::Center));
+        assert_eq!(computed.align_content, Some(CssAlignItems::FlexStart));
+        assert_eq!(computed.justify_content, None);
+    }
+
+    #[test]
     fn parse_basic_css_applies_universal_box_sizing_rule_to_box_styles() {
         let style = parse_basic_css("* { box-sizing: border-box; } .item { min-width: 0; }");
         let key = ElementStyleKey {
@@ -7331,6 +7752,76 @@ mod tests {
         assert_eq!(centered_style.margin, Some(CssEdges::default()));
         assert_eq!(centered_style.margin_auto.left, Some(true));
         assert_eq!(centered_style.margin_auto.right, Some(true));
+    }
+
+    #[test]
+    fn parse_basic_css_maps_ltr_logical_box_properties() {
+        let style = parse_basic_css(
+            r#"
+            .centered {
+                inline-size: min(960px, calc(100vw - 32px));
+                max-inline-size: 960px;
+                min-inline-size: 320px;
+                block-size: 120px;
+                min-block-size: 80px;
+                margin-inline: auto;
+                margin-block: 24px 32px;
+                padding-inline: 12px 20px;
+                padding-block: 6px 10px;
+                inset-inline: 14px 18px;
+                inset-block-start: 22px;
+            }
+            .responsive {
+                padding-inline: max(24px, calc((100vw - 960px) / 2));
+            }
+            "#,
+        );
+        let centered = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["centered".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let responsive = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["responsive".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &centered);
+        let responsive_computed = computed_box_style(&style, &responsive);
+
+        assert_eq!(
+            computed.width,
+            Some(CssLength::Min(
+                CssLengthExpression {
+                    px: 960.0,
+                    ..CssLengthExpression::default()
+                },
+                CssLengthExpression {
+                    px: -32.0,
+                    vw: 100.0,
+                    ..CssLengthExpression::default()
+                },
+            ))
+        );
+        assert_eq!(computed.max_width, Some(CssLength::Px(960.0)));
+        assert_eq!(computed.min_width, Some(CssLength::Px(320.0)));
+        assert_eq!(computed.height, Some(CssLength::Px(120.0)));
+        assert_eq!(computed.min_height, Some(CssLength::Px(80.0)));
+        assert_eq!(computed.margin_left, Some(0.0));
+        assert_eq!(computed.margin_right, Some(0.0));
+        assert_eq!(computed.margin_top, Some(24.0));
+        assert_eq!(computed.margin_bottom, Some(32.0));
+        assert_eq!(computed.margin_auto.left, Some(true));
+        assert_eq!(computed.margin_auto.right, Some(true));
+        assert_eq!(computed.padding_left, Some(12.0));
+        assert_eq!(computed.padding_right, Some(20.0));
+        assert_eq!(computed.padding_top, Some(6.0));
+        assert_eq!(computed.padding_bottom, Some(10.0));
+        assert_eq!(computed.inset_sides.left, Some(14.0));
+        assert_eq!(computed.inset_sides.right, Some(18.0));
+        assert_eq!(computed.inset_sides.top, Some(22.0));
+        assert_eq!(responsive_computed.padding_left, Some(160.0));
+        assert_eq!(responsive_computed.padding_right, Some(160.0));
     }
 
     #[test]
@@ -7617,6 +8108,113 @@ mod tests {
             computed_box_style(&style, &rows).grid_template_rows,
             Some(vec![CssLength::Px(40.0), CssLength::Percent(25.0)])
         );
+    }
+
+    #[test]
+    fn parse_basic_css_carries_grid_template_shorthand_named_areas() {
+        let style = parse_basic_css(
+            r#"
+            .page {
+                display: grid;
+                grid-template: "head head" 72px "side main" 1fr / 240px 1fr;
+            }
+            header { grid-area: head; }
+            aside { grid-area: side; }
+            main { grid-area: main; }
+            "#,
+        );
+        let page = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["page".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &page);
+
+        assert_eq!(
+            computed.grid_template_areas,
+            Some(vec![
+                vec!["head".to_owned(), "head".to_owned()],
+                vec!["side".to_owned(), "main".to_owned()],
+            ])
+        );
+        assert_eq!(
+            computed.grid_template_rows,
+            Some(vec![CssLength::Px(72.0), CssLength::Fr(1.0)])
+        );
+        assert_eq!(
+            computed.grid_template_column_tracks,
+            Some(vec![CssLength::Px(240.0), CssLength::Fr(1.0)])
+        );
+    }
+
+    #[test]
+    fn parse_basic_css_carries_multiline_grid_template_shorthand_named_areas() {
+        let style = parse_basic_css(
+            r#"
+            .page {
+                display: grid;
+                grid-template:
+                    "head head" 64px
+                    "side main" minmax(0, 1fr)
+                    / 16rem minmax(0, 1fr);
+            }
+            "#,
+        );
+        let page = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["page".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &page);
+
+        assert_eq!(
+            computed.grid_template_areas,
+            Some(vec![
+                vec!["head".to_owned(), "head".to_owned()],
+                vec!["side".to_owned(), "main".to_owned()],
+            ])
+        );
+        assert_eq!(
+            computed.grid_template_rows,
+            Some(vec![CssLength::Px(64.0), CssLength::Fr(1.0)])
+        );
+        assert_eq!(
+            computed.grid_template_column_tracks,
+            Some(vec![CssLength::Px(256.0), CssLength::Fr(1.0)])
+        );
+    }
+
+    #[test]
+    fn parse_basic_css_carries_grid_auto_rows_and_item_spans() {
+        let style = parse_basic_css(
+            r#"
+            .page { display: grid; grid-auto-rows: 96px; }
+            .wide { grid-column: span 3; }
+            .tall { grid-row: span 2; }
+            "#,
+        );
+        let page = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["page".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let wide = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["wide".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let tall = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["tall".to_owned()],
+            ..ElementStyleKey::default()
+        };
+
+        assert_eq!(
+            computed_box_style(&style, &page).grid_auto_rows,
+            Some(CssLength::Px(96.0))
+        );
+        assert_eq!(computed_box_style(&style, &wide).grid_column_span, Some(3));
+        assert_eq!(computed_box_style(&style, &tall).grid_row_span, Some(2));
     }
 
     #[test]

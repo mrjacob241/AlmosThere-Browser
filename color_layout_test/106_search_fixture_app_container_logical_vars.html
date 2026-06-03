@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>106 - Search Fixture App Container Logical Vars</title>
+<style>
+:root { --page: #f7f8fa; --line: rgba(20,30,40,.18); --green: #51cf66; --blue: #4dabf7; --yellow: #ffd43b; --pink: #f783ac; --muted: #5c6670; }
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body { font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: var(--page); color: #17212b; }
+.box { min-height: 72px; border: 1px solid var(--line); display: grid; place-items: center; padding: 10px; font-size: 13px; font-weight: 700; color: rgba(0,0,0,.74); text-align: center; }
+.label { position: fixed; right: 12px; bottom: 12px; padding: 6px 8px; background: rgba(255,255,255,.88); border: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+#app { --content-inline: 960px; --side: 280px; --gap: 24px; }
+.layout { max-inline-size: var(--content-inline); margin-inline: auto; margin-block: 24px; display: grid; gap: var(--gap); }
+.two-column { display: grid; grid-template-columns: minmax(0, 1fr) var(--side); gap: var(--gap); }
+.search { background: var(--blue); min-height: 90px; }
+.fixture-main { background: var(--green); min-height: 240px; }
+.sidebar { background: var(--yellow); min-height: 180px; }
+.below { background: var(--pink); min-height: 72px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <main class="layout">
+    <section class="box search">app variables define centered width</section>
+    <div class="two-column">
+      <section class="box fixture-main">fixture-main result area</section>
+      <aside class="box sidebar">sidebar</aside>
+    </div>
+    <section class="box below">full-width related strip</section>
+  </main>
+</div>
+<div class="label">106 - app container logical vars</div>
+</body>
+</html>
