@@ -32,6 +32,10 @@ const DEFAULT_PAGE_PATH: &str = concat!(
 );
 const DEFAULT_URL: &str = "https://latex.vercel.app/elements";
 const BOOKMARKS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bookmarks.txt");
+const HISTORY_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../appdata/history/history.json"
+);
 const DEBUG_EXPORT_DIR: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/../target/render_debug_export");
 const URL_SCREENSHOTS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/url_screenshots");
@@ -209,6 +213,14 @@ const SCRIPT_TEST_BOOKMARKS: &[(&str, &str)] = &[
 ];
 
 fn main() -> eframe::Result<()> {
+    if let Some((url, output_dir)) = page_loader_worker_invocation() {
+        if let Err(error) = run_page_loader_worker(&url, &output_dir) {
+            eprintln!("page loader worker failed: {error}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+
     let config = AppConfig::from_args();
     let options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -286,6 +298,52 @@ impl AppConfig {
     }
 }
 
+const PAGE_LOADER_WORKER_FLAG: &str = "--page-loader-worker";
+
+fn page_loader_worker_invocation() -> Option<(String, PathBuf)> {
+    let mut args = std::env::args().skip(1);
+    let flag = args.next()?;
+    if flag != PAGE_LOADER_WORKER_FLAG {
+        return None;
+    }
+    let url = args.next()?;
+    let output_dir = args.next().map(PathBuf::from)?;
+    Some((url, output_dir))
+}
+
+fn run_page_loader_worker(url: &str, output_dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(output_dir)?;
+    emit_global_telemetry("navigation.fetch.started", &[("url", url)]);
+    let source = load_url_source(url)?;
+    emit_global_telemetry(
+        "navigation.fetch.completed",
+        &[
+            ("url", url),
+            ("final_url", &source.source),
+            ("html_bytes", &source.html.len().to_string()),
+            (
+                "body_bytes",
+                &source
+                    .image
+                    .as_ref()
+                    .map(|image| image.bytes.len())
+                    .unwrap_or_else(|| source.html.len())
+                    .to_string(),
+            ),
+            (
+                "content_kind",
+                if source.image.is_some() {
+                    "image"
+                } else {
+                    "html"
+                },
+            ),
+        ],
+    );
+    let prepared = prepare_navigation_artifacts(source)?;
+    write_worker_prepared_navigation(output_dir, &prepared)
+}
+
 struct AlmostThereApp {
     canvas: BrowserCanvas,
     debug_canvas: BrowserCanvas,
@@ -299,6 +357,7 @@ struct AlmostThereApp {
     render_graph_debug_text: String,
     url_input: String,
     bookmarks: Vec<Bookmark>,
+    history: HistoryState,
     console_messages: Vec<justbarelyscript::ConsoleMessage>,
     live_js_debug_text: String,
     status: String,
@@ -358,7 +417,8 @@ struct Bookmark {
 struct PendingNavigation {
     url: String,
     fragment: Option<String>,
-    receiver: Receiver<io::Result<LoadedPageSource>>,
+    history_action: NavigationHistoryAction,
+    receiver: Receiver<io::Result<PreparedNavigation>>,
 }
 
 struct LoadedPageSource {
@@ -370,6 +430,55 @@ struct LoadedPageSource {
 struct LoadedImageSource {
     bytes: Vec<u8>,
     content_type: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct HistoryState {
+    entries: Vec<HistoryEntry>,
+    current_index: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoryEntry {
+    url: String,
+    title: String,
+    visited_at_ms: u128,
+    visited_at: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NavigationHistoryAction {
+    AddEntry,
+    ReplaceCurrent,
+    TraverseTo(usize),
+}
+
+struct PreparedNavigation {
+    document: BrowserDocument,
+    current_html: String,
+    live_html: String,
+    render_graph_debug_text: String,
+    console_messages: Vec<justbarelyscript::ConsoleMessage>,
+    live_js_debug_text: String,
+    script_state_safe_to_build: bool,
+    content_kind: PreparedContentKind,
+}
+
+struct WorkerPreparedNavigation {
+    source: String,
+    current_html: String,
+    live_html: String,
+    render_graph_debug_text: String,
+    console_messages: Vec<justbarelyscript::ConsoleMessage>,
+    live_js_debug_text: String,
+    image: Option<LoadedImageSource>,
+    content_kind: PreparedContentKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreparedContentKind {
+    Html,
+    Image,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -437,6 +546,7 @@ impl AlmostThereApp {
         }
 
         let mut bookmarks = load_bookmarks().unwrap_or_default();
+        let mut history = load_history().unwrap_or_default();
         let inserted_default_bookmark = ensure_bookmark(&mut bookmarks, default_sample_bookmark())
             | ensure_bookmark(&mut bookmarks, default_url_bookmark());
         if inserted_default_bookmark {
@@ -457,106 +567,56 @@ impl AlmostThereApp {
             console_messages,
             live_js_debug_text,
             status,
-        ) = match load_url_source(initial_url) {
-            Ok(source) if source.image.is_some() => {
-                match image_document_from_loaded_source(&source) {
-                    Ok(document) => {
-                        telemetry.emit(
-                            "navigation.loaded",
-                            &[
-                                ("url", &source.source),
-                                ("title", &document.title),
-                                ("blocks", &document.blocks.len().to_string()),
-                            ],
-                        );
-                        (
-                            document,
-                            String::new(),
-                            String::new(),
-                            justbarelyscript::BrowserExecutionState::default(),
-                            "Direct image response; HTML render graph not used.".to_owned(),
-                            Vec::new(),
-                            "Direct image response; JavaScript not used.".to_owned(),
-                            format!("Loaded image {}", source.source),
-                        )
-                    }
-                    Err(error) => {
-                        telemetry.emit(
-                            "navigation.failed",
-                            &[("url", initial_url), ("error", &error.to_string())],
-                        );
-                        let document = BrowserDocument {
-                            title: "Load failed".to_owned(),
-                            source: initial_url.to_owned(),
-                            style: Default::default(),
-                            canvas_graph: CanvasGraph::default(),
-                            blocks: vec![CanvasBlock::Paragraph {
-                                text: format!("Failed to load image {initial_url}: {error}"),
-                            }],
-                        };
-                        (
-                            document,
-                            String::new(),
-                            String::new(),
-                            justbarelyscript::BrowserExecutionState::default(),
-                            String::new(),
-                            vec![console_error_message(format!(
-                                "Failed to load image {initial_url}: {error}"
-                            ))],
-                            String::new(),
-                            format!("Failed to load image {initial_url}: {error}"),
-                        )
-                    }
-                }
-            }
-            Ok(source) => {
-                let live_html = apply_safe_script_browser_effects_with_source(
-                    &remove_html_comments(&source.html),
-                    Some(&source.source),
-                );
-                let document = parse_html_document_from_live_html(&live_html, &source.source, None);
-                let script_state =
-                    build_script_state_with_source(&source.html, Some(&source.source));
-                let render_graph_debug_text =
-                    parse_render_graph_debug_dump_from_live_html(&live_html, &source.source);
-                let console_messages = script_console_messages_from_html_with_source(
-                    &source.html,
-                    Some(&source.source),
-                );
-                let live_js_debug_text = live_js_debug_report(&source.html, Some(&source.source));
-                if config.record_events {
-                    write_recorded_live_js_debug_artifact(
-                        &telemetry,
-                        &source.source,
-                        &live_js_debug_text,
-                    );
-                }
-                if config.event_trace {
-                    write_pipeline_trace_artifacts(
-                        &telemetry,
-                        &source.html,
-                        &source.source,
-                        &config.trace_items,
-                        "initial_load",
-                    );
-                }
+        ) = match load_url_source(initial_url).and_then(|source| {
+            prepare_navigation_source(
+                source,
+                None,
+                Some(&telemetry),
+                config.record_events,
+                config.event_trace,
+                &config.trace_items,
+                "initial_load",
+            )
+        }) {
+            Ok(prepared) => {
                 telemetry.emit(
                     "navigation.loaded",
                     &[
-                        ("url", &source.source),
-                        ("title", &document.title),
-                        ("blocks", &document.blocks.len().to_string()),
+                        ("url", &prepared.document.source),
+                        ("title", &prepared.document.title),
+                        ("blocks", &prepared.document.blocks.len().to_string()),
                     ],
                 );
+                history.record_loaded(
+                    &prepared.document.source,
+                    &prepared.document.title,
+                    NavigationHistoryAction::AddEntry,
+                );
+                let _ = save_history(&history);
+                let status = match prepared.content_kind {
+                    PreparedContentKind::Html => format!("Loaded {}", prepared.document.source),
+                    PreparedContentKind::Image => {
+                        format!("Loaded image {}", prepared.document.source)
+                    }
+                };
+                let script_state = match prepared.content_kind {
+                    PreparedContentKind::Html => build_script_state_with_source(
+                        &prepared.current_html,
+                        Some(&prepared.document.source),
+                    ),
+                    PreparedContentKind::Image => {
+                        justbarelyscript::BrowserExecutionState::default()
+                    }
+                };
                 (
-                    document,
-                    source.html,
-                    live_html,
+                    prepared.document,
+                    prepared.current_html,
+                    prepared.live_html,
                     script_state,
-                    render_graph_debug_text,
-                    console_messages,
-                    live_js_debug_text,
-                    format!("Loaded {}", source.source),
+                    prepared.render_graph_debug_text,
+                    prepared.console_messages,
+                    prepared.live_js_debug_text,
+                    status,
                 )
             }
             Err(error) => {
@@ -609,6 +669,7 @@ impl AlmostThereApp {
             render_graph_debug_text,
             url_input,
             bookmarks,
+            history,
             console_messages,
             live_js_debug_text,
             status,
@@ -632,43 +693,37 @@ impl AlmostThereApp {
         self.status = format!("Loading {input}...");
         ctx.request_repaint();
 
-        self.start_navigation(input.to_owned(), None);
+        self.start_navigation(input.to_owned(), None, NavigationHistoryAction::AddEntry);
     }
 
-    fn start_navigation(&mut self, url: String, fragment: Option<String>) {
+    fn start_navigation(
+        &mut self,
+        url: String,
+        fragment: Option<String>,
+        history_action: NavigationHistoryAction,
+    ) {
         let (sender, receiver) = mpsc::channel();
         let thread_url = url.clone();
         thread::spawn(move || {
-            emit_global_telemetry("navigation.fetch.started", &[("url", &thread_url)]);
-            let result = load_url_source(&thread_url);
+            emit_global_telemetry("navigation.worker.started", &[("url", &thread_url)]);
+            let result = prepare_navigation_in_isolated_process(&thread_url);
             match &result {
-                Ok(source) => emit_global_telemetry(
-                    "navigation.fetch.completed",
+                Ok(prepared) => emit_global_telemetry(
+                    "navigation.worker.completed",
                     &[
                         ("url", &thread_url),
-                        ("final_url", &source.source),
-                        ("html_bytes", &source.html.len().to_string()),
-                        (
-                            "body_bytes",
-                            &source
-                                .image
-                                .as_ref()
-                                .map(|image| image.bytes.len())
-                                .unwrap_or_else(|| source.html.len())
-                                .to_string(),
-                        ),
+                        ("final_url", &prepared.document.source),
                         (
                             "content_kind",
-                            if source.image.is_some() {
-                                "image"
-                            } else {
-                                "html"
+                            match prepared.content_kind {
+                                PreparedContentKind::Html => "html",
+                                PreparedContentKind::Image => "image",
                             },
                         ),
                     ],
                 ),
                 Err(error) => emit_global_telemetry(
-                    "navigation.fetch.failed",
+                    "navigation.worker.failed",
                     &[("url", &thread_url), ("error", &error.to_string())],
                 ),
             }
@@ -677,6 +732,7 @@ impl AlmostThereApp {
         self.pending_navigation = Some(PendingNavigation {
             url,
             fragment,
+            history_action,
             receiver,
         });
     }
@@ -690,198 +746,13 @@ impl AlmostThereApp {
             Ok(result) => {
                 let pending = self.pending_navigation.take().expect("pending navigation");
                 match result {
-                    Ok(source) => {
-                        if source.image.is_some() {
-                            match image_document_from_loaded_source(&source) {
-                                Ok(document) => {
-                                    self.current_html.clear();
-                                    self.live_html.clear();
-                                    self.script_state =
-                                        justbarelyscript::BrowserExecutionState::default();
-                                    self.module_cache =
-                                        justbarelyscript::ModuleExecutionCache::default();
-                                    self.render_graph_debug_text =
-                                        "Direct image response; HTML render graph not used."
-                                            .to_owned();
-                                    self.console_messages.clear();
-                                    self.live_js_debug_text =
-                                        "Direct image response; JavaScript not used.".to_owned();
-                                    self.page_loaded_at = std::time::Instant::now();
-                                    self.last_hovered_element_id = None;
-                                    self.last_focused_input = None;
-                                    self.telemetry.emit(
-                                        "navigation.canvas_graph.completed",
-                                        &[
-                                            ("url", &source.source),
-                                            ("blocks", &document.blocks.len().to_string()),
-                                            (
-                                                "canvas_objects",
-                                                &document.canvas_graph.objects.len().to_string(),
-                                            ),
-                                        ],
-                                    );
-                                    self.telemetry.emit(
-                                        "navigation.loaded",
-                                        &[
-                                            ("url", &pending.url),
-                                            ("title", &document.title),
-                                            ("blocks", &document.blocks.len().to_string()),
-                                        ],
-                                    );
-                                    self.url_input = document.source.clone();
-                                    self.status = format!("Loaded image {}", document.source);
-                                    self.document = document;
-                                    self.canvas.scroll_offset = egui::Vec2::ZERO;
-                                    self.debug_canvas.scroll_offset = egui::Vec2::ZERO;
-                                    self.render_debug.object_limit =
-                                        self.document.canvas_graph.objects.len();
-                                    if let Some(fragment) = pending.fragment {
-                                        self.scroll_to_fragment(&fragment);
-                                    }
-                                }
-                                Err(error) => {
-                                    self.telemetry.emit(
-                                        "navigation.failed",
-                                        &[("url", &pending.url), ("error", &error.to_string())],
-                                    );
-                                    self.status = format!("Load image failed: {error}");
-                                    self.console_messages.push(console_error_message(format!(
-                                        "Load image failed: {error}"
-                                    )));
-                                    self.live_js_debug_text.clear();
-                                }
-                            }
-                            ctx.request_repaint();
-                            return;
-                        }
-                        self.telemetry.emit(
-                            "navigation.scripts.started",
-                            &[
-                                ("url", &source.source),
-                                ("html_bytes", &source.html.len().to_string()),
-                            ],
+                    Ok(prepared) => {
+                        self.install_prepared_navigation(
+                            prepared,
+                            &pending.url,
+                            pending.fragment,
+                            pending.history_action,
                         );
-                        self.current_html = source.html.clone();
-                        self.live_html = apply_safe_script_browser_effects_with_source(
-                            &remove_html_comments(&source.html),
-                            Some(&source.source),
-                        );
-                        self.telemetry.emit(
-                            "navigation.scripts.completed",
-                            &[
-                                ("url", &source.source),
-                                ("live_html_bytes", &self.live_html.len().to_string()),
-                            ],
-                        );
-                        self.telemetry.emit(
-                            "navigation.script_state.started",
-                            &[("url", &source.source)],
-                        );
-                        self.module_cache = justbarelyscript::ModuleExecutionCache::default();
-                        self.script_state =
-                            build_script_state_with_source(&source.html, Some(&source.source));
-                        self.telemetry.emit(
-                            "navigation.script_state.completed",
-                            &[("url", &source.source)],
-                        );
-                        self.page_loaded_at = std::time::Instant::now();
-                        self.last_hovered_element_id = None;
-                        self.last_focused_input = None;
-                        self.telemetry.emit(
-                            "navigation.render_graph.started",
-                            &[("url", &source.source)],
-                        );
-                        self.render_graph_debug_text = parse_render_graph_debug_dump_from_live_html(
-                            &self.live_html,
-                            &source.source,
-                        );
-                        self.telemetry.emit(
-                            "navigation.render_graph.completed",
-                            &[
-                                ("url", &source.source),
-                                ("bytes", &self.render_graph_debug_text.len().to_string()),
-                            ],
-                        );
-                        self.telemetry
-                            .emit("navigation.console.started", &[("url", &source.source)]);
-                        self.console_messages = script_console_messages_from_html_with_source(
-                            &source.html,
-                            Some(&source.source),
-                        );
-                        self.telemetry.emit(
-                            "navigation.console.completed",
-                            &[
-                                ("url", &source.source),
-                                ("messages", &self.console_messages.len().to_string()),
-                            ],
-                        );
-                        self.telemetry.emit(
-                            "navigation.live_js_debug.started",
-                            &[("url", &source.source)],
-                        );
-                        self.live_js_debug_text =
-                            live_js_debug_report(&source.html, Some(&source.source));
-                        if self.record_events {
-                            write_recorded_live_js_debug_artifact(
-                                &self.telemetry,
-                                &source.source,
-                                &self.live_js_debug_text,
-                            );
-                        }
-                        self.telemetry.emit(
-                            "navigation.live_js_debug.completed",
-                            &[
-                                ("url", &source.source),
-                                ("bytes", &self.live_js_debug_text.len().to_string()),
-                            ],
-                        );
-                        self.telemetry.emit(
-                            "navigation.canvas_graph.started",
-                            &[("url", &source.source)],
-                        );
-                        let document = parse_html_document_from_live_html(
-                            &self.live_html,
-                            &source.source,
-                            Some(ctx),
-                        );
-                        self.telemetry.emit(
-                            "navigation.canvas_graph.completed",
-                            &[
-                                ("url", &source.source),
-                                ("blocks", &document.blocks.len().to_string()),
-                                (
-                                    "canvas_objects",
-                                    &document.canvas_graph.objects.len().to_string(),
-                                ),
-                            ],
-                        );
-                        if self.event_trace {
-                            write_pipeline_trace_artifacts(
-                                &self.telemetry,
-                                &source.html,
-                                &source.source,
-                                &self.trace_items,
-                                "navigation",
-                            );
-                        }
-                        self.telemetry.emit(
-                            "navigation.loaded",
-                            &[
-                                ("url", &pending.url),
-                                ("title", &document.title),
-                                ("blocks", &document.blocks.len().to_string()),
-                            ],
-                        );
-                        self.url_input = document.source.clone();
-                        self.status = format!("Loaded {}", document.source);
-                        self.document = document;
-                        self.last_focused_input = None;
-                        self.canvas.scroll_offset = egui::Vec2::ZERO;
-                        self.debug_canvas.scroll_offset = egui::Vec2::ZERO;
-                        self.render_debug.object_limit = self.document.canvas_graph.objects.len();
-                        if let Some(fragment) = pending.fragment {
-                            self.scroll_to_fragment(&fragment);
-                        }
                     }
                     Err(error) => {
                         self.telemetry.emit(
@@ -909,6 +780,123 @@ impl AlmostThereApp {
                 ctx.request_repaint();
             }
         }
+    }
+
+    fn install_prepared_navigation(
+        &mut self,
+        prepared: PreparedNavigation,
+        requested_url: &str,
+        fragment: Option<String>,
+        history_action: NavigationHistoryAction,
+    ) {
+        self.current_html = prepared.current_html;
+        self.live_html = prepared.live_html;
+        match prepared.content_kind {
+            PreparedContentKind::Html if prepared.script_state_safe_to_build => {
+                self.telemetry.emit(
+                    "navigation.script_state.started",
+                    &[("url", &prepared.document.source)],
+                );
+                self.script_state = build_script_state_with_source(
+                    &self.current_html,
+                    Some(&prepared.document.source),
+                );
+                self.telemetry.emit(
+                    "navigation.script_state.completed",
+                    &[("url", &prepared.document.source)],
+                );
+            }
+            PreparedContentKind::Html => {
+                self.script_state = justbarelyscript::BrowserExecutionState::default();
+                self.telemetry.emit(
+                    "navigation.script_state.skipped",
+                    &[
+                        ("url", &prepared.document.source),
+                        ("reason", "isolated_worker_result"),
+                    ],
+                );
+                self.console_messages.push(console_error_message(
+                    "Page JavaScript state skipped after isolated load to keep the browser process alive.",
+                ));
+            }
+            PreparedContentKind::Image => {
+                self.script_state = justbarelyscript::BrowserExecutionState::default();
+            }
+        }
+        self.module_cache = justbarelyscript::ModuleExecutionCache::default();
+        self.render_graph_debug_text = prepared.render_graph_debug_text;
+        self.console_messages = prepared.console_messages;
+        self.live_js_debug_text = prepared.live_js_debug_text;
+        self.page_loaded_at = std::time::Instant::now();
+        self.last_hovered_element_id = None;
+        self.last_focused_input = None;
+        self.url_input = prepared.document.source.clone();
+        self.status = match prepared.content_kind {
+            PreparedContentKind::Html => format!("Loaded {}", prepared.document.source),
+            PreparedContentKind::Image => format!("Loaded image {}", prepared.document.source),
+        };
+        self.telemetry.emit(
+            "navigation.loaded",
+            &[
+                ("url", requested_url),
+                ("title", &prepared.document.title),
+                ("blocks", &prepared.document.blocks.len().to_string()),
+            ],
+        );
+        self.history.record_loaded(
+            &prepared.document.source,
+            &prepared.document.title,
+            history_action,
+        );
+        if let Err(error) = save_history(&self.history) {
+            self.status = format!("History save failed: {error}");
+        }
+        self.document = prepared.document;
+        self.canvas.scroll_offset = egui::Vec2::ZERO;
+        self.debug_canvas.scroll_offset = egui::Vec2::ZERO;
+        self.render_debug.object_limit = self.document.canvas_graph.objects.len();
+        if let Some(fragment) = fragment {
+            self.scroll_to_fragment(&fragment);
+        }
+    }
+
+    fn reload_current(&mut self, ctx: &egui::Context) {
+        let input = self.url_input.trim();
+        self.telemetry.emit(
+            "navigation.requested",
+            &[("url", input), ("source", "reload")],
+        );
+        self.status = format!("Reloading {input}...");
+        ctx.request_repaint();
+        self.start_navigation(
+            input.to_owned(),
+            None,
+            NavigationHistoryAction::ReplaceCurrent,
+        );
+    }
+
+    fn go_back(&mut self, ctx: &egui::Context) {
+        let Some((index, url)) = self.history.back_target() else {
+            return;
+        };
+        self.url_input = url.clone();
+        self.telemetry
+            .emit("navigation.history.back", &[("url", &url)]);
+        self.status = format!("Loading {url}...");
+        ctx.request_repaint();
+        self.start_navigation(url, None, NavigationHistoryAction::TraverseTo(index));
+    }
+
+    fn go_forward(&mut self, ctx: &egui::Context) {
+        let Some((index, url)) = self.history.forward_target() else {
+            return;
+        };
+        self.url_input = url.clone();
+        self.telemetry
+            .emit("navigation.history.forward", &[("url", &url)]);
+        self.status = format!("Loading {url}...");
+        ctx.request_repaint();
+        self.start_navigation(url, None, NavigationHistoryAction::TraverseTo(index));
     }
 
     fn current_url(&self) -> String {
@@ -993,6 +981,14 @@ impl AlmostThereApp {
                 self.canvas.scroll_offset = egui::Vec2::ZERO;
                 self.status = "Jumped to top".to_owned();
             }
+            self.history.record_loaded(
+                &self.url_input,
+                &self.document.title,
+                NavigationHistoryAction::AddEntry,
+            );
+            if let Err(error) = save_history(&self.history) {
+                self.status = format!("History save failed: {error}");
+            }
             return;
         }
 
@@ -1001,7 +997,7 @@ impl AlmostThereApp {
             .emit("navigation.requested", &[("url", &resolved)]);
         self.status = format!("Loading {resolved}...");
         ctx.request_repaint();
-        self.start_navigation(resolved, fragment);
+        self.start_navigation(resolved, fragment, NavigationHistoryAction::AddEntry);
     }
 
     fn handle_link_click(&mut self, href: &str, element_id: Option<&str>, ctx: &egui::Context) {
@@ -4752,6 +4748,10 @@ fn bookmarks_path() -> PathBuf {
     PathBuf::from(BOOKMARKS_PATH)
 }
 
+fn history_path() -> PathBuf {
+    PathBuf::from(HISTORY_PATH)
+}
+
 fn load_bookmarks() -> io::Result<Vec<Bookmark>> {
     let path = bookmarks_path();
     if !path.exists() {
@@ -4777,6 +4777,262 @@ fn save_bookmarks(bookmarks: &[Bookmark]) -> io::Result<()> {
     }
 
     fs::write(path, out)
+}
+
+fn load_history() -> io::Result<HistoryState> {
+    let path = history_path();
+    if !path.exists() {
+        return Ok(HistoryState::default());
+    }
+    let text = fs::read_to_string(path)?;
+    Ok(parse_history_json(&text))
+}
+
+fn save_history(history: &HistoryState) -> io::Result<()> {
+    let path = history_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, history_to_json(history))
+}
+
+impl HistoryState {
+    fn can_go_back(&self) -> bool {
+        self.current_index.is_some_and(|index| index > 0)
+    }
+
+    fn can_go_forward(&self) -> bool {
+        self.current_index
+            .is_some_and(|index| index + 1 < self.entries.len())
+    }
+
+    fn back_target(&self) -> Option<(usize, String)> {
+        let index = self.current_index?.checked_sub(1)?;
+        Some((index, self.entries.get(index)?.url.clone()))
+    }
+
+    fn forward_target(&self) -> Option<(usize, String)> {
+        let index = self.current_index? + 1;
+        Some((index, self.entries.get(index)?.url.clone()))
+    }
+
+    fn record_loaded(&mut self, url: &str, title: &str, action: NavigationHistoryAction) {
+        let now = unix_ms();
+        let title = if title.trim().is_empty() {
+            url.to_owned()
+        } else {
+            title.trim().to_owned()
+        };
+        let entry = HistoryEntry {
+            url: url.to_owned(),
+            title,
+            visited_at_ms: now,
+            visited_at: unix_ms_to_utc_datetime(now),
+        };
+
+        match action {
+            NavigationHistoryAction::AddEntry => {
+                if let Some(index) = self.current_index {
+                    if self.entries.get(index).is_some_and(|item| item.url == url) {
+                        self.entries[index] = entry;
+                        return;
+                    }
+                    self.entries.truncate(index + 1);
+                }
+                self.entries.push(entry);
+                self.current_index = self.entries.len().checked_sub(1);
+            }
+            NavigationHistoryAction::ReplaceCurrent => {
+                if let Some(index) = self
+                    .current_index
+                    .filter(|index| *index < self.entries.len())
+                {
+                    self.entries[index] = entry;
+                } else {
+                    self.entries.push(entry);
+                    self.current_index = self.entries.len().checked_sub(1);
+                }
+            }
+            NavigationHistoryAction::TraverseTo(index) => {
+                if index < self.entries.len() {
+                    self.entries[index] = entry;
+                    self.current_index = Some(index);
+                }
+            }
+        }
+    }
+}
+
+fn history_to_json(history: &HistoryState) -> String {
+    let current_index = history
+        .current_index
+        .map(|index| index.to_string())
+        .unwrap_or_else(|| "null".to_owned());
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str("  \"schema_version\": 1,\n");
+    out.push_str("  \"format\": \"almostthere_browser_history_v1\",\n");
+    out.push_str(&format!("  \"current_index\": {current_index},\n"));
+    out.push_str("  \"entries\": [\n");
+    for (index, entry) in history.entries.iter().enumerate() {
+        if index > 0 {
+            out.push_str(",\n");
+        }
+        out.push_str("    {\n");
+        out.push_str(&format!(
+            "      \"url\": \"{}\",\n",
+            json_escape(&entry.url)
+        ));
+        out.push_str(&format!(
+            "      \"title\": \"{}\",\n",
+            json_escape(&entry.title)
+        ));
+        out.push_str(&format!(
+            "      \"visited_at\": \"{}\",\n",
+            json_escape(&entry.visited_at)
+        ));
+        out.push_str(&format!(
+            "      \"visited_at_ms\": {}\n",
+            entry.visited_at_ms
+        ));
+        out.push_str("    }");
+    }
+    out.push_str("\n  ]\n");
+    out.push_str("}\n");
+    out
+}
+
+fn parse_history_json(text: &str) -> HistoryState {
+    let mut history = HistoryState {
+        entries: parse_history_entries(text),
+        current_index: parse_json_usize_field(text, "current_index"),
+    };
+    if history
+        .current_index
+        .is_some_and(|index| index >= history.entries.len())
+    {
+        history.current_index = history.entries.len().checked_sub(1);
+    }
+    history
+}
+
+fn parse_history_entries(text: &str) -> Vec<HistoryEntry> {
+    let Some(entries_start) = text.find("\"entries\"") else {
+        return Vec::new();
+    };
+    let Some(array_start_rel) = text[entries_start..].find('[') else {
+        return Vec::new();
+    };
+    let array_start = entries_start + array_start_rel + 1;
+    let Some(array_end_rel) = text[array_start..].rfind(']') else {
+        return Vec::new();
+    };
+    let array = &text[array_start..array_start + array_end_rel];
+    split_json_object_array(array)
+        .into_iter()
+        .filter_map(|object| {
+            let url = parse_json_string_field(object, "url")?;
+            let title = parse_json_string_field(object, "title").unwrap_or_else(|| url.clone());
+            let visited_at_ms =
+                parse_json_u128_field(object, "visited_at_ms").unwrap_or_else(unix_ms);
+            let visited_at = parse_json_string_field(object, "visited_at")
+                .unwrap_or_else(|| unix_ms_to_utc_datetime(visited_at_ms));
+            Some(HistoryEntry {
+                url,
+                title,
+                visited_at_ms,
+                visited_at,
+            })
+        })
+        .collect()
+}
+
+fn split_json_object_array(array: &str) -> Vec<&str> {
+    let mut objects = Vec::new();
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, ch) in array.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(index);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    if let Some(start) = start.take() {
+                        objects.push(&array[start..=index]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    objects
+}
+
+fn parse_json_string_field(object: &str, field: &str) -> Option<String> {
+    let key = format!("\"{field}\"");
+    let start = object.find(&key)?;
+    let after_key = &object[start + key.len()..];
+    let colon = after_key.find(':')?;
+    let mut value = after_key[colon + 1..].trim_start();
+    value = value.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            match ch {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                other => out.push(other),
+            }
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(out);
+        } else {
+            out.push(ch);
+        }
+    }
+    None
+}
+
+fn parse_json_usize_field(object: &str, field: &str) -> Option<usize> {
+    parse_json_u128_field(object, field).and_then(|value| usize::try_from(value).ok())
+}
+
+fn parse_json_u128_field(object: &str, field: &str) -> Option<u128> {
+    let key = format!("\"{field}\"");
+    let start = object.find(&key)?;
+    let after_key = &object[start + key.len()..];
+    let colon = after_key.find(':')?;
+    let value = after_key[colon + 1..].trim_start();
+    let digits: String = value.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
 }
 
 fn parse_bookmarks(text: &str) -> Vec<Bookmark> {
@@ -4863,10 +5119,20 @@ impl App for AlmostThereApp {
 
         egui::TopBottomPanel::top("browser_toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.add_enabled(false, egui::Button::new("Back"));
-                ui.add_enabled(false, egui::Button::new("Forward"));
+                if ui
+                    .add_enabled(self.history.can_go_back(), egui::Button::new("Back"))
+                    .clicked()
+                {
+                    self.go_back(ctx);
+                }
+                if ui
+                    .add_enabled(self.history.can_go_forward(), egui::Button::new("Forward"))
+                    .clicked()
+                {
+                    self.go_forward(ctx);
+                }
                 if ui.button("Reload").clicked() {
-                    self.load_current_input(ctx);
+                    self.reload_current(ctx);
                 }
                 let debug_label = if self.render_debug.open {
                     "Close Debug"
@@ -6626,6 +6892,438 @@ fn parse_html_document(html: &str, source: &str) -> BrowserDocument {
     parse_html_document_with_text_metrics(html, source, None)
 }
 
+fn prepare_navigation_artifacts(source: LoadedPageSource) -> io::Result<WorkerPreparedNavigation> {
+    if source.image.is_some() {
+        return Ok(WorkerPreparedNavigation {
+            source: source.source,
+            current_html: String::new(),
+            live_html: String::new(),
+            render_graph_debug_text: "Direct image response; HTML render graph not used."
+                .to_owned(),
+            console_messages: Vec::new(),
+            live_js_debug_text: "Direct image response; JavaScript not used.".to_owned(),
+            image: source.image,
+            content_kind: PreparedContentKind::Image,
+        });
+    }
+
+    emit_global_telemetry(
+        "navigation.scripts.started",
+        &[
+            ("url", &source.source),
+            ("html_bytes", &source.html.len().to_string()),
+        ],
+    );
+    let live_html = apply_safe_script_browser_effects_with_source(
+        &remove_html_comments(&source.html),
+        Some(&source.source),
+    );
+    emit_global_telemetry(
+        "navigation.scripts.completed",
+        &[
+            ("url", &source.source),
+            ("live_html_bytes", &live_html.len().to_string()),
+        ],
+    );
+
+    emit_global_telemetry(
+        "navigation.render_graph.started",
+        &[("url", &source.source)],
+    );
+    let render_graph_debug_text =
+        parse_render_graph_debug_dump_from_live_html(&live_html, &source.source);
+    emit_global_telemetry(
+        "navigation.render_graph.completed",
+        &[
+            ("url", &source.source),
+            ("bytes", &render_graph_debug_text.len().to_string()),
+        ],
+    );
+
+    emit_global_telemetry("navigation.console.started", &[("url", &source.source)]);
+    let console_messages =
+        script_console_messages_from_html_with_source(&source.html, Some(&source.source));
+    emit_global_telemetry(
+        "navigation.console.completed",
+        &[
+            ("url", &source.source),
+            ("messages", &console_messages.len().to_string()),
+        ],
+    );
+
+    emit_global_telemetry(
+        "navigation.live_js_debug.started",
+        &[("url", &source.source)],
+    );
+    let live_js_debug_text = live_js_debug_report(&source.html, Some(&source.source));
+    emit_global_telemetry(
+        "navigation.live_js_debug.completed",
+        &[
+            ("url", &source.source),
+            ("bytes", &live_js_debug_text.len().to_string()),
+        ],
+    );
+
+    Ok(WorkerPreparedNavigation {
+        source: source.source,
+        current_html: source.html,
+        live_html,
+        render_graph_debug_text,
+        console_messages,
+        live_js_debug_text,
+        image: None,
+        content_kind: PreparedContentKind::Html,
+    })
+}
+
+fn prepare_navigation_in_isolated_process(url: &str) -> io::Result<PreparedNavigation> {
+    let output_dir = page_loader_worker_output_dir();
+    fs::create_dir_all(&output_dir)?;
+    let exe = std::env::current_exe().map_err(io::Error::other)?;
+    let output = std::process::Command::new(exe)
+        .arg(PAGE_LOADER_WORKER_FLAG)
+        .arg(url)
+        .arg(&output_dir)
+        .output()
+        .map_err(io::Error::other)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.lines().last().unwrap_or("").trim();
+        let message = if detail.is_empty() {
+            "Page Apparently Crashed Lol".to_owned()
+        } else {
+            format!("Page Apparently Crashed Lol ({detail})")
+        };
+        return Err(io::Error::other(message));
+    }
+
+    let worker_prepared = read_worker_prepared_navigation(&output_dir)?;
+    prepared_navigation_from_worker_artifacts(worker_prepared)
+}
+
+fn page_loader_worker_output_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../target/page_loader_workers")
+        .join(format!("{}_{}", unix_ms(), std::process::id()))
+}
+
+fn prepared_navigation_from_worker_artifacts(
+    prepared: WorkerPreparedNavigation,
+) -> io::Result<PreparedNavigation> {
+    match prepared.content_kind {
+        PreparedContentKind::Image => {
+            let source = LoadedPageSource {
+                html: String::new(),
+                source: prepared.source,
+                image: prepared.image,
+            };
+            let document = image_document_from_loaded_source(&source)?;
+            Ok(PreparedNavigation {
+                document,
+                current_html: String::new(),
+                live_html: String::new(),
+                render_graph_debug_text: prepared.render_graph_debug_text,
+                console_messages: prepared.console_messages,
+                live_js_debug_text: prepared.live_js_debug_text,
+                script_state_safe_to_build: false,
+                content_kind: PreparedContentKind::Image,
+            })
+        }
+        PreparedContentKind::Html => {
+            let document =
+                parse_html_document_from_live_html(&prepared.live_html, &prepared.source, None);
+            Ok(PreparedNavigation {
+                document,
+                current_html: prepared.current_html,
+                live_html: prepared.live_html,
+                render_graph_debug_text: prepared.render_graph_debug_text,
+                console_messages: prepared.console_messages,
+                live_js_debug_text: prepared.live_js_debug_text,
+                script_state_safe_to_build: false,
+                content_kind: PreparedContentKind::Html,
+            })
+        }
+    }
+}
+
+fn write_worker_prepared_navigation(
+    output_dir: &Path,
+    prepared: &WorkerPreparedNavigation,
+) -> io::Result<()> {
+    fs::create_dir_all(output_dir)?;
+    fs::write(
+        output_dir.join("kind.txt"),
+        match prepared.content_kind {
+            PreparedContentKind::Html => "html",
+            PreparedContentKind::Image => "image",
+        },
+    )?;
+    fs::write(output_dir.join("source.txt"), &prepared.source)?;
+    fs::write(output_dir.join("current.html"), &prepared.current_html)?;
+    fs::write(output_dir.join("live.html"), &prepared.live_html)?;
+    fs::write(
+        output_dir.join("render_graph_debug.txt"),
+        &prepared.render_graph_debug_text,
+    )?;
+    fs::write(
+        output_dir.join("live_js_debug.txt"),
+        &prepared.live_js_debug_text,
+    )?;
+    fs::write(
+        output_dir.join("console.txt"),
+        encode_worker_console_messages(&prepared.console_messages),
+    )?;
+    if let Some(image) = &prepared.image {
+        fs::write(output_dir.join("image.bin"), &image.bytes)?;
+        fs::write(
+            output_dir.join("image_content_type.txt"),
+            &image.content_type,
+        )?;
+    }
+    Ok(())
+}
+
+fn read_worker_prepared_navigation(output_dir: &Path) -> io::Result<WorkerPreparedNavigation> {
+    let kind = fs::read_to_string(output_dir.join("kind.txt"))?;
+    let content_kind = match kind.trim() {
+        "html" => PreparedContentKind::Html,
+        "image" => PreparedContentKind::Image,
+        other => {
+            return Err(io::Error::other(format!(
+                "unknown worker content kind {other:?}"
+            )));
+        }
+    };
+    let image = if content_kind == PreparedContentKind::Image {
+        Some(LoadedImageSource {
+            bytes: fs::read(output_dir.join("image.bin"))?,
+            content_type: fs::read_to_string(output_dir.join("image_content_type.txt"))?,
+        })
+    } else {
+        None
+    };
+    Ok(WorkerPreparedNavigation {
+        source: fs::read_to_string(output_dir.join("source.txt"))?,
+        current_html: fs::read_to_string(output_dir.join("current.html")).unwrap_or_default(),
+        live_html: fs::read_to_string(output_dir.join("live.html")).unwrap_or_default(),
+        render_graph_debug_text: fs::read_to_string(output_dir.join("render_graph_debug.txt"))
+            .unwrap_or_default(),
+        console_messages: decode_worker_console_messages(
+            &fs::read_to_string(output_dir.join("console.txt")).unwrap_or_default(),
+        ),
+        live_js_debug_text: fs::read_to_string(output_dir.join("live_js_debug.txt"))
+            .unwrap_or_default(),
+        image,
+        content_kind,
+    })
+}
+
+fn encode_worker_console_messages(messages: &[justbarelyscript::ConsoleMessage]) -> String {
+    let mut out = String::new();
+    for message in messages {
+        let level = match message.level {
+            justbarelyscript::ConsoleLevel::Log => "log",
+            justbarelyscript::ConsoleLevel::Info => "info",
+            justbarelyscript::ConsoleLevel::Warn => "warn",
+            justbarelyscript::ConsoleLevel::Error => "error",
+        };
+        out.push_str(level);
+        out.push('\t');
+        out.push_str(&escape_worker_line(&message.text));
+        out.push('\n');
+    }
+    out
+}
+
+fn decode_worker_console_messages(text: &str) -> Vec<justbarelyscript::ConsoleMessage> {
+    text.lines()
+        .filter_map(|line| {
+            let (level, text) = line.split_once('\t')?;
+            let level = match level {
+                "log" => justbarelyscript::ConsoleLevel::Log,
+                "info" => justbarelyscript::ConsoleLevel::Info,
+                "warn" => justbarelyscript::ConsoleLevel::Warn,
+                "error" => justbarelyscript::ConsoleLevel::Error,
+                _ => justbarelyscript::ConsoleLevel::Info,
+            };
+            Some(justbarelyscript::ConsoleMessage {
+                level,
+                text: unescape_worker_line(text),
+            })
+        })
+        .collect()
+}
+
+fn escape_worker_line(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+fn unescape_worker_line(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+fn prepare_navigation_source(
+    source: LoadedPageSource,
+    text_metrics: Option<&egui::Context>,
+    telemetry: Option<&TelemetrySession>,
+    record_events: bool,
+    event_trace: bool,
+    trace_items: &[String],
+    trace_context: &str,
+) -> io::Result<PreparedNavigation> {
+    if source.image.is_some() {
+        emit_global_telemetry(
+            "navigation.canvas_graph.started",
+            &[("url", &source.source)],
+        );
+        let document = image_document_from_loaded_source(&source)?;
+        emit_global_telemetry(
+            "navigation.canvas_graph.completed",
+            &[
+                ("url", &source.source),
+                ("blocks", &document.blocks.len().to_string()),
+                (
+                    "canvas_objects",
+                    &document.canvas_graph.objects.len().to_string(),
+                ),
+            ],
+        );
+        return Ok(PreparedNavigation {
+            document,
+            current_html: String::new(),
+            live_html: String::new(),
+            render_graph_debug_text: "Direct image response; HTML render graph not used."
+                .to_owned(),
+            console_messages: Vec::new(),
+            live_js_debug_text: "Direct image response; JavaScript not used.".to_owned(),
+            script_state_safe_to_build: true,
+            content_kind: PreparedContentKind::Image,
+        });
+    }
+
+    emit_global_telemetry(
+        "navigation.scripts.started",
+        &[
+            ("url", &source.source),
+            ("html_bytes", &source.html.len().to_string()),
+        ],
+    );
+    let live_html = apply_safe_script_browser_effects_with_source(
+        &remove_html_comments(&source.html),
+        Some(&source.source),
+    );
+    emit_global_telemetry(
+        "navigation.scripts.completed",
+        &[
+            ("url", &source.source),
+            ("live_html_bytes", &live_html.len().to_string()),
+        ],
+    );
+
+    emit_global_telemetry(
+        "navigation.render_graph.started",
+        &[("url", &source.source)],
+    );
+    let render_graph_debug_text =
+        parse_render_graph_debug_dump_from_live_html(&live_html, &source.source);
+    emit_global_telemetry(
+        "navigation.render_graph.completed",
+        &[
+            ("url", &source.source),
+            ("bytes", &render_graph_debug_text.len().to_string()),
+        ],
+    );
+
+    emit_global_telemetry("navigation.console.started", &[("url", &source.source)]);
+    let console_messages =
+        script_console_messages_from_html_with_source(&source.html, Some(&source.source));
+    emit_global_telemetry(
+        "navigation.console.completed",
+        &[
+            ("url", &source.source),
+            ("messages", &console_messages.len().to_string()),
+        ],
+    );
+
+    emit_global_telemetry(
+        "navigation.live_js_debug.started",
+        &[("url", &source.source)],
+    );
+    let live_js_debug_text = live_js_debug_report(&source.html, Some(&source.source));
+    if let Some(telemetry) = telemetry {
+        if record_events {
+            write_recorded_live_js_debug_artifact(telemetry, &source.source, &live_js_debug_text);
+        }
+        if event_trace {
+            write_pipeline_trace_artifacts(
+                telemetry,
+                &source.html,
+                &source.source,
+                trace_items,
+                trace_context,
+            );
+        }
+    }
+    emit_global_telemetry(
+        "navigation.live_js_debug.completed",
+        &[
+            ("url", &source.source),
+            ("bytes", &live_js_debug_text.len().to_string()),
+        ],
+    );
+
+    emit_global_telemetry(
+        "navigation.canvas_graph.started",
+        &[("url", &source.source)],
+    );
+    let document = parse_html_document_from_live_html(&live_html, &source.source, text_metrics);
+    emit_global_telemetry(
+        "navigation.canvas_graph.completed",
+        &[
+            ("url", &source.source),
+            ("blocks", &document.blocks.len().to_string()),
+            (
+                "canvas_objects",
+                &document.canvas_graph.objects.len().to_string(),
+            ),
+        ],
+    );
+
+    Ok(PreparedNavigation {
+        document,
+        current_html: source.html,
+        live_html,
+        render_graph_debug_text,
+        console_messages,
+        live_js_debug_text,
+        script_state_safe_to_build: true,
+        content_kind: PreparedContentKind::Html,
+    })
+}
+
 fn parse_html_document_with_text_metrics(
     html: &str,
     source: &str,
@@ -7562,12 +8260,6 @@ fn inherited_style_for_element(
         }
         "body" => {
             style.background = document_style.page_background;
-            style.padding = CssEdges {
-                top: document_style.main_padding_y,
-                right: document_style.main_padding_x,
-                bottom: document_style.main_padding_y,
-                left: document_style.main_padding_x,
-            };
         }
         "h1" => {
             style.font_size = document_style.h1_font_size;
@@ -8520,6 +9212,7 @@ fn layout_css_box(
             .max(css_used_content_min_width(&box_.style, 1.0));
     }
 
+    apply_css_horizontal_auto_margins(box_, content_width, containing_width);
     let mut content_x = containing_x
         + box_.dimensions.margin.left
         + box_.dimensions.border.left
@@ -8666,6 +9359,45 @@ fn layout_css_box(
             DEFAULT_LAYOUT_VIEWPORT_HEIGHT,
         ),
     );
+}
+
+fn apply_css_horizontal_auto_margins(
+    box_: &mut CssLayoutBox<'_>,
+    content_width: f32,
+    containing_width: f32,
+) {
+    if box_.kind == CssLayoutKind::AnonymousBlock {
+        return;
+    }
+    let fixed_horizontal = content_width
+        + box_.dimensions.border.left
+        + box_.dimensions.border.right
+        + box_.dimensions.padding.left
+        + box_.dimensions.padding.right
+        + if box_.style.margin_auto.left {
+            0.0
+        } else {
+            box_.dimensions.margin.left
+        }
+        + if box_.style.margin_auto.right {
+            0.0
+        } else {
+            box_.dimensions.margin.right
+        };
+    let free_space = (containing_width - fixed_horizontal).max(0.0);
+    match (box_.style.margin_auto.left, box_.style.margin_auto.right) {
+        (true, true) => {
+            box_.dimensions.margin.left = free_space * 0.5;
+            box_.dimensions.margin.right = free_space * 0.5;
+        }
+        (true, false) => {
+            box_.dimensions.margin.left = free_space;
+        }
+        (false, true) => {
+            box_.dimensions.margin.right = free_space;
+        }
+        (false, false) => {}
+    }
 }
 
 fn css_layout_inline_flow_visual_height(
@@ -16237,6 +16969,7 @@ fn write_telemetry_line(sink: &TelemetrySink, event: &str, fields: &[(&str, &str
     }
 }
 
+#[derive(Clone)]
 struct TelemetrySession {
     session_id: String,
     session_path: Option<PathBuf>,
@@ -16506,6 +17239,32 @@ fn unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
+}
+
+fn unix_ms_to_utc_datetime(ms: u128) -> String {
+    let seconds = (ms / 1000) as i128;
+    let millis = ms % 1000;
+    let days = seconds.div_euclid(86_400);
+    let second_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = second_of_day / 3600;
+    let minute = (second_of_day % 3600) / 60;
+    let second = second_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+fn civil_from_days(days_since_epoch: i128) -> (i128, i128, i128) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096).div_euclid(365);
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2).div_euclid(153);
+    let day = doy - (153 * mp + 2).div_euclid(5) + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+    (year, month, day)
 }
 
 fn json_escape(value: &str) -> String {
@@ -19502,6 +20261,36 @@ mod tests {
     }
 
     #[test]
+    fn color_layout_single_centered_column_uses_horizontal_auto_margins() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../color_layout_test/01_single_centered_column.html");
+        let html = fs::read_to_string(&fixture)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", fixture.display()));
+        let document = parse_html_document(&html, &path_to_file_url(&fixture));
+        let hero = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(77, 171, 247),
+        )
+        .unwrap_or_else(|| panic!("missing centered hero rect in {}", fixture.display()));
+
+        assert!(
+            (hero.rect.left() - 160.0).abs() <= 1.5,
+            "expected fixture 01 hero to be horizontally centered: {:?}",
+            hero.rect
+        );
+        assert!(
+            (hero.rect.width() - 960.0).abs() <= 2.5,
+            "expected fixture 01 hero width to follow min(960px, 100vw - 32px): {:?}",
+            hero.rect
+        );
+        assert!(
+            (hero.rect.top() - 24.0).abs() <= 1.5,
+            "expected fixture 01 hero to start at the declared 24px page margin: {:?}",
+            hero.rect
+        );
+    }
+
+    #[test]
     #[ignore = "requires Chrome/Chromium; run with CHROME_BIN=/path/to/chrome cargo test -p almostthere_browser color_layout_fixtures_generate_static_pngs -- --ignored --nocapture"]
     fn color_layout_fixtures_generate_static_pngs() {
         let chrome = find_chrome_binary().expect(
@@ -19550,15 +20339,24 @@ mod tests {
                 .unwrap_or("fixture");
             let chrome_png = report_dir.join(format!("{stem}.chrome.png"));
             let almost_png = report_dir.join(format!("{stem}.almostthere.png"));
+            let paired_png = report_dir.join("paired").join(format!("{stem}.paired.png"));
 
             render_chrome_color_layout_png(&chrome, &fixture, &chrome_png);
             render_almostthere_color_layout_png(&html, &fixture, &almost_png);
+            write_color_layout_paired_png(&almost_png, &chrome_png, &paired_png);
 
             index_rows.push(format!(
-                r#"<section class="pair"><h2>{}</h2><div><figure><figcaption>Chrome</figcaption><img src="{}"></figure><figure><figcaption>AlmostThere</figcaption><img src="{}"></figure></div></section>"#,
+                r#"<section class="pair"><h2>{}</h2><div><figure class="wide"><figcaption>Paired: This browser | Reference</figcaption><img src="{}"></figure><figure><figcaption>This browser</figcaption><img src="{}"></figure><figure><figcaption>Reference</figcaption><img src="{}"></figure></div></section>"#,
                 html_escape(&name),
-                html_escape(chrome_png.file_name().and_then(|name| name.to_str()).unwrap_or("")),
-                html_escape(almost_png.file_name().and_then(|name| name.to_str()).unwrap_or(""))
+                html_escape(
+                    paired_png
+                        .strip_prefix(&report_dir)
+                        .ok()
+                        .and_then(|path| path.to_str())
+                        .unwrap_or("")
+                ),
+                html_escape(almost_png.file_name().and_then(|name| name.to_str()).unwrap_or("")),
+                html_escape(chrome_png.file_name().and_then(|name| name.to_str()).unwrap_or(""))
             ));
         }
 
@@ -19625,6 +20423,257 @@ mod tests {
             .unwrap_or_else(|error| panic!("failed to write {}: {error}", output_path.display()));
     }
 
+    fn write_color_layout_paired_png(almost_png: &Path, chrome_png: &Path, output_path: &Path) {
+        let this_browser = image::open(almost_png)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", almost_png.display()))
+            .to_rgba8();
+        let reference = image::open(chrome_png)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", chrome_png.display()))
+            .to_rgba8();
+        let panel_width = this_browser.width().max(reference.width());
+        let panel_content_height = this_browser.height().max(reference.height());
+        let margin = 28;
+        let header_height = 58;
+        let divider_width = 18;
+        let canvas_width = margin * 2 + panel_width * 2 + divider_width;
+        let canvas_height = margin * 2 + header_height + panel_content_height;
+        let mut canvas = image::RgbaImage::from_pixel(
+            canvas_width,
+            canvas_height,
+            image::Rgba([244, 247, 250, 255]),
+        );
+
+        let left_x = margin;
+        let right_x = margin + panel_width + divider_width;
+        let top_y = margin;
+        let content_y = top_y + header_height;
+
+        fill_rgba_rect(
+            &mut canvas,
+            left_x,
+            top_y,
+            panel_width,
+            header_height + panel_content_height,
+            image::Rgba([255, 255, 255, 255]),
+        );
+        fill_rgba_rect(
+            &mut canvas,
+            right_x,
+            top_y,
+            panel_width,
+            header_height + panel_content_height,
+            image::Rgba([255, 255, 255, 255]),
+        );
+        fill_rgba_rect(
+            &mut canvas,
+            left_x,
+            top_y,
+            panel_width,
+            header_height,
+            image::Rgba([228, 235, 244, 255]),
+        );
+        fill_rgba_rect(
+            &mut canvas,
+            right_x,
+            top_y,
+            panel_width,
+            header_height,
+            image::Rgba([228, 235, 244, 255]),
+        );
+
+        blit_rgba(&mut canvas, &this_browser, left_x, content_y);
+        blit_rgba(&mut canvas, &reference, right_x, content_y);
+        draw_rgba_rect_outline(
+            &mut canvas,
+            left_x,
+            top_y,
+            panel_width,
+            header_height + panel_content_height,
+            image::Rgba([44, 57, 70, 255]),
+        );
+        draw_rgba_rect_outline(
+            &mut canvas,
+            right_x,
+            top_y,
+            panel_width,
+            header_height + panel_content_height,
+            image::Rgba([44, 57, 70, 255]),
+        );
+        draw_dashed_vertical_rgba_line(
+            &mut canvas,
+            margin + panel_width + divider_width / 2,
+            top_y,
+            header_height + panel_content_height,
+            10,
+            30,
+            18,
+            image::Rgba([0, 0, 0, 255]),
+        );
+        draw_ascii_label(
+            &mut canvas,
+            "THIS BROWSER",
+            left_x + 18,
+            top_y + 18,
+            3,
+            image::Rgba([18, 27, 36, 255]),
+        );
+        draw_ascii_label(
+            &mut canvas,
+            "REFERENCE",
+            right_x + 18,
+            top_y + 18,
+            3,
+            image::Rgba([18, 27, 36, 255]),
+        );
+
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)
+                .unwrap_or_else(|error| panic!("failed to create {}: {error}", parent.display()));
+        }
+        canvas
+            .save(output_path)
+            .unwrap_or_else(|error| panic!("failed to write {}: {error}", output_path.display()));
+    }
+
+    fn blit_rgba(
+        destination: &mut image::RgbaImage,
+        source: &image::RgbaImage,
+        x_offset: u32,
+        y_offset: u32,
+    ) {
+        for (x, y, pixel) in source.enumerate_pixels() {
+            destination.put_pixel(x_offset + x, y_offset + y, *pixel);
+        }
+    }
+
+    fn fill_rgba_rect(
+        image: &mut image::RgbaImage,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        color: image::Rgba<u8>,
+    ) {
+        for rect_y in y..(y + height).min(image.height()) {
+            for rect_x in x..(x + width).min(image.width()) {
+                image.put_pixel(rect_x, rect_y, color);
+            }
+        }
+    }
+
+    fn draw_rgba_rect_outline(
+        image: &mut image::RgbaImage,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        color: image::Rgba<u8>,
+    ) {
+        fill_rgba_rect(image, x, y, width, 2, color);
+        fill_rgba_rect(image, x, y + height.saturating_sub(2), width, 2, color);
+        fill_rgba_rect(image, x, y, 2, height, color);
+        fill_rgba_rect(image, x + width.saturating_sub(2), y, 2, height, color);
+    }
+
+    fn draw_dashed_vertical_rgba_line(
+        image: &mut image::RgbaImage,
+        center_x: u32,
+        y: u32,
+        height: u32,
+        width: u32,
+        dash: u32,
+        gap: u32,
+        color: image::Rgba<u8>,
+    ) {
+        let x = center_x.saturating_sub(width / 2);
+        let mut cursor_y = y;
+        let bottom = y + height;
+        while cursor_y < bottom {
+            let segment_height = dash.min(bottom - cursor_y);
+            fill_rgba_rect(image, x, cursor_y, width, segment_height, color);
+            cursor_y = cursor_y.saturating_add(dash + gap);
+        }
+    }
+
+    fn draw_ascii_label(
+        image: &mut image::RgbaImage,
+        text: &str,
+        x: u32,
+        y: u32,
+        scale: u32,
+        color: image::Rgba<u8>,
+    ) {
+        let mut cursor_x = x;
+        for ch in text.chars() {
+            if ch == ' ' {
+                cursor_x += scale * 4;
+                continue;
+            }
+            if let Some(glyph) = ascii_label_glyph(ch) {
+                for (row, bits) in glyph.iter().enumerate() {
+                    for col in 0..5u32 {
+                        if bits & (1u8 << (4 - col)) != 0 {
+                            fill_rgba_rect(
+                                image,
+                                cursor_x + col * scale,
+                                y + row as u32 * scale,
+                                scale,
+                                scale,
+                                color,
+                            );
+                        }
+                    }
+                }
+            }
+            cursor_x += scale * 6;
+        }
+    }
+
+    fn ascii_label_glyph(ch: char) -> Option<[u8; 7]> {
+        match ch {
+            'A' => Some([
+                0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+            ]),
+            'B' => Some([
+                0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+            ]),
+            'C' => Some([
+                0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111,
+            ]),
+            'E' => Some([
+                0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+            ]),
+            'F' => Some([
+                0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+            ]),
+            'H' => Some([
+                0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+            ]),
+            'I' => Some([
+                0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111,
+            ]),
+            'N' => Some([
+                0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+            ]),
+            'O' => Some([
+                0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+            ]),
+            'R' => Some([
+                0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+            ]),
+            'S' => Some([
+                0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+            ]),
+            'T' => Some([
+                0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+            ]),
+            'W' => Some([
+                0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010,
+            ]),
+            _ => None,
+        }
+    }
+
     fn color_layout_reference_index(rows: &[String]) -> String {
         format!(
             r#"<!doctype html>
@@ -19639,6 +20688,7 @@ h1 {{ margin: 0 0 16px; }}
 .pair {{ margin: 0 0 28px; padding-bottom: 28px; border-bottom: 1px solid #c9d1d9; }}
 .pair h2 {{ margin: 0 0 12px; font-size: 16px; }}
 .pair > div {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }}
+.pair figure.wide {{ grid-column: 1 / -1; }}
 figure {{ margin: 0; background: white; border: 1px solid #c9d1d9; }}
 figcaption {{ padding: 8px 10px; font-weight: 700; background: #eef2f7; border-bottom: 1px solid #c9d1d9; }}
 img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
