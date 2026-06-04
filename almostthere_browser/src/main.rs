@@ -4,12 +4,13 @@ use std::{
     io::{self, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{
         Arc, Mutex, OnceLock,
         mpsc::{self, Receiver, TryRecvError},
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use eframe::{App, Frame, NativeOptions, egui};
@@ -244,6 +245,7 @@ struct AppConfig {
     debug_socket: bool,
     event_trace: bool,
     debug_links: bool,
+    page_loader_timeout_enabled: bool,
     initial_url: Option<String>,
     trace_items: Vec<String>,
 }
@@ -259,6 +261,7 @@ impl AppConfig {
         let mut debug_socket = false;
         let mut event_trace = false;
         let mut debug_links = false;
+        let mut page_loader_timeout_override = None;
         let mut initial_url = None;
         let mut trace_items = Vec::new();
         let mut index = 0usize;
@@ -272,6 +275,10 @@ impl AppConfig {
                 event_trace = true;
             } else if arg == "--debug-links" {
                 debug_links = true;
+            } else if arg == "--page-loader-timeout" || arg == "--debug-page-loader-timeout" {
+                page_loader_timeout_override = Some(true);
+            } else if arg == "--no-page-loader-timeout" {
+                page_loader_timeout_override = Some(false);
             } else if arg == "--trace-item" || arg == "--track-item" {
                 if let Some(value) = args.get(index + 1) {
                     trace_items.push(value.to_owned());
@@ -299,6 +306,7 @@ impl AppConfig {
             debug_socket,
             event_trace,
             debug_links,
+            page_loader_timeout_enabled: page_loader_timeout_override.unwrap_or(false),
             initial_url,
             trace_items,
         }
@@ -306,6 +314,8 @@ impl AppConfig {
 }
 
 const PAGE_LOADER_WORKER_FLAG: &str = "--page-loader-worker";
+const PAGE_LOADER_WORKER_TIMEOUT_SECS: u64 = 45;
+const PAGE_LOADER_WORKER_POLL_MS: u64 = 50;
 
 fn page_loader_worker_invocation() -> Option<(String, PathBuf)> {
     let mut args = std::env::args().skip(1);
@@ -320,13 +330,20 @@ fn page_loader_worker_invocation() -> Option<(String, PathBuf)> {
 
 fn run_page_loader_worker(url: &str, output_dir: &Path) -> io::Result<()> {
     fs::create_dir_all(output_dir)?;
+    let _ = WORKER_TRACE_PATH.set(output_dir.join("worker_trace.jsonl"));
+    let output_dir_text = output_dir.display().to_string();
+    emit_global_telemetry(
+        "navigation.worker.output_dir.ready",
+        &[("url", url), ("output_dir", &output_dir_text)],
+    );
     emit_global_telemetry("navigation.fetch.started", &[("url", url)]);
     let source = load_url_source(url)?;
+    let final_url = source.source.clone();
     emit_global_telemetry(
         "navigation.fetch.completed",
         &[
             ("url", url),
-            ("final_url", &source.source),
+            ("final_url", &final_url),
             ("html_bytes", &source.html.len().to_string()),
             (
                 "body_bytes",
@@ -347,8 +364,25 @@ fn run_page_loader_worker(url: &str, output_dir: &Path) -> io::Result<()> {
             ),
         ],
     );
+    emit_global_telemetry(
+        "navigation.artifacts.prepare.started",
+        &[("url", url), ("final_url", &final_url)],
+    );
     let prepared = prepare_navigation_artifacts(source)?;
-    write_worker_prepared_navigation(output_dir, &prepared)
+    emit_global_telemetry(
+        "navigation.artifacts.prepare.completed",
+        &[("url", url), ("final_url", &prepared.source)],
+    );
+    emit_global_telemetry(
+        "navigation.artifacts.write.started",
+        &[("url", url), ("final_url", &prepared.source)],
+    );
+    write_worker_prepared_navigation(output_dir, &prepared)?;
+    emit_global_telemetry(
+        "navigation.artifacts.write.completed",
+        &[("url", url), ("final_url", &prepared.source)],
+    );
+    Ok(())
 }
 
 struct AlmostThereApp {
@@ -376,6 +410,7 @@ struct AlmostThereApp {
     record_events: bool,
     event_trace: bool,
     debug_links: bool,
+    page_loader_timeout_enabled: bool,
     trace_items: Vec<String>,
     recorded_event_count: u64,
     tabs: Vec<BrowserTabState>,
@@ -411,19 +446,7 @@ struct BrowserTabState {
 
 impl BrowserTabState {
     fn blank(id: u64, url: String) -> Self {
-        let mut document = BrowserDocument {
-            title: "New tab".to_owned(),
-            source: url.clone(),
-            style: Default::default(),
-            canvas_graph: CanvasGraph::default(),
-            blocks: vec![CanvasBlock::Paragraph {
-                text: format!("Loading {url}..."),
-            }],
-        };
-        document.canvas_graph.viewport = egui::vec2(
-            DEFAULT_LAYOUT_VIEWPORT_WIDTH,
-            DEFAULT_LAYOUT_VIEWPORT_HEIGHT,
-        );
+        let document = loading_document(&url);
         Self {
             id,
             title: tab_title_from_url(&url),
@@ -480,6 +503,48 @@ impl BrowserTabState {
     }
 }
 
+fn loading_document(url: &str) -> BrowserDocument {
+    let mut document = BrowserDocument {
+        title: "Loading".to_owned(),
+        source: url.to_owned(),
+        style: Default::default(),
+        canvas_graph: CanvasGraph::default(),
+        blocks: vec![CanvasBlock::Paragraph {
+            text: format!("Loading {url}..."),
+        }],
+    };
+    document.canvas_graph.viewport = egui::vec2(
+        DEFAULT_LAYOUT_VIEWPORT_WIDTH,
+        DEFAULT_LAYOUT_VIEWPORT_HEIGHT,
+    );
+    document
+}
+
+fn compact_loading_target(url: &str) -> String {
+    if let Ok(parsed) = reqwest::Url::parse(url)
+        && let Some(host) = parsed.host_str()
+    {
+        let path = parsed.path().trim_end_matches('/');
+        if path.is_empty() || path == "/" {
+            return host.to_owned();
+        }
+        let last_segment = path
+            .rsplit('/')
+            .find(|segment| !segment.trim().is_empty())
+            .unwrap_or(path);
+        return format!("{host}/{last_segment}");
+    }
+
+    let trimmed = url.trim();
+    const MAX_TARGET_CHARS: usize = 42;
+    if trimmed.chars().count() <= MAX_TARGET_CHARS {
+        trimmed.to_owned()
+    } else {
+        let prefix: String = trimmed.chars().take(MAX_TARGET_CHARS - 1).collect();
+        format!("{prefix}...")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FocusedInputMetadata {
     label: String,
@@ -526,6 +591,9 @@ struct PendingNavigation {
     url: String,
     fragment: Option<String>,
     history_action: NavigationHistoryAction,
+    started_at: Instant,
+    worker_output_dir: PathBuf,
+    worker_trace_imported_bytes: u64,
     receiver: Receiver<io::Result<PreparedNavigation>>,
 }
 
@@ -654,7 +722,7 @@ impl AlmostThereApp {
         }
 
         let mut bookmarks = load_bookmarks().unwrap_or_default();
-        let mut history = load_history().unwrap_or_default();
+        let history = load_history().unwrap_or_default();
         let inserted_default_bookmark = ensure_bookmark(&mut bookmarks, default_sample_bookmark())
             | ensure_bookmark(&mut bookmarks, default_url_bookmark());
         if inserted_default_bookmark {
@@ -665,96 +733,19 @@ impl AlmostThereApp {
             .as_deref()
             .filter(|url| !url.trim().is_empty())
             .unwrap_or(DEFAULT_URL);
+        telemetry.emit(
+            "navigation.initial_load.deferred",
+            &[("url", initial_url), ("reason", "isolated_worker")],
+        );
 
-        let (
-            mut document,
-            current_html,
-            live_html,
-            script_state,
-            render_graph_debug_text,
-            console_messages,
-            live_js_debug_text,
-            status,
-        ) = match load_url_source(initial_url).and_then(|source| {
-            prepare_navigation_source(
-                source,
-                None,
-                Some(&telemetry),
-                config.record_events,
-                config.event_trace,
-                &config.trace_items,
-                "initial_load",
-            )
-        }) {
-            Ok(prepared) => {
-                telemetry.emit(
-                    "navigation.loaded",
-                    &[
-                        ("url", &prepared.document.source),
-                        ("title", &prepared.document.title),
-                        ("blocks", &prepared.document.blocks.len().to_string()),
-                    ],
-                );
-                history.record_loaded(
-                    &prepared.document.source,
-                    &prepared.document.title,
-                    NavigationHistoryAction::AddEntry,
-                );
-                let _ = save_history(&history);
-                let status = match prepared.content_kind {
-                    PreparedContentKind::Html => format!("Loaded {}", prepared.document.source),
-                    PreparedContentKind::Image => {
-                        format!("Loaded image {}", prepared.document.source)
-                    }
-                };
-                let script_state = match prepared.content_kind {
-                    PreparedContentKind::Html => build_script_state_with_source(
-                        &prepared.current_html,
-                        Some(&prepared.document.source),
-                    ),
-                    PreparedContentKind::Image => {
-                        justbarelyscript::BrowserExecutionState::default()
-                    }
-                };
-                (
-                    prepared.document,
-                    prepared.current_html,
-                    prepared.live_html,
-                    script_state,
-                    prepared.render_graph_debug_text,
-                    prepared.console_messages,
-                    prepared.live_js_debug_text,
-                    status,
-                )
-            }
-            Err(error) => {
-                telemetry.emit(
-                    "navigation.failed",
-                    &[("url", initial_url), ("error", &error.to_string())],
-                );
-                let document = BrowserDocument {
-                    title: "Load failed".to_owned(),
-                    source: initial_url.to_owned(),
-                    style: Default::default(),
-                    canvas_graph: CanvasGraph::default(),
-                    blocks: vec![CanvasBlock::Paragraph {
-                        text: format!("Failed to load page {initial_url}: {error}"),
-                    }],
-                };
-                (
-                    document,
-                    String::new(),
-                    String::new(),
-                    justbarelyscript::BrowserExecutionState::default(),
-                    String::new(),
-                    vec![console_error_message(format!(
-                        "Failed to load page {initial_url}: {error}"
-                    ))],
-                    String::new(),
-                    format!("Failed to load page {initial_url}: {error}"),
-                )
-            }
-        };
+        let mut document = loading_document(initial_url);
+        let current_html = String::new();
+        let live_html = String::new();
+        let script_state = justbarelyscript::BrowserExecutionState::default();
+        let render_graph_debug_text = String::new();
+        let console_messages = Vec::new();
+        let live_js_debug_text = String::new();
+        let status = format!("Loading {initial_url}...");
 
         apply_debug_link_hits(&mut document.canvas_graph, config.debug_links);
 
@@ -776,7 +767,7 @@ impl AlmostThereApp {
             document.source.clone(),
         );
 
-        Self {
+        let mut app = Self {
             canvas: BrowserCanvas::new(),
             debug_canvas: BrowserCanvas::new(),
             document,
@@ -801,12 +792,19 @@ impl AlmostThereApp {
             record_events: config.record_events,
             event_trace: config.event_trace,
             debug_links: config.debug_links,
+            page_loader_timeout_enabled: config.page_loader_timeout_enabled,
             trace_items: config.trace_items,
             recorded_event_count: 0,
             tabs: vec![initial_tab],
             active_tab_index: 0,
             next_tab_id: 1,
-        }
+        };
+        app.start_navigation(
+            initial_url.to_owned(),
+            None,
+            NavigationHistoryAction::AddEntry,
+        );
+        app
     }
 
     fn open_new_tab(&mut self, url: Option<String>, ctx: &egui::Context) {
@@ -969,9 +967,16 @@ impl AlmostThereApp {
     ) {
         let (sender, receiver) = mpsc::channel();
         let thread_url = url.clone();
+        let timeout_enabled = self.page_loader_timeout_enabled;
+        let worker_output_dir = page_loader_worker_output_dir();
+        let thread_worker_output_dir = worker_output_dir.clone();
         thread::spawn(move || {
             emit_global_telemetry("navigation.worker.started", &[("url", &thread_url)]);
-            let result = prepare_navigation_in_isolated_process(&thread_url);
+            let result = prepare_navigation_in_isolated_process(
+                &thread_url,
+                timeout_enabled,
+                thread_worker_output_dir,
+            );
             match &result {
                 Ok(prepared) => emit_global_telemetry(
                     "navigation.worker.completed",
@@ -998,11 +1003,72 @@ impl AlmostThereApp {
             url,
             fragment,
             history_action,
+            started_at: Instant::now(),
+            worker_output_dir,
+            worker_trace_imported_bytes: 0,
             receiver,
         });
     }
 
+    fn pending_loading_summary(&self) -> Option<(f32, String)> {
+        let pending = self.pending_navigation.as_ref()?;
+        let elapsed = pending.started_at.elapsed();
+        let elapsed_secs = elapsed.as_secs_f32();
+        let (progress, phase) = if elapsed_secs < 1.5 {
+            (0.12, "starting isolated page process")
+        } else if elapsed_secs < 6.0 {
+            (0.32, "fetching document and subresources")
+        } else if elapsed_secs < 20.0 {
+            (0.64, "parsing scripts and building render data")
+        } else {
+            (0.82, "waiting for slow page work")
+        };
+        let target = compact_loading_target(&pending.url);
+        Some((progress, format!("{target}: {phase} ({elapsed_secs:.0}s)")))
+    }
+
+    fn import_pending_worker_trace(&mut self) {
+        let Some(pending) = self.pending_navigation.as_mut() else {
+            return;
+        };
+        let trace_path = pending.worker_output_dir.join("worker_trace.jsonl");
+        let Ok(text) = fs::read_to_string(&trace_path) else {
+            return;
+        };
+        let imported = pending.worker_trace_imported_bytes as usize;
+        if imported >= text.len() || !text.is_char_boundary(imported) {
+            pending.worker_trace_imported_bytes = text.len() as u64;
+            return;
+        }
+
+        for line in text[imported..]
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+        {
+            let worker_event =
+                parse_json_string_field(line, "event").unwrap_or_else(|| "unknown".to_owned());
+            let worker_pid = parse_json_u128_field(line, "pid")
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            let worker_timestamp_ms = parse_json_u128_field(line, "timestamp_ms")
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            self.telemetry.emit(
+                "navigation.worker.trace",
+                &[
+                    ("url", &pending.url),
+                    ("worker_event", &worker_event),
+                    ("worker_pid", &worker_pid),
+                    ("worker_timestamp_ms", &worker_timestamp_ms),
+                    ("line", line),
+                ],
+            );
+        }
+        pending.worker_trace_imported_bytes = text.len() as u64;
+    }
+
     fn poll_pending_navigation(&mut self, ctx: &egui::Context) {
+        self.import_pending_worker_trace();
         let Some(pending) = self.pending_navigation.as_ref() else {
             return;
         };
@@ -3075,6 +3141,10 @@ enum PageScriptKind {
 
 const MAX_EXTERNAL_SCRIPT_PARSE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_SCRIPT_DIAGNOSTIC_BYTES: usize = MAX_EXTERNAL_SCRIPT_PARSE_BYTES;
+const SCRIPT_RESOURCE_SOFT_TIMEOUT_SECS: u64 = 10;
+const SCRIPT_RESOURCE_HARD_TIMEOUT_SECS: u64 = 30;
+const SCRIPT_ANALYSIS_SOFT_TIMEOUT_SECS: u64 = 10;
+const SCRIPT_ANALYSIS_BACKGROUND_TIMEOUT_SECS: u64 = 30;
 const LIVE_JS_DEBUG_STATEMENT_BUDGET: usize = 50_000;
 const MAX_INITIAL_DYNAMIC_IMPORT_DRAINS: usize = 64;
 const MAX_RENDER_GRAPH_DEBUG_NODES: usize = 2_500;
@@ -3667,6 +3737,55 @@ fn apply_safe_script_browser_effects_with_source(html: &str, source: Option<&str
 struct ScriptApplicationResult {
     html: String,
     hydration_failed: bool,
+    pipeline_unhealthy: Option<ScriptPipelineUnhealthy>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ScriptPipelineUnhealthy {
+    BudgetExhausted { label: String },
+    EnginePanic { label: String, detail: String },
+}
+
+impl ScriptPipelineUnhealthy {
+    fn summary(&self) -> String {
+        match self {
+            ScriptPipelineUnhealthy::BudgetExhausted { label } => format!(
+                "{label}: execution stopped after {LIVE_JS_DEBUG_STATEMENT_BUDGET} statements"
+            ),
+            ScriptPipelineUnhealthy::EnginePanic { label, detail } => {
+                format!("{label}: script engine panic: {detail}")
+            }
+        }
+    }
+}
+
+fn degraded_script_console_messages(
+    reason: &ScriptPipelineUnhealthy,
+) -> Vec<justbarelyscript::ConsoleMessage> {
+    let mut messages = Vec::new();
+    if let ScriptPipelineUnhealthy::BudgetExhausted { label } = reason {
+        messages.push(console_error_message(format!(
+            "BrowserScriptBudgetError: {label} exceeded the browser statement budget; script aborted and page load continued"
+        )));
+    }
+    messages.push(console_error_message(format!(
+        "{}; JavaScript diagnostics skipped to continue navigation with best-effort HTML",
+        reason.summary()
+    )));
+    messages
+}
+
+fn degraded_live_js_debug_report(
+    html: &str,
+    source: Option<&str>,
+    reason: &ScriptPipelineUnhealthy,
+) -> String {
+    format!(
+        "Live JS Debug\n================\nsource: {}\nhtml_bytes: {}\nstatus: skipped\nreason: {}\n\nInitial DOM script execution already exhausted/crashed; skipped repeated JavaScript debug pass and continued with best-effort HTML.\n",
+        source.unwrap_or("<unknown>"),
+        html.len(),
+        reason.summary()
+    )
 }
 
 fn drain_initial_script_effects(
@@ -4031,9 +4150,13 @@ fn apply_safe_script_browser_effects_detailed(
     seed_script_dom_state_from_html(html, &mut state);
     seed_script_computed_styles_from_html(html, &mut state);
     let mut hydration_failed = false;
+    let mut pipeline_unhealthy = None;
     let mut module_cache = justbarelyscript::ModuleExecutionCache::default();
 
     for script in scripts {
+        if pipeline_unhealthy.is_some() {
+            break;
+        }
         let script_hydration_candidate = page_script_is_hydration_candidate(&script);
         let Ok(program) = &script.program else {
             if script_hydration_candidate {
@@ -4068,6 +4191,16 @@ fn apply_safe_script_browser_effects_detailed(
             Some(&mut output),
             "dom_effects",
         );
+        if state.execution_budget_exhausted() {
+            pipeline_unhealthy = Some(ScriptPipelineUnhealthy::BudgetExhausted {
+                label: script.label.clone(),
+            });
+        } else if let Some(ScriptExecutionFault::EnginePanic(detail)) = &script_fault {
+            pipeline_unhealthy = Some(ScriptPipelineUnhealthy::EnginePanic {
+                label: script.label.clone(),
+                detail: detail.clone(),
+            });
+        }
         let effect_count = effects.len().to_string();
         emit_global_telemetry(
             "js.script.execute.completed",
@@ -4119,6 +4252,7 @@ fn apply_safe_script_browser_effects_detailed(
     ScriptApplicationResult {
         html: output,
         hydration_failed,
+        pipeline_unhealthy,
     }
 }
 
@@ -4576,22 +4710,32 @@ fn load_external_page_script(
                     ))),
                 };
             }
-            let diagnostics = script_construct_diagnostics(&source);
-            let program = justbarelyscript::parse_script(&source);
-            let parse_context = program
-                .as_ref()
-                .err()
-                .and_then(|error| script_error_context(&source, error));
+            let analysis = match analyze_external_script_with_policy(&label, &resolved, source) {
+                Ok(analysis) => analysis,
+                Err(error) => {
+                    return PageScript {
+                        label,
+                        kind: PageScriptKind::External,
+                        is_module,
+                        source_url: Some(resolved),
+                        byte_len: error.byte_len,
+                        deferred,
+                        diagnostics: Vec::new(),
+                        parse_context: None,
+                        program: Err(synthetic_script_error(&error.message)),
+                    };
+                }
+            };
             PageScript {
                 label,
                 kind: PageScriptKind::External,
                 is_module,
                 source_url: Some(resolved),
-                byte_len: source.len(),
+                byte_len: analysis.byte_len,
                 deferred,
-                diagnostics,
-                parse_context,
-                program,
+                diagnostics: analysis.diagnostics,
+                parse_context: analysis.parse_context,
+                program: analysis.program,
             }
         }
         Err(error) => PageScript {
@@ -4607,6 +4751,141 @@ fn load_external_page_script(
                 "external script load failed: {error}"
             ))),
         },
+    }
+}
+
+struct ScriptAnalysisResult {
+    byte_len: usize,
+    diagnostics: Vec<String>,
+    parse_context: Option<String>,
+    program: Result<justbarelyscript::Program, justbarelyscript::JsError>,
+}
+
+struct ScriptAnalysisTimeout {
+    byte_len: usize,
+    message: String,
+}
+
+fn analyze_external_script_with_policy(
+    label: &str,
+    resolved: &str,
+    source: String,
+) -> Result<ScriptAnalysisResult, ScriptAnalysisTimeout> {
+    let started = Instant::now();
+    let byte_len = source.len();
+    let label_owned = label.to_owned();
+    let resolved_owned = resolved.to_owned();
+    emit_global_telemetry(
+        "js.script.analysis.started",
+        &[
+            ("label", label),
+            ("url", resolved),
+            ("bytes", &byte_len.to_string()),
+            ("kind", "external"),
+        ],
+    );
+
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let analysis_started = Instant::now();
+        let diagnostics = script_construct_diagnostics(&source);
+        let diagnostics_elapsed_ms = analysis_started.elapsed().as_millis().to_string();
+        emit_global_telemetry(
+            "js.script.analysis.diagnostics.completed",
+            &[
+                ("label", &label_owned),
+                ("url", &resolved_owned),
+                ("elapsed_ms", &diagnostics_elapsed_ms),
+            ],
+        );
+        let parse_started = Instant::now();
+        let program = justbarelyscript::parse_script(&source);
+        let parse_elapsed_ms = parse_started.elapsed().as_millis().to_string();
+        let parse_context = program
+            .as_ref()
+            .err()
+            .and_then(|error| script_error_context(&source, error));
+        let elapsed_ms = started.elapsed().as_millis().to_string();
+        let status = if program.is_ok() { "ok" } else { "parse_error" };
+        emit_global_telemetry(
+            "js.script.analysis.background.completed",
+            &[
+                ("label", &label_owned),
+                ("url", &resolved_owned),
+                ("bytes", &byte_len.to_string()),
+                ("status", status),
+                ("parse_elapsed_ms", &parse_elapsed_ms),
+                ("elapsed_ms", &elapsed_ms),
+            ],
+        );
+        let _ = sender.send(ScriptAnalysisResult {
+            byte_len,
+            diagnostics,
+            parse_context,
+            program,
+        });
+    });
+
+    match receiver.recv_timeout(Duration::from_secs(SCRIPT_ANALYSIS_SOFT_TIMEOUT_SECS)) {
+        Ok(analysis) => {
+            let elapsed_ms = started.elapsed().as_millis().to_string();
+            emit_global_telemetry(
+                "js.script.analysis.completed",
+                &[
+                    ("label", label),
+                    ("url", resolved),
+                    ("bytes", &byte_len.to_string()),
+                    ("elapsed_ms", &elapsed_ms),
+                    ("mode", "foreground"),
+                ],
+            );
+            Ok(analysis)
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let elapsed_ms = started.elapsed().as_millis().to_string();
+            emit_global_telemetry(
+                "js.script.analysis.soft_timeout",
+                &[
+                    ("label", label),
+                    ("url", resolved),
+                    ("bytes", &byte_len.to_string()),
+                    ("elapsed_ms", &elapsed_ms),
+                    (
+                        "soft_timeout_ms",
+                        &(SCRIPT_ANALYSIS_SOFT_TIMEOUT_SECS * 1000).to_string(),
+                    ),
+                    (
+                        "background_timeout_ms",
+                        &(SCRIPT_ANALYSIS_BACKGROUND_TIMEOUT_SECS * 1000).to_string(),
+                    ),
+                    ("action", "script_skipped_page_load_continues"),
+                ],
+            );
+            Err(ScriptAnalysisTimeout {
+                byte_len,
+                message: format!(
+                    "external script analysis exceeded soft timeout of {}s; script skipped and page load continued",
+                    SCRIPT_ANALYSIS_SOFT_TIMEOUT_SECS
+                ),
+            })
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let elapsed_ms = started.elapsed().as_millis().to_string();
+            emit_global_telemetry(
+                "js.script.analysis.failed",
+                &[
+                    ("label", label),
+                    ("url", resolved),
+                    ("bytes", &byte_len.to_string()),
+                    ("elapsed_ms", &elapsed_ms),
+                    ("reason", "analysis_worker_disconnected"),
+                ],
+            );
+            Err(ScriptAnalysisTimeout {
+                byte_len,
+                message: "external script analysis worker disconnected; script skipped".to_owned(),
+            })
+        }
     }
 }
 
@@ -4657,6 +4936,7 @@ fn script_construct_diagnostics(source: &str) -> Vec<String> {
 }
 
 fn read_script_resource(resolved: &str) -> io::Result<String> {
+    let started = Instant::now();
     let cache = SCRIPT_RESOURCE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(guard) = cache.lock()
         && let Some(cached) = guard.get(resolved).cloned()
@@ -4673,29 +4953,292 @@ fn read_script_resource(resolved: &str) -> io::Result<String> {
         return cached.map_err(io::Error::other);
     }
 
-    emit_global_telemetry("js.resource.cache_miss", &[("url", resolved)]);
-    let loaded = if is_remote_url(resolved) {
-        http_client()?
-            .get(resolved)
-            .send()
-            .map_err(io::Error::other)?
-            .error_for_status()
-            .map_err(io::Error::other)?
-            .text()
-            .map_err(io::Error::other)
+    let remote = if is_remote_url(resolved) {
+        "true"
     } else {
-        fs::read_to_string(input_to_path(resolved))
+        "false"
+    };
+    emit_global_telemetry(
+        "js.resource.cache_miss",
+        &[("url", resolved), ("remote", remote)],
+    );
+    if is_remote_url(resolved) {
+        return read_remote_script_resource_lazy(resolved, started);
+    }
+
+    let loaded = {
+        let path = input_to_path(resolved);
+        let path_label = path.display().to_string();
+        emit_global_telemetry(
+            "js.resource.local.read.started",
+            &[("url", resolved), ("path", &path_label)],
+        );
+        match fs::read_to_string(&path) {
+            Ok(text) => {
+                let elapsed_ms = started.elapsed().as_millis().to_string();
+                let bytes = text.len().to_string();
+                emit_global_telemetry(
+                    "js.resource.local.read.completed",
+                    &[
+                        ("url", resolved),
+                        ("path", &path_label),
+                        ("bytes", &bytes),
+                        ("elapsed_ms", &elapsed_ms),
+                    ],
+                );
+                Ok(text)
+            }
+            Err(error) => {
+                let elapsed_ms = started.elapsed().as_millis().to_string();
+                let detail = error.to_string();
+                emit_global_telemetry(
+                    "js.resource.local.read.failed",
+                    &[
+                        ("url", resolved),
+                        ("path", &path_label),
+                        ("elapsed_ms", &elapsed_ms),
+                        ("detail", &detail),
+                    ],
+                );
+                Err(error)
+            }
+        }
     };
 
+    store_script_resource_cache(resolved, &loaded, started, "local");
+    loaded
+}
+
+fn read_remote_script_resource_lazy(resolved: &str, started: Instant) -> io::Result<String> {
+    let (sender, receiver) = mpsc::channel();
+    let resolved_owned = resolved.to_owned();
+    thread::spawn(move || {
+        let loaded = fetch_remote_script_resource(&resolved_owned, started);
+        store_script_resource_cache(&resolved_owned, &loaded, started, "remote");
+        let elapsed_ms = started.elapsed().as_millis().to_string();
+        let status = if loaded.is_ok() { "ok" } else { "error" };
+        let bytes = loaded
+            .as_ref()
+            .map(|source| source.len().to_string())
+            .unwrap_or_else(|_| "0".to_owned());
+        emit_global_telemetry(
+            "js.resource.lazy.background.completed",
+            &[
+                ("url", &resolved_owned),
+                ("status", status),
+                ("bytes", &bytes),
+                ("elapsed_ms", &elapsed_ms),
+            ],
+        );
+        let _ = sender.send(loaded);
+    });
+
+    let soft_timeout = Duration::from_secs(SCRIPT_RESOURCE_SOFT_TIMEOUT_SECS);
+    match receiver.recv_timeout(soft_timeout) {
+        Ok(loaded) => loaded,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let elapsed_ms = started.elapsed().as_millis().to_string();
+            emit_global_telemetry(
+                "js.resource.lazy.soft_timeout",
+                &[
+                    ("url", resolved),
+                    ("elapsed_ms", &elapsed_ms),
+                    (
+                        "soft_timeout_ms",
+                        &(SCRIPT_RESOURCE_SOFT_TIMEOUT_SECS * 1000).to_string(),
+                    ),
+                    (
+                        "hard_timeout_ms",
+                        &(SCRIPT_RESOURCE_HARD_TIMEOUT_SECS * 1000).to_string(),
+                    ),
+                    ("action", "script_skipped_page_load_continues"),
+                ],
+            );
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "script resource exceeded soft timeout of {}s; loading page lazily",
+                    SCRIPT_RESOURCE_SOFT_TIMEOUT_SECS
+                ),
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let elapsed_ms = started.elapsed().as_millis().to_string();
+            emit_global_telemetry(
+                "js.resource.fetch.failed",
+                &[
+                    ("url", resolved),
+                    ("stage", "background_worker"),
+                    ("elapsed_ms", &elapsed_ms),
+                    ("detail", "script resource worker disconnected"),
+                ],
+            );
+            Err(io::Error::other("script resource worker disconnected"))
+        }
+    }
+}
+
+fn fetch_remote_script_resource(resolved: &str, started: Instant) -> io::Result<String> {
+    emit_global_telemetry(
+        "js.resource.fetch.request.build.started",
+        &[("url", resolved)],
+    );
+    let client = match script_resource_http_client() {
+        Ok(client) => {
+            let elapsed_ms = started.elapsed().as_millis().to_string();
+            emit_global_telemetry(
+                "js.resource.fetch.request.build.completed",
+                &[("url", resolved), ("elapsed_ms", &elapsed_ms)],
+            );
+            client
+        }
+        Err(error) => {
+            let elapsed_ms = started.elapsed().as_millis().to_string();
+            let detail = error.to_string();
+            emit_global_telemetry(
+                "js.resource.fetch.failed",
+                &[
+                    ("url", resolved),
+                    ("stage", "client_build"),
+                    ("elapsed_ms", &elapsed_ms),
+                    ("detail", &detail),
+                ],
+            );
+            return Err(error);
+        }
+    };
+
+    emit_global_telemetry(
+        "js.resource.fetch.request.send.started",
+        &[("url", resolved)],
+    );
+    let response = match client.get(resolved).send() {
+        Ok(response) => {
+            let elapsed_ms = started.elapsed().as_millis().to_string();
+            let status = response.status().as_u16().to_string();
+            let final_url = response.url().to_string();
+            emit_global_telemetry(
+                "js.resource.fetch.response.headers.received",
+                &[
+                    ("url", resolved),
+                    ("final_url", &final_url),
+                    ("status", &status),
+                    ("elapsed_ms", &elapsed_ms),
+                ],
+            );
+            response
+        }
+        Err(error) => {
+            let elapsed_ms = started.elapsed().as_millis().to_string();
+            let detail = error.to_string();
+            emit_global_telemetry(
+                "js.resource.fetch.failed",
+                &[
+                    ("url", resolved),
+                    ("stage", "send"),
+                    ("elapsed_ms", &elapsed_ms),
+                    ("detail", &detail),
+                ],
+            );
+            return Err(io::Error::other(error));
+        }
+    };
+
+    let response = match response.error_for_status() {
+        Ok(response) => {
+            let elapsed_ms = started.elapsed().as_millis().to_string();
+            emit_global_telemetry(
+                "js.resource.fetch.response.status.checked",
+                &[("url", resolved), ("elapsed_ms", &elapsed_ms)],
+            );
+            response
+        }
+        Err(error) => {
+            let elapsed_ms = started.elapsed().as_millis().to_string();
+            let detail = error.to_string();
+            emit_global_telemetry(
+                "js.resource.fetch.failed",
+                &[
+                    ("url", resolved),
+                    ("stage", "status"),
+                    ("elapsed_ms", &elapsed_ms),
+                    ("detail", &detail),
+                ],
+            );
+            return Err(io::Error::other(error));
+        }
+    };
+
+    emit_global_telemetry("js.resource.fetch.body.started", &[("url", resolved)]);
+    match response.text() {
+        Ok(text) => {
+            let elapsed_ms = started.elapsed().as_millis().to_string();
+            let bytes = text.len().to_string();
+            emit_global_telemetry(
+                "js.resource.fetch.body.completed",
+                &[
+                    ("url", resolved),
+                    ("bytes", &bytes),
+                    ("elapsed_ms", &elapsed_ms),
+                ],
+            );
+            Ok(text)
+        }
+        Err(error) => {
+            let elapsed_ms = started.elapsed().as_millis().to_string();
+            let detail = error.to_string();
+            emit_global_telemetry(
+                "js.resource.fetch.failed",
+                &[
+                    ("url", resolved),
+                    ("stage", "body"),
+                    ("elapsed_ms", &elapsed_ms),
+                    ("detail", &detail),
+                ],
+            );
+            Err(io::Error::other(error))
+        }
+    }
+}
+
+fn script_resource_http_client() -> io::Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(SCRIPT_RESOURCE_HARD_TIMEOUT_SECS))
+        .user_agent(format!("{APP_TITLE}/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(io::Error::other)
+}
+
+fn store_script_resource_cache(
+    resolved: &str,
+    loaded: &io::Result<String>,
+    started: Instant,
+    mode: &str,
+) {
     let cached = loaded
         .as_ref()
         .map(|source| source.to_owned())
         .map_err(|error| error.to_string());
+    let cache = SCRIPT_RESOURCE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut guard) = cache.lock() {
         guard.insert(resolved.to_owned(), cached);
     }
-
-    loaded
+    let elapsed_ms = started.elapsed().as_millis().to_string();
+    let status = if loaded.is_ok() { "ok" } else { "error" };
+    let bytes = loaded
+        .as_ref()
+        .map(|source| source.len().to_string())
+        .unwrap_or_else(|_| "0".to_owned());
+    emit_global_telemetry(
+        "js.resource.cache_store.completed",
+        &[
+            ("url", resolved),
+            ("status", status),
+            ("bytes", &bytes),
+            ("elapsed_ms", &elapsed_ms),
+            ("mode", mode),
+        ],
+    );
 }
 
 fn script_allowed_for_document(source: &str, resource: &str) -> bool {
@@ -5516,6 +6059,15 @@ impl App for AlmostThereApp {
                 {
                     self.duplicate_current_tab(ctx);
                 }
+                if let Some((progress, summary)) = self.pending_loading_summary() {
+                    ui.separator();
+                    ui.add(
+                        egui::ProgressBar::new(progress)
+                            .desired_width(120.0)
+                            .animate(true),
+                    );
+                    ui.label(egui::RichText::new(summary).small());
+                }
                 if let Some(index) = tab_to_close {
                     self.close_tab(index, ctx);
                 } else if let Some(index) = selected_tab {
@@ -5554,10 +6106,6 @@ impl App for AlmostThereApp {
                 }
                 if ui.button("Report Error").clicked() {
                     self.report_user_error();
-                }
-                if self.pending_navigation.is_some() {
-                    ui.add(egui::Spinner::new().size(16.0));
-                    ui.label("Loading");
                 }
                 let bookmark_label = if self.current_bookmark_index().is_some() {
                     "★"
@@ -5614,9 +6162,6 @@ impl App for AlmostThereApp {
 
         egui::TopBottomPanel::bottom("browser_status").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if self.pending_navigation.is_some() {
-                    ui.add(egui::Spinner::new().size(14.0));
-                }
                 ui.label(&self.status);
                 ui.separator();
                 ui.label(format!("Telemetry: {}", self.telemetry.display_path()));
@@ -6659,8 +7204,24 @@ fn load_url_document_with_optional_text_metrics(
 fn load_url_source(input: &str) -> io::Result<LoadedPageSource> {
     let input = input.trim();
     if input.starts_with("http://") || input.starts_with("https://") {
-        let response = http_client()?.get(input).send().map_err(io::Error::other)?;
+        emit_global_telemetry("navigation.fetch.request.build.started", &[("url", input)]);
+        let request = http_client()?.get(input);
+        emit_global_telemetry("navigation.fetch.request.send.started", &[("url", input)]);
+        let response = request.send().map_err(io::Error::other)?;
+        emit_global_telemetry(
+            "navigation.fetch.response.headers.received",
+            &[("url", input), ("final_url", response.url().as_str())],
+        );
         let final_url = response.url().to_string();
+        let status_text = response.status().as_u16().to_string();
+        emit_global_telemetry(
+            "navigation.fetch.response.status.checked",
+            &[
+                ("url", input),
+                ("final_url", &final_url),
+                ("status", &status_text),
+            ],
+        );
         let response = response.error_for_status().map_err(io::Error::other)?;
         let content_type = response
             .headers()
@@ -6668,8 +7229,28 @@ fn load_url_source(input: &str) -> io::Result<LoadedPageSource> {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_owned();
+        emit_global_telemetry(
+            "navigation.fetch.response.content_type",
+            &[
+                ("url", input),
+                ("final_url", &final_url),
+                ("content_type", &content_type),
+            ],
+        );
         if response_content_is_image(&content_type, &final_url) {
+            emit_global_telemetry(
+                "navigation.fetch.image_body.started",
+                &[("url", input), ("final_url", &final_url)],
+            );
             let bytes = response.bytes().map_err(io::Error::other)?.to_vec();
+            emit_global_telemetry(
+                "navigation.fetch.image_body.completed",
+                &[
+                    ("url", input),
+                    ("final_url", &final_url),
+                    ("bytes", &bytes.len().to_string()),
+                ],
+            );
             return Ok(LoadedPageSource {
                 html: String::new(),
                 source: final_url,
@@ -6679,7 +7260,19 @@ fn load_url_source(input: &str) -> io::Result<LoadedPageSource> {
                 }),
             });
         }
+        emit_global_telemetry(
+            "navigation.fetch.text_body.started",
+            &[("url", input), ("final_url", &final_url)],
+        );
         let html = response.text().map_err(io::Error::other)?;
+        emit_global_telemetry(
+            "navigation.fetch.text_body.completed",
+            &[
+                ("url", input),
+                ("final_url", &final_url),
+                ("bytes", &html.len().to_string()),
+            ],
+        );
         return Ok(LoadedPageSource {
             html,
             source: final_url,
@@ -7322,10 +7915,12 @@ fn prepare_navigation_artifacts(source: LoadedPageSource) -> io::Result<WorkerPr
             ("html_bytes", &source.html.len().to_string()),
         ],
     );
-    let live_html = apply_safe_script_browser_effects_with_source(
+    let script_result = apply_safe_script_browser_effects_detailed(
         &remove_html_comments(&source.html),
         Some(&source.source),
     );
+    let script_pipeline_unhealthy = script_result.pipeline_unhealthy.clone();
+    let live_html = script_result.html;
     emit_global_telemetry(
         "navigation.scripts.completed",
         &[
@@ -7348,29 +7943,42 @@ fn prepare_navigation_artifacts(source: LoadedPageSource) -> io::Result<WorkerPr
         ],
     );
 
-    emit_global_telemetry("navigation.console.started", &[("url", &source.source)]);
-    let console_messages =
-        script_console_messages_from_html_with_source(&source.html, Some(&source.source));
-    emit_global_telemetry(
-        "navigation.console.completed",
-        &[
-            ("url", &source.source),
-            ("messages", &console_messages.len().to_string()),
-        ],
-    );
+    let (console_messages, live_js_debug_text) =
+        if let Some(reason) = script_pipeline_unhealthy.as_ref() {
+            emit_global_telemetry(
+                "navigation.script_diagnostics.skipped",
+                &[("url", &source.source), ("reason", &reason.summary())],
+            );
+            (
+                degraded_script_console_messages(reason),
+                degraded_live_js_debug_report(&source.html, Some(&source.source), reason),
+            )
+        } else {
+            emit_global_telemetry("navigation.console.started", &[("url", &source.source)]);
+            let console_messages =
+                script_console_messages_from_html_with_source(&source.html, Some(&source.source));
+            emit_global_telemetry(
+                "navigation.console.completed",
+                &[
+                    ("url", &source.source),
+                    ("messages", &console_messages.len().to_string()),
+                ],
+            );
 
-    emit_global_telemetry(
-        "navigation.live_js_debug.started",
-        &[("url", &source.source)],
-    );
-    let live_js_debug_text = live_js_debug_report(&source.html, Some(&source.source));
-    emit_global_telemetry(
-        "navigation.live_js_debug.completed",
-        &[
-            ("url", &source.source),
-            ("bytes", &live_js_debug_text.len().to_string()),
-        ],
-    );
+            emit_global_telemetry(
+                "navigation.live_js_debug.started",
+                &[("url", &source.source)],
+            );
+            let live_js_debug_text = live_js_debug_report(&source.html, Some(&source.source));
+            emit_global_telemetry(
+                "navigation.live_js_debug.completed",
+                &[
+                    ("url", &source.source),
+                    ("bytes", &live_js_debug_text.len().to_string()),
+                ],
+            );
+            (console_messages, live_js_debug_text)
+        };
 
     Ok(WorkerPreparedNavigation {
         source: source.source,
@@ -7384,16 +7992,86 @@ fn prepare_navigation_artifacts(source: LoadedPageSource) -> io::Result<WorkerPr
     })
 }
 
-fn prepare_navigation_in_isolated_process(url: &str) -> io::Result<PreparedNavigation> {
-    let output_dir = page_loader_worker_output_dir();
+fn prepare_navigation_in_isolated_process(
+    url: &str,
+    timeout_enabled: bool,
+    output_dir: PathBuf,
+) -> io::Result<PreparedNavigation> {
     fs::create_dir_all(&output_dir)?;
     let exe = std::env::current_exe().map_err(io::Error::other)?;
-    let output = std::process::Command::new(exe)
+    let mut child = std::process::Command::new(exe)
         .arg(PAGE_LOADER_WORKER_FLAG)
         .arg(url)
         .arg(&output_dir)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(io::Error::other)?;
+    let output_dir_text = output_dir.display().to_string();
+    let child_pid = child.id().to_string();
+    emit_global_telemetry(
+        "navigation.worker.process.spawned",
+        &[
+            ("url", url),
+            ("pid", &child_pid),
+            ("output_dir", &output_dir_text),
+            (
+                "timeout_enabled",
+                if timeout_enabled { "true" } else { "false" },
+            ),
+        ],
+    );
+    let timeout = Duration::from_secs(PAGE_LOADER_WORKER_TIMEOUT_SECS);
+    let started_at = Instant::now();
+    let output = loop {
+        if child.try_wait().map_err(io::Error::other)?.is_some() {
+            break child.wait_with_output().map_err(io::Error::other)?;
+        }
+
+        if timeout_enabled && started_at.elapsed() >= timeout {
+            emit_global_telemetry(
+                "navigation.worker.timeout",
+                &[
+                    ("url", url),
+                    ("pid", &child_pid),
+                    ("output_dir", &output_dir_text),
+                    (
+                        "timeout_ms",
+                        &(PAGE_LOADER_WORKER_TIMEOUT_SECS * 1000).to_string(),
+                    ),
+                ],
+            );
+            if let Err(error) = child.kill()
+                && error.kind() != io::ErrorKind::InvalidInput
+            {
+                emit_global_telemetry(
+                    "navigation.worker.kill.failed",
+                    &[
+                        ("url", url),
+                        ("pid", &child_pid),
+                        ("error", &error.to_string()),
+                    ],
+                );
+            }
+            let output = child.wait_with_output().map_err(io::Error::other)?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.lines().last().unwrap_or("").trim();
+            let message = if detail.is_empty() {
+                format!(
+                    "Page Apparently Crashed Lol (loader timeout after {}s)",
+                    PAGE_LOADER_WORKER_TIMEOUT_SECS
+                )
+            } else {
+                format!(
+                    "Page Apparently Crashed Lol (loader timeout after {}s; {detail})",
+                    PAGE_LOADER_WORKER_TIMEOUT_SECS
+                )
+            };
+            return Err(io::Error::other(message));
+        }
+
+        thread::sleep(Duration::from_millis(PAGE_LOADER_WORKER_POLL_MS));
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -7639,10 +8317,12 @@ fn prepare_navigation_source(
             ("html_bytes", &source.html.len().to_string()),
         ],
     );
-    let live_html = apply_safe_script_browser_effects_with_source(
+    let script_result = apply_safe_script_browser_effects_detailed(
         &remove_html_comments(&source.html),
         Some(&source.source),
     );
+    let script_pipeline_unhealthy = script_result.pipeline_unhealthy.clone();
+    let live_html = script_result.html;
     emit_global_telemetry(
         "navigation.scripts.completed",
         &[
@@ -7665,22 +8345,42 @@ fn prepare_navigation_source(
         ],
     );
 
-    emit_global_telemetry("navigation.console.started", &[("url", &source.source)]);
-    let console_messages =
-        script_console_messages_from_html_with_source(&source.html, Some(&source.source));
-    emit_global_telemetry(
-        "navigation.console.completed",
-        &[
-            ("url", &source.source),
-            ("messages", &console_messages.len().to_string()),
-        ],
-    );
+    let (console_messages, live_js_debug_text) =
+        if let Some(reason) = script_pipeline_unhealthy.as_ref() {
+            emit_global_telemetry(
+                "navigation.script_diagnostics.skipped",
+                &[("url", &source.source), ("reason", &reason.summary())],
+            );
+            (
+                degraded_script_console_messages(reason),
+                degraded_live_js_debug_report(&source.html, Some(&source.source), reason),
+            )
+        } else {
+            emit_global_telemetry("navigation.console.started", &[("url", &source.source)]);
+            let console_messages =
+                script_console_messages_from_html_with_source(&source.html, Some(&source.source));
+            emit_global_telemetry(
+                "navigation.console.completed",
+                &[
+                    ("url", &source.source),
+                    ("messages", &console_messages.len().to_string()),
+                ],
+            );
 
-    emit_global_telemetry(
-        "navigation.live_js_debug.started",
-        &[("url", &source.source)],
-    );
-    let live_js_debug_text = live_js_debug_report(&source.html, Some(&source.source));
+            emit_global_telemetry(
+                "navigation.live_js_debug.started",
+                &[("url", &source.source)],
+            );
+            let live_js_debug_text = live_js_debug_report(&source.html, Some(&source.source));
+            emit_global_telemetry(
+                "navigation.live_js_debug.completed",
+                &[
+                    ("url", &source.source),
+                    ("bytes", &live_js_debug_text.len().to_string()),
+                ],
+            );
+            (console_messages, live_js_debug_text)
+        };
     if let Some(telemetry) = telemetry {
         if record_events {
             write_recorded_live_js_debug_artifact(telemetry, &source.source, &live_js_debug_text);
@@ -7695,13 +8395,6 @@ fn prepare_navigation_source(
             );
         }
     }
-    emit_global_telemetry(
-        "navigation.live_js_debug.completed",
-        &[
-            ("url", &source.source),
-            ("bytes", &live_js_debug_text.len().to_string()),
-        ],
-    );
 
     emit_global_telemetry(
         "navigation.canvas_graph.started",
@@ -7727,7 +8420,7 @@ fn prepare_navigation_source(
         render_graph_debug_text,
         console_messages,
         live_js_debug_text,
-        script_state_safe_to_build: true,
+        script_state_safe_to_build: script_pipeline_unhealthy.is_none(),
         content_kind: PreparedContentKind::Html,
     })
 }
@@ -15822,15 +16515,44 @@ fn replaced_content_from_dom_element(
 
     let label = element
         .attr("alt")
-        .or_else(|| element.attr("src"))
+        .or_else(|| preferred_image_source_from_dom_element(element))
         .unwrap_or("image")
         .to_owned();
     let requested_size = requested_image_size_from_dom(element);
-    let Some(src) = element.attr("src").filter(|src| !src.is_empty()) else {
+    let Some(src) = preferred_image_source_from_dom_element(element) else {
+        emit_global_telemetry(
+            "document.image.skipped",
+            &[
+                ("document", source),
+                ("tag", &element.tag_name),
+                ("reason", "missing-source"),
+                ("alt", element.attr("alt").unwrap_or_default()),
+            ],
+        );
         return unavailable_image_block(label, "missing-image", requested_size);
     };
     let resolved = resolve_resource_url(source, src);
+    emit_global_telemetry(
+        "document.image.discovered",
+        &[
+            ("document", source),
+            ("tag", &element.tag_name),
+            ("src", src),
+            ("resolved", &resolved),
+            ("alt", element.attr("alt").unwrap_or_default()),
+        ],
+    );
     if !resource_allowed_for_document(source, &resolved) {
+        emit_global_telemetry(
+            "document.image.skipped",
+            &[
+                ("document", source),
+                ("tag", &element.tag_name),
+                ("src", src),
+                ("resolved", &resolved),
+                ("reason", "blocked-by-resource-policy"),
+            ],
+        );
         return unavailable_image_block(label, resolved, requested_size);
     }
     match load_image_resource(&resolved, requested_size, image_height_auto) {
@@ -15852,6 +16574,35 @@ fn replaced_content_from_dom_element(
             unavailable_image_block(label, resolved, requested_size)
         }
     }
+}
+
+fn preferred_image_source_from_dom_element(element: &DomElement) -> Option<&str> {
+    for name in [
+        "src",
+        "data-src",
+        "data-original",
+        "data-lazy-src",
+        "data-srcset",
+        "srcset",
+    ] {
+        if let Some(value) = element.attr(name).filter(|value| !value.trim().is_empty()) {
+            if name.ends_with("srcset") || name == "srcset" {
+                if let Some(candidate) = first_srcset_candidate(value) {
+                    return Some(candidate);
+                }
+            } else {
+                return Some(value.trim());
+            }
+        }
+    }
+    None
+}
+
+fn first_srcset_candidate(value: &str) -> Option<&str> {
+    value
+        .split(',')
+        .filter_map(|candidate| candidate.split_whitespace().next())
+        .find(|candidate| !candidate.is_empty())
 }
 
 fn unavailable_image_block(
@@ -17183,7 +17934,7 @@ fn current_label(state: &ParseState, fallback: &str) -> String {
 
 fn media_label(open_tag: &str, fallback: &str) -> String {
     extract_attr(open_tag, "alt")
-        .or_else(|| extract_attr(open_tag, "src"))
+        .or_else(|| preferred_image_source_from_tag(open_tag))
         .filter(|label| !label.is_empty())
         .unwrap_or_else(|| fallback.to_owned())
 }
@@ -17191,11 +17942,40 @@ fn media_label(open_tag: &str, fallback: &str) -> String {
 fn image_block_from_tag(open_tag: &str, state: &ParseState) -> CanvasBlock {
     let label = media_label(open_tag, "image");
     let requested_size = requested_image_size(open_tag);
-    let Some(src) = extract_attr(open_tag, "src").filter(|src| !src.is_empty()) else {
+    let Some(src) = preferred_image_source_from_tag(open_tag) else {
+        emit_global_telemetry(
+            "document.image.skipped",
+            &[
+                ("document", &state.source),
+                ("tag", "img"),
+                ("reason", "missing-source"),
+                ("alt", &extract_attr(open_tag, "alt").unwrap_or_default()),
+            ],
+        );
         return unavailable_image_block(label, "missing-image", requested_size);
     };
     let resolved = resolve_resource_url(&state.source, &src);
+    emit_global_telemetry(
+        "document.image.discovered",
+        &[
+            ("document", &state.source),
+            ("tag", "img"),
+            ("src", &src),
+            ("resolved", &resolved),
+            ("alt", &extract_attr(open_tag, "alt").unwrap_or_default()),
+        ],
+    );
     if !resource_allowed_for_document(&state.source, &resolved) {
+        emit_global_telemetry(
+            "document.image.skipped",
+            &[
+                ("document", &state.source),
+                ("tag", "img"),
+                ("src", &src),
+                ("resolved", &resolved),
+                ("reason", "blocked-by-resource-policy"),
+            ],
+        );
         return unavailable_image_block(label, resolved, requested_size);
     }
 
@@ -17218,6 +17998,28 @@ fn image_block_from_tag(open_tag: &str, state: &ParseState) -> CanvasBlock {
             unavailable_image_block(label, resolved, requested_size)
         }
     }
+}
+
+fn preferred_image_source_from_tag(open_tag: &str) -> Option<String> {
+    for name in [
+        "src",
+        "data-src",
+        "data-original",
+        "data-lazy-src",
+        "data-srcset",
+        "srcset",
+    ] {
+        if let Some(value) = extract_attr(open_tag, name).filter(|value| !value.trim().is_empty()) {
+            if name.ends_with("srcset") || name == "srcset" {
+                if let Some(candidate) = first_srcset_candidate(&value) {
+                    return Some(candidate.to_owned());
+                }
+            } else {
+                return Some(value.trim().to_owned());
+            }
+        }
+    }
+    None
 }
 
 fn svg_block_from_tag(open_tag: &str, content: &str) -> CanvasBlock {
@@ -17357,19 +18159,63 @@ fn load_image_resource_bytes(url: &str) -> io::Result<Arc<Vec<u8>>> {
     }
 
     emit_global_telemetry("document.image.resource.cache_miss", &[("url", url)]);
+    emit_global_telemetry("document.image.resource.fetch.started", &[("url", url)]);
     let loaded = if is_remote_url(url) {
-        http_client()?
-            .get(url)
-            .send()
-            .map_err(io::Error::other)?
-            .error_for_status()
-            .map_err(io::Error::other)?
-            .bytes()
-            .map(|bytes| bytes.to_vec())
-            .map_err(io::Error::other)
+        let response = match http_client()?.get(url).send() {
+            Ok(response) => response,
+            Err(error) => {
+                emit_global_telemetry(
+                    "document.image.resource.fetch.failed",
+                    &[
+                        ("url", url),
+                        ("stage", "send"),
+                        ("error", &error.to_string()),
+                    ],
+                );
+                return Err(io::Error::other(error));
+            }
+        };
+        let status = response.status();
+        emit_global_telemetry(
+            "document.image.resource.fetch.response",
+            &[("url", url), ("status", &status.as_u16().to_string())],
+        );
+        let response = match response.error_for_status() {
+            Ok(response) => response,
+            Err(error) => {
+                emit_global_telemetry(
+                    "document.image.resource.fetch.failed",
+                    &[
+                        ("url", url),
+                        ("stage", "status"),
+                        ("status", &status.as_u16().to_string()),
+                        ("error", &error.to_string()),
+                    ],
+                );
+                return Err(io::Error::other(error));
+            }
+        };
+        match response.bytes() {
+            Ok(bytes) => Ok(bytes.to_vec()),
+            Err(error) => {
+                emit_global_telemetry(
+                    "document.image.resource.fetch.failed",
+                    &[
+                        ("url", url),
+                        ("stage", "bytes"),
+                        ("error", &error.to_string()),
+                    ],
+                );
+                Err(io::Error::other(error))
+            }
+        }
     } else {
         fs::read(input_to_path(url))
     }?;
+    emit_global_telemetry(
+        "document.image.resource.fetch.completed",
+        &[("url", url), ("bytes", &loaded.len().to_string())],
+    );
     let loaded = Arc::new(loaded);
     if let Ok(mut guard) = cache.lock() {
         guard.insert(url.to_owned(), Arc::clone(&loaded));
@@ -17893,6 +18739,7 @@ struct TelemetrySink {
 }
 
 static GLOBAL_TELEMETRY: OnceLock<Mutex<Option<TelemetrySink>>> = OnceLock::new();
+static WORKER_TRACE_PATH: OnceLock<PathBuf> = OnceLock::new();
 static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 static SCRIPT_RESOURCE_CACHE: OnceLock<Mutex<HashMap<String, Result<String, String>>>> =
     OnceLock::new();
@@ -17983,6 +18830,7 @@ fn install_global_telemetry(session: &TelemetrySession) {
 }
 
 fn emit_global_telemetry(event: &str, fields: &[(&str, &str)]) {
+    write_worker_trace_line(event, fields);
     let Some(slot) = GLOBAL_TELEMETRY.get() else {
         return;
     };
@@ -17993,6 +18841,31 @@ fn emit_global_telemetry(event: &str, fields: &[(&str, &str)]) {
         return;
     };
     write_telemetry_line(sink, event, fields);
+}
+
+fn write_worker_trace_line(event: &str, fields: &[(&str, &str)]) {
+    let Some(path) = WORKER_TRACE_PATH.get() else {
+        return;
+    };
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+
+    let mut line = format!(
+        "{{\"schema_version\":1,\"pid\":{},\"timestamp_ms\":{},\"event\":\"{}\"",
+        std::process::id(),
+        unix_ms(),
+        json_escape(event)
+    );
+    for (key, value) in fields {
+        line.push_str(&format!(
+            ",\"{}\":\"{}\"",
+            json_escape(key),
+            json_escape(value)
+        ));
+    }
+    line.push_str("}\n");
+    let _ = file.write_all(line.as_bytes());
 }
 
 fn install_telemetry_panic_hook() {
@@ -18404,6 +19277,37 @@ mod tests {
     }
 
     #[test]
+    fn page_loader_timeout_is_off_by_default_and_debug_runs() {
+        let normal = AppConfig::from_arg_values(vec![]);
+        assert!(!normal.page_loader_timeout_enabled);
+
+        let debug_socket = AppConfig::from_arg_values(vec!["--debug-socket".to_owned()]);
+        assert!(!debug_socket.page_loader_timeout_enabled);
+
+        let recorded = AppConfig::from_arg_values(vec!["--record-events".to_owned()]);
+        assert!(!recorded.page_loader_timeout_enabled);
+
+        let full_debug = AppConfig::from_arg_values(vec![
+            "--debug-socket".to_owned(),
+            "--record-events".to_owned(),
+            "--event-trace".to_owned(),
+        ]);
+        assert!(!full_debug.page_loader_timeout_enabled);
+    }
+
+    #[test]
+    fn page_loader_timeout_cli_override_wins() {
+        let enabled = AppConfig::from_arg_values(vec!["--page-loader-timeout".to_owned()]);
+        assert!(enabled.page_loader_timeout_enabled);
+
+        let disabled_debug = AppConfig::from_arg_values(vec![
+            "--debug-socket".to_owned(),
+            "--no-page-loader-timeout".to_owned(),
+        ]);
+        assert!(!disabled_debug.page_loader_timeout_enabled);
+    }
+
+    #[test]
     fn dom_parser_preserves_nested_elements_text_and_attributes() {
         let document = parse_dom_document(
             r#"<!doctype html><html><head><title>DOM &amp; Browser</title></head>
@@ -18457,6 +19361,28 @@ mod tests {
             2
         );
         assert!(document.first_descendant_by_tag("p").is_some());
+    }
+
+    #[test]
+    fn image_source_selection_supports_lazy_and_srcset_attributes() {
+        assert_eq!(
+            preferred_image_source_from_tag(r#"<img data-src="/lazy.png">"#).as_deref(),
+            Some("/lazy.png")
+        );
+        assert_eq!(
+            preferred_image_source_from_tag(r#"<img srcset="/small.png 1x, /large.png 2x">"#)
+                .as_deref(),
+            Some("/small.png")
+        );
+
+        let document = parse_dom_document(
+            r#"<html><body><img data-srcset="/lazy-small.png 320w, /lazy-large.png 640w"></body></html>"#,
+        );
+        let image = document.first_descendant_by_tag("img").unwrap();
+        assert_eq!(
+            preferred_image_source_from_dom_element(image),
+            Some("/lazy-small.png")
+        );
     }
 
     #[test]
@@ -25542,15 +26468,57 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
               </body>
             </html>
         "#;
-        let document = parse_html_document(html, "https://example.test/");
+        let script_result =
+            apply_safe_script_browser_effects_detailed(html, Some("https://example.test/"));
         let messages =
             script_console_messages_from_html_with_source(html, Some("https://example.test/"));
 
-        assert!(find_canvas_text(&document.canvas_graph, "Still visible").is_some());
+        assert!(script_result.html.contains("Still visible"));
+        assert!(matches!(
+            script_result.pipeline_unhealthy,
+            Some(ScriptPipelineUnhealthy::BudgetExhausted { .. })
+        ));
         assert!(messages.iter().any(|message| {
             message.level == justbarelyscript::ConsoleLevel::Error
                 && message.text.contains("execution stopped")
         }));
+    }
+
+    #[test]
+    fn navigation_skips_repeated_js_passes_after_budget_exhaustion() {
+        let html = r#"
+            <html>
+              <body>
+                <p>Still visible</p>
+                <div id="after">Not run</div>
+                <script>while (true) { var x = 1; }</script>
+                <script>document.getElementById("after").textContent = "Ran";</script>
+              </body>
+            </html>
+        "#;
+        let prepared = prepare_navigation_artifacts(LoadedPageSource {
+            html: html.to_owned(),
+            source: "https://example.test/slow".to_owned(),
+            image: None,
+        })
+        .expect("prepare navigation artifacts");
+
+        assert!(prepared.live_html.contains("Still visible"));
+        assert!(prepared.live_html.contains(">Not run</div>"));
+        assert!(!prepared.live_html.contains(">Ran</div>"));
+        assert!(prepared.console_messages.iter().any(|message| {
+            message.level == justbarelyscript::ConsoleLevel::Error
+                && message.text.contains("BrowserScriptBudgetError")
+                && message
+                    .text
+                    .contains("script aborted and page load continued")
+        }));
+        assert!(prepared.console_messages.iter().any(|message| {
+            message.level == justbarelyscript::ConsoleLevel::Error
+                && message.text.contains("JavaScript diagnostics skipped")
+        }));
+        assert!(prepared.live_js_debug_text.contains("status: skipped"));
+        assert!(!prepared.live_js_debug_text.contains("budget_exhausted: 1"));
     }
 
     #[test]

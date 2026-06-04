@@ -404,6 +404,7 @@ pub struct BrowserExecutionState {
     next_async_continuation_id: u64,
     promise_resolve_guards: HashSet<u64>,
     next_promise_resolve_guard_id: u64,
+    call_depth: usize,
     pub current_time_ms: u64,
     early_exit: Option<EarlyExit>,
     execution_budget_remaining: Option<usize>,
@@ -435,7 +436,22 @@ pub struct BrowserExecutionState {
 
 #[derive(Default)]
 pub struct ModuleExecutionCache {
-    exports: HashMap<String, HashMap<String, JsValue>>,
+    modules: HashMap<String, ModuleCacheEntry>,
+}
+
+enum ModuleCacheEntry {
+    Loading(HashMap<String, JsValue>),
+    Evaluated(HashMap<String, JsValue>),
+}
+
+impl ModuleCacheEntry {
+    fn exports(&self) -> HashMap<String, JsValue> {
+        match self {
+            ModuleCacheEntry::Loading(exports) | ModuleCacheEntry::Evaluated(exports) => {
+                exports.clone()
+            }
+        }
+    }
 }
 
 // ─── Environment Record Slot (Phase B: const / let mutability) ───────────────
@@ -1016,6 +1032,8 @@ pub fn collect_browser_effects(program: &Program) -> Vec<BrowserEffect> {
 impl BrowserExecutionState {
     const MAX_MICROTASK_DRAIN: usize = 1024;
     const MAX_POST_SCRIPT_TIMER_DRAIN: usize = 64;
+    const DEFAULT_SCRIPT_STATEMENT_BUDGET: usize = 100_000;
+    const MAX_CALL_DEPTH: usize = 8;
 
     // ── Core object model helpers ─────────────────────────────────────────────
 
@@ -1072,7 +1090,28 @@ impl BrowserExecutionState {
                 // Non-writable data property — silently fail in sloppy mode.
                 return;
             }
-            Some(Property::Data { .. }) | None => {}
+            Some(Property::Data {
+                writable: true,
+                enumerable,
+                configurable,
+                ..
+            }) => {
+                rc.borrow_mut().define(
+                    key,
+                    Property::Data {
+                        value,
+                        writable: true,
+                        enumerable,
+                        configurable,
+                    },
+                );
+                return;
+            }
+            None => {}
+        }
+        if own.is_none() && !rc.borrow().extensible {
+            // Non-extensible objects reject new own properties in sloppy mode.
+            return;
         }
         // Check prototype chain for inherited setter.
         let proto = rc.borrow().prototype.clone();
@@ -1196,6 +1235,37 @@ impl BrowserExecutionState {
     pub fn set_execution_budget(&mut self, statement_budget: usize) {
         self.execution_budget_remaining = Some(statement_budget);
         self.execution_budget_exhausted = false;
+    }
+
+    fn install_default_script_budget(&mut self) -> Option<(Option<usize>, bool)> {
+        if self.execution_budget_remaining.is_some() {
+            return None;
+        }
+        let previous = (
+            self.execution_budget_remaining,
+            self.execution_budget_exhausted,
+        );
+        self.execution_budget_remaining = Some(Self::DEFAULT_SCRIPT_STATEMENT_BUDGET);
+        self.execution_budget_exhausted = false;
+        Some(previous)
+    }
+
+    fn restore_default_script_budget(&mut self, previous: Option<(Option<usize>, bool)>) {
+        let Some((budget_remaining, budget_exhausted)) = previous else {
+            return;
+        };
+        if self.execution_budget_exhausted {
+            self.trace_runtime(
+                "script.execution.aborted",
+                format!(
+                    "statement budget {} exhausted",
+                    Self::DEFAULT_SCRIPT_STATEMENT_BUDGET
+                ),
+            );
+            self.early_exit = None;
+        }
+        self.execution_budget_remaining = budget_remaining;
+        self.execution_budget_exhausted = budget_exhausted;
     }
 
     pub fn set_execution_deadline(&mut self, deadline: std::time::Instant) {
@@ -1401,6 +1471,20 @@ impl BrowserExecutionState {
             JsValue::HostFunction("MediaQueryList".into()),
         );
         for name in ["MutationObserver", "IntersectionObserver", "ResizeObserver"] {
+            self.globals
+                .insert(name.into(), JsValue::HostFunction(name.into()));
+        }
+        for name in [
+            "eval",
+            "parseInt",
+            "parseFloat",
+            "isNaN",
+            "isFinite",
+            "decodeURI",
+            "decodeURIComponent",
+            "encodeURI",
+            "encodeURIComponent",
+        ] {
             self.globals
                 .insert(name.into(), JsValue::HostFunction(name.into()));
         }
@@ -1862,6 +1946,7 @@ impl BrowserExecutionState {
     }
 
     pub fn execute_program(&mut self, program: &Program) {
+        let default_budget = self.install_default_script_budget();
         self.ensure_global_frame();
         self.hoist_function_declarations(&program.body);
         for statement in &program.body {
@@ -1871,6 +1956,7 @@ impl BrowserExecutionState {
             }
         }
         self.drain_and_run_microtasks();
+        self.restore_default_script_budget(default_budget);
     }
 
     pub fn execute_module_program_with_loader<F>(
@@ -1882,7 +1968,7 @@ impl BrowserExecutionState {
         F: FnMut(&str, &str) -> Option<(String, Program)>,
     {
         let mut cache = ModuleExecutionCache::default();
-        self.execute_module_internal(program, module_key, &mut loader, &mut cache.exports);
+        self.execute_module_internal(program, module_key, &mut loader, &mut cache.modules);
         self.drain_and_run_microtasks();
     }
 
@@ -1895,7 +1981,7 @@ impl BrowserExecutionState {
     ) where
         F: FnMut(&str, &str) -> Option<(String, Program)>,
     {
-        self.execute_module_internal(program, module_key, &mut loader, &mut cache.exports);
+        self.execute_module_internal(program, module_key, &mut loader, &mut cache.modules);
         self.drain_and_run_microtasks();
     }
 
@@ -1904,16 +1990,20 @@ impl BrowserExecutionState {
         program: &Program,
         module_key: &str,
         loader: &mut F,
-        cache: &mut HashMap<String, HashMap<String, JsValue>>,
+        cache: &mut HashMap<String, ModuleCacheEntry>,
     ) -> HashMap<String, JsValue>
     where
         F: FnMut(&str, &str) -> Option<(String, Program)>,
     {
-        if let Some(exports) = cache.get(module_key) {
-            return exports.clone();
+        if let Some(entry) = cache.get(module_key) {
+            return entry.exports();
         }
 
         let previous_module_url = self.current_module_url.replace(module_key.to_owned());
+        cache.insert(
+            module_key.to_owned(),
+            ModuleCacheEntry::Loading(HashMap::new()),
+        );
         let mut imported_modules: HashMap<String, HashMap<String, JsValue>> = HashMap::new();
         for statement in &program.body {
             let source = match statement {
@@ -2033,7 +2123,10 @@ impl BrowserExecutionState {
             }
         }
 
-        cache.insert(module_key.to_owned(), exports.clone());
+        cache.insert(
+            module_key.to_owned(),
+            ModuleCacheEntry::Evaluated(exports.clone()),
+        );
         self.current_module_url = previous_module_url;
         exports
     }
@@ -2434,7 +2527,7 @@ impl BrowserExecutionState {
         F: FnMut(&str, &str) -> Option<(String, Program)>,
     {
         let exports =
-            self.execute_module_internal(program, module_key, &mut loader, &mut cache.exports);
+            self.execute_module_internal(program, module_key, &mut loader, &mut cache.modules);
         self.drain_and_run_microtasks();
         if let Some(ps) = self.pending_dynamic_imports.remove(&promise_id) {
             let ns = JsValue::from_map(exports.into_iter());
@@ -2555,10 +2648,7 @@ impl BrowserExecutionState {
                     let mut remaining = remaining.borrow_mut();
                     *remaining = remaining.saturating_sub(1);
                     if *remaining == 0 {
-                        self.settle_promise(
-                            &result,
-                            PromiseStatus::Fulfilled(JsValue::Array(values.borrow().clone())),
-                        );
+                        self.promise_resolve_to(&result, JsValue::Array(values.borrow().clone()));
                     }
                 }
                 PromiseStatus::Rejected(reason) => {
@@ -2587,15 +2677,12 @@ impl BrowserExecutionState {
                 let mut remaining = remaining.borrow_mut();
                 *remaining = remaining.saturating_sub(1);
                 if *remaining == 0 {
-                    self.settle_promise(
-                        &result,
-                        PromiseStatus::Fulfilled(JsValue::Array(values.borrow().clone())),
-                    );
+                    self.promise_resolve_to(&result, JsValue::Array(values.borrow().clone()));
                 }
             }
             PromiseReaction::RaceElement { result } => match status {
                 PromiseStatus::Fulfilled(value) => {
-                    self.settle_promise(&result, PromiseStatus::Fulfilled(value));
+                    self.promise_resolve_to(&result, value);
                 }
                 PromiseStatus::Rejected(reason) => {
                     self.settle_promise(&result, PromiseStatus::Rejected(reason));
@@ -2609,7 +2696,7 @@ impl BrowserExecutionState {
                 result,
             } => match status {
                 PromiseStatus::Fulfilled(value) => {
-                    self.settle_promise(&result, PromiseStatus::Fulfilled(value));
+                    self.promise_resolve_to(&result, value);
                 }
                 PromiseStatus::Rejected(reason) => {
                     errors.borrow_mut()[index] = reason;
@@ -3436,6 +3523,9 @@ impl BrowserExecutionState {
                     .as_ref()
                     .map(|e| self.execute_expression(e))
                     .unwrap_or(JsValue::Undefined);
+                if self.early_exit.is_some() {
+                    return;
+                }
                 if self.pending_async_await.is_some() {
                     self.pending_async_return = true;
                     return;
@@ -6104,6 +6194,26 @@ impl BrowserExecutionState {
                     return JsValue::Boolean(rc.borrow().has_own(&key));
                 }
             }
+            if let Some(owner) = Self::member_prototype_fallback_owner(&receiver) {
+                let native_owner =
+                    if Self::native_prototype_methods(owner).contains(&method_name.as_str()) {
+                        Some(owner)
+                    } else if owner != "Object"
+                        && Self::native_prototype_methods("Object").contains(&method_name.as_str())
+                    {
+                        Some("Object")
+                    } else {
+                        None
+                    };
+                if let Some(native_owner) = native_owner {
+                    let args = self.eval_args(arguments);
+                    return self.call_host_function(
+                        &format!("{native_owner}.prototype.{method_name}"),
+                        receiver.clone(),
+                        args,
+                    );
+                }
+            }
             if Self::is_noop_style_method(&method_name) {
                 let args = self.eval_args(arguments);
                 return args.first().cloned().unwrap_or(receiver);
@@ -6615,6 +6725,9 @@ impl BrowserExecutionState {
             let new_configurable = desc_ref.get_own_data("configurable");
             drop(desc_ref);
             let existing = target.borrow().get_own(key.as_str()).cloned();
+            if existing.is_none() && !target.borrow().extensible {
+                return false;
+            }
             let (def_enumerable, def_configurable) = match &existing {
                 Some(Property::Data {
                     enumerable,
@@ -6626,9 +6739,9 @@ impl BrowserExecutionState {
                     configurable,
                     ..
                 }) => (*enumerable, *configurable),
-                None => (false, true),
+                None => (false, false),
             };
-            if !def_configurable {
+            if existing.is_some() && !def_configurable {
                 // non-configurable: can't change to accessor or change enumerable/get/set
                 let new_enum = new_enumerable
                     .as_ref()
@@ -6695,6 +6808,10 @@ impl BrowserExecutionState {
             let new_configurable = desc_ref.get_own_data("configurable");
             drop(desc_ref);
             let existing = target.borrow().get_own(key.as_str()).cloned();
+            if existing.is_none() && !target.borrow().extensible {
+                return false;
+            }
+            let had_existing = existing.is_some();
             let (def_value, def_writable, def_enumerable, def_configurable) = match existing {
                 Some(Property::Data {
                     value,
@@ -6713,10 +6830,10 @@ impl BrowserExecutionState {
                     }
                     (JsValue::Undefined, false, enumerable, configurable)
                 }
-                None => (JsValue::Undefined, false, false, true),
+                None => (JsValue::Undefined, false, false, false),
             };
             // Enforce non-configurable constraints
-            if !def_configurable {
+            if had_existing && !def_configurable {
                 let new_cfg = new_configurable
                     .as_ref()
                     .map(|v| matches!(v, JsValue::Boolean(true)));
@@ -6765,6 +6882,56 @@ impl BrowserExecutionState {
             );
             true
         }
+    }
+
+    fn object_prevent_extensions(value: &JsValue) -> bool {
+        match value {
+            JsValue::Object(rc) => {
+                rc.borrow_mut().extensible = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn object_set_integrity_level(value: &JsValue, frozen: bool) -> bool {
+        let JsValue::Object(rc) = value else {
+            return false;
+        };
+        let mut object = rc.borrow_mut();
+        object.extensible = false;
+        for property in object.properties.values_mut() {
+            match property {
+                Property::Data {
+                    writable,
+                    configurable,
+                    ..
+                } => {
+                    if frozen {
+                        *writable = false;
+                    }
+                    *configurable = false;
+                }
+                Property::Accessor { configurable, .. } => {
+                    *configurable = false;
+                }
+            }
+        }
+        true
+    }
+
+    fn object_test_integrity_level(value: &JsValue, frozen: bool) -> bool {
+        let JsValue::Object(rc) = value else {
+            return true;
+        };
+        let object = rc.borrow();
+        if object.extensible {
+            return false;
+        }
+        object.properties.values().all(|property| {
+            !property.is_configurable()
+                && (!frozen || !matches!(property, Property::Data { writable: true, .. }))
+        })
     }
 
     fn call_object_static(&mut self, name: &str, args: Vec<JsValue>) -> JsValue {
@@ -6978,11 +7145,38 @@ impl BrowserExecutionState {
                 }
                 JsValue::Object(new_obj_rc)
             }
-            "freeze" | "seal" | "preventExtensions" => {
-                args.into_iter().next().unwrap_or(JsValue::Undefined)
+            "preventExtensions" => {
+                let obj = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                Self::object_prevent_extensions(&obj);
+                obj
             }
-            "isExtensible" => JsValue::Boolean(true),
-            "isFrozen" | "isSealed" => JsValue::Boolean(false),
+            "seal" => {
+                let obj = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                Self::object_set_integrity_level(&obj, false);
+                obj
+            }
+            "freeze" => {
+                let obj = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                Self::object_set_integrity_level(&obj, true);
+                obj
+            }
+            "isExtensible" => JsValue::Boolean(match args.first() {
+                Some(JsValue::Object(rc)) => rc.borrow().extensible,
+                Some(
+                    JsValue::Function(_)
+                    | JsValue::HostFunction(_)
+                    | JsValue::BoundHostFunction { .. },
+                ) => true,
+                _ => false,
+            }),
+            "isSealed" => JsValue::Boolean(Self::object_test_integrity_level(
+                args.first().unwrap_or(&JsValue::Undefined),
+                false,
+            )),
+            "isFrozen" => JsValue::Boolean(Self::object_test_integrity_level(
+                args.first().unwrap_or(&JsValue::Undefined),
+                true,
+            )),
             "hasOwn" => {
                 if let (Some(JsValue::Object(rc)), Some(k)) = (args.first(), args.get(1)) {
                     JsValue::Boolean(rc.borrow().has_own(Self::value_to_string(k).as_str()))
@@ -8403,9 +8597,9 @@ impl BrowserExecutionState {
         {
             let key = Self::value_to_string(&self.execute_expression(key_expr));
             let receiver = self.execute_expression(object);
-            match receiver {
+            match receiver.clone() {
                 JsValue::Proxy { target, traps } => {
-                    self.proxy_set_property(*target, traps.set.clone(), &key, value);
+                    self.proxy_set_property(*target, traps.set.clone(), &key, value, receiver);
                 }
                 JsValue::Object(rc) => {
                     self.obj_set(&rc, &key, value);
@@ -8472,9 +8666,9 @@ impl BrowserExecutionState {
 
         if let Some((object, property)) = member_assignment_target(target) {
             let receiver = self.execute_expression(object);
-            match receiver {
+            match receiver.clone() {
                 JsValue::Proxy { target, traps } => {
-                    self.proxy_set_property(*target, traps.set.clone(), &property, value);
+                    self.proxy_set_property(*target, traps.set.clone(), &property, value, receiver);
                     return;
                 }
                 JsValue::ElementRef(element_ref) => {
@@ -8949,10 +9143,10 @@ impl BrowserExecutionState {
         match property {
             MemberProperty::Computed(_) => {
                 let index = computed_key.unwrap_or(JsValue::Undefined);
-                match receiver {
+                match receiver.clone() {
                     JsValue::Proxy { target, traps } => {
                         let key = Self::value_to_string(&index);
-                        self.proxy_get_property(*target, traps.get.clone(), &key)
+                        self.proxy_get_property(*target, traps.get.clone(), &key, receiver)
                     }
                     JsValue::Array(items) => {
                         let idx = Self::value_to_number(&index);
@@ -9018,9 +9212,9 @@ impl BrowserExecutionState {
     }
 
     fn named_member_value_from_receiver(&mut self, receiver: JsValue, property: &str) -> JsValue {
-        match receiver {
+        match receiver.clone() {
             JsValue::Proxy { target, traps } => {
-                self.proxy_get_property(*target, traps.get.clone(), property)
+                self.proxy_get_property(*target, traps.get.clone(), property, receiver)
             }
             JsValue::String(ref s) if property == "length" => {
                 JsValue::Number(s.chars().count() as f64)
@@ -9070,8 +9264,9 @@ impl BrowserExecutionState {
             },
             JsValue::HostFunction(ref fn_name) => match property {
                 "call" | "apply" | "bind" => JsValue::HostFunction(fn_name.clone()),
-                "prototype" => Self::constructor_prototype_object(fn_name)
-                    .unwrap_or_else(|| Self::host_function_prototype(fn_name)),
+                "prototype" => {
+                    Self::constructor_prototype_object(fn_name).unwrap_or(JsValue::Undefined)
+                }
                 "name" => JsValue::String(Self::host_fn_short_name(fn_name)),
                 "length" => JsValue::Number(Self::host_fn_arity(fn_name) as f64),
                 _ => Self::host_fn_static_member(fn_name, property)
@@ -9233,7 +9428,7 @@ impl BrowserExecutionState {
                         | "Atomics" => {
                             return match property.as_str() {
                                 "prototype" => Self::constructor_prototype_object(obj_name)
-                                    .unwrap_or_else(|| Self::native_prototype_object("Object")),
+                                    .unwrap_or(JsValue::Undefined),
                                 _ => Self::host_fn_static_member(obj_name, property)
                                     .unwrap_or(JsValue::Undefined),
                             };
@@ -9318,9 +9513,12 @@ impl BrowserExecutionState {
                     return JsValue::Undefined;
                 }
                 let result = match receiver.clone() {
-                    JsValue::Proxy { target, traps } => {
-                        self.proxy_get_property(*target, traps.get.clone(), property)
-                    }
+                    JsValue::Proxy { target, traps } => self.proxy_get_property(
+                        *target,
+                        traps.get.clone(),
+                        property,
+                        receiver.clone(),
+                    ),
                     JsValue::String(ref s) if property == "length" => {
                         JsValue::Number(s.chars().count() as f64)
                     }
@@ -9549,7 +9747,7 @@ impl BrowserExecutionState {
                     JsValue::HostFunction(ref fn_name) => match property.as_str() {
                         "call" | "apply" | "bind" => JsValue::HostFunction(fn_name.clone()),
                         "prototype" => Self::constructor_prototype_object(fn_name)
-                            .unwrap_or_else(|| Self::host_function_prototype(fn_name)),
+                            .unwrap_or(JsValue::Undefined),
                         "name" => JsValue::String(Self::host_fn_short_name(fn_name)),
                         "length" => JsValue::Number(Self::host_fn_arity(fn_name) as f64),
                         // Array[Symbol.species] is an accessor; calling it returns Array.
@@ -9684,9 +9882,13 @@ impl BrowserExecutionState {
         target: JsValue,
         get: Option<JsFunction>,
         property: &str,
+        receiver: JsValue,
     ) -> JsValue {
         if let Some(getter) = get {
-            return self.call_function(getter, vec![target, JsValue::String(property.to_owned())]);
+            return self.call_function(
+                getter,
+                vec![target, JsValue::String(property.to_owned()), receiver],
+            );
         }
         match target {
             JsValue::Object(rc) => self.obj_get(&rc, property),
@@ -9711,11 +9913,17 @@ impl BrowserExecutionState {
         set: Option<JsFunction>,
         property: &str,
         value: JsValue,
+        receiver: JsValue,
     ) -> bool {
         if let Some(setter) = set {
             let result = self.call_function(
                 setter,
-                vec![target, JsValue::String(property.to_owned()), value],
+                vec![
+                    target,
+                    JsValue::String(property.to_owned()),
+                    value,
+                    receiver,
+                ],
             );
             return Self::is_truthy(&result);
         }
@@ -10054,6 +10262,15 @@ impl BrowserExecutionState {
             | "cancelAnimationFrame"
             | "queueMicrotask"
             | "matchMedia"
+            | "eval"
+            | "parseInt"
+            | "parseFloat"
+            | "isNaN"
+            | "isFinite"
+            | "decodeURI"
+            | "decodeURIComponent"
+            | "encodeURI"
+            | "encodeURIComponent"
             | "escape"
             | "unescape" => JsValue::HostFunction(name.to_owned()),
             "localStorage" => JsValue::StorageRef(StorageKind::Local),
@@ -11905,9 +12122,15 @@ impl BrowserExecutionState {
     fn begin_for_of_loop_cursor(&mut self, statement: ForOfStatement) -> Option<LoopCursor> {
         let iterable = self.execute_expression(&statement.iterable);
         let mut iterator = self.get_iterator_record(iterable)?;
-        let first_value = self.iterator_next_value(&mut iterator)?;
+        let Some(first_value) = self.iterator_next_value(&mut iterator) else {
+            return None;
+        };
         self.stack.push(StackFrame::block_scope());
         self.bind_iteration_value(&statement.binding, statement.binding_kind, first_value);
+        if self.early_exit.is_some() {
+            self.iterator_close(&mut iterator);
+            return None;
+        }
         Some(LoopCursor::ForOf {
             statement,
             iterator,
@@ -11934,6 +12157,14 @@ impl BrowserExecutionState {
             let promise = self.call_async_function_with_this(func, args, this_value.clone());
             return (promise, this_value);
         }
+        if self.call_depth >= Self::MAX_CALL_DEPTH {
+            self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                "RangeError",
+                "Maximum call stack size exceeded".to_owned(),
+            )));
+            return (JsValue::Undefined, this_value);
+        }
+        self.call_depth += 1;
         let super_ctor = func.super_ctor.clone();
         let instance_fields = func.instance_fields.clone();
         let default_derived_ctor = func.default_derived_ctor;
@@ -12004,6 +12235,7 @@ impl BrowserExecutionState {
         if let Some(previous) = saved_module_url {
             self.current_module_url = previous;
         }
+        self.call_depth = self.call_depth.saturating_sub(1);
         (result, this_after)
     }
 
@@ -12157,10 +12389,17 @@ impl BrowserExecutionState {
                 iterator,
             } => {
                 let Some(value) = self.iterator_next_value(iterator) else {
+                    if self.early_exit.is_some() {
+                        return LoopCursorStep::Suspended;
+                    }
                     return LoopCursorStep::Done;
                 };
                 self.stack.push(StackFrame::block_scope());
                 self.bind_iteration_value(&statement.binding, statement.binding_kind, value);
+                if self.early_exit.is_some() {
+                    self.iterator_close(iterator);
+                    return LoopCursorStep::Suspended;
+                }
                 LoopCursorStep::Body(*statement.body.clone())
             }
         }
@@ -14235,9 +14474,10 @@ impl BrowserExecutionState {
                 let mut iter = args.into_iter();
                 let obj = iter.next().unwrap_or(JsValue::Undefined);
                 let prop = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
-                match obj {
+                let receiver = iter.next().unwrap_or_else(|| obj.clone());
+                match obj.clone() {
                     JsValue::Proxy { target, traps } => {
-                        self.proxy_get_property(*target, traps.get.clone(), &prop)
+                        self.proxy_get_property(*target, traps.get.clone(), &prop, receiver)
                     }
                     JsValue::Object(rc) => self.obj_get(&rc, &prop),
                     _ => JsValue::Undefined,
@@ -14334,12 +14574,14 @@ impl BrowserExecutionState {
                 let obj = iter.next().unwrap_or(JsValue::Undefined);
                 let prop = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
                 let value = iter.next().unwrap_or(JsValue::Undefined);
-                match obj {
+                let receiver = iter.next().unwrap_or_else(|| obj.clone());
+                match obj.clone() {
                     JsValue::Proxy { target, traps } => JsValue::Boolean(self.proxy_set_property(
                         *target,
                         traps.set.clone(),
                         &prop,
                         value,
+                        receiver,
                     )),
                     JsValue::Object(rc) => {
                         self.obj_set(&rc, &prop, value);
@@ -14512,6 +14754,14 @@ impl BrowserExecutionState {
                     JsValue::Array(items) => {
                         JsValue::Boolean(key.parse::<usize>().map_or(false, |i| i < items.len()))
                     }
+                    JsValue::HostFunction(fn_name) => {
+                        JsValue::Boolean(Self::host_fn_own_property_is_enumerable(fn_name, &key))
+                    }
+                    JsValue::BoundHostFunction { .. } => JsValue::Boolean(false),
+                    JsValue::Function(func) => JsValue::Boolean(
+                        !matches!(key.as_str(), "name" | "length" | "prototype")
+                            && func.properties.contains_key(&key),
+                    ),
                     _ => JsValue::Boolean(false),
                 }
             }
@@ -15580,15 +15830,6 @@ impl BrowserExecutionState {
         }
     }
 
-    fn host_function_prototype(name: &str) -> JsValue {
-        JsValue::from_map(["call", "apply", "bind"].iter().map(|method| {
-            (
-                method.to_owned().to_owned(),
-                JsValue::HostFunction(format!("{name}.prototype.{method}")),
-            )
-        }))
-    }
-
     fn constructor_prototype_object(name: &str) -> Option<JsValue> {
         match name {
             "Object"
@@ -15928,6 +16169,10 @@ impl BrowserExecutionState {
                     | "create"
                     | "freeze"
                     | "seal"
+                    | "preventExtensions"
+                    | "isExtensible"
+                    | "isSealed"
+                    | "isFrozen"
                     | "defineProperty"
                     | "defineProperties"
                     | "getOwnPropertyNames"
@@ -16037,6 +16282,10 @@ impl BrowserExecutionState {
         }
     }
 
+    fn host_fn_own_property_is_enumerable(_fn_name: &str, _key: &str) -> bool {
+        false
+    }
+
     /// Returns `true` when the HostFunction with this name can be used as a constructor (new target).
     fn host_fn_is_constructor(fn_name: &str) -> bool {
         matches!(
@@ -16107,6 +16356,7 @@ impl BrowserExecutionState {
             | "Number.isSafeInteger"
             | "Number.parseFloat"
             | "Number.parseInt"
+            | "parseInt"
             | "String.fromCharCode"
             | "String.fromCodePoint"
             | "Math.abs"
@@ -16179,7 +16429,17 @@ impl BrowserExecutionState {
             | "Promise.any"
             | "Promise.race"
             | "Promise.try"
-            | "JSON.parse" => 1,
+            | "JSON.parse"
+            | "eval"
+            | "parseFloat"
+            | "isNaN"
+            | "isFinite"
+            | "decodeURI"
+            | "decodeURIComponent"
+            | "encodeURI"
+            | "encodeURIComponent"
+            | "escape"
+            | "unescape" => 1,
             "matchMedia"
             | "requestAnimationFrame"
             | "cancelAnimationFrame"
@@ -18703,6 +18963,78 @@ mod tests {
     }
 
     #[test]
+    fn default_script_budget_aborts_runaway_script_and_allows_next_script() {
+        let runaway = crate::parse_script("while (true) {}").expect("valid runaway script");
+        let next =
+            crate::parse_script(r#"document.getElementById("app").textContent = "continued";"#)
+                .expect("valid next script");
+        let mut state = BrowserExecutionState::default();
+
+        state.execute_program(&runaway);
+        let effects = state.drain_effects();
+
+        assert!(!state.execution_budget_exhausted());
+        assert!(
+            effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    BrowserEffect::RuntimeTrace { kind, detail }
+                        if kind == "script.execution.aborted"
+                            && detail.contains("statement budget")
+                )
+            }),
+            "runaway script should emit an abort trace: {effects:?}"
+        );
+
+        state.execute_program(&next);
+        assert_eq!(state.drain_effects(), vec![text("app", "continued")]);
+    }
+
+    #[test]
+    fn recursive_script_hits_call_depth_limit_and_allows_next_script() {
+        let recursive = crate::parse_script(
+            r#"
+            function recurse() { return recurse(); }
+            recurse();
+            "#,
+        )
+        .expect("valid recursive script");
+        let next =
+            crate::parse_script(r#"document.getElementById("app").textContent = "continued";"#)
+                .expect("valid next script");
+        let mut state = BrowserExecutionState::default();
+
+        state.execute_program(&recursive);
+        assert_eq!(
+            state.clear_uncaught_throw().as_deref(),
+            Some("RangeError: Maximum call stack size exceeded")
+        );
+
+        state.execute_program(&next);
+        assert_eq!(state.drain_effects(), vec![text("app", "continued")]);
+    }
+
+    #[test]
+    fn finite_recursion_below_call_depth_limit_still_runs() {
+        let program = crate::parse_script(
+            r#"
+            function sum(n) {
+                if (n < 1) { return 0; }
+                return n + sum(n - 1);
+            }
+            document.getElementById("app").textContent = String(sum(4));
+            "#,
+        )
+        .expect("valid recursive script");
+        let mut state = BrowserExecutionState::default();
+
+        state.execute_program(&program);
+
+        assert!(state.clear_uncaught_throw().is_none());
+        assert_eq!(state.drain_effects(), vec![text("app", "10")]);
+    }
+
+    #[test]
     fn click_event_closure_mutates_counter_across_firings() {
         let program = crate::parse_script(
             r#"
@@ -19013,6 +19345,42 @@ mod tests {
     }
 
     #[test]
+    fn standard_global_functions_expose_builtin_metadata() {
+        let program = crate::parse_script(
+            r#"
+            let lengthDesc = Object.getOwnPropertyDescriptor(decodeURI, "length");
+            let nameDesc = Object.getOwnPropertyDescriptor(parseInt, "name");
+            let names = Object.getOwnPropertyNames(encodeURIComponent);
+            document.getElementById("result").textContent =
+                decodeURI.name + "/" +
+                String(decodeURI.length) + "/" +
+                String(decodeURI.hasOwnProperty("length")) + "/" +
+                String(decodeURI.propertyIsEnumerable("length")) + "/" +
+                String(lengthDesc.writable) + "/" +
+                String(lengthDesc.enumerable) + "/" +
+                String(lengthDesc.configurable) + "/" +
+                parseInt.name + "/" +
+                String(parseInt.length) + "/" +
+                String(nameDesc.writable) + "/" +
+                String(globalThis.propertyIsEnumerable("decodeURI")) + "/" +
+                String(decodeURI.prototype === undefined) + "/" +
+                String(Reflect.prototype === undefined) + "/" +
+                names.join(",");
+            "#,
+        )
+        .expect("script should parse");
+
+        assert_eq!(
+            collect_browser_effects(&program),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "decodeURI/1/true/false/false/false/true/parseInt/2/false/false/true/true/length,name"
+                    .to_owned(),
+            }]
+        );
+    }
+
+    #[test]
     fn promise_resolve_assimilates_thenable_object() {
         let program = crate::parse_script(
             r#"
@@ -19227,6 +19595,119 @@ mod tests {
             vec![BrowserEffect::SetTextContent {
                 element_id: "result".to_owned(),
                 value: "ok".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    #[ignore = "Block 3 deferred: Promise static receiver constructor capabilities"]
+    fn promise_resolve_call_uses_custom_constructor_capability() {
+        let program = crate::parse_script(
+            r#"
+            function Capture(executor) {
+                this.kind = "capture";
+                let self = this;
+                executor(function (value) {
+                    self.value = value;
+                }, function (reason) {
+                    self.reason = reason;
+                });
+            }
+
+            let fulfilled = Promise.resolve.call(Capture, "A");
+            let rejected = Promise.reject.call(Capture, "B");
+            document.getElementById("result").textContent =
+                fulfilled.kind + "/" + fulfilled.value + "/" + rejected.reason;
+            "#,
+        )
+        .expect("script should parse");
+
+        assert_eq!(
+            collect_browser_effects(&program),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "capture/A/B".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    #[ignore = "Block 3 deferred: Promise static receiver constructor capabilities"]
+    fn promise_all_call_uses_custom_constructor_capability() {
+        let program = crate::parse_script(
+            r#"
+            function Capture(executor) {
+                this.kind = "capture";
+                let self = this;
+                executor(function (value) {
+                    self.value = value.join("");
+                }, function (reason) {
+                    self.reason = reason;
+                });
+            }
+
+            let result = Promise.all.call(Capture, [Promise.resolve("A"), "B"]);
+            setTimeout(function () {
+                document.getElementById("result").textContent =
+                    result.kind + "/" + result.value;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "capture/AB".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    #[ignore = "Block 3 deferred: Promise static receiver constructor capabilities"]
+    fn promise_all_call_rejects_custom_capability_when_iterator_throws() {
+        let program = crate::parse_script(
+            r#"
+            function Capture(executor) {
+                this.kind = "capture";
+                let self = this;
+                executor(function (value) {
+                    self.value = value;
+                }, function (reason) {
+                    self.reason = reason;
+                });
+            }
+            let iterable = {};
+            iterable[Symbol.iterator] = function () {
+                return {
+                    next: function () { throw "bad"; },
+                    return: function () { return { done: true }; }
+                };
+            };
+
+            let result = Promise.all.call(Capture, iterable);
+            setTimeout(function () {
+                document.getElementById("result").textContent =
+                    result.kind + "/" + result.reason;
+            }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "capture/bad".to_owned(),
             }]
         );
     }
@@ -19938,6 +20419,122 @@ mod tests {
     }
 
     #[test]
+    fn object_prevent_extensions_rejects_new_properties() {
+        let program = crate::parse_script(
+            r#"
+            let obj = { existing: "A" };
+            let returned = Object.preventExtensions(obj);
+            obj.extra = "B";
+            let threw = "no";
+            try {
+                Object.defineProperty(obj, "defined", { value: "C" });
+            } catch (e) {
+                threw = e.name;
+            }
+            obj.existing = "D";
+            document.getElementById("result").textContent =
+                String(returned === obj) + "/" +
+                String(Object.isExtensible(obj)) + "/" +
+                String(Object.hasOwn(obj, "extra")) + "/" +
+                threw + "/" + obj.existing;
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "true/false/false/TypeError/D".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn object_define_property_new_descriptor_defaults_are_not_configurable() {
+        let program = crate::parse_script(
+            r#"
+            let obj = {};
+            Object.defineProperty(obj, "locked", { value: "A" });
+            let before = Object.getOwnPropertyDescriptor(obj, "locked");
+            let threw = "no";
+            try {
+                Object.defineProperty(obj, "locked", { configurable: true });
+            } catch (e) {
+                threw = e.name;
+            }
+            let after = Object.getOwnPropertyDescriptor(obj, "locked");
+            document.getElementById("result").textContent =
+                String(before.configurable) + "/" +
+                String(before.enumerable) + "/" +
+                String(before.writable) + "/" +
+                threw + "/" +
+                String(after.configurable);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "false/false/false/TypeError/false".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn object_seal_and_freeze_update_descriptor_integrity() {
+        let program = crate::parse_script(
+            r#"
+            let sealed = { keep: "A" };
+            Object.seal(sealed);
+            let sealedDesc = Object.getOwnPropertyDescriptor(sealed, "keep");
+            sealed.keep = "B";
+            sealed.extra = "C";
+
+            let frozen = { keep: "D" };
+            Object.freeze(frozen);
+            let frozenDesc = Object.getOwnPropertyDescriptor(frozen, "keep");
+            frozen.keep = "E";
+            frozen.extra = "F";
+
+            document.getElementById("result").textContent =
+                String(Object.isSealed(sealed)) + "/" +
+                String(Object.isFrozen(sealed)) + "/" +
+                String(sealedDesc.configurable) + "/" +
+                String(sealedDesc.writable) + "/" +
+                sealed.keep + "/" +
+                String(Object.hasOwn(sealed, "extra")) + "/" +
+                String(Object.isSealed(frozen)) + "/" +
+                String(Object.isFrozen(frozen)) + "/" +
+                String(frozenDesc.configurable) + "/" +
+                String(frozenDesc.writable) + "/" +
+                frozen.keep + "/" +
+                String(Object.hasOwn(frozen, "extra"));
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "true/false/false/true/B/false/true/true/false/false/D/false".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
     fn reflect_construct_static_call_reaches_host_dispatch() {
         let program = crate::parse_script(
             r#"
@@ -20165,6 +20762,54 @@ mod tests {
                 element_id: "result".to_owned(),
                 value: "get:name:B/true/x=Y/true/false/false/gone/b,a/desc:slot/true/newProp=V"
                     .to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn proxy_get_set_and_reflect_pass_receiver_to_traps() {
+        let program = crate::parse_script(
+            r#"
+            let target = {};
+            let explicitReceiver = { marker: "R" };
+            let proxy = new Proxy(target, {
+                get: function (obj, prop, receiver) {
+                    if (prop === "slot") {
+                        return prop + ":" + receiver.marker;
+                    }
+                    return prop + ":P";
+                },
+                set: function (obj, prop, value, receiver) {
+                    if (value === "V") {
+                        obj.lastSet = prop + ":" + value + ":" + receiver.marker;
+                    } else {
+                        obj.lastSet = prop + ":" + value + ":P";
+                    }
+                    return true;
+                }
+            });
+
+            let directGet = proxy.name;
+            let reflectGet = Reflect.get(proxy, "slot", explicitReceiver);
+            let directSet = proxy.value = "D";
+            let directSetSeen = target.lastSet;
+            let reflectSet = Reflect.set(proxy, "value", "V", explicitReceiver);
+
+            document.getElementById("result").textContent =
+                directGet + "/" + reflectGet + "/" + directSet + "/" +
+                directSetSeen + "/" + String(reflectSet) + "/" + target.lastSet;
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "name:P/slot:R/D/value:D:P/true/value:V:R".to_owned(),
             }]
         );
     }
@@ -22194,6 +22839,132 @@ mod tests {
     }
 
     #[test]
+    fn generator_for_of_closes_iterator_when_resumed_binding_throws() {
+        let program = crate::parse_script(
+            r#"
+            let output = "";
+            let iterable = {};
+            iterable[Symbol.iterator] = function () {
+                let i = 0;
+                return {
+                    next: function () {
+                        i = i + 1;
+                        if (i === 1) {
+                            return { value: { x: "A" }, done: false };
+                        }
+                        let value = {};
+                        Object.defineProperty(value, "x", {
+                            get: function () {
+                                throw "boom";
+                            }
+                        });
+                        return { value: value, done: false };
+                    },
+                    return: function () {
+                        output = output + "R";
+                        return { done: true };
+                    }
+                };
+            };
+
+            function* gen() {
+                try {
+                    for (const { x } of iterable) {
+                        output = output + x;
+                        yield "pause";
+                    }
+                    output = output + "after";
+                } catch (e) {
+                    output = output + "C" + e;
+                }
+                yield output;
+            }
+
+            let g = gen();
+            let r1 = g.next();
+            let r2 = g.next();
+            document.getElementById("result").textContent =
+                r1.value + "/" + r2.value + "/" + String(r2.done);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "pause/ARCboom/false".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn async_for_of_closes_iterator_when_resumed_binding_throws() {
+        let program = crate::parse_script(
+            r#"
+            let resolveLater;
+            let p = new Promise(function (resolve) { resolveLater = resolve; });
+            let output = "";
+            let iterable = {};
+            iterable[Symbol.iterator] = function () {
+                let i = 0;
+                return {
+                    next: function () {
+                        i = i + 1;
+                        if (i === 1) {
+                            return { value: { x: "A" }, done: false };
+                        }
+                        let value = {};
+                        Object.defineProperty(value, "x", {
+                            get: function () {
+                                throw "boom";
+                            }
+                        });
+                        return { value: value, done: false };
+                    },
+                    return: function () {
+                        output = output + "R";
+                        return { done: true };
+                    }
+                };
+            };
+
+            async function run() {
+                try {
+                    for (const { x } of iterable) {
+                        output = output + x;
+                        await p;
+                    }
+                    output = output + "after";
+                } catch (e) {
+                    output = output + "C" + e;
+                }
+                document.getElementById("result").textContent = output;
+            }
+
+            run();
+            setTimeout(function () { resolveLater("resume"); }, 0);
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+        state.drain_effects();
+
+        assert_eq!(
+            state.poll_timers(0),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "ARCboom".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
     fn generator_return_closes_yield_star_custom_iterator() {
         let program = crate::parse_script(
             r#"
@@ -23777,6 +24548,101 @@ mod tests {
             vec![BrowserEffect::SetTextContent {
                 element_id: "result".to_owned(),
                 value: "Hello from module/3/(1,2)/default export".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn static_module_cycle_does_not_recurse_forever() {
+        let entry = crate::parse_script(
+            r#"
+            import { a, seenB } from "./a.js";
+            document.getElementById("result").textContent = a + "/" + seenB;
+            "#,
+        )
+        .expect("entry module should parse");
+        let module_a = crate::parse_script(
+            r#"
+            import { b } from "./b.js";
+            export const a = "A";
+            export const seenB = String(b);
+            "#,
+        )
+        .expect("module a should parse");
+        let module_b = crate::parse_script(
+            r#"
+            import { a } from "./a.js";
+            export const b = "B";
+            export const seenA = String(a);
+            "#,
+        )
+        .expect("module b should parse");
+        let mut loads = 0usize;
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_module_program_with_loader(&entry, "entry.js", |base, source| {
+            loads += 1;
+            assert!(loads < 8, "cyclic module loading should terminate");
+            match (base, source) {
+                ("entry.js", "./a.js") => Some(("a.js".to_owned(), module_a.clone())),
+                ("a.js", "./b.js") => Some(("b.js".to_owned(), module_b.clone())),
+                ("b.js", "./a.js") => Some(("a.js".to_owned(), module_a.clone())),
+                _ => None,
+            }
+        });
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "A/B".to_owned(),
+            }]
+        );
+        assert_eq!(loads, 3);
+    }
+
+    #[test]
+    fn static_module_cycle_imports_loading_exports_as_partial_snapshot() {
+        let entry = crate::parse_script(
+            r#"
+            import { seenA } from "./b.js";
+            import { seenB } from "./a.js";
+            document.getElementById("result").textContent = seenA + "/" + seenB;
+            "#,
+        )
+        .expect("entry module should parse");
+        let module_a = crate::parse_script(
+            r#"
+            import { b } from "./b.js";
+            export const a = "A";
+            export const seenB = String(b);
+            "#,
+        )
+        .expect("module a should parse");
+        let module_b = crate::parse_script(
+            r#"
+            import { a } from "./a.js";
+            export const b = "B";
+            export const seenA = String(a);
+            "#,
+        )
+        .expect("module b should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_module_program_with_loader(&entry, "entry.js", |base, source| {
+            match (base, source) {
+                ("entry.js", "./b.js") => Some(("b.js".to_owned(), module_b.clone())),
+                ("b.js", "./a.js") => Some(("a.js".to_owned(), module_a.clone())),
+                ("a.js", "./b.js") => Some(("b.js".to_owned(), module_b.clone())),
+                _ => None,
+            }
+        });
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "A/undefined".to_owned(),
             }]
         );
     }
