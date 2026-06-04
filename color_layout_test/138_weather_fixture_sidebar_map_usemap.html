@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>138 - Weather Fixture Sidebar Map Usemap</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 28px; background: #f1f3f5; font: 14px/1.35 system-ui, sans-serif; }
+.sidebar { width: 360px; margin: 0 auto; background: #e7f5ff; padding: 14px; border: 1px solid rgba(20,30,40,.2); }
+h2 { margin: 0 0 10px; min-height: 42px; background: #ffd43b; padding: 8px; font-size: 18px; }
+map, area { background: #ff8787; width: 280px; height: 120px; display: block; }
+.map-wrap { background: #d0bfff; padding: 10px; }
+img { display: block; width: 300px; height: 260px; background: #51cf66; border: 8px solid #91a7ff; }
+.below { margin-top: 12px; min-height: 70px; background: #63e6be; padding: 10px; }
+.label { position: fixed; right: 12px; bottom: 12px; padding: 6px 8px; background: rgba(255,255,255,.9); border: 1px solid rgba(20,30,40,.2); font-size: 12px; }
+</style>
+</head>
+<body>
+<aside class="sidebar">
+<h2>Mappa Meteo Sicilia</h2>
+<map id="map1" name="SIC">
+<area shape="poly" coords="10,10,40,10,40,40" href="#" alt="Palermo">
+<area shape="poly" coords="60,20,90,20,90,60" href="#" alt="Catania">
+</map>
+<div class="map-wrap"><img usemap="#SIC" src="sicilia.png" alt="cartina regione"></div>
+<div class="below">Map and area elements should be non-rendering; only the image box should paint.</div>
+</aside>
+<div class="label">138 - sidebar map usemap</div>
+</body>
+</html>

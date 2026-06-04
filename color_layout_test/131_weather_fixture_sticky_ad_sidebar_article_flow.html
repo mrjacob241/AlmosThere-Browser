@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>131 - Weather Fixture Sticky Ad Sidebar Article Flow</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 28px; background: #f8f9fa; font: 14px/1.35 system-ui, sans-serif; }
+.layout { width: 1120px; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 20px; align-items: start; }
+.main { min-width: 0; background: #e7f5ff; border: 1px solid rgba(20,30,40,.18); padding: 16px; }
+.forecast-row { display: grid; grid-template-columns: 90px minmax(0, 1fr) 110px 110px; gap: 8px; min-height: 58px; margin-bottom: 8px; background: #d3f9d8; padding: 8px; }
+.forecast-row > div { min-width: 0; background: #ffd43b; padding: 8px; }
+.sidebar { position: sticky; top: 12px; min-height: 520px; background: #d0bfff; border: 1px solid rgba(20,30,40,.18); padding: 14px; }
+.ad { height: 260px; background: #ff8787; margin-bottom: 14px; }
+.widget { height: 180px; background: #63e6be; }
+.label { position: fixed; right: 12px; bottom: 12px; padding: 6px 8px; background: rgba(255,255,255,.9); border: 1px solid rgba(20,30,40,.2); font-size: 12px; }
+@media (max-width: 900px) { .layout { width: auto; grid-template-columns: 1fr; } .sidebar { position: static; min-height: 180px; } }
+</style>
+</head>
+<body>
+<main class="layout">
+<section class="main">
+<div class="forecast-row"><div>Ora</div><div>Descrizione molto lunga della previsione locale</div><div>Temp</div><div>Vento</div></div>
+<div class="forecast-row"><div>12</div><div>Nubi sparse e caldo con dettagli extra</div><div>29 C</div><div>WNW</div></div>
+<div class="forecast-row"><div>15</div><div>Sereno con mare mosso e umidita moderata</div><div>32 C</div><div>W</div></div>
+<div class="forecast-row"><div>18</div><div>Parzialmente nuvoloso</div><div>28 C</div><div>NW</div></div>
+</section>
+<aside class="sidebar"><div class="ad"></div><div class="widget"></div></aside>
+</main>
+<div class="label">131 - sticky ad sidebar article flow</div>
+</body>
+</html>

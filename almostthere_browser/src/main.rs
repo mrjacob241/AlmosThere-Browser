@@ -3563,6 +3563,7 @@ fn seed_script_computed_styles_from_html(
             classes,
             attributes: vec![],
             child_index: None,
+            child_count: None,
             parent: None,
             previous_sibling: None,
         };
@@ -7762,11 +7763,18 @@ fn parse_dom_nodes<'a>(mut html: &'a str, closing_tag: Option<&str>) -> (Vec<Dom
                 return (children, "");
             };
             let found_tag = after_close[..end].trim();
+            if closing_tag.is_some_and(|tag| dom_end_tag_implicitly_closes(tag, found_tag)) {
+                return (children, html);
+            }
             html = &after_close[end + 1..];
             if closing_tag.is_some_and(|tag| found_tag.eq_ignore_ascii_case(tag)) {
                 return (children, html);
             }
             continue;
+        }
+
+        if closing_tag.is_some_and(|tag| dom_start_tag_implicitly_closes(tag, html)) {
+            return (children, html);
         }
 
         let Some((open_tag, after_open)) = parse_dom_open_tag(html) else {
@@ -7794,6 +7802,74 @@ fn parse_dom_nodes<'a>(mut html: &'a str, closing_tag: Option<&str>) -> (Vec<Dom
     }
 
     (children, html)
+}
+
+fn dom_start_tag_implicitly_closes(closing_tag: &str, html: &str) -> bool {
+    let Some((open_tag, _)) = parse_dom_open_tag(html) else {
+        return false;
+    };
+    let next = open_tag.tag_name.as_str();
+    let closing = closing_tag.to_ascii_lowercase();
+    match closing.as_str() {
+        // HTML table cell mode closes the current cell when a new table cell,
+        // row, section, or table boundary starts. This prevents malformed
+        // real-world markup like <th>One</div><th>Two from nesting cells.
+        "td" | "th" => matches!(
+            next,
+            "td" | "th" | "tr" | "tbody" | "tfoot" | "thead" | "caption" | "colgroup" | "col"
+        ),
+        "tr" => matches!(
+            next,
+            "tr" | "tbody" | "tfoot" | "thead" | "caption" | "colgroup" | "col"
+        ),
+        "tbody" | "tfoot" | "thead" => matches!(
+            next,
+            "tbody" | "tfoot" | "thead" | "caption" | "colgroup" | "col"
+        ),
+        "caption" | "colgroup" => matches!(next, "tbody" | "tfoot" | "thead" | "tr" | "td" | "th"),
+        _ => {
+            // If malformed table markup leaves inline/container tags open inside
+            // a cell, a following cell/row boundary must unwind those tags so the
+            // boundary can close the table cell itself. This mirrors browser
+            // recovery for real-world markup such as:
+            // <th><span>Vento<span>km/h</div><th>Onde</div>
+            matches!(
+                next,
+                "td" | "th" | "tr" | "tbody" | "tfoot" | "thead" | "caption" | "colgroup"
+            ) && !matches!(
+                closing.as_str(),
+                "html"
+                    | "body"
+                    | "table"
+                    | "thead"
+                    | "tbody"
+                    | "tfoot"
+                    | "tr"
+                    | "td"
+                    | "th"
+                    | "caption"
+                    | "colgroup"
+            )
+        }
+    }
+}
+
+fn dom_end_tag_implicitly_closes(closing_tag: &str, found_tag: &str) -> bool {
+    let closing = closing_tag.to_ascii_lowercase();
+    let found = found_tag.to_ascii_lowercase();
+    match closing.as_str() {
+        "td" | "th" => matches!(
+            found.as_str(),
+            "tr" | "tbody" | "tfoot" | "thead" | "table" | "body" | "html"
+        ),
+        "tr" => matches!(
+            found.as_str(),
+            "tbody" | "tfoot" | "thead" | "table" | "body" | "html"
+        ),
+        "tbody" | "tfoot" | "thead" => matches!(found.as_str(), "table" | "body" | "html"),
+        "caption" | "colgroup" => matches!(found.as_str(), "table" | "body" | "html"),
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -9011,6 +9087,7 @@ fn build_render_graph(dom: &DomDocument, document_style: &BrowserStyle) -> Rende
                 None,
                 None,
                 None,
+                None,
                 &root_style,
                 document_style,
                 &mut stats,
@@ -9057,6 +9134,7 @@ fn build_render_node(
     parent_key: Option<&ElementStyleKey>,
     previous_element_sibling: Option<&ElementStyleKey>,
     child_index: Option<usize>,
+    child_count: Option<usize>,
     parent_style: &ResolvedBoxStyle,
     document_style: &BrowserStyle,
     stats: &mut RenderGraphBuildStats,
@@ -9084,6 +9162,7 @@ fn build_render_node(
                 parent_key,
                 previous_element_sibling,
                 child_index,
+                child_count,
                 parent_style,
                 document_style,
                 stats,
@@ -9115,6 +9194,7 @@ fn build_render_element(
     parent_key: Option<&ElementStyleKey>,
     previous_element_sibling: Option<&ElementStyleKey>,
     child_index: Option<usize>,
+    child_count: Option<usize>,
     parent_style: &ResolvedBoxStyle,
     document_style: &BrowserStyle,
     stats: &mut RenderGraphBuildStats,
@@ -9144,8 +9224,13 @@ fn build_render_element(
             ],
         );
     }
-    let key =
-        element_style_key_with_context(element, parent_key, previous_element_sibling, child_index);
+    let key = element_style_key_with_context(
+        element,
+        parent_key,
+        previous_element_sibling,
+        child_index,
+        child_count,
+    );
     let style = compute_render_style(element, &key, parent_style, document_style);
     if trace_style {
         emit_global_telemetry(
@@ -9184,6 +9269,10 @@ fn build_render_children(
     let mut out = Vec::new();
     let mut previous_element_sibling: Option<ElementStyleKey> = None;
     let mut child_index = 0usize;
+    let element_child_count = children
+        .iter()
+        .filter(|child| matches!(child, DomNode::Element(_)))
+        .count();
     let trace_children = children.len() >= RENDER_GRAPH_CHILD_TRACE_THRESHOLD;
     if trace_children {
         emit_global_telemetry(
@@ -9234,6 +9323,7 @@ fn build_render_children(
             parent_key,
             previous_element_sibling.as_ref(),
             current_child_index,
+            current_child_index.map(|_| element_child_count),
             parent_style,
             document_style,
             stats,
@@ -9247,6 +9337,7 @@ fn build_render_children(
                 parent_key,
                 previous_element_sibling.as_ref(),
                 current_child_index,
+                current_child_index.map(|_| element_child_count),
             ));
         }
     }
@@ -10775,11 +10866,40 @@ fn css_visual_replaced_content_size(
         return None;
     };
     let content = replaced_content_from_dom_element(element, source, image_height_auto);
-    Some(replaced_content_size(
-        &content,
+    let intrinsic_size = replaced_content_size(&content, containing_width, box_.style.font_size);
+    Some(css_replaced_content_used_size(
+        &box_.style,
+        intrinsic_size,
         containing_width,
-        box_.style.font_size,
     ))
+}
+
+fn css_replaced_content_used_size(
+    style: &ResolvedBoxStyle,
+    intrinsic_size: egui::Vec2,
+    containing_width: f32,
+) -> egui::Vec2 {
+    let explicit_width =
+        css_layout_explicit_content_width_for_available(style, containing_width, 0.0);
+    let explicit_height = explicit_width
+        .and_then(|width| css_declared_box_height(style, width))
+        .or_else(|| css_declared_box_height(style, containing_width));
+    let mut size = intrinsic_size;
+    if let Some(width) = explicit_width {
+        size.x = width.min(containing_width).max(1.0);
+        if explicit_height.is_none() && intrinsic_size.x > 0.0 {
+            size.y = (size.x * intrinsic_size.y / intrinsic_size.x).max(1.0);
+        }
+    }
+    if let Some(height) = explicit_height {
+        size.y = height.max(1.0);
+        if explicit_width.is_none() && intrinsic_size.y > 0.0 {
+            size.x = (size.y * intrinsic_size.x / intrinsic_size.y)
+                .min(containing_width)
+                .max(1.0);
+        }
+    }
+    size
 }
 
 fn css_layout_node_is_button(node: &RenderNode) -> bool {
@@ -10909,10 +11029,8 @@ fn layout_css_flex_children(
     };
     for (index, item_width) in flow_indices.iter().zip(item_widths) {
         let child = &mut container.children[*index];
-        layout_css_box(
+        layout_css_flex_item_box(
             child,
-            0.0,
-            0.0,
             item_width.max(1.0),
             flex_child_containing_height,
             source,
@@ -11127,10 +11245,8 @@ fn layout_css_wrapped_row_flex_children(
         css_declared_box_height(&container.style, content.width()).unwrap_or(0.0);
     for (slot, index) in flow_indices.iter().enumerate() {
         let child = &mut container.children[*index];
-        layout_css_box(
+        layout_css_flex_item_box(
             child,
-            0.0,
-            0.0,
             base_widths[slot].max(1.0),
             flex_child_containing_height,
             source,
@@ -11229,6 +11345,38 @@ fn layout_css_wrapped_row_flex_children(
     );
 
     (cross_cursor - gap).max(0.0)
+}
+
+fn layout_css_flex_item_box(
+    child: &mut CssLayoutBox<'_>,
+    item_width: f32,
+    containing_height: f32,
+    source: &str,
+    image_height_auto: bool,
+    text_metrics: Option<&egui::Context>,
+) {
+    let item_width = item_width.max(1.0);
+    let resolved_percentage_width = child.style.width_percent.is_some();
+    let old_width = child.style.width;
+    let old_width_percent = child.style.width_percent;
+    if resolved_percentage_width {
+        child.style.width = Some(item_width);
+        child.style.width_percent = None;
+    }
+    layout_css_box(
+        child,
+        0.0,
+        0.0,
+        item_width,
+        containing_height,
+        source,
+        image_height_auto,
+        text_metrics,
+    );
+    if resolved_percentage_width {
+        child.style.width = old_width;
+        child.style.width_percent = old_width_percent;
+    }
 }
 
 fn css_flex_row_item_widths(
@@ -11349,11 +11497,15 @@ fn css_flex_item_base_width(
     available_width: f32,
     text_metrics: Option<&egui::Context>,
 ) -> f32 {
-    if let Some(width) = child
-        .style
-        .width
-        .or_else(|| css_style_max_width_for_containing(&child.style, available_width))
-    {
+    if let Some(percent) = child.style.width_percent {
+        return (available_width * percent / 100.0)
+            .min(available_width)
+            .max(1.0);
+    }
+    if let Some(width) = child.style.width {
+        return width.min(available_width).max(1.0);
+    }
+    if let Some(width) = css_style_max_width_for_containing(&child.style, available_width) {
         return width.min(available_width).max(1.0);
     }
 
@@ -13123,25 +13275,34 @@ fn estimate_special_css_box_height(
             0.0
         }
         "img" => match image_block_from_dom_element(element, source, image_height_auto) {
-            CanvasBlock::Image { image, .. } => image.size.y,
+            CanvasBlock::Image { image, .. } => {
+                css_replaced_content_used_size(&node.style, image.size, width).y
+            }
             _ => (node.style.font_size * 3.0).max(48.0),
         },
-        "table" => collect_table_layout_rows(node)
-            .iter()
-            .map(|row| {
-                let columns = row
-                    .iter()
-                    .map(|cell| cell.column + cell.colspan)
-                    .max()
-                    .unwrap_or(0)
-                    .max(1) as f32;
-                table_layout_row_height(row, (width / columns).max(24.0), 6.0, 5.0, text_metrics)
-            })
-            .sum::<f32>()
-            .max((node.style.font_size * 1.35).max(1.0)),
+        "table" => {
+            let rows = collect_table_layout_rows(node);
+            let column_count = rows
+                .iter()
+                .flat_map(|row| row.iter().map(|cell| cell.column + cell.colspan))
+                .max()
+                .unwrap_or(0)
+                .max(1);
+            let column_widths =
+                table_layout_column_widths(&rows, column_count, width, 6.0, text_metrics);
+            rows.iter()
+                .map(|row| table_layout_row_height(row, &column_widths, 6.0, 5.0, text_metrics))
+                .sum::<f32>()
+                .max((node.style.font_size * 1.35).max(1.0))
+        }
         "svg" => {
             let block = replaced_content_from_dom_element(element, source, image_height_auto);
-            replaced_content_size(&block, width, node.style.font_size).y
+            css_replaced_content_used_size(
+                &node.style,
+                replaced_content_size(&block, width, node.style.font_size),
+                width,
+            )
+            .y
         }
         "textarea" => {
             let rows = element
@@ -15325,9 +15486,15 @@ fn push_canvas_graph_table(
         .max()
         .unwrap_or(0)
         .max(1);
-    let cell_width = (table_width / column_count as f32).max(24.0);
     let cell_padding_x = 6.0;
     let cell_padding_y = 5.0;
+    let column_widths = table_layout_column_widths(
+        &rows,
+        column_count,
+        table_width,
+        cell_padding_x,
+        text_metrics,
+    );
     let border_color = if node.style.border_color == egui::Color32::TRANSPARENT {
         egui::Color32::from_rgb(178, 187, 196)
     } else {
@@ -15350,7 +15517,7 @@ fn push_canvas_graph_table(
         .map(|row| {
             table_layout_row_height(
                 row,
-                cell_width,
+                &column_widths,
                 cell_padding_x,
                 cell_padding_y,
                 text_metrics,
@@ -15368,9 +15535,14 @@ fn push_canvas_graph_table(
             let cell_height = row_heights[row_index..row_index + spanned_rows]
                 .iter()
                 .sum::<f32>();
-            let spanned_width = cell_width * cell.colspan as f32;
+            let cell_left = cursor.x + column_widths[..cell.column].iter().sum::<f32>();
+            let spanned_width = column_widths
+                [cell.column..(cell.column + cell.colspan).min(column_widths.len())]
+                .iter()
+                .sum::<f32>()
+                .max(24.0);
             let rect = egui::Rect::from_min_size(
-                egui::pos2(cursor.x + cell.column as f32 * cell_width, cursor.y),
+                egui::pos2(cell_left, cursor.y),
                 egui::vec2(spanned_width, cell_height),
             );
             graph.objects.push(CanvasObject::Rect(CanvasRectObject {
@@ -15496,7 +15668,8 @@ fn collect_table_rows_inner<'a>(node: &'a RenderNode, rows: &mut Vec<Vec<&'a Ren
                     matches!(
                         &child.kind,
                         RenderNodeKind::Element(element)
-                            if element.tag_name == "th" || element.tag_name == "td"
+                            if (element.tag_name == "th" || element.tag_name == "td")
+                                && child.style.display != CssDisplay::None
                     )
                 })
                 .collect::<Vec<_>>();
@@ -15504,6 +15677,23 @@ fn collect_table_rows_inner<'a>(node: &'a RenderNode, rows: &mut Vec<Vec<&'a Ren
                 rows.push(cells);
             }
             return;
+        }
+        if matches!(element.tag_name.as_str(), "thead" | "tbody" | "tfoot") {
+            let cells = node
+                .children
+                .iter()
+                .filter(|child| {
+                    matches!(
+                        &child.kind,
+                        RenderNodeKind::Element(element)
+                            if (element.tag_name == "th" || element.tag_name == "td")
+                                && child.style.display != CssDisplay::None
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !cells.is_empty() {
+                rows.push(cells);
+            }
         }
     }
 
@@ -15528,14 +15718,19 @@ fn table_caption_text(node: &RenderNode) -> Option<String> {
 
 fn table_layout_row_height(
     row: &[TableLayoutCell<'_>],
-    cell_width: f32,
+    column_widths: &[f32],
     padding_x: f32,
     padding_y: f32,
     text_metrics: Option<&egui::Context>,
 ) -> f32 {
     row.iter()
         .map(|cell| {
-            let text_width = (cell_width * cell.colspan as f32 - padding_x * 2.0).max(1.0);
+            let spanned_width = column_widths
+                [cell.column..(cell.column + cell.colspan).min(column_widths.len())]
+                .iter()
+                .sum::<f32>()
+                .max(24.0);
+            let text_width = (spanned_width - padding_x * 2.0).max(1.0);
             let lines = wrap_browser_textboxes(
                 text_metrics,
                 &render_node_text_content(cell.node),
@@ -15551,6 +15746,113 @@ fn table_layout_row_height(
         })
         .fold(0.0, f32::max)
         .max(28.0)
+}
+
+fn table_layout_column_widths(
+    rows: &[Vec<TableLayoutCell<'_>>],
+    column_count: usize,
+    table_width: f32,
+    padding_x: f32,
+    text_metrics: Option<&egui::Context>,
+) -> Vec<f32> {
+    let column_count = column_count.max(1);
+    let equal_width = (table_width / column_count as f32).max(24.0);
+    let mut explicit = vec![0.0_f32; column_count];
+    let mut minima = vec![24.0_f32; column_count];
+
+    for row in rows {
+        for cell in row {
+            let end = (cell.column + cell.colspan).min(column_count);
+            if end <= cell.column {
+                continue;
+            }
+            if let Some(width) = table_cell_declared_width(cell.node, table_width) {
+                let per_column = width / (end - cell.column) as f32;
+                for slot in &mut explicit[cell.column..end] {
+                    *slot = (*slot).max(per_column);
+                }
+            }
+            let min_width = table_cell_min_content_width(cell.node, padding_x, text_metrics);
+            let per_column = min_width / (end - cell.column) as f32;
+            for slot in &mut minima[cell.column..end] {
+                *slot = (*slot).max(per_column);
+            }
+        }
+    }
+
+    let minima_total = minima.iter().sum::<f32>();
+    let explicit_total = explicit.iter().sum::<f32>();
+    let mut widths = if table_width > 0.0 && explicit_total > table_width {
+        if minima_total <= table_width {
+            let extra = table_width - minima_total;
+            let weights = explicit
+                .iter()
+                .zip(minima.iter())
+                .map(|(declared, minimum)| (*declared - *minimum).max(0.0))
+                .collect::<Vec<_>>();
+            let weight_total = weights.iter().sum::<f32>();
+            if weight_total > 0.0 {
+                minima
+                    .iter()
+                    .zip(weights.iter())
+                    .map(|(minimum, weight)| *minimum + extra * *weight / weight_total)
+                    .collect::<Vec<_>>()
+            } else {
+                let per_column_extra = extra / column_count as f32;
+                minima
+                    .iter()
+                    .map(|minimum| *minimum + per_column_extra)
+                    .collect::<Vec<_>>()
+            }
+        } else if minima_total > 0.0 {
+            let scale = table_width / minima_total;
+            minima
+                .iter()
+                .map(|minimum| (*minimum * scale).max(1.0))
+                .collect::<Vec<_>>()
+        } else {
+            vec![equal_width; column_count]
+        }
+    } else {
+        explicit
+            .iter()
+            .zip(minima.iter())
+            .map(|(explicit, minimum)| explicit.max(*minimum).max(24.0))
+            .collect::<Vec<_>>()
+    };
+    let total = widths.iter().sum::<f32>();
+    if total <= 0.0 {
+        return vec![equal_width; column_count];
+    }
+    if total < table_width {
+        let extra = (table_width - total) / column_count as f32;
+        for width in &mut widths {
+            *width += extra;
+        }
+    }
+    widths
+}
+
+fn table_cell_declared_width(node: &RenderNode, table_width: f32) -> Option<f32> {
+    node.style
+        .width_percent
+        .map(|percent| table_width * percent / 100.0)
+        .or(node.style.width)
+        .filter(|width| *width > 0.0)
+}
+
+fn table_cell_min_content_width(
+    node: &RenderNode,
+    padding_x: f32,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    let text = render_node_text_content(node);
+    let longest_word = text
+        .split_whitespace()
+        .filter(|word| !word.is_empty())
+        .map(|word| measure_canvas_text_run(text_metrics, word, &node.style).x)
+        .fold(0.0, f32::max);
+    (longest_word + padding_x * 2.0).max(24.0)
 }
 
 fn table_cell_span(node: &RenderNode, attr: &str) -> usize {
@@ -16410,7 +16712,7 @@ fn dom_list_blocks(
 }
 
 fn element_style_key(element: &DomElement) -> ElementStyleKey {
-    element_style_key_with_context(element, None, None, None)
+    element_style_key_with_context(element, None, None, None, None)
 }
 
 fn element_style_key_with_context(
@@ -16418,6 +16720,7 @@ fn element_style_key_with_context(
     parent: Option<&ElementStyleKey>,
     previous_sibling: Option<&ElementStyleKey>,
     child_index: Option<usize>,
+    child_count: Option<usize>,
 ) -> ElementStyleKey {
     ElementStyleKey {
         tag: element.tag_name.clone(),
@@ -16444,6 +16747,7 @@ fn element_style_key_with_context(
             })
             .collect(),
         child_index,
+        child_count,
         parent: parent.map(|key| {
             Box::new(clone_element_style_key_context(
                 key,
@@ -16472,6 +16776,7 @@ fn clone_element_style_key_context(
         classes: key.classes.clone(),
         attributes: key.attributes.clone(),
         child_index: key.child_index,
+        child_count: key.child_count,
         parent: None,
         previous_sibling: None,
     };
@@ -20067,6 +20372,294 @@ mod tests {
         assert_eq!(top.rect.left(), bottom.rect.left());
         assert!(top.rect.left() >= tall.rect.right());
         assert!(bottom.rect.top() > top.rect.top());
+    }
+
+    #[test]
+    fn malformed_table_section_direct_header_cells_define_columns() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <body style="padding: 0; margin: 0;">
+                <table style="width: 560px;">
+                  <thead>
+                    <th style="width: 6%;">Ora</th>
+                    <th style="width: 18%;">Precipitazioni</th>
+                    <th style="width: 11%;">Vento</th>
+                    <th style="width: 9%;">Visibilita</th>
+                    <th style="width: 9%;">Quota</th>
+                  </thead>
+                  <tbody>
+                    <tr><td>21</td><td>- assenti -</td><td>ES 8 14</td><td>&gt;10km buona</td><td>4540m</td></tr>
+                  </tbody>
+                </table>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let rain = find_canvas_cell_rect(&document.canvas_graph, "- assenti -")
+            .expect("expected precipitation cell");
+        let quota =
+            find_canvas_cell_rect(&document.canvas_graph, "4540m").expect("expected quota cell");
+
+        assert!(
+            rain.rect.width() > 90.0,
+            "direct th percentage width should influence data column width, got {:?}",
+            rain.rect
+        );
+        assert!(
+            quota.rect.width() > 55.0,
+            "quota value should not be squeezed into an equal tiny column, got {:?}",
+            quota.rect
+        );
+    }
+
+    #[test]
+    fn table_percent_columns_keep_long_weather_values_readable() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <body style="padding: 0; margin: 0;">
+                <table style="width: 640px;">
+                  <thead>
+                    <tr>
+                      <th style="width: 8%;">Ora</th>
+                      <th style="width: 24%;">Precipitazioni</th>
+                      <th style="width: 16%;">Vento</th>
+                      <th style="width: 20%;">Visibilita</th>
+                      <th style="width: 16%;">Quota</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr><td>21</td><td>- assenti -</td><td>ES 8 14</td><td>&gt;10km buona</td><td>4540m</td></tr>
+                  </tbody>
+                </table>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let rain = find_canvas_cell_rect(&document.canvas_graph, "- assenti -")
+            .expect("expected precipitation cell");
+        let wind = find_canvas_cell_rect(&document.canvas_graph, "ES 8 14").expect("expected wind");
+        let quota = find_canvas_cell_rect(&document.canvas_graph, "4540m").expect("expected quota");
+
+        assert!(
+            rain.rect.width() > wind.rect.width(),
+            "24% precipitation column should be wider than 16% wind: rain={:?} wind={:?}",
+            rain.rect,
+            wind.rect
+        );
+        assert!(
+            quota.rect.width() > 80.0,
+            "quota text should keep a readable table column, got {:?}",
+            quota.rect
+        );
+    }
+
+    #[test]
+    fn table_percent_columns_over_one_hundred_normalize_to_table_width() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <body style="padding: 0; margin: 0;">
+                <table style="width: 500px;">
+                  <thead>
+                    <tr>
+                      <th style="width: 60%;">Left</th>
+                      <th style="width: 60%;">Middle</th>
+                      <th style="width: 30%;">Right</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr><td>A</td><td>B</td><td>C</td></tr>
+                  </tbody>
+                </table>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let left = find_canvas_cell_rect(&document.canvas_graph, "Left").expect("left");
+        let right = find_canvas_cell_rect(&document.canvas_graph, "Right").expect("right");
+
+        assert!(
+            right.rect.right() <= 501.0,
+            "overcommitted percentage columns should stay inside table width: left={:?} right={:?}",
+            left.rect,
+            right.rect
+        );
+        assert!(
+            left.rect.width() > right.rect.width(),
+            "normalized 60% column should remain wider than 30% column: left={:?} right={:?}",
+            left.rect,
+            right.rect
+        );
+    }
+
+    #[test]
+    fn overcommitted_weather_table_percentages_keep_temperature_readable() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <body style="padding: 0; margin: 0;">
+                <table style="width: 1280px;">
+                  <thead>
+                    <tr>
+                      <th style="width: 6%;">Ora</th>
+                      <th style="width: 9%;">Tempo</th>
+                      <th style="width: 8%;">°C °F</th>
+                      <th style="width: 18%;">Precipitazioni</th>
+                      <th style="width: 5%;"></th>
+                      <th style="width: 11%;">Vento km/h nodi</th>
+                      <th style="width: 10%;">Onde (cm)</th>
+                      <th style="width: 9%;">UV</th>
+                      <th style="width: 11%;">UR%</th>
+                      <th style="width: 9%;">Pressione (mbar)</th>
+                      <th style="width: 9%;">Visibilita</th>
+                      <th style="width: 8%;">T perc (°C)</th>
+                      <th style="width: 8%;">Grandine</th>
+                      <th style="width: 9%;">Quota 0°C / neve</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>22 :00</td><td></td><td>22.1</td><td>- assenti -</td><td></td>
+                      <td>ESE 8 14</td><td>64</td><td>0</td><td>82</td><td>1012</td>
+                      <td>&gt;10km buona</td><td>23.7</td><td></td><td>4550m</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let temp = find_canvas_cell_rect(&document.canvas_graph, "22.1").expect("temperature");
+        let pressure = find_canvas_cell_rect(&document.canvas_graph, "1012").expect("pressure");
+        let quota = find_canvas_cell_rect(&document.canvas_graph, "4550m").expect("quota");
+
+        assert!(
+            temp.rect.width() >= 54.0,
+            "temperature column should keep enough width for the value, got {:?}",
+            temp.rect
+        );
+        assert!(
+            pressure.rect.left() > temp.rect.right(),
+            "later weather columns should remain ordered: temp={:?} pressure={:?}",
+            temp.rect,
+            pressure.rect
+        );
+        assert!(
+            quota.rect.right() <= 1281.0,
+            "overcommitted weather percentages should stay inside table width: quota={:?}",
+            quota.rect
+        );
+    }
+
+    #[test]
+    fn malformed_table_cells_with_wrong_div_end_tags_do_not_nest() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <body style="padding: 0; margin: 0;">
+                <table style="width: 560px;">
+                  <thead><th style="width: 6%;">Ora</div>
+                  <th style="width: 18%;">Precipitazioni</div>
+                  <th style="width: 11%;">Vento</div>
+                  <th style="width: 9%;">Visibilita</div>
+                  <th style="width: 9%;">Quota</div>
+                  </thead>
+                  <tbody>
+                    <tr><td>21</td><td>- assenti -</td><td>ES 8 14</td><td>&gt;10km buona</td><td>4540m</td></tr>
+                  </tbody>
+                </table>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let table = document
+            .canvas_graph
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                CanvasObject::Rect(rect) => Some(rect.rect),
+                _ => None,
+            })
+            .find(|rect| rect.width() > 500.0 && rect.height() > 20.0)
+            .expect("expected table-sized row");
+        let rain = find_canvas_cell_rect(&document.canvas_graph, "- assenti -")
+            .expect("expected precipitation cell");
+        let quota =
+            find_canvas_cell_rect(&document.canvas_graph, "4540m").expect("expected quota cell");
+
+        assert!(
+            table.height() < 80.0,
+            "malformed header cells should not create a tall nested header stack, got {:?}",
+            table
+        );
+        assert!(
+            rain.rect.top() < 120.0,
+            "data row should stay near the repaired table header, got {:?}",
+            rain.rect
+        );
+        assert!(
+            quota.rect.left() > rain.rect.right(),
+            "later table cells should remain separate siblings, rain={:?} quota={:?}",
+            rain.rect,
+            quota.rect
+        );
+    }
+
+    #[test]
+    fn malformed_table_cell_unwinds_open_inline_wrappers_before_next_cell() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <body style="padding: 0; margin: 0;">
+                <table style="width: 560px;">
+                  <thead><th style="width: 6%;">Ora</div>
+                  <th style="width: 18%;">Precipitazioni</div>
+                  <th style="width: 11%;"><span><span>Vento</span><span>km/h nodi</span></div>
+                  <th style="width: 10%;">Onde</div>
+                  <th style="width: 9%;">UV</div>
+                  <th style="width: 9%;">Quota</div>
+                  </thead>
+                  <tbody>
+                    <tr><td>22</td><td>- assenti -</td><td>ESE 8 14</td><td>64</td><td>0</td><td>4550m</td></tr>
+                  </tbody>
+                </table>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let wind = find_canvas_cell_rect_containing(&document.canvas_graph, "Vento")
+            .expect("expected wind header cell");
+        let waves = find_canvas_cell_rect_containing(&document.canvas_graph, "Onde")
+            .expect("expected waves header");
+        let quota =
+            find_canvas_cell_rect(&document.canvas_graph, "4550m").expect("expected quota cell");
+
+        assert!(
+            waves.rect.left() > wind.rect.left(),
+            "next th should start a separate cell instead of nesting inside wind: wind={:?} waves={:?}",
+            wind.rect,
+            waves.rect
+        );
+        assert!(
+            quota.rect.top() > wind.rect.bottom() - 2.0,
+            "body row should not be swallowed by malformed header cell: wind={:?} quota={:?}",
+            wind.rect,
+            quota.rect
+        );
     }
 
     #[test]
@@ -24275,6 +24868,172 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
     }
 
     #[test]
+    fn flex_row_percentage_cells_use_container_width_as_base() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  * { box-sizing: border-box; }
+                  body { margin: 0; padding: 0; }
+                  .row { display: flex; align-items: center; width: 1000px; min-height: 48px; background: #d3f9d8; }
+                  .cell { min-width: 0; padding: 6px 8px; }
+                  .time { width: 9%; background: #ffd43b; }
+                  .desc { width: 28%; background: #d0bfff; }
+                  .temp { width: 12%; background: #ff922b; }
+                </style>
+              </head>
+              <body>
+                <div class="row">
+                  <div class="cell time">09</div>
+                  <div class="cell desc">Poco nuvoloso con vento moderato</div>
+                  <div class="cell temp">25 C</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let desc = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0xd0, 0xbf, 0xff),
+        )
+        .expect("expected percentage description cell");
+        let row = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0xd3, 0xf9, 0xd8),
+        )
+        .expect("expected flex row");
+
+        assert!(
+            desc.rect.width() > 270.0,
+            "28% flex cell should be based on the 1000px row, got {:?}",
+            desc.rect
+        );
+        assert!(
+            row.rect.height() < 70.0,
+            "row should stay compact instead of growing from narrow text wraps, got {:?}",
+            row.rect
+        );
+    }
+
+    #[test]
+    fn ilmeteo_weather_table_percentage_cells_stay_compact() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  * { box-sizing: border-box; }
+                  body { margin: 0; padding: 0; font: 14px/1.25 system-ui, sans-serif; }
+                  .table { width: 1080px; background: #ffffff; }
+                  .row { display: flex; align-items: center; min-height: 48px; background: #d3f9d8; }
+                  .cell { min-width: 0; padding: 6px 8px; text-align: center; }
+                  .time { width: 9%; background: #ffd43b; }
+                  .icon { width: 9%; display: flex; justify-content: center; align-items: center; background: #ffc9c9; }
+                  .icon img { display: block; width: 28px; height: 28px; background: #5c7cfa; }
+                  .desc { width: 28%; text-align: left; background: #d0bfff; }
+                  .temp { width: 12%; background: #ff922b; }
+                  .wind { width: 16%; background: #63e6be; }
+                  .rain { width: 10%; background: #91a7ff; }
+                  .uv { width: 8%; background: #f783ac; }
+                  .more { width: 8%; background: #ced4da; }
+                </style>
+              </head>
+              <body>
+                <main class="table">
+                  <div class="row">
+                    <div class="cell time">09</div>
+                    <div class="cell icon"><img src="missing-s1.gif" alt=""></div>
+                    <div class="cell desc">Poco nuvoloso con vento moderato</div>
+                    <div class="cell temp">25 C</div>
+                    <div class="cell wind">WNW 12</div>
+                    <div class="cell rain">0%</div>
+                    <div class="cell uv">5</div>
+                    <div class="cell more">+</div>
+                  </div>
+                </main>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let desc = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0xd0, 0xbf, 0xff),
+        )
+        .expect("expected weather description cell");
+        let row = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0xd3, 0xf9, 0xd8),
+        )
+        .expect("expected weather row");
+
+        assert!(
+            desc.rect.width() > 290.0,
+            "description cell should use 28% of the 1080px table, got {:?}",
+            desc.rect
+        );
+        assert!(
+            row.rect.height() < 80.0,
+            "weather row should not inflate from vertical text wrapping, got {:?}",
+            row.rect
+        );
+    }
+
+    #[test]
+    fn missing_replaced_image_keeps_explicit_css_dimensions_in_flex_cell() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  * { box-sizing: border-box; }
+                  body { margin: 0; padding: 0; }
+                  .row { display: flex; align-items: center; width: 720px; min-height: 48px; background: #d3f9d8; }
+                  .icon { width: 18%; min-width: 0; display: flex; align-items: center; justify-content: center; padding: 6px 8px; background: #ffc9c9; }
+                  .icon img { display: block; width: 28px; height: 28px; background: #5c7cfa; }
+                  .text { width: 82%; min-width: 0; padding: 6px 8px; background: #d0bfff; }
+                </style>
+              </head>
+              <body>
+                <div class="row">
+                  <div class="icon"><img src="missing-weather-icon.gif" alt=""></div>
+                  <div class="text">Forecast details</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let image = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Image(image) if image.src.ends_with("missing-weather-icon.gif") => {
+                    Some(image)
+                }
+                _ => None,
+            })
+            .expect("expected missing icon placeholder image");
+
+        assert!(
+            (image.rect.width() - 28.0).abs() < 0.5,
+            "explicit CSS image width should win over fallback intrinsic size, got {:?}",
+            image.rect
+        );
+        assert!(
+            (image.rect.height() - 28.0).abs() < 0.5,
+            "explicit CSS image height should win over fallback intrinsic size, got {:?}",
+            image.rect
+        );
+    }
+
+    #[test]
     fn document_style_collection_uses_all_style_tags_in_order() {
         let document = parse_html_document(
             r#"
@@ -26863,6 +27622,21 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
         text: &str,
     ) -> Option<&'a CanvasRectObject> {
         let text = find_canvas_text(graph, text)?;
+        find_canvas_cell_rect_for_text(graph, text)
+    }
+
+    fn find_canvas_cell_rect_containing<'a>(
+        graph: &'a CanvasGraph,
+        text: &str,
+    ) -> Option<&'a CanvasRectObject> {
+        let text = find_canvas_text_containing(graph, text)?;
+        find_canvas_cell_rect_for_text(graph, text)
+    }
+
+    fn find_canvas_cell_rect_for_text<'a>(
+        graph: &'a CanvasGraph,
+        text: &CanvasTextObject,
+    ) -> Option<&'a CanvasRectObject> {
         graph
             .objects
             .iter()

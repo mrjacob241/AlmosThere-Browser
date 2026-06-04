@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>143 - Table Section Direct TH Percent Columns</title>
+<style>
+body { margin: 0; padding: 24px; background: #eef2f6; font: 16px/1.25 Arial, sans-serif; color: #333; }
+.panel { width: 640px; margin: 0 auto; background: #fff; }
+table { width: 100%; border-collapse: collapse; table-layout: auto; }
+th, td { border: 1px solid #adb5bd; padding: 6px 8px; text-align: center; font-weight: 700; }
+.time { width: 8%; background: #ffd43b; }
+.rain { width: 24%; background: #d0bfff; }
+.wind { width: 16%; background: #63e6be; }
+.visibility { width: 20%; background: #91a7ff; }
+.quota { width: 16%; background: #ced4da; }
+.label { position: fixed; right: 12px; bottom: 12px; padding: 6px 8px; background: rgba(255,255,255,.9); border: 1px solid rgba(20,30,40,.2); font-size: 12px; }
+</style>
+</head>
+<body>
+<main class="panel">
+<table>
+<thead>
+<th class="time">Ora</th>
+<th class="rain">Precipitazioni</th>
+<th class="wind">Vento</th>
+<th class="visibility">Visibilita</th>
+<th class="quota">Quota</th>
+</thead>
+<tbody>
+<tr><td class="time">21</td><td class="rain">- assenti -</td><td class="wind">ES 8 14</td><td class="visibility">&gt;10km buona</td><td class="quota">4540m</td></tr>
+<tr><td class="time">22</td><td class="rain">- assenti -</td><td class="wind">SE 8 14</td><td class="visibility">&gt;10km buona</td><td class="quota">4550m</td></tr>
+</tbody>
+</table>
+</main>
+<div class="label">143 - direct th percent columns</div>
+</body>
+</html>

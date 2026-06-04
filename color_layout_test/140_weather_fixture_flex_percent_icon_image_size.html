@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>140 - Weather Fixture Flex Percent Icon Image Size</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f8f9fa; font: 14px/1.3 system-ui, sans-serif; }
+.row { width: 720px; margin: 0 auto; display: flex; align-items: center; min-height: 48px; background: #d3f9d8; border: 1px solid rgba(20,30,40,.22); }
+.icon { width: 18%; min-width: 0; display: flex; align-items: center; justify-content: center; padding: 6px 8px; background: #ffc9c9; border-right: 1px solid rgba(20,30,40,.12); }
+.icon img { display: block; width: 28px; height: 28px; background: #5c7cfa; }
+.text { width: 82%; min-width: 0; padding: 6px 8px; background: #d0bfff; }
+.label { position: fixed; right: 12px; bottom: 12px; padding: 6px 8px; background: rgba(255,255,255,.9); border: 1px solid rgba(20,30,40,.2); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="row"><div class="icon"><img src="missing-weather-icon.gif" alt=""></div><div class="text">Missing icon should still occupy a 28 by 28 CSS image box centered in a percentage-width flex cell.</div></div>
+<div class="label">140 - flex percent icon image size</div>
+</body>
+</html>

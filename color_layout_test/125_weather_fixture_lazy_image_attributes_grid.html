@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>125 - Weather Fixture Lazy Image Attributes Grid</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 28px; background: #f8f9fa; font: 14px/1.35 system-ui, sans-serif; }
+.grid { width: 980px; margin: 0 auto; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+.card { background: #e7f5ff; border: 1px solid rgba(20,30,40,.18); padding: 12px; min-width: 0; }
+.card img { display: block; width: 100%; height: 118px; object-fit: cover; background: #adb5bd; border: 8px solid #69db7c; }
+.caption { min-height: 42px; margin-top: 8px; padding: 8px; background: #ffd43b; }
+.label { position: fixed; right: 12px; bottom: 12px; padding: 6px 8px; background: rgba(255,255,255,.9); border: 1px solid rgba(20,30,40,.2); font-size: 12px; }
+@media (max-width: 760px) { .grid { width: auto; grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+</style>
+</head>
+<body>
+<main class="grid">
+<article class="card"><img data-src="lazy-a.png" alt="data-src image"><div class="caption">data-src tile</div></article>
+<article class="card"><img data-original="lazy-b.png" alt="data-original image"><div class="caption">data-original tile</div></article>
+<article class="card"><img data-lazy-src="lazy-c.png" alt="data-lazy-src image"><div class="caption">data-lazy-src tile</div></article>
+<article class="card"><img srcset="small.png 1x, large.png 2x" alt="srcset image"><div class="caption">srcset tile</div></article>
+</main>
+<div class="label">125 - lazy image attributes grid</div>
+</body>
+</html>

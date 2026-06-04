@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>144 - Weather Fixture Nth Last Child More Data Table</title>
+<style>
+body { margin: 0; padding: 20px; background: #f1f3f5; font: 18px/1.2 Arial, sans-serif; color: #343a40; }
+.wrap { width: 480px; margin: 0 auto; background: #ffffff; }
+.weather_grid { width: 100%; border-collapse: collapse; table-layout: auto; background: #f8fbff; }
+.weather_grid th, .weather_grid td { border: 1px solid #adb5bd; padding: 5px 6px; text-align: center; vertical-align: middle; font-weight: 700; white-space: normal; }
+.weather_grid .weather-note { font-size: 80%; font-weight: 700; white-space: nowrap; }
+.weather_grid.more_data thead tr th:nth-last-child(-n+12),
+.weather_grid.more_data tbody tr td:nth-last-child(-n+12) { display: none; background: #ffd8a8; }
+.weather_grid.more_data thead tr th:nth-last-child(-n+6),
+.weather_grid.more_data tbody tr td:nth-last-child(-n+6) { display: table-cell; background: #d0ebff; }
+.weather_grid.more_data.summer thead tr th:nth-last-child(-n+11),
+.weather_grid.more_data.summer tbody tr td:nth-last-child(-n+11) { display: none; background: #ffc9c9; }
+.weather_grid.more_data.summer thead tr th:nth-last-child(-n+5),
+.weather_grid.more_data.summer tbody tr td:nth-last-child(-n+5) { display: table-cell; background: #d3f9d8; }
+.label { position: fixed; right: 12px; bottom: 12px; padding: 6px 8px; background: rgba(255,255,255,.9); border: 1px solid rgba(20,30,40,.2); font-size: 12px; }
+</style>
+</head>
+<body>
+<main class="wrap">
+<table class="weather_grid more_data summer">
+<thead><th style="width: 6%">Ora</div>
+<th style="width: 9%">Tempo</div>
+<th style="width: 8%">C</div>
+<th style="width: 18%">Precipitazioni</div>
+<th style="width: 5%"></div>
+<th style="width: 11%">Vento km/h nodi</div>
+<th style="width: 10%">Onde cm</div>
+<th style="width: 9%">UV</div>
+<th style="width: 11%">UR%</div>
+<th style="width: 9%">Pressione mbar</div>
+<th style="width: 9%">Visibilita</div>
+<th style="width: 8%">Tperc C</div>
+<th style="width: 8%">Grandine</div>
+<th style="width: 9%">Quota zero neve</div>
+</thead>
+<tbody>
+<tr><td colspan="14">Real Time - Radar e Centraline Apri Centraline Segnala il tempo</td></tr>
+<tr><td>22</td><td></td><td>22.1</td><td><span class="weather-note">- assenti -</span></td><td></td><td>ESE 8 14</td><td>64</td><td>0</td><td>82</td><td>1012</td><td>&gt;10km<br><span class="weather-note">buona</span></td><td>23.7</td><td>0%</td><td>4550m</td></tr>
+<tr><td>23</td><td></td><td>21.8</td><td><span class="weather-note">- assenti -</span></td><td></td><td>SE 7 12</td><td>63</td><td>0</td><td>83</td><td>1012</td><td>&gt;10km<br><span class="weather-note">buona</span></td><td>23.2</td><td>0%</td><td>4540m</td></tr>
+</tbody>
+</table>
+</main>
+<div class="label">144 - nth-last-child more_data weather table</div>
+</body>
+</html>

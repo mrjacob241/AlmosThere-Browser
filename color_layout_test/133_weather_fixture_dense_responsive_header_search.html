@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>133 - Weather Fixture Dense Responsive Header Search</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #f8f9fa; font: 14px/1.3 system-ui, sans-serif; }
+.shell { width: 1100px; margin: 0 auto; background: #74c0fc; border: 1px solid rgba(20,30,40,.2); padding: 12px; }
+.search-bar { display: flex; align-items: center; gap: 10px; min-height: 66px; background: #e7f5ff; padding: 10px; }
+.logo { flex: 0 0 154px; height: 44px; background: #ffd43b; border: 1px solid rgba(20,30,40,.18); }
+.menu { flex: 0 0 46px; height: 44px; background: #ff8787; border: 1px solid rgba(20,30,40,.18); }
+.field { flex: 1 1 auto; min-width: 180px; height: 44px; background: #fff; border: 4px solid #51cf66; }
+.submit { flex: 0 0 92px; height: 44px; background: #d0bfff; border: 1px solid rgba(20,30,40,.18); }
+.dropdown { margin-top: 10px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; background: #fff3bf; padding: 10px; }
+.dropdown ul { margin: 0; padding: 0; list-style: none; background: #63e6be; min-height: 180px; }
+.dropdown li { min-height: 26px; padding: 4px 8px; border-bottom: 1px solid rgba(20,30,40,.12); }
+.label { position: fixed; right: 12px; bottom: 12px; padding: 6px 8px; background: rgba(255,255,255,.9); border: 1px solid rgba(20,30,40,.2); font-size: 12px; }
+@media (max-width: 760px) {
+  .shell { width: auto; }
+  .search-bar { flex-wrap: wrap; }
+  .logo { flex-basis: 120px; }
+  .field { order: 3; flex-basis: 100%; }
+  .dropdown { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<main class="shell">
+<form class="search-bar">
+<div class="logo"></div>
+<div class="menu"></div>
+<input class="field" value="" placeholder="Cerca localita">
+<div class="submit"></div>
+</form>
+<div class="dropdown">
+<ul><li>Nord</li><li>Aosta</li><li>Milano</li><li>Torino</li></ul>
+<ul><li>Centro</li><li>Ancona</li><li>Roma</li><li>Firenze</li></ul>
+<ul><li>Sud e Isole</li><li>Bari</li><li>Napoli</li><li>Palermo</li></ul>
+</div>
+</main>
+<div class="label">133 - dense responsive header search</div>
+</body>
+</html>

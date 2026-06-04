@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>128 - Weather Fixture CSS Background Cards</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 28px; background: #f1f3f5; font: 15px/1.4 system-ui, sans-serif; }
+.cards { width: 1040px; margin: 0 auto; display: grid; grid-template-columns: 2fr 1fr; gap: 16px; }
+.hero { min-height: 260px; padding: 18px; color: #17212b; background-color: #91a7ff; background-image: url("missing-weather-hero.png"); background-size: cover; background-position: center; border: 1px solid rgba(20,30,40,.2); }
+.side { min-height: 260px; padding: 14px; background-color: #63e6be; background-image: url("missing-arrow-sprite.png"); background-repeat: no-repeat; background-position: right 14px top 14px; border: 1px solid rgba(20,30,40,.2); }
+.title { min-height: 54px; padding: 12px; background: rgba(255,255,255,.78); border: 1px solid rgba(20,30,40,.18); }
+.body { margin-top: 14px; min-height: 118px; padding: 12px; background: #ffd43b; }
+.label { position: fixed; right: 12px; bottom: 12px; padding: 6px 8px; background: rgba(255,255,255,.9); border: 1px solid rgba(20,30,40,.2); font-size: 12px; }
+</style>
+</head>
+<body>
+<main class="cards">
+<section class="hero"><div class="title">Main forecast card with missing CSS background image</div><div class="body">Fallback color and child blocks should remain visible and sized.</div></section>
+<aside class="side"><div class="title">Sidebar title sprite</div><div class="body">Background sprite should not replace normal flow content.</div></aside>
+</main>
+<div class="label">128 - css background cards</div>
+</body>
+</html>

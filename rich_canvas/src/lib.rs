@@ -110,6 +110,7 @@ pub struct ElementStyleKey {
     pub classes: Vec<String>,
     pub attributes: Vec<String>,
     pub child_index: Option<usize>,
+    pub child_count: Option<usize>,
     pub parent: Option<Box<ElementStyleKey>>,
     pub previous_sibling: Option<Box<ElementStyleKey>>,
 }
@@ -129,9 +130,11 @@ pub struct CssSelector {
     pub attributes: Vec<String>,
     pub attribute_selectors: Vec<CssAttributeSelector>,
     pub nth_child: Option<CssNthChild>,
+    pub nth_last_child: Option<CssNthChild>,
     pub not_selectors: Vec<SimpleCssSelector>,
     pub is_selectors: Vec<SimpleCssSelector>,
     pub where_selectors: Vec<SimpleCssSelector>,
+    pub ancestor_chain: Vec<SimpleCssSelector>,
     pub ancestor: Option<SimpleCssSelector>,
     pub parent: Option<SimpleCssSelector>,
     pub previous_sibling: Option<SimpleCssSelector>,
@@ -147,6 +150,7 @@ pub struct SimpleCssSelector {
     pub attributes: Vec<String>,
     pub attribute_selectors: Vec<CssAttributeSelector>,
     pub nth_child: Option<CssNthChild>,
+    pub nth_last_child: Option<CssNthChild>,
     pub not_selectors: Vec<SimpleCssSelector>,
     pub is_selectors: Vec<SimpleCssSelector>,
     pub where_selectors: Vec<SimpleCssSelector>,
@@ -4379,6 +4383,11 @@ fn css_selector_fast_filter(selector: &CssSelector, key: &ElementStyleKey) -> bo
             return false;
         }
     }
+    if let Some(nth_last_child) = selector.nth_last_child {
+        if !nth_last_child_matches(nth_last_child, key) {
+            return false;
+        }
+    }
     if selector
         .classes
         .iter()
@@ -4418,11 +4427,15 @@ fn css_selector_matches(selector: &CssSelector, key: &ElementStyleKey) -> bool {
         attributes: selector.attributes.clone(),
         attribute_selectors: selector.attribute_selectors.clone(),
         nth_child: selector.nth_child,
+        nth_last_child: selector.nth_last_child,
         not_selectors: selector.not_selectors.clone(),
         is_selectors: selector.is_selectors.clone(),
         where_selectors: selector.where_selectors.clone(),
     };
     if !simple_css_selector_matches(&current, key) {
+        return false;
+    }
+    if !ancestor_chain_matches(&selector.ancestor_chain, key.parent.as_deref()) {
         return false;
     }
     if let Some(ancestor_selector) = &selector.ancestor {
@@ -4475,6 +4488,11 @@ fn simple_css_selector_matches(selector: &SimpleCssSelector, key: &ElementStyleK
             return false;
         }
     }
+    if let Some(nth_last_child) = selector.nth_last_child {
+        if !nth_last_child_matches(nth_last_child, key) {
+            return false;
+        }
+    }
     selector
         .classes
         .iter()
@@ -4514,6 +4532,51 @@ fn previous_sibling_chain_matches(selector: &SimpleCssSelector, sibling: &Elemen
         current = key.previous_sibling.as_deref();
     }
     false
+}
+
+fn ancestor_chain_matches(
+    selectors: &[SimpleCssSelector],
+    parent: Option<&ElementStyleKey>,
+) -> bool {
+    let mut current = parent;
+    for selector in selectors.iter().rev() {
+        if simple_selector_is_plain_tag(selector, "tr")
+            && current.is_some_and(|key| {
+                matches!(
+                    key.tag.as_str(),
+                    "table" | "thead" | "tbody" | "tfoot" | "caption" | "colgroup"
+                )
+            })
+        {
+            continue;
+        }
+        let mut matched = None;
+        while let Some(key) = current {
+            if simple_css_selector_matches(selector, key) {
+                matched = Some(key);
+                break;
+            }
+            current = key.parent.as_deref();
+        }
+        let Some(key) = matched else {
+            return false;
+        };
+        current = key.parent.as_deref();
+    }
+    true
+}
+
+fn simple_selector_is_plain_tag(selector: &SimpleCssSelector, tag: &str) -> bool {
+    selector.tag.as_deref() == Some(tag)
+        && selector.id.is_none()
+        && selector.classes.is_empty()
+        && selector.attributes.is_empty()
+        && selector.attribute_selectors.is_empty()
+        && selector.nth_child.is_none()
+        && selector.nth_last_child.is_none()
+        && selector.not_selectors.is_empty()
+        && selector.is_selectors.is_empty()
+        && selector.where_selectors.is_empty()
 }
 
 fn css_attribute_selector_matches(selector: &CssAttributeSelector, attributes: &[String]) -> bool {
@@ -4577,6 +4640,19 @@ fn nth_child_matches(nth_child: CssNthChild, child_index: usize) -> bool {
     }
 }
 
+fn nth_last_child_matches(nth_last_child: CssNthChild, key: &ElementStyleKey) -> bool {
+    let Some(child_index) = key.child_index else {
+        return false;
+    };
+    let Some(child_count) = key.child_count else {
+        return false;
+    };
+    if child_index == 0 || child_index > child_count {
+        return false;
+    }
+    nth_child_matches(nth_last_child, child_count - child_index + 1)
+}
+
 fn ancestor_css_selector_matches(
     selector: &SimpleCssSelector,
     parent: Option<&ElementStyleKey>,
@@ -4599,11 +4675,17 @@ fn css_selector_specificity(selector: &CssSelector) -> usize {
         attributes: selector.attributes.clone(),
         attribute_selectors: selector.attribute_selectors.clone(),
         nth_child: selector.nth_child,
+        nth_last_child: selector.nth_last_child,
         not_selectors: selector.not_selectors.clone(),
         is_selectors: selector.is_selectors.clone(),
         where_selectors: selector.where_selectors.clone(),
     };
     simple_css_selector_specificity(&current)
+        + selector
+            .ancestor_chain
+            .iter()
+            .map(simple_css_selector_specificity)
+            .sum::<usize>()
         + selector
             .ancestor
             .as_ref()
@@ -4635,7 +4717,11 @@ fn simple_css_selector_specificity(selector: &SimpleCssSelector) -> usize {
         .max()
         .unwrap_or_default();
     selector.id.iter().count() * 100
-        + (selector.classes.len() + attribute_count + selector.nth_child.iter().count()) * 10
+        + (selector.classes.len()
+            + attribute_count
+            + selector.nth_child.iter().count()
+            + selector.nth_last_child.iter().count())
+            * 10
         + selector.tag.iter().count()
         + pseudo_specificity
 }
@@ -4872,9 +4958,11 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             attributes: right.attributes,
             attribute_selectors: right.attribute_selectors,
             nth_child: right.nth_child,
+            nth_last_child: right.nth_last_child,
             not_selectors: right.not_selectors,
             is_selectors: right.is_selectors,
             where_selectors: right.where_selectors,
+            ancestor_chain: Vec::new(),
             ancestor: None,
             parent,
             previous_sibling: Some(previous_sibling),
@@ -4893,9 +4981,11 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             attributes: right.attributes,
             attribute_selectors: right.attribute_selectors,
             nth_child: right.nth_child,
+            nth_last_child: right.nth_last_child,
             not_selectors: right.not_selectors,
             is_selectors: right.is_selectors,
             where_selectors: right.where_selectors,
+            ancestor_chain: Vec::new(),
             ancestor: None,
             parent,
             previous_sibling: Some(previous_sibling),
@@ -4914,9 +5004,11 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             attributes: child.attributes,
             attribute_selectors: child.attribute_selectors,
             nth_child: child.nth_child,
+            nth_last_child: child.nth_last_child,
             not_selectors: child.not_selectors,
             is_selectors: child.is_selectors,
             where_selectors: child.where_selectors,
+            ancestor_chain: Vec::new(),
             ancestor: None,
             parent: Some(parent),
             previous_sibling: None,
@@ -4926,9 +5018,12 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
     }
 
     if selector_has_top_level_whitespace(&selector) {
-        let (ancestor, descendant) = split_descendant_selector(&selector)?;
+        let (ancestors, descendant) = split_descendant_selector(&selector)?;
         let descendant = parse_simple_css_selector(descendant)?;
-        let ancestor = parse_simple_css_selector(ancestor)?;
+        let ancestor_chain = ancestors
+            .iter()
+            .map(|ancestor| parse_simple_css_selector(ancestor))
+            .collect::<Option<Vec<_>>>()?;
         return Some(CssSelector {
             tag: descendant.tag,
             id: descendant.id,
@@ -4936,10 +5031,12 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             attributes: descendant.attributes,
             attribute_selectors: descendant.attribute_selectors,
             nth_child: descendant.nth_child,
+            nth_last_child: descendant.nth_last_child,
             not_selectors: descendant.not_selectors,
             is_selectors: descendant.is_selectors,
             where_selectors: descendant.where_selectors,
-            ancestor: Some(ancestor),
+            ancestor_chain,
+            ancestor: None,
             parent: None,
             previous_sibling: None,
             requires_previous_sibling: false,
@@ -4954,6 +5051,7 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
         && simple.attributes.is_empty()
         && simple.attribute_selectors.is_empty()
         && simple.nth_child.is_none()
+        && simple.nth_last_child.is_none()
         && simple.not_selectors.is_empty()
         && simple.is_selectors.is_empty()
         && simple.where_selectors.is_empty()
@@ -4967,9 +5065,11 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             attributes: simple.attributes,
             attribute_selectors: simple.attribute_selectors,
             nth_child: simple.nth_child,
+            nth_last_child: simple.nth_last_child,
             not_selectors: simple.not_selectors,
             is_selectors: simple.is_selectors,
             where_selectors: simple.where_selectors,
+            ancestor_chain: Vec::new(),
             ancestor: None,
             parent: None,
             previous_sibling: None,
@@ -4979,23 +5079,24 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
     }
 }
 
-fn split_descendant_selector(selector: &str) -> Option<(&str, &str)> {
+fn split_descendant_selector(selector: &str) -> Option<(Vec<&str>, &str)> {
     let mut parts = split_selector_by_top_level_whitespace(selector);
-    if parts.len() != 2 {
+    if parts.len() < 2 {
         return None;
     }
     let descendant = parts.pop()?;
-    let ancestor = parts.pop()?;
-    if find_top_level_char(ancestor, '>').is_some()
-        || find_top_level_char(ancestor, '+').is_some()
-        || find_top_level_char(ancestor, '~').is_some()
-        || find_top_level_char(descendant, '>').is_some()
+    if find_top_level_char(descendant, '>').is_some()
         || find_top_level_char(descendant, '+').is_some()
         || find_top_level_char(descendant, '~').is_some()
+        || parts.iter().any(|ancestor| {
+            find_top_level_char(ancestor, '>').is_some()
+                || find_top_level_char(ancestor, '+').is_some()
+                || find_top_level_char(ancestor, '~').is_some()
+        })
     {
         None
     } else {
-        Some((ancestor, descendant))
+        Some((parts, descendant))
     }
 }
 
@@ -5052,6 +5153,7 @@ fn parse_simple_css_selector(selector: &str) -> Option<SimpleCssSelector> {
         attributes,
         attribute_selectors,
         nth_child: pseudo_classes.nth_child,
+        nth_last_child: pseudo_classes.nth_last_child,
         not_selectors: pseudo_classes.not_selectors,
         is_selectors: pseudo_classes.is_selectors,
         where_selectors: pseudo_classes.where_selectors,
@@ -5083,6 +5185,7 @@ fn strip_simple_selector_attributes(selector: &str) -> Option<(String, Vec<CssAt
 #[derive(Clone, Debug, Default)]
 struct CssSimplePseudoClasses {
     nth_child: Option<CssNthChild>,
+    nth_last_child: Option<CssNthChild>,
     not_selectors: Vec<SimpleCssSelector>,
     is_selectors: Vec<SimpleCssSelector>,
     where_selectors: Vec<SimpleCssSelector>,
@@ -5100,6 +5203,14 @@ fn strip_simple_selector_pseudo_classes(
             let open_paren = index + ":nth-child".len();
             let end = find_function_end(selector, open_paren)?;
             pseudo_classes.nth_child =
+                Some(parse_nth_child_formula(&selector[open_paren + 1..end])?);
+            index = end + 1;
+            continue;
+        }
+        if rest.starts_with(":nth-last-child(") {
+            let open_paren = index + ":nth-last-child".len();
+            let end = find_function_end(selector, open_paren)?;
+            pseudo_classes.nth_last_child =
                 Some(parse_nth_child_formula(&selector[open_paren + 1..end])?);
             index = end + 1;
             continue;
@@ -6063,7 +6174,9 @@ fn parse_display(value: &str) -> Option<CssDisplay> {
         "inline-flex" => Some(CssDisplay::Flex),
         "flex" => Some(CssDisplay::Flex),
         "grid" | "inline-grid" => Some(CssDisplay::Grid),
-        "table" => Some(CssDisplay::Table),
+        "table" | "inline-table" | "table-row" | "table-cell" | "table-caption"
+        | "table-row-group" | "table-header-group" | "table-footer-group" | "table-column"
+        | "table-column-group" => Some(CssDisplay::Table),
         "list-item" => Some(CssDisplay::ListItem),
         _ => None,
     }
@@ -7748,6 +7861,20 @@ mod tests {
     }
 
     #[test]
+    fn nth_last_child_pseudo_classes_stay_bound_to_compound_selectors() {
+        let selector = parse_css_selector(".weather_table th:nth-last-child(-n+5)").unwrap();
+
+        assert_eq!(selector.tag.as_deref(), Some("th"));
+        assert_eq!(
+            selector.nth_last_child,
+            Some(CssNthChild {
+                step: -1,
+                offset: 5
+            })
+        );
+    }
+
+    #[test]
     fn computed_box_style_matches_classed_nth_child_cascade() {
         let style = parse_basic_css(
             r#"
@@ -7787,6 +7914,97 @@ mod tests {
             ..ElementStyleKey::default()
         };
         assert_eq!(computed_box_style(&style, &non_tile).background, None);
+    }
+
+    #[test]
+    fn computed_box_style_matches_ilmeteo_nth_last_child_show_hide_cascade() {
+        let style = parse_basic_css(
+            r#"
+            .weather_table.more_data tr th:nth-last-child(-n+12) { display: none; }
+            .weather_table.more_data tr th:nth-last-child(-n+6) { display: table-cell; }
+            .weather_table.more_data.summer tr th:nth-last-child(-n+11) { display: none; }
+            .weather_table.more_data.summer tr th:nth-last-child(-n+5) { display: table-cell; }
+            "#,
+        );
+        let table = ElementStyleKey {
+            tag: "table".to_owned(),
+            classes: vec![
+                "weather_table".to_owned(),
+                "more_data".to_owned(),
+                "summer".to_owned(),
+            ],
+            ..ElementStyleKey::default()
+        };
+        let tr = ElementStyleKey {
+            tag: "tr".to_owned(),
+            parent: Some(Box::new(table)),
+            ..ElementStyleKey::default()
+        };
+        let th = |child_index| ElementStyleKey {
+            tag: "th".to_owned(),
+            child_index: Some(child_index),
+            child_count: Some(14),
+            parent: Some(Box::new(tr.clone())),
+            ..ElementStyleKey::default()
+        };
+
+        assert_eq!(computed_box_style(&style, &th(2)).display, None);
+        assert_eq!(
+            computed_box_style(&style, &th(3)).display,
+            Some(CssDisplay::None)
+        );
+        assert_eq!(
+            computed_box_style(&style, &th(4)).display,
+            Some(CssDisplay::None)
+        );
+        assert_eq!(
+            computed_box_style(&style, &th(9)).display,
+            Some(CssDisplay::None)
+        );
+        assert_eq!(
+            computed_box_style(&style, &th(10)).display,
+            Some(CssDisplay::Table)
+        );
+        assert_eq!(
+            computed_box_style(&style, &th(14)).display,
+            Some(CssDisplay::Table)
+        );
+    }
+
+    #[test]
+    fn table_section_direct_cells_match_implicit_tr_descendant_selectors() {
+        let style = parse_basic_css(
+            r#"
+            .weather_table thead tr th:nth-last-child(-n+2) { display: none; }
+            "#,
+        );
+        let table = ElementStyleKey {
+            tag: "table".to_owned(),
+            classes: vec!["weather_table".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let thead = ElementStyleKey {
+            tag: "thead".to_owned(),
+            parent: Some(Box::new(table)),
+            ..ElementStyleKey::default()
+        };
+        let th = |child_index| ElementStyleKey {
+            tag: "th".to_owned(),
+            child_index: Some(child_index),
+            child_count: Some(4),
+            parent: Some(Box::new(thead.clone())),
+            ..ElementStyleKey::default()
+        };
+
+        assert_eq!(computed_box_style(&style, &th(2)).display, None);
+        assert_eq!(
+            computed_box_style(&style, &th(3)).display,
+            Some(CssDisplay::None)
+        );
+        assert_eq!(
+            computed_box_style(&style, &th(4)).display,
+            Some(CssDisplay::None)
+        );
     }
 
     #[test]
