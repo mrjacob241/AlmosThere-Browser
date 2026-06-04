@@ -32,6 +32,7 @@ const DEFAULT_PAGE_PATH: &str = concat!(
     "/../sample_pages/test_basic_page.html"
 );
 const DEFAULT_URL: &str = "https://latex.vercel.app/elements";
+const DEFAULT_NEW_TAB_URL: &str = "https://www.ecosia.org/";
 const BOOKMARKS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bookmarks.txt");
 const HISTORY_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -377,6 +378,106 @@ struct AlmostThereApp {
     debug_links: bool,
     trace_items: Vec<String>,
     recorded_event_count: u64,
+    tabs: Vec<BrowserTabState>,
+    active_tab_index: usize,
+    next_tab_id: u64,
+}
+
+struct BrowserTabState {
+    id: u64,
+    title: String,
+    url: String,
+    crashed: bool,
+    canvas: BrowserCanvas,
+    debug_canvas: BrowserCanvas,
+    document: BrowserDocument,
+    current_html: String,
+    live_html: String,
+    script_state: justbarelyscript::BrowserExecutionState,
+    module_cache: justbarelyscript::ModuleExecutionCache,
+    last_hovered_element_id: Option<String>,
+    last_focused_input: Option<FocusedInputMetadata>,
+    render_graph_debug_text: String,
+    url_input: String,
+    history: HistoryState,
+    console_messages: Vec<justbarelyscript::ConsoleMessage>,
+    live_js_debug_text: String,
+    status: String,
+    text_metrics_ready: bool,
+    pending_navigation: Option<PendingNavigation>,
+    render_debug: PageRenderDebugState,
+    page_loaded_at: std::time::Instant,
+}
+
+impl BrowserTabState {
+    fn blank(id: u64, url: String) -> Self {
+        let mut document = BrowserDocument {
+            title: "New tab".to_owned(),
+            source: url.clone(),
+            style: Default::default(),
+            canvas_graph: CanvasGraph::default(),
+            blocks: vec![CanvasBlock::Paragraph {
+                text: format!("Loading {url}..."),
+            }],
+        };
+        document.canvas_graph.viewport = egui::vec2(
+            DEFAULT_LAYOUT_VIEWPORT_WIDTH,
+            DEFAULT_LAYOUT_VIEWPORT_HEIGHT,
+        );
+        Self {
+            id,
+            title: tab_title_from_url(&url),
+            url: url.clone(),
+            crashed: false,
+            canvas: BrowserCanvas::new(),
+            debug_canvas: BrowserCanvas::new(),
+            document,
+            current_html: String::new(),
+            live_html: String::new(),
+            script_state: justbarelyscript::BrowserExecutionState::default(),
+            module_cache: justbarelyscript::ModuleExecutionCache::default(),
+            last_hovered_element_id: None,
+            last_focused_input: None,
+            render_graph_debug_text: String::new(),
+            url_input: url.clone(),
+            history: HistoryState::default(),
+            console_messages: Vec::new(),
+            live_js_debug_text: String::new(),
+            status: format!("Loading {url}..."),
+            text_metrics_ready: true,
+            pending_navigation: None,
+            render_debug: PageRenderDebugState::default(),
+            page_loaded_at: std::time::Instant::now(),
+        }
+    }
+
+    fn placeholder(id: u64, title: String, url: String) -> Self {
+        Self {
+            id,
+            title,
+            url: url.clone(),
+            crashed: false,
+            canvas: BrowserCanvas::new(),
+            debug_canvas: BrowserCanvas::new(),
+            document: BrowserDocument::default(),
+            current_html: String::new(),
+            live_html: String::new(),
+            script_state: justbarelyscript::BrowserExecutionState::default(),
+            module_cache: justbarelyscript::ModuleExecutionCache::default(),
+            last_hovered_element_id: None,
+            last_focused_input: None,
+            render_graph_debug_text: String::new(),
+            url_input: url,
+            history: HistoryState::default(),
+            console_messages: Vec::new(),
+            live_js_debug_text: String::new(),
+            status: String::new(),
+            text_metrics_ready: true,
+            pending_navigation: None,
+            render_debug: PageRenderDebugState::default(),
+            page_loaded_at: std::time::Instant::now(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -665,6 +766,16 @@ impl AlmostThereApp {
         };
         let url_input = document.source.clone();
 
+        let initial_tab = BrowserTabState::placeholder(
+            0,
+            if document.title.trim().is_empty() {
+                tab_title_from_url(&document.source)
+            } else {
+                shorten_tab_title(&document.title)
+            },
+            document.source.clone(),
+        );
+
         Self {
             canvas: BrowserCanvas::new(),
             debug_canvas: BrowserCanvas::new(),
@@ -692,7 +803,151 @@ impl AlmostThereApp {
             debug_links: config.debug_links,
             trace_items: config.trace_items,
             recorded_event_count: 0,
+            tabs: vec![initial_tab],
+            active_tab_index: 0,
+            next_tab_id: 1,
         }
+    }
+
+    fn open_new_tab(&mut self, url: Option<String>, ctx: &egui::Context) {
+        let url = url.unwrap_or_else(|| DEFAULT_NEW_TAB_URL.to_owned());
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+
+        self.store_active_tab_state();
+        self.tabs.push(BrowserTabState::blank(id, url.clone()));
+        self.active_tab_index = self.tabs.len() - 1;
+        self.restore_active_tab_state();
+        self.telemetry.emit(
+            "tab.opened",
+            &[
+                ("id", &id.to_string()),
+                ("url", &url),
+                ("mode", "same_window"),
+            ],
+        );
+        self.status = format!("Opened tab {id}: {url}");
+        self.start_navigation(url, None, NavigationHistoryAction::AddEntry);
+        ctx.request_repaint();
+    }
+
+    fn duplicate_current_tab(&mut self, ctx: &egui::Context) {
+        self.open_new_tab(Some(self.current_url()), ctx);
+    }
+
+    fn switch_to_tab(&mut self, index: usize, ctx: &egui::Context) {
+        if index == self.active_tab_index || index >= self.tabs.len() {
+            return;
+        }
+        let previous = self.active_tab_index;
+        self.store_active_tab_state();
+        self.active_tab_index = index;
+        self.restore_active_tab_state();
+        self.telemetry.emit(
+            "tab.selected",
+            &[
+                ("from", &previous.to_string()),
+                ("to", &index.to_string()),
+                ("url", &self.url_input),
+            ],
+        );
+        ctx.request_repaint();
+    }
+
+    fn close_tab(&mut self, index: usize, ctx: &egui::Context) {
+        if self.tabs.len() <= 1 || index >= self.tabs.len() {
+            return;
+        }
+        let closing_active = index == self.active_tab_index;
+        let closed = self.tabs.remove(index);
+        self.telemetry.emit(
+            "tab.closed",
+            &[("id", &closed.id.to_string()), ("url", &closed.url)],
+        );
+        if closing_active {
+            if self.active_tab_index >= self.tabs.len() {
+                self.active_tab_index = self.tabs.len().saturating_sub(1);
+            }
+            self.restore_active_tab_state();
+        } else if index < self.active_tab_index {
+            self.active_tab_index = self.active_tab_index.saturating_sub(1);
+        }
+        ctx.request_repaint();
+    }
+
+    fn store_active_tab_state(&mut self) {
+        if self.active_tab_index >= self.tabs.len() {
+            return;
+        }
+        self.tabs[self.active_tab_index] = self.take_current_tab_state();
+    }
+
+    fn restore_active_tab_state(&mut self) {
+        if self.active_tab_index >= self.tabs.len() {
+            return;
+        }
+        let replacement = BrowserTabState::placeholder(
+            self.tabs[self.active_tab_index].id,
+            self.tabs[self.active_tab_index].title.clone(),
+            self.tabs[self.active_tab_index].url.clone(),
+        );
+        let state = std::mem::replace(&mut self.tabs[self.active_tab_index], replacement);
+        self.install_tab_state(state);
+    }
+
+    fn take_current_tab_state(&mut self) -> BrowserTabState {
+        let title = if self.document.title.trim().is_empty() {
+            tab_title_from_url(&self.url_input)
+        } else {
+            shorten_tab_title(&self.document.title)
+        };
+        BrowserTabState {
+            id: self.tabs[self.active_tab_index].id,
+            title,
+            url: self.url_input.clone(),
+            crashed: self.status.contains("Page Apparently Crashed Lol"),
+            canvas: std::mem::take(&mut self.canvas),
+            debug_canvas: std::mem::take(&mut self.debug_canvas),
+            document: std::mem::take(&mut self.document),
+            current_html: std::mem::take(&mut self.current_html),
+            live_html: std::mem::take(&mut self.live_html),
+            script_state: std::mem::take(&mut self.script_state),
+            module_cache: std::mem::take(&mut self.module_cache),
+            last_hovered_element_id: std::mem::take(&mut self.last_hovered_element_id),
+            last_focused_input: std::mem::take(&mut self.last_focused_input),
+            render_graph_debug_text: std::mem::take(&mut self.render_graph_debug_text),
+            url_input: std::mem::take(&mut self.url_input),
+            history: std::mem::take(&mut self.history),
+            console_messages: std::mem::take(&mut self.console_messages),
+            live_js_debug_text: std::mem::take(&mut self.live_js_debug_text),
+            status: std::mem::take(&mut self.status),
+            text_metrics_ready: self.text_metrics_ready,
+            pending_navigation: std::mem::take(&mut self.pending_navigation),
+            render_debug: std::mem::take(&mut self.render_debug),
+            page_loaded_at: self.page_loaded_at,
+        }
+    }
+
+    fn install_tab_state(&mut self, state: BrowserTabState) {
+        self.canvas = state.canvas;
+        self.debug_canvas = state.debug_canvas;
+        self.document = state.document;
+        self.current_html = state.current_html;
+        self.live_html = state.live_html;
+        self.script_state = state.script_state;
+        self.module_cache = state.module_cache;
+        self.last_hovered_element_id = state.last_hovered_element_id;
+        self.last_focused_input = state.last_focused_input;
+        self.render_graph_debug_text = state.render_graph_debug_text;
+        self.url_input = state.url_input;
+        self.history = state.history;
+        self.console_messages = state.console_messages;
+        self.live_js_debug_text = state.live_js_debug_text;
+        self.status = state.status;
+        self.text_metrics_ready = state.text_metrics_ready;
+        self.pending_navigation = state.pending_navigation;
+        self.render_debug = state.render_debug;
+        self.page_loaded_at = state.page_loaded_at;
     }
 
     fn load_current_input(&mut self, ctx: &egui::Context) {
@@ -869,6 +1124,15 @@ impl AlmostThereApp {
         self.render_debug.object_limit = self.document.canvas_graph.objects.len();
         if let Some(fragment) = fragment {
             self.scroll_to_fragment(&fragment);
+        }
+        if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
+            tab.title = if self.document.title.trim().is_empty() {
+                tab_title_from_url(&self.document.source)
+            } else {
+                shorten_tab_title(&self.document.title)
+            };
+            tab.url = self.document.source.clone();
+            tab.crashed = self.status.contains("Page Apparently Crashed Lol");
         }
     }
 
@@ -5138,6 +5402,36 @@ fn workspace_root_path() -> PathBuf {
     manifest_dir.parent().unwrap_or(manifest_dir).to_path_buf()
 }
 
+fn tab_title_from_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return "New tab".to_owned();
+    }
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let title = without_scheme.split('/').next().unwrap_or(without_scheme);
+    if title.is_empty() {
+        "New tab".to_owned()
+    } else {
+        shorten_tab_title(title)
+    }
+}
+
+fn shorten_tab_title(title: &str) -> String {
+    const MAX_CHARS: usize = 28;
+    if title.chars().count() <= MAX_CHARS {
+        return title.to_owned();
+    }
+    let mut out = title
+        .chars()
+        .take(MAX_CHARS.saturating_sub(1))
+        .collect::<String>();
+    out.push_str("...");
+    out
+}
+
 impl App for AlmostThereApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         self.record_frame_events(ctx);
@@ -5171,6 +5465,64 @@ impl App for AlmostThereApp {
             "{APP_TITLE} :: {}",
             self.document.title
         )));
+
+        egui::TopBottomPanel::top("browser_tabs").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.visuals_mut().button_frame = true;
+                let mut selected_tab = None;
+                let mut tab_to_close = None;
+                for index in 0..self.tabs.len() {
+                    let active = index == self.active_tab_index;
+                    let title = if active {
+                        if self.document.title.trim().is_empty() {
+                            tab_title_from_url(&self.current_url())
+                        } else {
+                            shorten_tab_title(&self.document.title)
+                        }
+                    } else {
+                        self.tabs[index].title.clone()
+                    };
+                    let crashed = if self.tabs[index].crashed { "! " } else { "" };
+                    let tab_text = format!("{crashed}{title}");
+                    let hover_url = if active {
+                        self.current_url()
+                    } else {
+                        self.tabs[index].url.clone()
+                    };
+                    if active {
+                        ui.label(egui::RichText::new(tab_text).strong())
+                            .on_hover_text(hover_url);
+                    } else if ui.button(tab_text).on_hover_text(hover_url).clicked() {
+                        selected_tab = Some(index);
+                    }
+                    if self.tabs.len() > 1
+                        && ui.small_button("x").on_hover_text("Close tab").clicked()
+                    {
+                        tab_to_close = Some(index);
+                    }
+                    ui.separator();
+                }
+                if ui
+                    .button("+")
+                    .on_hover_text("Open a new tab in this window")
+                    .clicked()
+                {
+                    self.open_new_tab(None, ctx);
+                }
+                if ui
+                    .button("Duplicate")
+                    .on_hover_text("Duplicate the current tab in this window")
+                    .clicked()
+                {
+                    self.duplicate_current_tab(ctx);
+                }
+                if let Some(index) = tab_to_close {
+                    self.close_tab(index, ctx);
+                } else if let Some(index) = selected_tab {
+                    self.switch_to_tab(index, ctx);
+                }
+            });
+        });
 
         egui::TopBottomPanel::top("browser_toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -5903,6 +6255,7 @@ impl App for AlmostThereApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.store_active_tab_state();
         self.telemetry.emit("app.window_closed", &[]);
     }
 }
