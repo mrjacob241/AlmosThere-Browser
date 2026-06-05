@@ -4436,6 +4436,18 @@ impl BrowserExecutionState {
 
     fn execute_call(&mut self, callee: &Expression, arguments: &[Expression]) -> JsValue {
         if let Expression::Member {
+            property: MemberProperty::Named(method_name),
+            ..
+        } = callee
+        {
+            if let Some(result) =
+                self.call_jquery_selector_method_fallback(callee, method_name, arguments)
+            {
+                return result;
+            }
+        }
+
+        if let Expression::Member {
             object,
             property: MemberProperty::Named(method_name),
             optional,
@@ -4527,6 +4539,13 @@ impl BrowserExecutionState {
                 self.execute_expression(argument);
             }
             return JsValue::HostFunction("Function".into());
+        }
+
+        if matches!(callee, Expression::Identifier(name) if name == "$" || name == "jQuery") {
+            let Some(args) = self.eval_args_or_suspend_call(callee, arguments) else {
+                return JsValue::Undefined;
+            };
+            return self.call_jquery_constructor(args);
         }
 
         if let Some(method) = method_call(callee) {
@@ -6170,6 +6189,11 @@ impl BrowserExecutionState {
             }
 
             if let JsValue::Object(ref rc) = receiver {
+                if let Some(result) =
+                    self.call_jquery_like_collection_method(&receiver, &method_name, arguments)
+                {
+                    return result;
+                }
                 let method_val = self.obj_get(rc, &method_name);
                 if let JsValue::Function(func) = method_val {
                     let args = self.eval_args(arguments);
@@ -6217,6 +6241,11 @@ impl BrowserExecutionState {
             if Self::is_noop_style_method(&method_name) {
                 let args = self.eval_args(arguments);
                 return args.first().cloned().unwrap_or(receiver);
+            }
+            if let Some(result) =
+                self.call_jquery_selector_method_fallback(callee, &method_name, arguments)
+            {
+                return result;
             }
             // Evaluated receiver but method not found; trace it and still evaluate args for side effects.
             self.trace_runtime(
@@ -6320,6 +6349,370 @@ impl BrowserExecutionState {
             }
             _ => JsValue::Undefined,
         }
+    }
+
+    fn call_jquery_constructor(&mut self, args: Vec<JsValue>) -> JsValue {
+        match args.first().cloned().unwrap_or(JsValue::Undefined) {
+            JsValue::Function(callback) => {
+                self.enqueue_function_microtask(callback, Vec::new());
+                self.jquery_collection_object(Vec::new())
+            }
+            JsValue::String(selector) => {
+                let ids = self.query_selector_all_ids(&selector);
+                if ids.is_empty() {
+                    self.trace_dom_query_empty("jQuery", "document", &selector);
+                }
+                self.jquery_collection_object(ids)
+            }
+            JsValue::ElementRef(element_ref) => {
+                let id = existing_id_from_ref(&element_ref).unwrap_or(element_ref);
+                self.jquery_collection_object(vec![id])
+            }
+            JsValue::DocumentRef | JsValue::WindowRef => self.jquery_collection_object(Vec::new()),
+            JsValue::NodeList(ids) => self.jquery_collection_object(ids),
+            _ => self.jquery_collection_object(Vec::new()),
+        }
+    }
+
+    fn jquery_collection_object(&self, ids: Vec<String>) -> JsValue {
+        let rc = JsObject::new();
+        {
+            let mut obj = rc.borrow_mut();
+            obj.set(
+                "\0jquery_ids",
+                JsValue::Array(ids.iter().cloned().map(JsValue::String).collect()),
+            );
+            obj.set("length", JsValue::Number(ids.len() as f64));
+            for (index, id) in ids.iter().enumerate() {
+                obj.set(index.to_string(), self.element_ref_for_key(id));
+            }
+            for method in [
+                "ready",
+                "show",
+                "hide",
+                "css",
+                "addClass",
+                "removeClass",
+                "each",
+                "parent",
+                "find",
+                "click",
+            ] {
+                obj.set(method, JsValue::HostFunction(format!("jQuery.{method}")));
+            }
+        }
+        JsValue::Object(rc)
+    }
+
+    fn jquery_collection_ids(value: &JsValue) -> Vec<String> {
+        match value {
+            JsValue::Object(rc) => {
+                if let Some(JsValue::Array(ids)) = rc.borrow().get_own_data("\0jquery_ids") {
+                    return ids
+                        .into_iter()
+                        .filter_map(|id| match id {
+                            JsValue::String(id) => Some(id),
+                            _ => None,
+                        })
+                        .collect();
+                }
+                let object = rc.borrow();
+                let mut out = Vec::new();
+                let mut seen = HashSet::new();
+                let length = object
+                    .get_own_data("length")
+                    .map(|value| Self::value_to_number(&value).max(0.0) as usize)
+                    .unwrap_or(0);
+                for index in 0..length {
+                    if let Some(value) = object.get_own_data(&index.to_string())
+                        && let Some(id) = Self::jquery_element_id_from_value(value)
+                        && seen.insert(id.clone())
+                    {
+                        out.push(id);
+                    }
+                }
+                out
+            }
+            JsValue::Array(items) => {
+                let mut out = Vec::new();
+                let mut seen = HashSet::new();
+                for value in items {
+                    if let Some(id) = Self::jquery_element_id_from_value(value.clone())
+                        && seen.insert(id.clone())
+                    {
+                        out.push(id);
+                    }
+                }
+                out
+            }
+            JsValue::NodeList(ids) => ids.clone(),
+            JsValue::ElementRef(element_ref) => {
+                Self::jquery_element_id_from_value(JsValue::ElementRef(element_ref.clone()))
+                    .into_iter()
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn jquery_element_id_from_value(value: JsValue) -> Option<String> {
+        match value {
+            JsValue::ElementRef(element_ref) => {
+                Some(existing_id_from_ref(&element_ref).unwrap_or(element_ref))
+            }
+            JsValue::String(id) => Some(id),
+            JsValue::Object(rc) => {
+                if let Some(JsValue::String(id)) = rc.borrow().get_own_data("id") {
+                    return Some(id);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn call_jquery_like_collection_method(
+        &mut self,
+        collection: &JsValue,
+        method_name: &str,
+        arguments: &[Expression],
+    ) -> Option<JsValue> {
+        if !Self::is_jquery_collection_method_name(method_name) {
+            return None;
+        }
+        if Self::jquery_collection_ids(collection).is_empty() {
+            return None;
+        }
+
+        let args = self.eval_args(arguments);
+        match method_name {
+            "show" => {
+                self.apply_jquery_display(collection, None);
+                Some(collection.clone())
+            }
+            "hide" => {
+                self.apply_jquery_display(collection, Some("none"));
+                Some(collection.clone())
+            }
+            "css" => {
+                let name = args.first().map(Self::value_to_string).unwrap_or_default();
+                if let Some(value) = args.get(1) {
+                    self.apply_jquery_css(collection, &name, value.clone());
+                    Some(collection.clone())
+                } else {
+                    Some(self.jquery_first_css_value(collection, &name))
+                }
+            }
+            "addClass" => {
+                if let Some(classes) = args.first().map(Self::value_to_string) {
+                    self.apply_jquery_class_tokens(collection, &classes, true);
+                }
+                Some(collection.clone())
+            }
+            "removeClass" => {
+                if let Some(classes) = args.first().map(Self::value_to_string) {
+                    self.apply_jquery_class_tokens(collection, &classes, false);
+                }
+                Some(collection.clone())
+            }
+            "parent" => Some(self.jquery_parent_collection(collection)),
+            "find" => {
+                let selector = args.first().map(Self::value_to_string).unwrap_or_default();
+                Some(self.jquery_find_collection(collection, &selector))
+            }
+            "click" => Some(self.jquery_click(collection, args)),
+            "each" => {
+                if let Some(callback) = args.first().cloned().and_then(Self::function_from_value) {
+                    let ids = Self::jquery_collection_ids(collection);
+                    for (index, id) in ids.iter().enumerate() {
+                        let (result, _) = self.call_function_with_this(
+                            callback.clone(),
+                            vec![JsValue::Number(index as f64), self.element_ref_for_key(id)],
+                            self.element_ref_for_key(id),
+                        );
+                        if matches!(result, JsValue::Boolean(false)) {
+                            break;
+                        }
+                    }
+                }
+                Some(collection.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn call_jquery_selector_method_fallback(
+        &mut self,
+        callee: &Expression,
+        method_name: &str,
+        arguments: &[Expression],
+    ) -> Option<JsValue> {
+        if !Self::is_jquery_collection_method_name(method_name) {
+            return None;
+        }
+        let Expression::Member { object, .. } = callee else {
+            return None;
+        };
+        let Expression::Call {
+            callee: selector_callee,
+            arguments: selector_args,
+        } = object.as_ref()
+        else {
+            return None;
+        };
+        if !matches!(
+            selector_callee.as_ref(),
+            Expression::Identifier(name) if name == "$" || name == "jQuery"
+        ) {
+            return None;
+        }
+        let Some(Expression::String(selector)) = selector_args.first() else {
+            return None;
+        };
+        let ids = self.query_selector_all_ids(selector);
+        if ids.is_empty() {
+            self.trace_dom_query_empty("jQuery.method_fallback", "document", selector);
+            return None;
+        }
+        let collection = self.jquery_collection_object(ids);
+        self.call_jquery_like_collection_method(&collection, method_name, arguments)
+    }
+
+    fn is_jquery_collection_method_name(method_name: &str) -> bool {
+        matches!(
+            method_name,
+            "show"
+                | "hide"
+                | "css"
+                | "addClass"
+                | "removeClass"
+                | "each"
+                | "parent"
+                | "find"
+                | "click"
+        )
+    }
+
+    fn jquery_parent_collection(&self, collection: &JsValue) -> JsValue {
+        let mut parents = Vec::new();
+        let mut seen = HashSet::new();
+        for id in Self::jquery_collection_ids(collection) {
+            if let Some(parent) = self.dom.parent_by_id.get(&id) {
+                if seen.insert(parent.clone()) {
+                    parents.push(parent.clone());
+                }
+            }
+        }
+        self.jquery_collection_object(parents)
+    }
+
+    fn jquery_find_collection(&self, collection: &JsValue, selector: &str) -> JsValue {
+        let mut found = Vec::new();
+        let mut seen = HashSet::new();
+        for id in Self::jquery_collection_ids(collection) {
+            for child_id in self.scoped_query_selector_all_ids(&id, selector) {
+                if seen.insert(child_id.clone()) {
+                    found.push(child_id);
+                }
+            }
+        }
+        self.jquery_collection_object(found)
+    }
+
+    fn apply_jquery_display(&mut self, collection: &JsValue, display: Option<&str>) {
+        for id in Self::jquery_collection_ids(collection) {
+            let value = display
+                .map(str::to_owned)
+                .unwrap_or_else(|| self.default_display_for_element_id(&id));
+            self.assign_style_property(&id, "display", JsValue::String(value));
+        }
+    }
+
+    fn apply_jquery_css(&mut self, collection: &JsValue, name: &str, value: JsValue) {
+        let css_prop = js_style_prop_to_css(name);
+        for id in Self::jquery_collection_ids(collection) {
+            self.assign_style_property(&id, &css_prop, value.clone());
+        }
+    }
+
+    fn jquery_first_css_value(&self, collection: &JsValue, name: &str) -> JsValue {
+        let Some(id) = Self::jquery_collection_ids(collection).into_iter().next() else {
+            return JsValue::Undefined;
+        };
+        let element_ref = existing_element_ref(&id);
+        let inline = self
+            .get_element_attribute(&element_ref, "style")
+            .unwrap_or_default();
+        let css_prop = js_style_prop_to_css(name);
+        parse_inline_style_map(&inline)
+            .into_iter()
+            .find(|(prop, _)| *prop == css_prop)
+            .map(|(_, value)| JsValue::String(value))
+            .unwrap_or(JsValue::String(String::new()))
+    }
+
+    fn apply_jquery_class_tokens(&mut self, collection: &JsValue, classes: &str, add: bool) {
+        let requested: Vec<&str> = classes
+            .split_ascii_whitespace()
+            .filter(|class_name| !class_name.is_empty())
+            .collect();
+        if requested.is_empty() {
+            return;
+        }
+        for id in Self::jquery_collection_ids(collection) {
+            let element_ref = existing_element_ref(&id);
+            let mut tokens = self.element_class_tokens(&element_ref);
+            if add {
+                for class_name in &requested {
+                    if !tokens.iter().any(|existing| existing == class_name) {
+                        tokens.push((*class_name).to_owned());
+                    }
+                }
+            } else {
+                tokens
+                    .retain(|existing| !requested.iter().any(|class_name| existing == class_name));
+            }
+            self.set_element_class_tokens(&element_ref, tokens);
+        }
+    }
+
+    fn jquery_click(&mut self, collection: &JsValue, args: Vec<JsValue>) -> JsValue {
+        let ids = Self::jquery_collection_ids(collection);
+        if let Some(callback) = args.first().cloned().and_then(Self::function_from_value) {
+            for id in ids {
+                self.register_event_handler(id, "click".to_owned(), callback.clone());
+            }
+            return collection.clone();
+        }
+
+        for id in ids {
+            let effects = self.fire_event(&id, "click", None);
+            self.effects.extend(effects);
+        }
+        collection.clone()
+    }
+
+    fn default_display_for_element_id(&self, element_id: &str) -> String {
+        match self
+            .dom
+            .tag_name_by_id
+            .get(element_id)
+            .map(|tag| tag.as_str())
+            .unwrap_or("div")
+        {
+            "a" | "abbr" | "b" | "bdi" | "bdo" | "br" | "cite" | "code" | "data" | "dfn" | "em"
+            | "i" | "kbd" | "label" | "mark" | "q" | "rp" | "rt" | "ruby" | "s" | "samp"
+            | "small" | "span" | "strong" | "sub" | "sup" | "time" | "u" | "var" => "inline",
+            "table" => "table",
+            "thead" => "table-header-group",
+            "tbody" => "table-row-group",
+            "tfoot" => "table-footer-group",
+            "tr" => "table-row",
+            "td" | "th" => "table-cell",
+            "li" => "list-item",
+            _ => "block",
+        }
+        .to_owned()
     }
 
     fn canvas_context_ref(&self, context_name: &str) -> JsValue {
@@ -9536,6 +9929,11 @@ impl BrowserExecutionState {
                                 JsValue::Undefined
                             };
                         }
+                        if property == "id" {
+                            if let Some(id) = existing_id_from_ref(&element_ref) {
+                                return JsValue::String(id);
+                            }
+                        }
                         // Layout/position dimensions — safe zero stubs (no layout engine).
                         if matches!(
                             property.as_str(),
@@ -10233,6 +10631,7 @@ impl BrowserExecutionState {
             "window" | "this" => JsValue::WindowRef,
             "navigator" => JsValue::NavigatorRef,
             "globalThis" => JsValue::WindowRef,
+            "$" | "jQuery" => JsValue::HostFunction("jQuery".into()),
             "import" => JsValue::HostFunction("import".into()),
             "import.meta" => JsValue::from_map([(
                 "url".to_owned(),
@@ -13969,6 +14368,72 @@ impl BrowserExecutionState {
 
     fn call_host_function(&mut self, name: &str, this_arg: JsValue, args: Vec<JsValue>) -> JsValue {
         match name {
+            "jQuery" => self.call_jquery_constructor(args),
+            "jQuery.ready" => {
+                if let Some(callback) = args.first().cloned().and_then(Self::function_from_value) {
+                    self.enqueue_function_microtask(callback, Vec::new());
+                }
+                this_arg
+            }
+            "jQuery.show" => {
+                self.apply_jquery_display(&this_arg, None);
+                this_arg
+            }
+            "jQuery.hide" => {
+                self.apply_jquery_display(&this_arg, Some("none"));
+                this_arg
+            }
+            "jQuery.css" => {
+                if let Some(name) = args.first().map(Self::value_to_string) {
+                    if let Some(value) = args.get(1) {
+                        self.apply_jquery_css(&this_arg, &name, value.clone());
+                        return this_arg;
+                    }
+                    return self.jquery_first_css_value(&this_arg, &name);
+                }
+                this_arg
+            }
+            "jQuery.addClass" => {
+                if let Some(classes) = args.first().map(Self::value_to_string) {
+                    self.apply_jquery_class_tokens(&this_arg, &classes, true);
+                }
+                this_arg
+            }
+            "jQuery.removeClass" => {
+                if let Some(classes) = args.first().map(Self::value_to_string) {
+                    self.apply_jquery_class_tokens(&this_arg, &classes, false);
+                }
+                this_arg
+            }
+            "jQuery.parent" => self.jquery_parent_collection(&this_arg),
+            "jQuery.find" => {
+                let selector = args.first().map(Self::value_to_string).unwrap_or_default();
+                self.jquery_find_collection(&this_arg, &selector)
+            }
+            "jQuery.click" => self.jquery_click(&this_arg, args),
+            "jQuery.each" => {
+                if let Some(callback) = args.first().cloned().and_then(Self::function_from_value) {
+                    let ids = Self::jquery_collection_ids(&this_arg);
+                    for (index, id) in ids.into_iter().enumerate() {
+                        if self.execution_budget_exhausted {
+                            break;
+                        }
+                        let element = self.element_ref_for_key(&id);
+                        let (result, _) = self.call_function_with_this(
+                            callback.clone(),
+                            vec![JsValue::Number(index as f64), element.clone()],
+                            element,
+                        );
+                        if matches!(result, JsValue::Boolean(false)) {
+                            break;
+                        }
+                        if self.early_exit.is_some() {
+                            break;
+                        }
+                    }
+                }
+                this_arg
+            }
             "Event.preventDefault" => {
                 if let JsValue::Object(rc) = this_arg {
                     rc.borrow_mut()
@@ -24854,6 +25319,676 @@ mod tests {
                 element_id: "box".to_owned(),
                 name: "style".to_owned(),
                 value: "display: block; color: red".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn jquery_show_reveals_selector_collection_with_default_display() {
+        let program = crate::parse_script(
+            r##"
+            $(".value").show();
+            "##,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        let mut attrs = HashMap::new();
+        attrs.insert("class".to_owned(), "value".to_owned());
+        attrs.insert("style".to_owned(), "display: none; color: red".to_owned());
+        state.seed_existing_element_with_metadata(
+            "temperature",
+            "22.1".to_owned(),
+            attrs,
+            Some("span"),
+            Some("row"),
+        );
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetAttribute {
+                element_id: "temperature".to_owned(),
+                name: "style".to_owned(),
+                value: "display: inline; color: red".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn jquery_like_array_object_show_reveals_indexed_element_refs() {
+        let program = crate::parse_script(
+            r##"
+            let collection = { 0: document.getElementById("temperature"), length: 1 };
+            collection.show();
+            "##,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        let mut attrs = HashMap::new();
+        attrs.insert("style".to_owned(), "display: none; color: red".to_owned());
+        state.seed_existing_element_with_metadata(
+            "temperature",
+            "22.1".to_owned(),
+            attrs,
+            Some("span"),
+            Some("row"),
+        );
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetAttribute {
+                element_id: "temperature".to_owned(),
+                name: "style".to_owned(),
+                value: "display: inline; color: red".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn jquery_like_array_object_show_prefers_browser_effect_over_own_method() {
+        let program = crate::parse_script(
+            r##"
+            let collection = {
+                0: document.getElementById("temperature"),
+                length: 1,
+                show: function () { document.getElementById("marker").textContent = "wrong"; }
+            };
+            collection.show();
+            "##,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        let mut attrs = HashMap::new();
+        attrs.insert("style".to_owned(), "display: none; color: red".to_owned());
+        state.seed_existing_element_with_metadata(
+            "temperature",
+            "22.1".to_owned(),
+            attrs,
+            Some("span"),
+            Some("row"),
+        );
+        state.seed_existing_element("marker", String::new(), HashMap::new());
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetAttribute {
+                element_id: "temperature".to_owned(),
+                name: "style".to_owned(),
+                value: "display: inline; color: red".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn jquery_selector_method_fallback_handles_unusable_dollar_result() {
+        let program = crate::parse_script(
+            r##"
+            function $(selector) { return {}; }
+            $(".value").show();
+            "##,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        let mut attrs = HashMap::new();
+        attrs.insert("class".to_owned(), "value".to_owned());
+        attrs.insert("style".to_owned(), "display: none; color: red".to_owned());
+        state.seed_existing_element_with_metadata(
+            "temperature",
+            "22.1".to_owned(),
+            attrs,
+            Some("span"),
+            Some("row"),
+        );
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetAttribute {
+                element_id: "temperature".to_owned(),
+                name: "style".to_owned(),
+                value: "display: inline; color: red".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn jquery_css_sets_display_on_all_matching_elements() {
+        let program = crate::parse_script(
+            r##"
+            jQuery(".cell").css("display", "table-cell");
+            "##,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        let mut attrs = HashMap::new();
+        attrs.insert("class".to_owned(), "cell".to_owned());
+        attrs.insert("style".to_owned(), "display: none".to_owned());
+        state.seed_existing_element_with_metadata(
+            "a",
+            String::new(),
+            attrs.clone(),
+            Some("td"),
+            Some("row"),
+        );
+        state.seed_existing_element_with_metadata(
+            "b",
+            String::new(),
+            attrs,
+            Some("td"),
+            Some("row"),
+        );
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![
+                BrowserEffect::SetAttribute {
+                    element_id: "a".to_owned(),
+                    name: "style".to_owned(),
+                    value: "display: table-cell".to_owned(),
+                },
+                BrowserEffect::SetAttribute {
+                    element_id: "b".to_owned(),
+                    name: "style".to_owned(),
+                    value: "display: table-cell".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn jquery_hide_sets_display_none_and_remains_chainable() {
+        let program = crate::parse_script(
+            r##"
+            $(".value").hide().css("color", "blue");
+            "##,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        let mut attrs = HashMap::new();
+        attrs.insert("class".to_owned(), "value".to_owned());
+        attrs.insert("style".to_owned(), "display: inline; color: red".to_owned());
+        state.seed_existing_element_with_metadata(
+            "temperature",
+            "22.1".to_owned(),
+            attrs,
+            Some("span"),
+            Some("row"),
+        );
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![
+                BrowserEffect::SetAttribute {
+                    element_id: "temperature".to_owned(),
+                    name: "style".to_owned(),
+                    value: "display: none; color: red".to_owned(),
+                },
+                BrowserEffect::SetAttribute {
+                    element_id: "temperature".to_owned(),
+                    name: "style".to_owned(),
+                    value: "display: none; color: blue".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn jquery_each_passes_index_element_and_this() {
+        let program = crate::parse_script(
+            r##"
+            $(".reading").each(function (index, element) {
+                this.textContent = String(index) + ":" + element.id;
+            });
+            "##,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        let mut attrs = HashMap::new();
+        attrs.insert("class".to_owned(), "reading".to_owned());
+        state.seed_existing_element_with_metadata(
+            "a",
+            String::new(),
+            attrs.clone(),
+            Some("span"),
+            Some("row"),
+        );
+        state.seed_existing_element_with_metadata(
+            "b",
+            String::new(),
+            attrs,
+            Some("span"),
+            Some("row"),
+        );
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![
+                BrowserEffect::SetTextContent {
+                    element_id: "a".to_owned(),
+                    value: "0:a".to_owned(),
+                },
+                BrowserEffect::SetTextContent {
+                    element_id: "b".to_owned(),
+                    value: "1:b".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn jquery_each_can_wrap_this_and_reveal_each_element() {
+        let program = crate::parse_script(
+            r##"
+            $(".reading").each(function () {
+                $(this).show();
+            });
+            "##,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        let mut attrs = HashMap::new();
+        attrs.insert("class".to_owned(), "reading".to_owned());
+        attrs.insert("style".to_owned(), "display: none".to_owned());
+        state.seed_existing_element_with_metadata(
+            "a",
+            String::new(),
+            attrs.clone(),
+            Some("span"),
+            Some("row"),
+        );
+        state.seed_existing_element_with_metadata(
+            "b",
+            String::new(),
+            attrs,
+            Some("span"),
+            Some("row"),
+        );
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![
+                BrowserEffect::SetAttribute {
+                    element_id: "a".to_owned(),
+                    name: "style".to_owned(),
+                    value: "display: inline".to_owned(),
+                },
+                BrowserEffect::SetAttribute {
+                    element_id: "b".to_owned(),
+                    name: "style".to_owned(),
+                    value: "display: inline".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn jquery_css_getter_reads_first_inline_value() {
+        let program = crate::parse_script(
+            r##"
+            document.getElementById("result").textContent = $(".reading").css("display");
+            "##,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        let mut attrs = HashMap::new();
+        attrs.insert("class".to_owned(), "reading".to_owned());
+        attrs.insert(
+            "style".to_owned(),
+            "display: table-cell; color: red".to_owned(),
+        );
+        state.seed_existing_element_with_metadata(
+            "temperature",
+            String::new(),
+            attrs,
+            Some("td"),
+            Some("row"),
+        );
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "table-cell".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn jquery_hide_sets_display_none_and_preserves_other_inline_styles() {
+        let program = crate::parse_script(
+            r##"
+            $(".value").hide();
+            "##,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        let mut attrs = HashMap::new();
+        attrs.insert("class".to_owned(), "value".to_owned());
+        attrs.insert("style".to_owned(), "color: red; display: inline".to_owned());
+        state.seed_existing_element_with_metadata(
+            "temperature",
+            "22.1".to_owned(),
+            attrs,
+            Some("span"),
+            Some("row"),
+        );
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetAttribute {
+                element_id: "temperature".to_owned(),
+                name: "style".to_owned(),
+                value: "color: red; display: none".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn jquery_ready_callback_can_reveal_css_hidden_content() {
+        let program = crate::parse_script(
+            r##"
+            $(function () {
+                $(".reading").show().addClass("visible");
+            });
+            "##,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        let mut attrs = HashMap::new();
+        attrs.insert("class".to_owned(), "reading".to_owned());
+        attrs.insert("style".to_owned(), "display: none".to_owned());
+        state.seed_existing_element_with_metadata(
+            "reading",
+            "23".to_owned(),
+            attrs,
+            Some("span"),
+            Some("row"),
+        );
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![
+                BrowserEffect::SetAttribute {
+                    element_id: "reading".to_owned(),
+                    name: "style".to_owned(),
+                    value: "display: inline".to_owned(),
+                },
+                BrowserEffect::SetAttribute {
+                    element_id: "reading".to_owned(),
+                    name: "class".to_owned(),
+                    value: "reading visible".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn jquery_parent_returns_unique_parent_collection() {
+        let program = crate::parse_script(
+            r##"
+            $(".child").parent().addClass("has-child");
+            "##,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        let mut parent_attrs = HashMap::new();
+        parent_attrs.insert("class".to_owned(), "row".to_owned());
+        let mut child_attrs = HashMap::new();
+        child_attrs.insert("class".to_owned(), "child".to_owned());
+        state.seed_existing_element_with_metadata(
+            "row",
+            String::new(),
+            parent_attrs,
+            Some("div"),
+            Some("table"),
+        );
+        state.seed_existing_element_with_metadata(
+            "a",
+            String::new(),
+            child_attrs.clone(),
+            Some("span"),
+            Some("row"),
+        );
+        state.seed_existing_element_with_metadata(
+            "b",
+            String::new(),
+            child_attrs,
+            Some("span"),
+            Some("row"),
+        );
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetAttribute {
+                element_id: "row".to_owned(),
+                name: "class".to_owned(),
+                value: "row has-child".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn jquery_find_scopes_selector_to_collection_descendants() {
+        let program = crate::parse_script(
+            r##"
+            $(".active").find(".reading").show();
+            "##,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        let mut active_attrs = HashMap::new();
+        active_attrs.insert("class".to_owned(), "row active".to_owned());
+        let mut inactive_attrs = HashMap::new();
+        inactive_attrs.insert("class".to_owned(), "row".to_owned());
+        let mut reading_attrs = HashMap::new();
+        reading_attrs.insert("class".to_owned(), "reading".to_owned());
+        reading_attrs.insert("style".to_owned(), "display: none".to_owned());
+        state.seed_existing_element_with_metadata(
+            "active",
+            String::new(),
+            active_attrs,
+            Some("div"),
+            Some("root"),
+        );
+        state.seed_existing_element_with_metadata(
+            "inactive",
+            String::new(),
+            inactive_attrs,
+            Some("div"),
+            Some("root"),
+        );
+        state.seed_existing_element_with_metadata(
+            "visible",
+            "22".to_owned(),
+            reading_attrs.clone(),
+            Some("span"),
+            Some("active"),
+        );
+        state.seed_existing_element_with_metadata(
+            "still-hidden",
+            "19".to_owned(),
+            reading_attrs,
+            Some("span"),
+            Some("inactive"),
+        );
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetAttribute {
+                element_id: "visible".to_owned(),
+                name: "style".to_owned(),
+                value: "display: inline".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn jquery_click_registers_and_dispatches_parent_reveal_handler() {
+        let program = crate::parse_script(
+            r##"
+            $(".switch").parent().click(function () {
+                $(this).find(".reading").show();
+            });
+            $(".switch").parent().click();
+            "##,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        let mut row_attrs = HashMap::new();
+        row_attrs.insert("class".to_owned(), "row".to_owned());
+        let mut switch_attrs = HashMap::new();
+        switch_attrs.insert("class".to_owned(), "switch".to_owned());
+        let mut reading_attrs = HashMap::new();
+        reading_attrs.insert("class".to_owned(), "reading".to_owned());
+        reading_attrs.insert("style".to_owned(), "display: none".to_owned());
+        state.seed_existing_element_with_metadata(
+            "row",
+            String::new(),
+            row_attrs,
+            Some("div"),
+            Some("root"),
+        );
+        state.seed_existing_element_with_metadata(
+            "switch",
+            "C".to_owned(),
+            switch_attrs,
+            Some("button"),
+            Some("row"),
+        );
+        state.seed_existing_element_with_metadata(
+            "reading",
+            "22".to_owned(),
+            reading_attrs,
+            Some("span"),
+            Some("row"),
+        );
+        state.execute_program(&program);
+
+        assert!(state.has_listener("row", "click"));
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetAttribute {
+                element_id: "reading".to_owned(),
+                name: "style".to_owned(),
+                value: "display: inline".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn jquery_each_binds_this_and_passes_index_and_element() {
+        let program = crate::parse_script(
+            r##"
+            $(".reading").each(function (index, element) {
+                this.textContent = String(index) + ":" + element.id + ":" + this.textContent;
+            });
+            "##,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        let mut first_attrs = HashMap::new();
+        first_attrs.insert("id".to_owned(), "first".to_owned());
+        first_attrs.insert("class".to_owned(), "reading".to_owned());
+        let mut second_attrs = HashMap::new();
+        second_attrs.insert("id".to_owned(), "second".to_owned());
+        second_attrs.insert("class".to_owned(), "reading".to_owned());
+        state.seed_existing_element_with_metadata(
+            "first",
+            "A".to_owned(),
+            first_attrs,
+            Some("span"),
+            Some("row"),
+        );
+        state.seed_existing_element_with_metadata(
+            "second",
+            "B".to_owned(),
+            second_attrs,
+            Some("span"),
+            Some("row"),
+        );
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![
+                BrowserEffect::SetTextContent {
+                    element_id: "first".to_owned(),
+                    value: "0:first:A".to_owned(),
+                },
+                BrowserEffect::SetTextContent {
+                    element_id: "second".to_owned(),
+                    value: "1:second:B".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn jquery_each_stops_when_callback_returns_false() {
+        let program = crate::parse_script(
+            r##"
+            $(".reading").each(function (index) {
+                this.textContent = String(index);
+                return false;
+            });
+            "##,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        let mut first_attrs = HashMap::new();
+        first_attrs.insert("id".to_owned(), "first".to_owned());
+        first_attrs.insert("class".to_owned(), "reading".to_owned());
+        let mut second_attrs = HashMap::new();
+        second_attrs.insert("id".to_owned(), "second".to_owned());
+        second_attrs.insert("class".to_owned(), "reading".to_owned());
+        state.seed_existing_element_with_metadata(
+            "first",
+            "A".to_owned(),
+            first_attrs,
+            Some("span"),
+            Some("row"),
+        );
+        state.seed_existing_element_with_metadata(
+            "second",
+            "B".to_owned(),
+            second_attrs,
+            Some("span"),
+            Some("row"),
+        );
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "first".to_owned(),
+                value: "0".to_owned(),
             }]
         );
     }

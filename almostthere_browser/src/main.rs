@@ -314,7 +314,7 @@ impl AppConfig {
 }
 
 const PAGE_LOADER_WORKER_FLAG: &str = "--page-loader-worker";
-const PAGE_LOADER_WORKER_TIMEOUT_SECS: u64 = 45;
+const PAGE_LOADER_WORKER_TIMEOUT_SECS: u64 = 120;
 const PAGE_LOADER_WORKER_POLL_MS: u64 = 50;
 
 fn page_loader_worker_invocation() -> Option<(String, PathBuf)> {
@@ -4134,10 +4134,312 @@ fn apply_initial_script_effect_to_html(
         }
         justbarelyscript::BrowserEffect::ConsoleLog { .. }
         | justbarelyscript::BrowserEffect::NetworkRequest { .. }
-        | justbarelyscript::BrowserEffect::RuntimeTrace { .. }
         | justbarelyscript::BrowserEffect::DynamicImportRequest { .. }
         | justbarelyscript::BrowserEffect::ScriptLoadRequest { .. } => {}
+        justbarelyscript::BrowserEffect::RuntimeTrace { kind, detail } => {
+            if kind == "unsupported.method" {
+                *output = apply_unsupported_jquery_show_trace(output, detail);
+            }
+        }
     }
+}
+
+fn apply_unsupported_jquery_show_trace(html: &str, detail: &str) -> String {
+    let Some(selector) = unsupported_jquery_selector_trace(detail, "show") else {
+        return html.to_owned();
+    };
+    reveal_html_elements_by_selector(html, &selector)
+}
+
+fn apply_literal_jquery_show_statements_to_html(html: &str, script_source: &str) -> String {
+    let mut output = html.to_owned();
+    let mut seen = std::collections::HashSet::new();
+    let selectors = literal_jquery_show_selectors(script_source);
+    let before_len = output.len();
+    for selector in &selectors {
+        if seen.insert(selector.clone()) {
+            output = reveal_html_elements_by_selector(&output, selector);
+        }
+    }
+    emit_global_telemetry(
+        "js.jquery_literal_show.recovered",
+        &[
+            ("selectors", &selectors.len().to_string()),
+            ("unique_selectors", &seen.len().to_string()),
+            ("bytes_before", &before_len.to_string()),
+            ("bytes_after", &output.len().to_string()),
+        ],
+    );
+    output
+}
+
+fn literal_jquery_show_selectors(script_source: &str) -> Vec<String> {
+    let mut selectors = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut cursor = 0usize;
+    while cursor < script_source.len() {
+        let dollar = script_source[cursor..]
+            .find("$(")
+            .map(|offset| cursor + offset);
+        let jquery = script_source[cursor..]
+            .find("jQuery(")
+            .map(|offset| cursor + offset);
+        let Some(start) = (match (dollar, jquery) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }) else {
+            break;
+        };
+        let open_paren = if script_source[start..].starts_with("$(") {
+            start + 1
+        } else {
+            start + "jQuery".len()
+        };
+        let Some((selector, after_string)) =
+            parse_first_string_argument(script_source, open_paren + 1)
+        else {
+            cursor = open_paren + 1;
+            continue;
+        };
+        let after_selector = script_source[after_string..].trim_start();
+        let Some(after_paren) = after_selector.strip_prefix(')') else {
+            cursor = after_string;
+            continue;
+        };
+        let after_paren = after_paren.trim_start();
+        if after_paren.starts_with(".show(") || after_paren.starts_with(".show (") {
+            if seen.insert(selector.clone()) {
+                selectors.push(selector);
+            }
+        }
+        cursor = after_string;
+    }
+
+    let mut show_cursor = 0usize;
+    while let Some(rel_show) = script_source[show_cursor..].find(".show") {
+        let show_start = show_cursor + rel_show;
+        let before = &script_source[..show_start];
+        let dollar = before.rfind("$(");
+        let jquery = before.rfind("jQuery(");
+        let Some(call_start) = (match (dollar, jquery) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }) else {
+            show_cursor = show_start + ".show".len();
+            continue;
+        };
+        let open_paren = if script_source[call_start..].starts_with("$(") {
+            call_start + 1
+        } else {
+            call_start + "jQuery".len()
+        };
+        if let Some((selector, after_string)) =
+            parse_first_string_argument(script_source, open_paren + 1)
+        {
+            let between = script_source[after_string..show_start].trim();
+            if between == ")" && seen.insert(selector.clone()) {
+                selectors.push(selector);
+            }
+        }
+        show_cursor = show_start + ".show".len();
+    }
+    selectors
+}
+
+fn parse_first_string_argument(source: &str, mut cursor: usize) -> Option<(String, usize)> {
+    while cursor < source.len() {
+        let ch = source[cursor..].chars().next()?;
+        if !ch.is_whitespace() {
+            break;
+        }
+        cursor += ch.len_utf8();
+    }
+    let quote = source[cursor..].chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    cursor += quote.len_utf8();
+    let mut value = String::new();
+    while cursor < source.len() {
+        let ch = source[cursor..].chars().next()?;
+        cursor += ch.len_utf8();
+        if ch == quote {
+            return Some((value, cursor));
+        }
+        if ch == '\\' {
+            let escaped = source[cursor..].chars().next()?;
+            cursor += escaped.len_utf8();
+            value.push(escaped);
+        } else {
+            value.push(ch);
+        }
+    }
+    None
+}
+
+fn unsupported_jquery_selector_trace(detail: &str, method: &str) -> Option<String> {
+    if !detail.starts_with(&format!("{method} on ")) {
+        return None;
+    }
+    if !(detail.contains("callee: Identifier(\"$\")")
+        || detail.contains("callee: Identifier(\"jQuery\")"))
+    {
+        return None;
+    }
+    let marker = "arguments: [String(\"";
+    let start = detail.find(marker)? + marker.len();
+    let rest = &detail[start..];
+    let end = rest.find("\")]")?;
+    let selector = rest[..end].trim();
+    if selector.is_empty() {
+        None
+    } else {
+        Some(selector.to_owned())
+    }
+}
+
+fn reveal_html_elements_by_selector(html: &str, selector: &str) -> String {
+    let mut selectors = Vec::new();
+    for group in selector
+        .split(',')
+        .map(str::trim)
+        .filter(|group| !group.is_empty())
+    {
+        if group.contains(':') {
+            continue;
+        }
+        if let Some(simple) = group.split_whitespace().last() {
+            selectors.push(simple.to_owned());
+        }
+    }
+    if selectors.is_empty() {
+        return html.to_owned();
+    }
+    reveal_html_open_tags_matching_selectors(html, &selectors)
+}
+
+fn reveal_html_open_tags_matching_selectors(html: &str, selectors: &[String]) -> String {
+    let mut output = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+
+    while let Some(rel_open_start) = html[cursor..].find('<') {
+        let open_start = cursor + rel_open_start;
+        output.push_str(&html[cursor..open_start]);
+        let after_open = &html[open_start..];
+        let Some(rel_open_end) = after_open.find('>') else {
+            output.push_str(after_open);
+            return output;
+        };
+        let open_end = open_start + rel_open_end + 1;
+        let open_tag = &html[open_start..open_end];
+
+        if open_tag.starts_with("</")
+            || open_tag.starts_with("<!")
+            || open_tag.starts_with("<?")
+            || tag_name(open_tag).is_none()
+        {
+            output.push_str(open_tag);
+            cursor = open_end;
+            continue;
+        }
+
+        let matches = selectors
+            .iter()
+            .any(|selector| open_tag_matches_simple_selector(open_tag, selector));
+        if matches {
+            output.push_str(&open_tag_with_merged_display_style(open_tag));
+        } else {
+            output.push_str(open_tag);
+        }
+        cursor = open_end;
+    }
+
+    output.push_str(&html[cursor..]);
+    output
+}
+
+fn open_tag_matches_simple_selector(open_tag: &str, selector: &str) -> bool {
+    if let Some(class_name) = selector.strip_prefix('.') {
+        return extract_attr(open_tag, "class").is_some_and(|classes| {
+            classes
+                .split_ascii_whitespace()
+                .any(|class| class == class_name)
+        });
+    }
+    if let Some(id) = selector.strip_prefix('#') {
+        return extract_attr(open_tag, "id").is_some_and(|element_id| element_id == id);
+    }
+    tag_name(open_tag).is_some_and(|tag| tag.eq_ignore_ascii_case(selector))
+}
+
+fn open_tag_with_merged_display_style(open_tag: &str) -> String {
+    let Some(tag) = tag_name(open_tag) else {
+        return open_tag.to_owned();
+    };
+    let display = html_default_display_for_tag(tag);
+    let existing_style = extract_attr(open_tag, "style").unwrap_or_default();
+    let style = merge_html_inline_style(&existing_style, "display", display);
+    let Some(insert_at) = open_tag.rfind('>') else {
+        return open_tag.to_owned();
+    };
+    let attr = format!(" style=\"{}\"", encode_basic_attr(&style));
+    if let Some((attr_start, attr_end)) = find_attr_span_in_open_tag(open_tag, "style") {
+        let mut output = String::with_capacity(open_tag.len() + attr.len());
+        output.push_str(&open_tag[..attr_start]);
+        output.push_str(&attr);
+        output.push_str(&open_tag[attr_end..]);
+        return output;
+    }
+    let mut output = String::with_capacity(open_tag.len() + attr.len());
+    output.push_str(&open_tag[..insert_at]);
+    output.push_str(&attr);
+    output.push_str(&open_tag[insert_at..]);
+    output
+}
+
+fn html_default_display_for_tag(tag: &str) -> &'static str {
+    match tag.to_ascii_lowercase().as_str() {
+        "td" | "th" => "table-cell",
+        "tr" => "table-row",
+        "thead" => "table-header-group",
+        "tbody" => "table-row-group",
+        "table" => "table",
+        "div" | "section" | "article" | "main" | "header" | "footer" | "nav" | "p" | "ul"
+        | "ol" | "li" => "block",
+        _ => "inline",
+    }
+}
+
+fn merge_html_inline_style(existing: &str, prop: &str, value: &str) -> String {
+    let mut parts: Vec<(String, String)> = existing
+        .split(';')
+        .filter_map(|part| {
+            let (name, val) = part.split_once(':')?;
+            let name = name.trim();
+            if name.is_empty() {
+                None
+            } else {
+                Some((name.to_owned(), val.trim().to_owned()))
+            }
+        })
+        .collect();
+    if let Some((_, val)) = parts
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case(prop))
+    {
+        *val = value.to_owned();
+    } else {
+        parts.insert(0, (prop.to_owned(), value.to_owned()));
+    }
+    parts
+        .into_iter()
+        .map(|(name, val)| format!("{name}: {val}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn apply_safe_script_browser_effects_detailed(
@@ -5525,6 +5827,10 @@ fn find_attr_span_in_open_tag(open_tag: &str, name: &str) -> Option<(usize, usiz
 fn find_element_range_by_id(html: &str, element_id: &str) -> Option<(usize, usize, usize, usize)> {
     let mut offset = 0;
     let mut remaining = html;
+    let generated_dom_index = element_id
+        .strip_prefix("__dom_seed_")
+        .and_then(|value| value.parse::<usize>().ok());
+    let mut current_dom_index = 0usize;
 
     while let Some(rel_open_start) = remaining.find('<') {
         let open_start = offset + rel_open_start;
@@ -5537,18 +5843,31 @@ fn find_element_range_by_id(html: &str, element_id: &str) -> Option<(usize, usiz
 
         let open_end = open_start + after_open.find('>')? + 1;
         let open_tag = &html[open_start..open_end];
-        if extract_attr(open_tag, "id").as_deref() != Some(element_id) {
+        let Some(tag) = tag_name(open_tag) else {
             offset = open_end;
             remaining = &html[offset..];
             continue;
+        };
+        current_dom_index += 1;
+
+        let matches_real_id = extract_attr(open_tag, "id").as_deref() == Some(element_id)
+            || extract_attr(open_tag, "data-dom-id").as_deref() == Some(element_id)
+            || extract_attr(open_tag, "data-node-id").as_deref() == Some(element_id);
+        let matches_generated_id =
+            generated_dom_index.is_some_and(|index| index == current_dom_index);
+        if matches_real_id || matches_generated_id {
+            if is_void_tag(tag) {
+                return Some((open_start, open_end, open_end, open_end));
+            }
+            let close = format!("</{tag}>");
+            let close_rel = html[open_end..].find(&close)?;
+            let close_start = open_end + close_rel;
+            let close_end = close_start + close.len();
+            return Some((open_start, open_end, close_start, close_end));
         }
 
-        let tag = tag_name(open_tag)?;
-        let close = format!("</{tag}>");
-        let close_rel = html[open_end..].find(&close)?;
-        let close_start = open_end + close_rel;
-        let close_end = close_start + close.len();
-        return Some((open_start, open_end, close_start, close_end));
+        offset = open_end;
+        remaining = &html[offset..];
     }
 
     None
@@ -7996,7 +8315,7 @@ fn prepare_navigation_artifacts(source: LoadedPageSource) -> io::Result<WorkerPr
         Some(&source.source),
     );
     let script_pipeline_unhealthy = script_result.pipeline_unhealthy.clone();
-    let live_html = script_result.html;
+    let live_html = apply_literal_jquery_show_statements_to_html(&script_result.html, &source.html);
     emit_global_telemetry(
         "navigation.scripts.completed",
         &[
@@ -8074,7 +8393,7 @@ fn prepare_navigation_in_isolated_process(
     output_dir: PathBuf,
 ) -> io::Result<PreparedNavigation> {
     fs::create_dir_all(&output_dir)?;
-    let exe = std::env::current_exe().map_err(io::Error::other)?;
+    let exe = page_loader_worker_executable()?;
     let mut child = std::process::Command::new(exe)
         .arg(PAGE_LOADER_WORKER_FLAG)
         .arg(url)
@@ -8162,6 +8481,41 @@ fn prepare_navigation_in_isolated_process(
 
     let worker_prepared = read_worker_prepared_navigation(&output_dir)?;
     prepared_navigation_from_worker_artifacts(worker_prepared)
+}
+
+fn page_loader_worker_executable() -> io::Result<PathBuf> {
+    let current = std::env::current_exe().map_err(io::Error::other)?;
+    let Some(parent) = current.parent() else {
+        return Ok(current);
+    };
+    if parent.file_name().and_then(|name| name.to_str()) == Some("deps") {
+        if let Some(profile_dir) = parent.parent() {
+            let candidate = profile_dir.join(format!(
+                "almostthere_browser{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+            if page_loader_worker_binary_looks_usable(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    if page_loader_worker_binary_looks_usable(&current) {
+        return Ok(current);
+    }
+    Ok(current)
+}
+
+fn page_loader_worker_binary_looks_usable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name == format!("almostthere_browser{}", std::env::consts::EXE_SUFFIX)
+                || name.starts_with("almostthere_browser-")
+        })
 }
 
 fn page_loader_worker_output_dir() -> PathBuf {
@@ -8398,7 +8752,7 @@ fn prepare_navigation_source(
         Some(&source.source),
     );
     let script_pipeline_unhealthy = script_result.pipeline_unhealthy.clone();
-    let live_html = script_result.html;
+    let live_html = apply_literal_jquery_show_statements_to_html(&script_result.html, &source.html);
     emit_global_telemetry(
         "navigation.scripts.completed",
         &[
@@ -8703,8 +9057,8 @@ fn push_html_trace(html: &str, needle: &str, out: &mut String) {
             break;
         };
         let index = offset + relative;
-        let start = index.saturating_sub(180);
-        let end = (index + needle.len() + 180).min(html.len());
+        let start = clamp_to_char_boundary(html, index.saturating_sub(180), false);
+        let end = clamp_to_char_boundary(html, (index + needle.len() + 180).min(html.len()), true);
         let snippet = html[start..end]
             .split_whitespace()
             .collect::<Vec<_>>()
@@ -8717,6 +9071,18 @@ fn push_html_trace(html: &str, needle: &str, out: &mut String) {
         let _ = writeln!(out, "no HTML occurrences");
     }
     let _ = writeln!(out);
+}
+
+fn clamp_to_char_boundary(value: &str, mut index: usize, round_up: bool) -> usize {
+    index = index.min(value.len());
+    while index > 0 && index < value.len() && !value.is_char_boundary(index) {
+        if round_up {
+            index += 1;
+        } else {
+            index -= 1;
+        }
+    }
+    index
 }
 
 fn push_dom_trace(dom: &DomDocument, needle: &str, out: &mut String) {
@@ -9763,6 +10129,12 @@ fn apply_css_box_style(
     if let Some(flex_grow) = source.flex_grow {
         target.flex_grow = flex_grow;
     }
+    if let Some(flex_shrink) = source.flex_shrink {
+        target.flex_shrink = flex_shrink;
+    }
+    if let Some(flex_basis) = source.flex_basis {
+        target.flex_basis = Some(flex_basis);
+    }
     if let Some(flex_direction) = source.flex_direction {
         target.flex_direction = flex_direction;
     }
@@ -9774,6 +10146,9 @@ fn apply_css_box_style(
     }
     if let Some(align_items) = source.align_items {
         target.align_items = align_items;
+    }
+    if let Some(align_self) = source.align_self {
+        target.align_self = Some(align_self);
     }
     if let Some(justify_items) = source.justify_items {
         target.justify_items = justify_items;
@@ -10312,11 +10687,23 @@ fn layout_css_block_children(
             cursor_y = cursor_y.max(css_clearance_y(&active_floats));
         }
         active_floats.retain(|float_| float_.rect.bottom() > cursor_y);
-        let (left_float_offset, right_float_offset) =
+        let (mut left_float_offset, mut right_float_offset) =
             css_float_offsets_at_y(&active_floats, parent.dimensions.content, cursor_y);
+        let mut available_width =
+            parent.dimensions.content.width() - left_float_offset - right_float_offset;
+        if !active_floats.is_empty()
+            && child.style.float == CssFloat::None
+            && available_width < css_min_float_side_flow_width(child)
+        {
+            cursor_y = cursor_y.max(css_clearance_y(&active_floats));
+            active_floats.retain(|float_| float_.rect.bottom() > cursor_y);
+            (left_float_offset, right_float_offset) =
+                css_float_offsets_at_y(&active_floats, parent.dimensions.content, cursor_y);
+            available_width =
+                parent.dimensions.content.width() - left_float_offset - right_float_offset;
+        }
         let available_x = parent.dimensions.content.left() + left_float_offset;
-        let available_width =
-            (parent.dimensions.content.width() - left_float_offset - right_float_offset).max(1.0);
+        let available_width = available_width.max(1.0);
         layout_css_box(
             child,
             available_x,
@@ -10343,6 +10730,12 @@ fn layout_css_block_children(
     }
     let float_bottom = css_clearance_y(&active_floats);
     (cursor_y.max(float_bottom) - parent.dimensions.content.top()).max(0.0)
+}
+
+fn css_min_float_side_flow_width(box_: &CssLayoutBox<'_>) -> f32 {
+    css_used_content_min_width(&box_.style, 0.0)
+        .max(box_.style.font_size * 2.0)
+        .max(32.0)
 }
 
 fn css_clearance_y(active_floats: &[CssActiveFloat]) -> f32 {
@@ -11121,11 +11514,29 @@ fn layout_css_flex_children(
         } else {
             0.0
         };
-        let cross_offset = match container.style.align_items {
-            CssAlignItems::Center => {
-                ((available_cross - if is_row { size.y } else { size.x }) * 0.5).max(0.0)
-            }
-            CssAlignItems::Stretch | CssAlignItems::FlexStart => 0.0,
+        let cross_free_space = (available_cross - if is_row { size.y } else { size.x }).max(0.0);
+        let cross_auto_before = if is_row {
+            child.style.margin_auto.top
+        } else {
+            child.style.margin_auto.left
+        };
+        let cross_auto_after = if is_row {
+            child.style.margin_auto.bottom
+        } else {
+            child.style.margin_auto.right
+        };
+        let cross_offset = match (cross_auto_before, cross_auto_after) {
+            (true, true) => cross_free_space * 0.5,
+            (true, false) => cross_free_space,
+            (false, true) => 0.0,
+            (false, false) => match child
+                .style
+                .align_self
+                .unwrap_or(container.style.align_items)
+            {
+                CssAlignItems::Center => cross_free_space * 0.5,
+                CssAlignItems::Stretch | CssAlignItems::FlexStart => 0.0,
+            },
         };
 
         let content_x = if is_row {
@@ -11310,7 +11721,11 @@ fn layout_css_wrapped_row_flex_children(
             } else {
                 0.0
             };
-            let cross_offset = match container.style.align_items {
+            let cross_offset = match child
+                .style
+                .align_self
+                .unwrap_or(container.style.align_items)
+            {
                 CssAlignItems::Center => ((line_cross - size.y) * 0.5).max(0.0),
                 CssAlignItems::Stretch | CssAlignItems::FlexStart => 0.0,
             };
@@ -11443,7 +11858,15 @@ fn shrink_css_flex_row_item_widths(
     let shrinkable_total = widths
         .iter()
         .zip(children)
-        .map(|(width, child)| (*width - css_flex_item_shrink_floor(child, *width)).max(0.0))
+        .map(|(width, child)| {
+            if child.style.flex_shrink <= 0.0 {
+                0.0
+            } else {
+                ((*width - css_flex_item_shrink_floor(child, *width)).max(0.0))
+                    * child.style.flex_shrink
+                    * width.max(1.0)
+            }
+        })
         .sum::<f32>();
     if shrinkable_total <= 0.0 {
         return;
@@ -11451,7 +11874,11 @@ fn shrink_css_flex_row_item_widths(
     let overflow = total - available_for_items;
     for (width, child) in widths.iter_mut().zip(children) {
         let min_width = css_flex_item_shrink_floor(child, *width);
-        let shrinkable = (*width - min_width).max(0.0);
+        let shrinkable = if child.style.flex_shrink <= 0.0 {
+            0.0
+        } else {
+            ((*width - min_width).max(0.0)) * child.style.flex_shrink * width.max(1.0)
+        };
         *width = (*width - overflow * shrinkable / shrinkable_total)
             .max(min_width)
             .max(1.0);
@@ -11462,15 +11889,7 @@ fn css_flex_item_effective_grow(child: &CssLayoutBox<'_>) -> f32 {
     if child.style.flex_grow > 0.0 {
         return child.style.flex_grow;
     }
-    if child.style.width.is_none()
-        && child.style.max_width.is_none()
-        && child.style.max_width_percent.is_none()
-        && css_layout_box_contains_text_form_control(child)
-    {
-        1.0
-    } else {
-        0.0
-    }
+    0.0
 }
 
 fn css_flex_item_min_width(child: &CssLayoutBox<'_>) -> f32 {
@@ -11497,6 +11916,11 @@ fn css_flex_item_base_width(
     available_width: f32,
     text_metrics: Option<&egui::Context>,
 ) -> f32 {
+    if let Some(basis) = child.style.flex_basis {
+        if let Some(width) = resolve_css_width(basis, available_width) {
+            return width.min(available_width).max(1.0);
+        }
+    }
     if let Some(percent) = child.style.width_percent {
         return (available_width * percent / 100.0)
             .min(available_width)
@@ -11968,9 +12392,16 @@ fn layout_css_grid_children(
         return height;
     }
 
-    let column_widths = css_grid_column_widths(&container.style, flow_count, content.width(), gap);
-    let columns = column_widths.len().max(1);
+    let columns = css_grid_column_count(&container.style, flow_count, content.width(), gap).max(1);
     let placements = css_grid_auto_placements(&container.children, columns);
+    let column_widths = css_grid_column_widths(
+        &container.style,
+        flow_count,
+        content.width(),
+        gap,
+        Some((&container.children, &placements)),
+        text_metrics,
+    );
     let row_count = placements
         .iter()
         .flatten()
@@ -12314,6 +12745,8 @@ fn css_grid_column_widths(
     flow_count: usize,
     content_width: f32,
     gap: f32,
+    placed_children: Option<(&[CssLayoutBox<'_>], &[Option<CssGridAutoPlacement>])>,
+    text_metrics: Option<&egui::Context>,
 ) -> Vec<f32> {
     let columns = css_grid_column_count(style, flow_count, content_width, gap);
     if style.grid_auto_repeat_min_column_width.is_some() {
@@ -12326,7 +12759,8 @@ fn css_grid_column_widths(
     if tracks.is_empty() {
         return css_equal_grid_column_widths(columns, content_width, gap);
     }
-    css_resolve_grid_column_tracks(&tracks, content_width, gap)
+    let auto_base_widths = css_grid_auto_column_base_widths(&tracks, placed_children, text_metrics);
+    css_resolve_grid_column_tracks(&tracks, content_width, gap, &auto_base_widths)
 }
 
 fn css_equal_grid_column_widths(columns: usize, content_width: f32, gap: f32) -> Vec<f32> {
@@ -12349,7 +12783,7 @@ fn css_grid_item_used_width(
         && style.width.is_none()
         && !css_layout_box_contains_replaced_or_special(child)
     {
-        css_layout_preferred_content_width(child, text_metrics)
+        css_layout_preferred_outer_width(child, text_metrics)
     } else {
         style.width.unwrap_or(track_width)
     }
@@ -12362,7 +12796,52 @@ fn css_grid_item_used_width(
     width.max(min_width).min(track_width.max(min_width))
 }
 
-fn css_resolve_grid_column_tracks(tracks: &[CssLength], content_width: f32, gap: f32) -> Vec<f32> {
+fn css_grid_auto_column_base_widths(
+    tracks: &[CssLength],
+    placed_children: Option<(&[CssLayoutBox<'_>], &[Option<CssGridAutoPlacement>])>,
+    text_metrics: Option<&egui::Context>,
+) -> Vec<f32> {
+    let mut widths = vec![0.0_f32; tracks.len()];
+    let Some((children, placements)) = placed_children else {
+        return widths;
+    };
+
+    for (index, child) in children.iter().enumerate() {
+        if css_layout_box_is_out_of_flow(child) {
+            continue;
+        }
+        let Some(placement) = placements.get(index).copied().flatten() else {
+            continue;
+        };
+        if placement.column >= tracks.len() || placement.column_span != 1 {
+            continue;
+        }
+        if tracks[placement.column] != CssLength::Auto {
+            continue;
+        }
+        widths[placement.column] = widths[placement.column]
+            .max(css_layout_preferred_outer_width(child, text_metrics))
+            .max(css_layout_minimum_outer_width(child));
+    }
+
+    widths
+}
+
+fn css_layout_minimum_outer_width(box_: &CssLayoutBox<'_>) -> f32 {
+    css_used_content_min_width(&box_.style, 0.0)
+        + box_.style.margin.left
+        + box_.style.margin.right
+        + box_.style.border_width * 2.0
+        + box_.style.padding.left
+        + box_.style.padding.right
+}
+
+fn css_resolve_grid_column_tracks(
+    tracks: &[CssLength],
+    content_width: f32,
+    gap: f32,
+    auto_base_widths: &[f32],
+) -> Vec<f32> {
     let gap_total = gap * tracks.len().saturating_sub(1) as f32;
     let mut widths = vec![0.0; tracks.len()];
     let mut fixed_total = 0.0;
@@ -12374,7 +12853,9 @@ fn css_resolve_grid_column_tracks(tracks: &[CssLength], content_width: f32, gap:
                 flexible_total += fr;
             }
             CssLength::Auto => {
-                flexible_total += 1.0;
+                let width = auto_base_widths.get(index).copied().unwrap_or(0.0);
+                widths[index] = width;
+                fixed_total += width;
             }
             length => {
                 let width = resolve_css_grid_track_min_width(length, content_width).max(0.0);
@@ -12387,9 +12868,7 @@ fn css_resolve_grid_column_tracks(tracks: &[CssLength], content_width: f32, gap:
     let remaining = (content_width - gap_total - fixed_total).max(0.0);
     let flexible_columns = tracks
         .iter()
-        .filter(|track| {
-            matches!(track, CssLength::Fr(fr) if *fr > 0.0) || **track == CssLength::Auto
-        })
+        .filter(|track| matches!(track, CssLength::Fr(fr) if *fr > 0.0))
         .count();
     let flexible_floor = if flexible_columns > 0 {
         ((content_width - gap_total).max(1.0) / tracks.len().max(1) as f32)
@@ -12401,7 +12880,6 @@ fn css_resolve_grid_column_tracks(tracks: &[CssLength], content_width: f32, gap:
     for (index, track) in tracks.iter().copied().enumerate() {
         let share = match track {
             CssLength::Fr(fr) if fr > 0.0 && flexible_total > 0.0 => Some(fr),
-            CssLength::Auto if flexible_total > 0.0 => Some(1.0),
             _ => None,
         };
         if let Some(share) = share {
@@ -12493,7 +12971,14 @@ fn layout_named_css_grid_children(
         return None;
     }
 
-    let column_widths = css_grid_column_widths(&container.style, columns, content.width(), gap);
+    let column_widths = css_grid_column_widths(
+        &container.style,
+        columns,
+        content.width(),
+        gap,
+        None,
+        text_metrics,
+    );
     let mut placed_named_child = false;
     let row_count = areas.len().max(
         container
@@ -13366,11 +13851,7 @@ fn render_graph_to_canvas_graph(
 ) -> CanvasGraph {
     emit_global_telemetry("canvas_graph.build.start", &[("source", source)]);
     let viewport = egui::vec2(
-        graph
-            .root
-            .style
-            .max_width
-            .unwrap_or(DEFAULT_LAYOUT_VIEWPORT_WIDTH),
+        DEFAULT_LAYOUT_VIEWPORT_WIDTH,
         DEFAULT_LAYOUT_VIEWPORT_HEIGHT,
     );
     let mut layout_root = build_css_layout_tree(&graph.root);
@@ -16061,11 +16542,15 @@ fn push_render_node_debug(
 
 fn resolved_style_debug(style: &ResolvedBoxStyle) -> String {
     format!(
-        "style(display={:?}, color={}, bg={}, margin={}, padding={}, border_width={:.1}, border_color={}, radius={:.1}, width={}, min_width={}, max_width={}, max_width_percent={}, height={}, min_height={}, font_size={:.1}, bold={}, align={:?}, visible={}, opacity={:.2}, overflow_hidden={}, position={:?}, z_index={})",
+        "style(display={:?}, color={}, bg={}, margin={}, margin_auto={}/{}/{}/{}, padding={}, border_width={:.1}, border_color={}, radius={:.1}, width={}, min_width={}, max_width={}, max_width_percent={}, height={}, min_height={}, font_size={:.1}, bold={}, text_align={:?}, flex_direction={:?}, flex_wrap={:?}, flex_grow={:.2}, flex_shrink={:.2}, flex_basis={}, justify={:?}, align_items={:?}, align_self={:?}, visible={}, opacity={:.2}, overflow_hidden={}, position={:?}, z_index={})",
         style.display,
         color_debug(style.color),
         color_debug(style.background),
         edges_debug(style.margin),
+        style.margin_auto.top,
+        style.margin_auto.right,
+        style.margin_auto.bottom,
+        style.margin_auto.left,
         edges_debug(style.padding),
         style.border_width,
         color_debug(style.border_color),
@@ -16079,6 +16564,14 @@ fn resolved_style_debug(style: &ResolvedBoxStyle) -> String {
         style.font_size,
         style.font_weight_bold,
         style.text_align,
+        style.flex_direction,
+        style.flex_wrap,
+        style.flex_grow,
+        style.flex_shrink,
+        optional_css_length_debug(style.flex_basis),
+        style.justify_content,
+        style.align_items,
+        style.align_self,
         style.visibility_visible,
         style.opacity,
         style.overflow_hidden,
@@ -17472,12 +17965,22 @@ fn input_block_from_dom_element(element: &DomElement) -> CanvasBlock {
         })
         .unwrap_or_default();
 
-    CanvasBlock::Input {
-        label: element
+    let visible_label = if value.is_empty() {
+        element
+            .attr("placeholder")
+            .or_else(|| element.attr("aria-label"))
+            .or_else(|| element.attr("name"))
+            .or_else(|| element.attr("id"))
+    } else {
+        element
             .attr("aria-label")
             .or_else(|| element.attr("placeholder"))
             .or_else(|| element.attr("name"))
             .or_else(|| element.attr("id"))
+    };
+
+    CanvasBlock::Input {
+        label: visible_label
             .map(labelize_input_name)
             .unwrap_or_else(|| "Input".to_owned()),
         value,
@@ -21579,10 +22082,10 @@ mod tests {
                 <style>
                   body { padding: 0; }
                   .search { display: flex; align-items: center; width: 360px; gap: 8px; }
-                  .left { width: 32px; }
-                  .middle { display: flex; min-width: 0; }
+                  .left { flex: 0 0 32px; width: 32px; background: #00aa00; }
+                  .middle { display: flex; flex: 1 1 auto; min-width: 0; }
                   .middle textarea { width: 100%; }
-                  .right { width: 80px; }
+                  .right { flex: 0 0 80px; width: 80px; }
                 </style>
               </head>
               <body>
@@ -21597,7 +22100,9 @@ mod tests {
             "https://example.test/",
         );
 
-        let icon = find_canvas_text(&document.canvas_graph, "S").expect("expected left section");
+        let icon =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 170, 0))
+                .expect("expected left section");
         let placeholder =
             find_canvas_input(&document.canvas_graph, "Search the web...").expect("expected input");
         let ai_chat =
@@ -21606,6 +22111,105 @@ mod tests {
         assert!(placeholder.rect.left() > icon.rect.right());
         assert!(ai_chat.rect.left() > placeholder.rect.right());
         assert!((icon.rect.center().y - ai_chat.rect.center().y).abs() < 6.0);
+    }
+
+    #[test]
+    fn nested_flex_search_field_keeps_controls_on_same_row() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .outer {
+                    width: 760px;
+                  }
+                  .search {
+                    display: flex;
+                    align-items: center;
+                    max-width: 672px;
+                    min-height: 56px;
+                    border: 1px solid #777777;
+                    border-radius: 20px;
+                  }
+                  .input-row {
+                    display: flex;
+                    flex: 1 1 auto;
+                    min-width: 0;
+                    padding: 8px 8px 8px 16px;
+                  }
+                  .input-wrapper {
+                    display: flex;
+                    flex: 1 1 auto;
+                    min-width: 0;
+                  }
+                  textarea {
+                    width: 100%;
+                    padding: 8px 8px 0 0;
+                  }
+                  .controls-row {
+                    display: flex;
+                    flex: 0 0 auto;
+                    padding: 0 8px;
+                  }
+                  button {
+                    width: 40px;
+                    min-width: 40px;
+                    height: 40px;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="outer">
+                  <div class="search">
+                    <div class="input-row">
+                      <div class="input-wrapper">
+                        <textarea placeholder="Ask, search, browse..."></textarea>
+                      </div>
+                    </div>
+                    <div class="controls-row"><button>Go</button></div>
+                  </div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let input = find_canvas_input(&document.canvas_graph, "Ask, search, browse...")
+            .expect("expected textarea");
+        let go = find_canvas_text(&document.canvas_graph, "Go").expect("expected button text");
+        let search_rect = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.border_color == egui::Color32::from_rgb(0x77, 0x77, 0x77) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("expected search field border");
+
+        assert!(
+            search_rect.width() <= 674.0,
+            "max-width should clamp search field before laying out children: {:?}",
+            search_rect
+        );
+        assert!(
+            go.rect.left() > input.rect.left(),
+            "fixed controls should stay to the right of the textarea: input={:?} go={:?}",
+            input.rect,
+            go.rect
+        );
+        assert!(
+            (input.rect.center().y - go.rect.center().y).abs() < 16.0,
+            "textarea and controls should remain on the same flex row: input={:?} go={:?}",
+            input.rect,
+            go.rect
+        );
     }
 
     #[test]
@@ -22613,6 +23217,11 @@ mod tests {
             nested.rect
         );
         assert!(
+            nested.rect.width() > 55.0,
+            "centered grid child width should include text plus padding/border: nested={:?}",
+            nested.rect
+        );
+        assert!(
             rail_1.rect.width() < rail.rect.width() / 2.0,
             "rail children should not stretch horizontally under place-items:center: rail={:?} child={:?}",
             rail.rect,
@@ -22623,6 +23232,185 @@ mod tests {
             "align-content:start should pack implicit rows at the top: rail_1={:?} rail_2={:?}",
             rail_1.rect,
             rail_2.rect
+        );
+    }
+
+    #[test]
+    fn centered_grid_item_shrink_fit_width_includes_padding_and_border() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  * { box-sizing: border-box; }
+                  body { padding: 0; margin: 0; }
+                  .grid {
+                    display: grid;
+                    place-items: center;
+                    width: 400px;
+                    height: 160px;
+                  }
+                  .cell {
+                    display: grid;
+                    place-items: center;
+                    padding: 10px;
+                    border: 1px solid #222222;
+                    background: #51cf66;
+                    font-size: 13px;
+                    font-weight: 700;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="grid"><div class="cell">nested 1</div></div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let cell =
+            find_canvas_cell_rect(&document.canvas_graph, "nested 1").expect("expected cell");
+        let text = find_canvas_text(&document.canvas_graph, "nested 1").expect("expected text");
+
+        assert!(
+            cell.rect.width() >= text.rect.width() + 20.0,
+            "shrink-fit grid item should reserve padding around text: cell={:?} text={:?}",
+            cell.rect,
+            text.rect
+        );
+    }
+
+    #[test]
+    fn centered_grid_text_inside_wide_cell_stays_on_single_line() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  * { box-sizing: border-box; }
+                  body { padding: 0; margin: 0; }
+                  .search {
+                    width: 720px;
+                    display: grid;
+                    grid-template-columns: 1fr 72px;
+                    gap: 8px;
+                  }
+                  .box {
+                    min-height: 56px;
+                    display: grid;
+                    place-items: center;
+                    padding: 10px;
+                    border: 1px solid #222222;
+                    font-size: 13px;
+                    font-weight: 700;
+                    text-align: center;
+                  }
+                </style>
+              </head>
+              <body>
+                <form class="search">
+                  <div class="box input">search input</div>
+                  <div class="box button">button</div>
+                </form>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let input =
+            find_canvas_cell_rect(&document.canvas_graph, "search input").expect("input cell");
+        let text = find_canvas_text(&document.canvas_graph, "search input").expect("input text");
+
+        assert!(
+            input.rect.width() > 500.0,
+            "fixture input cell should keep its wide grid track: input={:?}",
+            input.rect
+        );
+        assert!(
+            text.rect.height() <= 20.0,
+            "plain text in a wide centered grid cell should remain one laid-out line: text={:?}",
+            text.rect
+        );
+    }
+
+    #[test]
+    fn grid_auto_columns_keep_intrinsic_width_next_to_fr_track() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  * { box-sizing: border-box; }
+                  body { padding: 0; margin: 0; }
+                  nav {
+                    display: grid;
+                    grid-template-columns: 1fr auto auto auto;
+                    gap: 8px;
+                    width: 1200px;
+                    padding: 10px 18px;
+                    background: #4dabf7;
+                  }
+                  .box {
+                    min-height: 48px;
+                    border: 1px solid #222222;
+                    display: grid;
+                    place-items: center;
+                    padding: 10px;
+                    font-size: 13px;
+                    font-weight: 700;
+                  }
+                  .logo { background: #51cf66; min-width: 130px; }
+                  .navitem { background: #ffd43b; min-width: 76px; }
+                </style>
+              </head>
+              <body>
+                <nav>
+                  <div class="box logo">logo</div>
+                  <div class="box navitem">nav</div>
+                  <div class="box navitem">nav</div>
+                  <div class="box navitem">menu</div>
+                </nav>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let mut green = Vec::new();
+        let mut yellow = Vec::new();
+        for object in &document.canvas_graph.objects {
+            if let CanvasObject::Rect(rect) = object {
+                if rect.fill == egui::Color32::from_rgb(0x51, 0xcf, 0x66) {
+                    green.push(rect.rect);
+                } else if rect.fill == egui::Color32::from_rgb(0xff, 0xd4, 0x3b) {
+                    yellow.push(rect.rect);
+                }
+            }
+        }
+
+        assert_eq!(green.len(), 1, "expected one logo rect: {green:?}");
+        assert_eq!(yellow.len(), 3, "expected three auto nav rects: {yellow:?}");
+        assert!(
+            green[0].width() > 850.0,
+            "1fr track should receive remaining width after compact auto tracks: logo={:?} nav={:?}",
+            green[0],
+            yellow
+        );
+        assert!(
+            yellow.iter().all(|rect| rect.width() <= 90.0),
+            "auto tracks should stay near intrinsic/min-width instead of sharing fr space: {yellow:?}"
+        );
+        let right_edge = yellow
+            .iter()
+            .map(|rect| rect.right())
+            .fold(green[0].right(), f32::max);
+        assert!(
+            right_edge <= 1200.0,
+            "auto tracks should include min-width in track sizing and stay inside the grid: right={right_edge} logo={:?} nav={:?}",
+            green[0],
+            yellow
         );
     }
 
@@ -23467,6 +24255,44 @@ mod tests {
         assert!(
             copy.rect.width() >= 450.0,
             "copy should keep a readable line next to the figure: figure {figure:?} copy {copy:?}"
+        );
+    }
+
+    #[test]
+    fn block_after_wide_float_clears_unusable_side_remainder() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .page { width: 500px; }
+                  .float { float: right; width: 470px; height: 80px; background: #ff0000; }
+                  .copy { height: 40px; background: #0000ff; }
+                </style>
+              </head>
+              <body>
+                <div class="page"><div class="float"></div><div class="copy"></div></div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let float =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .expect("expected float background");
+        let copy =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 0, 255))
+                .expect("expected following copy");
+
+        assert!(
+            copy.rect.top() >= float.rect.bottom(),
+            "a block should clear below a float when only an unusably narrow side strip remains: float {float:?} copy {copy:?}"
+        );
+        assert!(
+            copy.rect.width() >= 490.0,
+            "cleared copy should recover the full containing width instead of becoming a vertical strip: float {float:?} copy {copy:?}"
         );
     }
 
@@ -24318,12 +25144,38 @@ mod tests {
         document: BrowserDocument,
         output_path: &Path,
     ) -> io::Result<()> {
+        capture_color_layout_browser_window_with_size(
+            document,
+            egui::vec2(1280.0, 1800.0),
+            output_path,
+        )
+    }
+
+    fn capture_color_layout_browser_window_with_size(
+        document: BrowserDocument,
+        window_size: egui::Vec2,
+        output_path: &Path,
+    ) -> io::Result<()> {
+        capture_color_layout_browser_window_with_size_and_scroll(
+            document,
+            window_size,
+            egui::Vec2::ZERO,
+            output_path,
+        )
+    }
+
+    fn capture_color_layout_browser_window_with_size_and_scroll(
+        document: BrowserDocument,
+        window_size: egui::Vec2,
+        scroll_offset: egui::Vec2,
+        output_path: &Path,
+    ) -> io::Result<()> {
         let result = Arc::new(Mutex::new(ColorLayoutCaptureResult::default()));
         let app_result = Arc::clone(&result);
         let output_path = output_path.to_path_buf();
         let options = NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_inner_size(egui::vec2(1280.0, 1800.0))
+                .with_inner_size(window_size)
                 .with_resizable(false)
                 .with_decorations(false)
                 .with_title("AlmostThere Color Layout Capture"),
@@ -24348,7 +25200,7 @@ mod tests {
                 Ok(Box::new(ColorLayoutCaptureApp {
                     canvas: BrowserCanvas {
                         zoom: 1.0,
-                        scroll_offset: egui::Vec2::ZERO,
+                        scroll_offset,
                         hovered_link_href: None,
                         hovered_link_element_id: None,
                     },
@@ -24374,6 +25226,49 @@ mod tests {
             return Err(io::Error::other("window screenshot was not captured"));
         }
         Ok(())
+    }
+
+    fn capture_color_layout_browser_full_page(
+        document: &BrowserDocument,
+        output_path: &Path,
+    ) -> io::Result<()> {
+        let tile_size = egui::vec2(1280.0, 1400.0);
+        let content_height = document.canvas_graph.viewport.y.ceil().max(tile_size.y) as u32;
+        let width = tile_size.x.ceil() as u32;
+        let tile_height = tile_size.y.ceil() as u32;
+        let tile_dir = output_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("ilmeteo_palermo_actual_browser_tiles");
+        fs::create_dir_all(&tile_dir)?;
+
+        let mut stitched = image::RgbaImage::new(width, content_height);
+        let mut y = 0u32;
+        let mut tile_index = 0usize;
+        while y < content_height {
+            let tile_path = tile_dir.join(format!("tile_{tile_index:03}.png"));
+            capture_color_layout_browser_window_with_size_and_scroll(
+                document.clone(),
+                tile_size,
+                egui::vec2(0.0, y as f32),
+                &tile_path,
+            )?;
+            let tile = image::open(&tile_path)
+                .map_err(io::Error::other)?
+                .to_rgba8();
+            let copy_width = width.min(tile.width());
+            let remaining_height = content_height - y;
+            let copy_height = remaining_height.min(tile_height).min(tile.height());
+            for row in 0..copy_height {
+                for col in 0..copy_width {
+                    stitched.put_pixel(col, y + row, *tile.get_pixel(col, row));
+                }
+            }
+            y += copy_height.max(1);
+            tile_index += 1;
+        }
+
+        stitched.save(output_path).map_err(io::Error::other)
     }
 
     fn color_image_to_rgba(image: &egui::ColorImage) -> image::RgbaImage {
@@ -24723,9 +25618,9 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
                     flex-direction: row;
                     width: 500px;
                   }
-                  .left { width: 40px; }
+                  .left { width: 40px; height: 24px; background: #00aa00; }
                   .spacer { margin-left: auto; width: 1px; }
-                  .right { width: 80px; }
+                  .right { width: 80px; height: 24px; background: #aa0000; }
                 </style>
               </head>
               <body>
@@ -24740,11 +25635,137 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
             "https://example.test/",
         );
 
-        let left = find_canvas_text(&document.canvas_graph, "Left").expect("expected left text");
-        let right = find_canvas_text(&document.canvas_graph, "Right").expect("expected right text");
+        let left = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0x00, 0xaa, 0x00) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("expected left item background");
+        let right = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0xaa, 0x00, 0x00) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("expected right item background");
 
-        assert_eq!(left.rect.top(), right.rect.top());
-        assert!(right.rect.left() > 410.0, "right rect was {:?}", right.rect);
+        assert_eq!(left.top(), right.top());
+        assert!(right.left() > 410.0, "right rect was {right:?}");
+    }
+
+    #[test]
+    fn flex_column_cross_axis_auto_margins_center_constrained_child() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { margin: 0; }
+                  .column {
+                    display: flex;
+                    flex-direction: column;
+                    width: 100%;
+                    min-height: 240px;
+                  }
+                  .panel {
+                    width: 100%;
+                    max-width: 800px;
+                    margin: 0 auto 40px auto;
+                    padding: 0 16px;
+                    background: #abcdef;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="column"><div class="panel">Centered</div></div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let panel_rect = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0xab, 0xcd, 0xef) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("expected centered panel background");
+
+        assert!(
+            panel_rect.left() > 200.0 && panel_rect.right() < 1080.0,
+            "column flex cross-axis auto margins should center the panel: {panel_rect:?}"
+        );
+    }
+
+    #[test]
+    fn flex_column_align_self_centers_fixed_width_child() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { margin: 0; }
+                  .column {
+                    display: flex;
+                    flex-direction: column;
+                    align-items: stretch;
+                    width: 100%;
+                    min-height: 240px;
+                  }
+                  .panel {
+                    align-self: center;
+                    width: 760px;
+                    padding: 0 16px;
+                    background: #c0ffee;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="column"><div class="panel">Centered</div></div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let panel_rect = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0xc0, 0xff, 0xee) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("expected centered panel background");
+
+        assert!(
+            panel_rect.left() > 220.0 && panel_rect.right() < 1060.0,
+            "align-self:center should center a fixed-width flex item: {panel_rect:?}"
+        );
     }
 
     #[test]
@@ -24981,6 +26002,233 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
             "weather row should not inflate from vertical text wrapping, got {:?}",
             row.rect
         );
+    }
+
+    #[test]
+    #[ignore = "requires network and a GUI/windowing backend; run manually after live-site fixes"]
+    fn ilmeteo_live_page_actual_browser_shows_temperatures() {
+        const CHILD_ENV: &str = "ALMOSTTHERE_ILMETEO_LIVE_BROWSER_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            run_ilmeteo_live_page_actual_browser_temperature_check();
+            return;
+        }
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current test binary path should be available"),
+        )
+        .arg("--ignored")
+        .arg("--nocapture")
+        .arg("ilmeteo_live_page_actual_browser_shows_temperatures")
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("failed to spawn isolated live iLMeteo browser regression");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "isolated live iLMeteo browser regression failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            stdout,
+            stderr
+        );
+        assert!(
+            stdout.contains("running 1 test") || stdout.contains("running 1 tests"),
+            "isolated live iLMeteo browser regression did not run the child check\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            stderr
+        );
+    }
+
+    fn run_ilmeteo_live_page_actual_browser_temperature_check() {
+        let output_dir = Path::new(URL_SCREENSHOTS_DIR).join("ilmeteo_palermo_worker");
+        let prepared = prepare_navigation_in_isolated_process(
+            "https://www.ilmeteo.it/meteo/palermo",
+            true,
+            output_dir.clone(),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "live iLMeteo page should load through isolated browser worker {}; error: {error}",
+                output_dir.display()
+            )
+        });
+        let visible_text = canvas_graph_visible_text(&prepared.document.canvas_graph);
+        let table_temperatures =
+            ilmeteo_forecast_table_temperature_cells(&prepared.document.canvas_graph);
+
+        let output_dir = Path::new(URL_SCREENSHOTS_DIR);
+        fs::create_dir_all(output_dir).expect("failed to create live regression output dir");
+        let text_dump = output_dir.join("ilmeteo_palermo_visible_text.txt");
+        fs::write(&text_dump, &visible_text).expect("failed to write visible text dump");
+        let table_dump = output_dir.join("ilmeteo_palermo_forecast_table_text_rects.txt");
+        fs::write(
+            &table_dump,
+            ilmeteo_forecast_table_text_rect_dump(&prepared.document.canvas_graph),
+        )
+        .expect("failed to write forecast table text rect dump");
+        let screenshot = output_dir.join("ilmeteo_palermo_actual_browser_full.png");
+        capture_color_layout_browser_full_page(&prepared.document, &screenshot)
+            .expect("actual browser full-page screenshot should be captured");
+
+        assert!(
+            table_temperatures.len() >= 6,
+            "expected visible temperature cells in the rendered iLMeteo forecast table; found {:?}. text dump: {}; table rect dump: {}; screenshot: {}",
+            table_temperatures,
+            text_dump.display(),
+            table_dump.display(),
+            screenshot.display()
+        );
+    }
+
+    #[derive(Clone, Debug)]
+    struct CanvasTextSample {
+        text: String,
+        rect: egui::Rect,
+    }
+
+    fn ilmeteo_forecast_table_temperature_cells(graph: &CanvasGraph) -> Vec<String> {
+        let samples = canvas_text_samples(graph);
+        let Some(region) = ilmeteo_forecast_table_region(&samples) else {
+            return Vec::new();
+        };
+
+        samples
+            .iter()
+            .filter(|sample| {
+                sample.rect.center().y > region.header_y + 4.0
+                    && sample.rect.center().y < region.bottom_y
+                    && (sample.rect.center().x - region.temperature_column_x).abs() <= 75.0
+            })
+            .filter_map(|sample| ilmeteo_temperature_cell_text(&sample.text))
+            .collect()
+    }
+
+    fn ilmeteo_forecast_table_text_rect_dump(graph: &CanvasGraph) -> String {
+        let samples = canvas_text_samples(graph);
+        let Some(region) = ilmeteo_forecast_table_region(&samples) else {
+            return samples
+                .iter()
+                .map(|sample| {
+                    format!(
+                        "NO_TABLE_REGION text={:?} rect={}\n",
+                        sample.text,
+                        rect_debug_string(sample.rect)
+                    )
+                })
+                .collect();
+        };
+
+        let mut out = format!(
+            "forecast_table header_y={:.1} bottom_y={:.1} temperature_column_x={:.1}\n",
+            region.header_y, region.bottom_y, region.temperature_column_x
+        );
+        for sample in samples.iter().filter(|sample| {
+            sample.rect.center().y >= region.header_y - 80.0
+                && sample.rect.center().y <= region.bottom_y + 80.0
+        }) {
+            out.push_str(&format!(
+                "text={:?} rect={}\n",
+                sample.text,
+                rect_debug_string(sample.rect)
+            ));
+        }
+        out
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct IlmeteoForecastTableRegion {
+        header_y: f32,
+        bottom_y: f32,
+        temperature_column_x: f32,
+    }
+
+    fn ilmeteo_forecast_table_region(
+        samples: &[CanvasTextSample],
+    ) -> Option<IlmeteoForecastTableRegion> {
+        let temperature_header = samples
+            .iter()
+            .find(|sample| sample.text.contains("°C") || sample.text.contains("°F"))?;
+        let header_y = temperature_header.rect.center().y;
+        let has_table_neighbors = ["Ora", "Tempo", "Precipitazioni"].iter().all(|needle| {
+            samples.iter().any(|sample| {
+                sample.text.contains(needle)
+                    && (sample.rect.center().y - header_y).abs() <= 80.0
+                    && sample.rect.center().x <= temperature_header.rect.center().x + 420.0
+            })
+        });
+        if !has_table_neighbors {
+            return None;
+        }
+        let bottom_y = samples
+            .iter()
+            .filter(|sample| {
+                sample.rect.center().y > header_y
+                    && (sample.text.contains("Confronto")
+                        || sample.text.contains("Qualità")
+                        || sample.text.contains("Previsioni marine"))
+            })
+            .map(|sample| sample.rect.top())
+            .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(header_y + 900.0);
+        Some(IlmeteoForecastTableRegion {
+            header_y,
+            bottom_y,
+            temperature_column_x: temperature_header.rect.center().x,
+        })
+    }
+
+    fn canvas_text_samples(graph: &CanvasGraph) -> Vec<CanvasTextSample> {
+        graph
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                CanvasObject::Text(text) => Some(CanvasTextSample {
+                    text: text.text.clone(),
+                    rect: text.rect,
+                }),
+                CanvasObject::RichTextLine(line) => Some(CanvasTextSample {
+                    text: line
+                        .spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>(),
+                    rect: line.rect,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ilmeteo_temperature_cell_text(text: &str) -> Option<String> {
+        let compact = text.trim().replace('\u{a0}', " ");
+        if compact.is_empty() || compact.contains(':') {
+            return None;
+        }
+        let value = compact
+            .trim_end_matches("°C")
+            .trim_end_matches("°F")
+            .trim_end_matches('°')
+            .trim();
+        if value.is_empty()
+            || value
+                .chars()
+                .any(|ch| !ch.is_ascii_digit() && ch != '.' && ch != ',' && ch != '-' && ch != '+')
+        {
+            return None;
+        }
+        let parsed = value.replace(',', ".").parse::<f32>().ok()?;
+        (-30.0..=60.0).contains(&parsed).then_some(compact)
+    }
+
+    fn rect_debug_string(rect: egui::Rect) -> String {
+        format!(
+            "({:.1},{:.1}) {:.1}x{:.1}",
+            rect.left(),
+            rect.top(),
+            rect.width(),
+            rect.height()
+        )
     }
 
     #[test]
@@ -25437,6 +26685,47 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
     }
 
     #[test]
+    fn root_max_width_does_not_replace_browser_viewport_width() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  html { max-width: 760px; }
+                  body { margin: 0; }
+                  .full { width: 100%; height: 32px; background: #abcdef; }
+                </style>
+              </head>
+              <body><div class="full"></div></body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        assert_eq!(
+            document.canvas_graph.viewport.x,
+            DEFAULT_LAYOUT_VIEWPORT_WIDTH
+        );
+        let full_rect = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0xab, 0xcd, 0xef) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("expected full-width block background");
+        assert!(
+            full_rect.width() > 1000.0,
+            "root max-width should not collapse viewport-sized layout: {full_rect:?}"
+        );
+    }
+
+    #[test]
     fn nested_min_height_page_propagates_height_to_grid_rows() {
         let document = parse_html_document(
             r##"
@@ -25812,6 +27101,47 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
     }
 
     #[test]
+    fn empty_textarea_prefers_visible_placeholder_over_aria_label() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <body>
+                <textarea placeholder="Ask, search, browse..." aria-label="Search the web..." name="q"></textarea>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        assert!(
+            find_canvas_input(&document.canvas_graph, "Ask, search, browse...").is_some(),
+            "expected the visible placeholder to be rendered for an empty textarea"
+        );
+        assert!(
+            find_canvas_input(&document.canvas_graph, "Search the web...").is_none(),
+            "aria-label should not replace visible placeholder text"
+        );
+    }
+
+    #[test]
+    fn filled_textarea_keeps_accessible_label_as_canvas_label() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <body>
+                <textarea placeholder="Ask, search, browse..." aria-label="Search the web..." name="q">trees</textarea>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let input = find_canvas_input(&document.canvas_graph, "Search the web...")
+            .expect("expected filled textarea to keep its semantic label");
+        assert_eq!(input.value, "trees");
+    }
+
+    #[test]
     fn anonymous_inline_replaced_content_is_lowered_to_canvas_graph() {
         let document = parse_html_document(
             r#"
@@ -25907,6 +27237,56 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
         assert!(updated.contains(r#"data-state="ready""#));
         assert!(!updated.contains("data-state=idle"));
         assert_eq!(updated.matches("data-state").count(), 1);
+    }
+
+    #[test]
+    fn script_effects_can_update_class_only_generated_dom_handles() {
+        let html = r#"
+            <style>.value { display: none; }</style>
+            <main>
+              <span class="value">22.1</span>
+              <span class="value">21.5</span>
+            </main>
+            <script>$(".value").show();</script>
+        "#;
+        let updated = apply_safe_script_browser_effects_with_source(
+            html,
+            Some("https://example.test/generated-dom-handles"),
+        );
+
+        assert!(updated.contains(r#"<span class="value" style="display: inline">22.1</span>"#));
+        assert!(updated.contains(r#"<span class="value" style="display: inline">21.5</span>"#));
+    }
+
+    #[test]
+    fn unsupported_jquery_show_trace_reveals_class_only_elements() {
+        let html = r#"
+            <style>.temp_cf { display: none; }</style>
+            <table><tbody><tr><td><span class="temp_cf">25.5</span></td></tr></tbody></table>
+        "#;
+        let detail = r#"show on [object Object] via Member { object: Call { callee: Identifier("$"), arguments: [String(".temp_cf")] }, property: Named("show"), optional: false }"#;
+
+        let updated = apply_unsupported_jquery_show_trace(html, detail);
+
+        assert!(updated.contains(r#"<span class="temp_cf" style="display: inline">25.5</span>"#));
+    }
+
+    #[test]
+    fn literal_jquery_show_statement_reveals_matching_elements() {
+        let html = r#"
+            <style>.weather_table .temp_cf { display: none; }</style>
+            <table class="weather_table"><tbody><tr><td><span class="temp_cf">25.5</span></td></tr></tbody></table>
+        "#;
+        let source = r#"
+            <script>
+              $(".temp_cf").show();
+              jQuery(".weather_table .temp_cf").show();
+            </script>
+        "#;
+
+        let updated = apply_literal_jquery_show_statements_to_html(html, source);
+
+        assert!(updated.contains(r#"<span class="temp_cf" style="display: inline">25.5</span>"#));
     }
 
     #[test]

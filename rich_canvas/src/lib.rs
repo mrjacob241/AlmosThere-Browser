@@ -212,10 +212,13 @@ pub struct CssBoxStyle {
     pub text_align: Option<CssTextAlign>,
     pub list_style_type: Option<CssListStyleType>,
     pub flex_grow: Option<f32>,
+    pub flex_shrink: Option<f32>,
+    pub flex_basis: Option<CssLength>,
     pub flex_direction: Option<CssFlexDirection>,
     pub flex_wrap: Option<CssFlexWrap>,
     pub justify_content: Option<CssJustifyContent>,
     pub align_items: Option<CssAlignItems>,
+    pub align_self: Option<CssAlignItems>,
     pub justify_items: Option<CssJustifyContent>,
     pub align_content: Option<CssAlignItems>,
     pub grid_template_columns: Option<usize>,
@@ -271,10 +274,13 @@ pub struct ResolvedBoxStyle {
     pub text_align: CssTextAlign,
     pub list_style_type: CssListStyleType,
     pub flex_grow: f32,
+    pub flex_shrink: f32,
+    pub flex_basis: Option<CssLength>,
     pub flex_direction: CssFlexDirection,
     pub flex_wrap: CssFlexWrap,
     pub justify_content: CssJustifyContent,
     pub align_items: CssAlignItems,
+    pub align_self: Option<CssAlignItems>,
     pub justify_items: CssJustifyContent,
     pub align_content: CssAlignItems,
     pub grid_template_columns: Option<usize>,
@@ -331,10 +337,13 @@ impl Default for ResolvedBoxStyle {
             text_align: CssTextAlign::Left,
             list_style_type: CssListStyleType::Disc,
             flex_grow: 0.0,
+            flex_shrink: 1.0,
+            flex_basis: None,
             flex_direction: CssFlexDirection::Row,
             flex_wrap: CssFlexWrap::NoWrap,
             justify_content: CssJustifyContent::FlexStart,
             align_items: CssAlignItems::Stretch,
+            align_self: None,
             justify_items: CssJustifyContent::FlexStart,
             align_content: CssAlignItems::Stretch,
             grid_template_columns: None,
@@ -1442,8 +1451,10 @@ fn paint_canvas_graph(
                     line_height: Some((font_size * 1.35).max(paint_rect.height()).max(1.0)),
                     ..Default::default()
                 };
-                let galley =
-                    painter.layout_job(LayoutJob::simple_format(text.text.clone(), text_format));
+                let mut job = LayoutJob::simple_format(text.text.clone(), text_format);
+                job.wrap.max_width = f32::INFINITY;
+                job.wrap.max_rows = 1;
+                let galley = painter.layout_job(job);
                 let text_width = galley.size().x.min(paint_rect.width()).max(1.0);
                 let text_rect = match text.text_align {
                     CssTextAlign::Left => {
@@ -2337,23 +2348,25 @@ fn wrap_browser_textboxes_estimated(
     max_width: f32,
     font_size: f32,
 ) -> Vec<CanvasMeasuredText> {
-    let max_chars = (max_width / (font_size * 0.56).max(1.0)).floor().max(8.0) as usize;
-    if text.chars().count() <= max_chars {
+    let tolerance = 0.5;
+    let measured_width = estimated_browser_text_width(text, font_size);
+    if measured_width <= max_width + tolerance {
         return vec![CanvasMeasuredText {
             text: text.to_owned(),
-            size: vec2(
-                estimated_browser_text_width(text, font_size).min(max_width),
-                font_size * 1.35,
-            ),
+            size: vec2(measured_width.min(max_width), font_size * 1.35),
         }];
     }
 
     let mut lines = Vec::new();
     let mut current = String::new();
     for word in text.split_whitespace() {
-        let separator = usize::from(!current.is_empty());
+        let candidate = if current.is_empty() {
+            word.to_owned()
+        } else {
+            format!("{current} {word}")
+        };
         if !current.is_empty()
-            && current.chars().count() + separator + word.chars().count() > max_chars
+            && estimated_browser_text_width(&candidate, font_size) > max_width + tolerance
         {
             lines.push(CanvasMeasuredText {
                 size: vec2(
@@ -2363,10 +2376,12 @@ fn wrap_browser_textboxes_estimated(
                 text: std::mem::take(&mut current),
             });
         }
-        if !current.is_empty() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else {
             current.push(' ');
+            current.push_str(word);
         }
-        current.push_str(word);
     }
     if !current.is_empty() {
         lines.push(CanvasMeasuredText {
@@ -4838,6 +4853,12 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
     if source.flex_grow.is_some() {
         target.flex_grow = source.flex_grow;
     }
+    if source.flex_shrink.is_some() {
+        target.flex_shrink = source.flex_shrink;
+    }
+    if source.flex_basis.is_some() {
+        target.flex_basis = source.flex_basis;
+    }
     if source.flex_direction.is_some() {
         target.flex_direction = source.flex_direction;
     }
@@ -4849,6 +4870,9 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
     }
     if source.align_items.is_some() {
         target.align_items = source.align_items;
+    }
+    if source.align_self.is_some() {
+        target.align_self = source.align_self;
     }
     if source.justify_items.is_some() {
         target.justify_items = source.justify_items;
@@ -5762,9 +5786,25 @@ fn parse_css_box_style_with_vars(
                 style.list_style_type = parse_list_style_type(value);
                 seen |= style.list_style_type.is_some();
             }
-            "flex" | "flex-grow" => {
-                style.flex_grow = parse_flex_grow(value);
+            "flex" => {
+                if let Some((grow, shrink, basis)) = parse_flex_shorthand(value) {
+                    style.flex_grow = Some(grow);
+                    style.flex_shrink = Some(shrink);
+                    style.flex_basis = basis;
+                    seen = true;
+                }
+            }
+            "flex-grow" => {
+                style.flex_grow = parse_flex_factor(value);
                 seen |= style.flex_grow.is_some();
+            }
+            "flex-shrink" => {
+                style.flex_shrink = parse_flex_factor(value);
+                seen |= style.flex_shrink.is_some();
+            }
+            "flex-basis" => {
+                style.flex_basis = parse_css_length(value);
+                seen |= style.flex_basis.is_some();
             }
             "flex-direction" => {
                 style.flex_direction = match value {
@@ -5813,6 +5853,16 @@ fn parse_css_box_style_with_vars(
                     _ => None,
                 };
                 seen |= style.align_items.is_some();
+            }
+            "align-self" => {
+                style.align_self = match value {
+                    "auto" | "normal" => None,
+                    "center" => Some(CssAlignItems::Center),
+                    "flex-start" | "start" | "self-start" => Some(CssAlignItems::FlexStart),
+                    "stretch" => Some(CssAlignItems::Stretch),
+                    _ => None,
+                };
+                seen |= value.eq_ignore_ascii_case("auto") || style.align_self.is_some();
             }
             "justify-items" => {
                 style.justify_items = match value {
@@ -6211,13 +6261,45 @@ fn parse_clear(value: &str) -> Option<CssClear> {
     }
 }
 
-fn parse_flex_grow(value: &str) -> Option<f32> {
-    let first = value.split_whitespace().next()?.trim();
-    match first {
-        "none" => Some(0.0),
-        "auto" | "initial" => Some(0.0),
-        _ => first.parse::<f32>().ok().map(|value| value.max(0.0)),
+fn parse_flex_factor(value: &str) -> Option<f32> {
+    value.trim().parse::<f32>().ok().map(|value| value.max(0.0))
+}
+
+fn parse_flex_shorthand(value: &str) -> Option<(f32, f32, Option<CssLength>)> {
+    let value = value.trim();
+    match value {
+        "none" => return Some((0.0, 0.0, Some(CssLength::Auto))),
+        "auto" => return Some((1.0, 1.0, Some(CssLength::Auto))),
+        "initial" => return Some((0.0, 1.0, Some(CssLength::Auto))),
+        _ => {}
     }
+
+    let tokens = split_css_value_list(value);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut numbers = Vec::new();
+    let mut basis = None;
+    for token in tokens {
+        let token = token.trim();
+        if let Some(number) = parse_flex_factor(token) {
+            numbers.push(number);
+            continue;
+        }
+        if basis.is_none() {
+            basis = parse_css_length(token);
+        }
+    }
+
+    if numbers.is_empty() && basis.is_none() {
+        return None;
+    }
+
+    let grow = numbers.first().copied().unwrap_or(1.0);
+    let shrink = numbers.get(1).copied().unwrap_or(1.0);
+    let basis = basis.or_else(|| (numbers.len() == 1).then_some(CssLength::Percent(0.0)));
+    Some((grow, shrink, basis))
 }
 
 fn parse_flex_wrap(value: &str) -> Option<CssFlexWrap> {
@@ -7027,8 +7109,20 @@ fn parse_padding_2(value: &str) -> Option<(f32, f32)> {
 }
 
 fn parse_border(value: &str) -> Option<(f32, Color32)> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized == "none" || normalized == "0" {
+        return Some((0.0, Color32::TRANSPARENT));
+    }
     let values = split_css_value_list(value);
-    let width = values.iter().find_map(|value| parse_px(value))?;
+    if values
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case("none"))
+    {
+        return Some((0.0, Color32::TRANSPARENT));
+    }
+    let width = values
+        .iter()
+        .find_map(|value| parse_px(value).or_else(|| (value == "0").then_some(0.0)))?;
     let color = values
         .iter()
         .find_map(|value| parse_color(value))
@@ -8044,6 +8138,7 @@ mod tests {
             r#"
             .toolbar {
                 display: flex;
+                flex: 1 0 192px;
                 flex-direction: row;
                 flex-wrap: wrap;
                 justify-content: space-between;
@@ -8061,6 +8156,9 @@ mod tests {
         let computed = computed_box_style(&style, &key);
 
         assert_eq!(computed.display, Some(CssDisplay::Flex));
+        assert_eq!(computed.flex_grow, Some(1.0));
+        assert_eq!(computed.flex_shrink, Some(0.0));
+        assert_eq!(computed.flex_basis, Some(CssLength::Px(192.0)));
         assert_eq!(computed.flex_direction, Some(CssFlexDirection::Row));
         assert_eq!(computed.flex_wrap, Some(CssFlexWrap::Wrap));
         assert_eq!(
@@ -8069,6 +8167,86 @@ mod tests {
         );
         assert_eq!(computed.align_items, Some(CssAlignItems::Center));
         assert_eq!(computed.gap, Some(12.0));
+    }
+
+    #[test]
+    fn parse_basic_css_carries_flex_align_self() {
+        let style = parse_basic_css(".panel { align-self: center; } .auto { align-self: auto; }");
+        let key = |class_name: &str| ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec![class_name.to_owned()],
+            ..ElementStyleKey::default()
+        };
+
+        let panel = computed_box_style(&style, &key("panel"));
+        assert_eq!(panel.align_self, Some(CssAlignItems::Center));
+
+        let auto = computed_box_style(&style, &key("auto"));
+        assert_eq!(auto.align_self, None);
+    }
+
+    #[test]
+    fn parse_basic_css_expands_common_flex_shorthands() {
+        let style = parse_basic_css(
+            r#"
+            .grow { flex: 1; }
+            .auto { flex: auto; }
+            .none { flex: none; }
+            .basis { flex-basis: 25%; flex-shrink: 0; }
+            "#,
+        );
+        let key = |class_name: &str| ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec![class_name.to_owned()],
+            ..ElementStyleKey::default()
+        };
+
+        let grow = computed_box_style(&style, &key("grow"));
+        assert_eq!(grow.flex_grow, Some(1.0));
+        assert_eq!(grow.flex_shrink, Some(1.0));
+        assert_eq!(grow.flex_basis, Some(CssLength::Percent(0.0)));
+
+        let auto = computed_box_style(&style, &key("auto"));
+        assert_eq!(auto.flex_grow, Some(1.0));
+        assert_eq!(auto.flex_shrink, Some(1.0));
+        assert_eq!(auto.flex_basis, Some(CssLength::Auto));
+
+        let none = computed_box_style(&style, &key("none"));
+        assert_eq!(none.flex_grow, Some(0.0));
+        assert_eq!(none.flex_shrink, Some(0.0));
+        assert_eq!(none.flex_basis, Some(CssLength::Auto));
+
+        let basis = computed_box_style(&style, &key("basis"));
+        assert_eq!(basis.flex_shrink, Some(0.0));
+        assert_eq!(basis.flex_basis, Some(CssLength::Percent(25.0)));
+    }
+
+    #[test]
+    fn parse_basic_css_resets_border_from_none_and_zero() {
+        let style = parse_basic_css(
+            r#"
+            .none { border: none; }
+            .zero { border: 0; }
+            .solid { border: 0 solid transparent; }
+            "#,
+        );
+        let key = |class_name: &str| ElementStyleKey {
+            tag: "button".to_owned(),
+            classes: vec![class_name.to_owned()],
+            ..ElementStyleKey::default()
+        };
+
+        let none = computed_box_style(&style, &key("none"));
+        assert_eq!(none.border_width, Some(0.0));
+        assert_eq!(none.border_color, Some(Color32::TRANSPARENT));
+
+        let zero = computed_box_style(&style, &key("zero"));
+        assert_eq!(zero.border_width, Some(0.0));
+        assert_eq!(zero.border_color, Some(Color32::TRANSPARENT));
+
+        let solid = computed_box_style(&style, &key("solid"));
+        assert_eq!(solid.border_width, Some(0.0));
+        assert_eq!(solid.border_color, Some(Color32::TRANSPARENT));
     }
 
     #[test]
