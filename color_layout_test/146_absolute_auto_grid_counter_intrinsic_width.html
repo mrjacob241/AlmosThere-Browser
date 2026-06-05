@@ -1,0 +1,91 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>146 absolute auto grid counter intrinsic width</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: system-ui, sans-serif;
+      background: #202020;
+    }
+    .hero {
+      position: relative;
+      width: 760px;
+      height: 420px;
+      background: #245744;
+      overflow: hidden;
+    }
+    .background-band {
+      position: absolute;
+      inset: 0;
+      background: #4d7f65;
+    }
+    .panel {
+      position: absolute;
+      left: 92px;
+      top: 138px;
+      display: grid;
+      grid-template-columns: auto 1px auto;
+      border: 2px solid #ffffff;
+      border-radius: 10px;
+      overflow: hidden;
+      background: #6f8b7e;
+      color: #ffffff;
+    }
+    .counter-link {
+      display: inline;
+      min-width: 0;
+      color: #ffffff;
+      text-decoration: none;
+    }
+    .counter {
+      display: grid;
+      min-height: 72px;
+      padding: 16px 20px;
+      background: #8ca69a;
+    }
+    .count {
+      display: flex;
+      font-size: 20px;
+      font-weight: 700;
+      background: #c0d85b;
+      color: #1b1b1b;
+    }
+    .description {
+      display: block;
+      margin-top: 4px;
+      font-size: 14px;
+      background: #f6df73;
+      color: #1b1b1b;
+    }
+    .divider {
+      width: 1px;
+      margin: 16px 0;
+      background: #111111;
+    }
+  </style>
+</head>
+<body>
+  <main class="hero">
+    <div class="background-band"></div>
+    <div class="panel">
+      <a class="counter-link" href="#">
+        <div class="counter">
+          <div class="count">251,710,606</div>
+          <div class="description">trees planted by example</div>
+        </div>
+      </a>
+      <div class="divider"></div>
+      <a class="counter-link" href="#">
+        <div class="counter">
+          <div class="count">101,676,431</div>
+          <div class="description">dedicated to climate action</div>
+        </div>
+      </a>
+    </div>
+  </main>
+</body>
+</html>

@@ -10484,7 +10484,7 @@ fn build_css_layout_boxes_preserving_whitespace(
             let preserve_whitespace =
                 preserve_whitespace || css_layout_node_preserves_whitespace(node);
             let kind = css_layout_kind_from_display(node.style.display);
-            let raw_children = node
+            let raw_children: Vec<CssLayoutBox<'_>> = node
                 .children
                 .iter()
                 .flat_map(|child| {
@@ -10492,7 +10492,7 @@ fn build_css_layout_boxes_preserving_whitespace(
                 })
                 .collect();
             let children = if matches!(node.style.display, CssDisplay::Flex | CssDisplay::Grid) {
-                raw_children
+                blockify_css_layout_items(raw_children)
             } else if css_layout_box_is_block_container(kind) {
                 fix_css_anonymous_blocks(raw_children, &node.style)
             } else {
@@ -10510,6 +10510,16 @@ fn build_css_layout_boxes_preserving_whitespace(
             }]
         }
     }
+}
+
+fn blockify_css_layout_items(mut children: Vec<CssLayoutBox<'_>>) -> Vec<CssLayoutBox<'_>> {
+    for child in &mut children {
+        if child.kind == CssLayoutKind::Inline {
+            child.kind = CssLayoutKind::Block;
+            child.flags = css_layout_subtree_flags_for(child.kind, child.node, &child.children);
+        }
+    }
+    children
 }
 
 fn css_layout_kind_from_display(display: CssDisplay) -> CssLayoutKind {
@@ -12098,7 +12108,9 @@ fn css_layout_preferred_content_width(
         CssLayoutKind::Text => box_
             .text
             .as_deref()
-            .map(|text| measure_canvas_text_run(text_metrics, &normalize_ws(text), &box_.style).x)
+            .map(|text| {
+                css_text_preferred_content_width(text_metrics, &normalize_ws(text), &box_.style)
+            })
             .unwrap_or(1.0),
         CssLayoutKind::Inline | CssLayoutKind::AnonymousBlock | CssLayoutKind::Block => {
             if box_
@@ -12165,6 +12177,9 @@ fn css_layout_preferred_content_width(
                         + box_.style.gap.max(0.0) * flow_children.len().saturating_sub(1) as f32;
                 }
             }
+            if box_.style.display == CssDisplay::Grid {
+                return css_grid_preferred_content_width(box_, text_metrics);
+            }
             box_.children
                 .iter()
                 .map(|child| css_layout_preferred_outer_width(child, text_metrics))
@@ -12190,6 +12205,130 @@ fn css_layout_preferred_outer_width(
         + box_.style.border_width * 2.0
         + box_.style.padding.left
         + box_.style.padding.right
+}
+
+fn css_text_preferred_content_width(
+    text_metrics: Option<&egui::Context>,
+    text: &str,
+    style: &ResolvedBoxStyle,
+) -> f32 {
+    let measured = measure_canvas_text_run(text_metrics, text, style)
+        .x
+        .max(1.0);
+    if text.split_whitespace().count() <= 1 {
+        return measured;
+    }
+
+    measured + (style.font_size * 0.9).max(1.0)
+}
+
+fn css_grid_preferred_content_width(
+    box_: &CssLayoutBox<'_>,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    let flow_count = box_
+        .children
+        .iter()
+        .filter(|child| !css_layout_box_is_out_of_flow(child))
+        .count();
+    if flow_count == 0 {
+        return 1.0;
+    }
+
+    let gap = box_.style.gap.max(0.0);
+    if let Some(areas) = &box_.style.grid_template_areas {
+        let area_columns = areas.iter().map(Vec::len).max().unwrap_or(0);
+        if area_columns > 0 {
+            let columns = css_grid_column_count(
+                &box_.style,
+                area_columns,
+                DEFAULT_LAYOUT_VIEWPORT_WIDTH,
+                gap,
+            )
+            .max(area_columns);
+            let mut column_widths = vec![0.0_f32; columns];
+            for child in &box_.children {
+                if css_layout_box_is_out_of_flow(child) {
+                    continue;
+                }
+                let Some(bounds) = child
+                    .style
+                    .grid_area
+                    .as_deref()
+                    .and_then(|name| css_grid_area_bounds(areas, name))
+                else {
+                    continue;
+                };
+                let column = bounds.2.min(columns.saturating_sub(1));
+                let span = (bounds.3.saturating_sub(bounds.2) + 1)
+                    .max(1)
+                    .min(columns - column);
+                let preferred = css_layout_preferred_outer_width(child, text_metrics)
+                    .max(css_layout_minimum_outer_width(child));
+                if span == 1 {
+                    column_widths[column] = column_widths[column].max(preferred);
+                } else {
+                    let share =
+                        ((preferred - gap * span.saturating_sub(1) as f32) / span as f32).max(1.0);
+                    for column_width in &mut column_widths[column..column + span] {
+                        *column_width = (*column_width).max(share);
+                    }
+                }
+            }
+            if let Some(tracks) = &box_.style.grid_template_column_tracks {
+                for (index, track) in tracks.iter().take(columns).copied().enumerate() {
+                    if matches!(track, CssLength::Auto | CssLength::Fr(_)) {
+                        continue;
+                    }
+                    column_widths[index] = column_widths[index]
+                        .max(resolve_css_grid_track_min_width(
+                            track,
+                            DEFAULT_LAYOUT_VIEWPORT_WIDTH,
+                        ))
+                        .max(0.0);
+                }
+            }
+            return column_widths.iter().sum::<f32>() + gap * columns.saturating_sub(1) as f32;
+        }
+    }
+    let columns =
+        css_grid_column_count(&box_.style, flow_count, DEFAULT_LAYOUT_VIEWPORT_WIDTH, gap).max(1);
+    let placements = css_grid_auto_placements(&box_.children, columns);
+    let mut column_widths = vec![0.0_f32; columns];
+
+    for (index, child) in box_.children.iter().enumerate() {
+        if css_layout_box_is_out_of_flow(child) {
+            continue;
+        }
+        let Some(placement) = placements.get(index).copied().flatten() else {
+            continue;
+        };
+        let span = placement.column_span.max(1).min(columns - placement.column);
+        let preferred = css_layout_preferred_outer_width(child, text_metrics)
+            .max(css_layout_minimum_outer_width(child));
+        if span == 1 {
+            column_widths[placement.column] = column_widths[placement.column].max(preferred);
+        } else {
+            let share = ((preferred - gap * span.saturating_sub(1) as f32) / span as f32).max(1.0);
+            for column_width in &mut column_widths[placement.column..placement.column + span] {
+                *column_width = (*column_width).max(share);
+            }
+        }
+    }
+
+    if let Some(tracks) = &box_.style.grid_template_column_tracks {
+        for (index, track) in tracks.iter().take(columns).copied().enumerate() {
+            let track_width = match track {
+                CssLength::Auto | CssLength::Fr(_) => continue,
+                length => {
+                    resolve_css_grid_track_min_width(length, DEFAULT_LAYOUT_VIEWPORT_WIDTH).max(0.0)
+                }
+            };
+            column_widths[index] = column_widths[index].max(track_width);
+        }
+    }
+
+    column_widths.iter().sum::<f32>() + gap * columns.saturating_sub(1) as f32
 }
 
 fn css_style_horizontal_border_padding(style: &ResolvedBoxStyle) -> f32 {
@@ -12816,7 +12955,7 @@ fn css_grid_auto_column_base_widths(
         if placement.column >= tracks.len() || placement.column_span != 1 {
             continue;
         }
-        if tracks[placement.column] != CssLength::Auto {
+        if !matches!(tracks[placement.column], CssLength::Auto | CssLength::Fr(_)) {
             continue;
         }
         widths[placement.column] = widths[placement.column]
@@ -12850,6 +12989,9 @@ fn css_resolve_grid_column_tracks(
     for (index, track) in tracks.iter().copied().enumerate() {
         match track {
             CssLength::Fr(fr) if fr > 0.0 => {
+                let width = auto_base_widths.get(index).copied().unwrap_or(0.0);
+                widths[index] = width;
+                fixed_total += width;
                 flexible_total += fr;
             }
             CssLength::Auto => {
@@ -12883,7 +13025,23 @@ fn css_resolve_grid_column_tracks(
             _ => None,
         };
         if let Some(share) = share {
-            widths[index] = (remaining * share / flexible_total).max(flexible_floor);
+            widths[index] += remaining * share / flexible_total;
+            widths[index] = widths[index].max(flexible_floor.min(widths[index].max(1.0)));
+        }
+    }
+
+    if flexible_total <= 0.0 && remaining > 0.0 {
+        let auto_columns = tracks
+            .iter()
+            .filter(|track| matches!(track, CssLength::Auto))
+            .count();
+        if auto_columns > 0 {
+            let share = remaining / auto_columns as f32;
+            for (index, track) in tracks.iter().copied().enumerate() {
+                if track == CssLength::Auto {
+                    widths[index] += share;
+                }
+            }
         }
     }
 
@@ -12970,13 +13128,38 @@ fn layout_named_css_grid_children(
     if columns == 0 {
         return None;
     }
+    let named_placements = container
+        .children
+        .iter()
+        .map(|child| {
+            child
+                .style
+                .grid_area
+                .as_deref()
+                .and_then(|name| css_grid_area_bounds(&areas, name))
+                .map(|bounds| CssGridAutoPlacement {
+                    row: bounds.0,
+                    column: bounds.2,
+                    row_span: bounds.1.saturating_sub(bounds.0) + 1,
+                    column_span: bounds.3.saturating_sub(bounds.2) + 1,
+                })
+        })
+        .collect::<Vec<_>>();
+
+    let mut track_style = container.style.clone();
+    if let Some(tracks) = &mut track_style.grid_template_column_tracks {
+        if tracks.len() < columns {
+            tracks.resize(columns, CssLength::Auto);
+            track_style.grid_template_columns = Some(columns);
+        }
+    }
 
     let column_widths = css_grid_column_widths(
-        &container.style,
+        &track_style,
         columns,
         content.width(),
         gap,
-        None,
+        Some((&container.children, &named_placements)),
         text_metrics,
     );
     let mut placed_named_child = false;
@@ -20425,12 +20608,12 @@ mod tests {
     #[test]
     fn canvas_graph_keeps_resolved_text_attributes_and_coordinates() {
         let document = parse_html_document(
-            r#"
+            r##"
             <html>
               <head><style>.box { color: #445566; font-size: 20px; padding: 10px; }</style></head>
               <body><div class="box"><span>Hello graph</span><em>italic</em><u>under</u><del>gone</del><mark>marked</mark></div></body>
             </html>
-            "#,
+            "##,
             "https://example.test/",
         );
 
@@ -22076,7 +22259,7 @@ mod tests {
     #[test]
     fn flex_textarea_wrapper_grows_between_button_sections() {
         let document = parse_html_document(
-            r#"
+            r##"
             <html>
               <head>
                 <style>
@@ -22096,7 +22279,7 @@ mod tests {
                 </div>
               </body>
             </html>
-            "#,
+            "##,
             "https://example.test/",
         );
 
@@ -24544,6 +24727,590 @@ mod tests {
         assert!(
             (auto.rect.height() - 72.0).abs() <= 1.0,
             "absolute auto height should include child 50 + padding/border 22: auto={auto:?} child={child:?}"
+        );
+    }
+
+    #[test]
+    fn absolute_auto_grid_counter_uses_nested_text_intrinsic_width() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .hero {
+                    position: relative;
+                    width: 640px;
+                    height: 260px;
+                    background: #1b5e46;
+                  }
+                  .detached {
+                    position: absolute;
+                    left: 80px;
+                    top: 80px;
+                    display: grid;
+                    grid-template-columns: auto 1px auto;
+                    background: #385d55;
+                    border: 1px solid #ffffff;
+                    border-radius: 10px;
+                    overflow: hidden;
+                  }
+                  .item {
+                    display: inline;
+                    color: #ffffff;
+                    min-width: 0;
+                  }
+                  .counter {
+                    display: grid;
+                    padding: 16px;
+                    min-height: 69px;
+                    background: #8ca69a;
+                  }
+                  .count {
+                    display: flex;
+                    font-size: 20px;
+                    font-weight: 700;
+                  }
+                  .description {
+                    display: block;
+                    font-size: 14px;
+                    background: #f6df73;
+                  }
+                  .divider {
+                    width: 1px;
+                    margin: 16px 0;
+                    background: #ffffff;
+                  }
+                </style>
+              </head>
+              <body>
+                <section class="hero">
+                  <div class="detached">
+                    <a class="item" href="#">
+                      <div class="counter">
+                        <div class="count">251,710,606</div>
+                        <div class="description">trees planted by example</div>
+                      </div>
+                    </a>
+                    <div class="divider"></div>
+                    <a class="item" href="#">
+                      <div class="counter">
+                        <div class="count">101,676,431</div>
+                        <div class="description">dedicated to climate action</div>
+                      </div>
+                    </a>
+                  </div>
+                </section>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let detached = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x38, 0x5d, 0x55),
+        )
+        .expect("expected detached counter background");
+        let descriptions = document
+            .canvas_graph
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0xf6, 0xdf, 0x73) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let description_lines = document
+            .canvas_graph
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                CanvasObject::RichTextLine(line) => Some(
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>(),
+                ),
+                CanvasObject::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            detached.rect.width() > 360.0,
+            "absolute auto-width grid should shrink-to-fit nested grid items, not collapse: detached={:?}",
+            detached.rect
+        );
+        assert_eq!(
+            descriptions.len(),
+            2,
+            "expected two counter description backgrounds: {descriptions:?}"
+        );
+        assert!(
+            description_lines
+                .iter()
+                .any(|text| text == "trees planted by example")
+                && description_lines
+                    .iter()
+                    .any(|text| text == "dedicated to climate action"),
+            "counter descriptions should stay as complete single lines: {description_lines:?}"
+        );
+        assert!(
+            descriptions.iter().all(|rect| rect.width() > 160.0),
+            "counter description blocks should receive intrinsic inline width: {descriptions:?}"
+        );
+    }
+
+    #[test]
+    fn definite_grid_stretches_auto_tracks_after_intrinsic_base_sizes() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .panel {
+                    display: grid;
+                    grid-template-columns: auto 1px auto;
+                    width: 420px;
+                    background: #325c55;
+                  }
+                  .item {
+                    display: inline;
+                    min-width: 0;
+                    background: #76a494;
+                  }
+                  .counter {
+                    display: grid;
+                    padding: 16px;
+                    background: #f6df73;
+                  }
+                  .divider {
+                    width: 1px;
+                    background: #111111;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="panel">
+                  <a class="item" href="#"><div class="counter">first auto track</div></a>
+                  <div class="divider"></div>
+                  <a class="item" href="#"><div class="counter">second auto track</div></a>
+                </div>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let counter_rects = document
+            .canvas_graph
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0xf6, 0xdf, 0x73) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            counter_rects.len(),
+            2,
+            "expected two grid item counters: {counter_rects:?}"
+        );
+        assert!(
+            counter_rects.iter().all(|rect| rect.width() > 170.0),
+            "auto grid tracks in a definite-width grid should stretch into leftover space: {counter_rects:?}"
+        );
+    }
+
+    #[test]
+    fn auto_width_grid_fr_tracks_keep_intrinsic_child_bases() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .shell {
+                    position: absolute;
+                    left: 80px;
+                    top: 40px;
+                    display: flex;
+                    align-items: center;
+                  }
+                  .panel {
+                    display: grid;
+                    grid-template-columns: 1fr auto 1fr;
+                    overflow: hidden;
+                    border: 1px solid #ffffff;
+                    border-radius: 10px;
+                    background: #365e57;
+                  }
+                  .item {
+                    display: inline;
+                    min-width: 0;
+                    color: #ffffff;
+                  }
+                  .counter {
+                    display: grid;
+                    grid-template-areas:
+                      "image count"
+                      "image description";
+                    grid-template-columns: max-content;
+                    padding: 16px;
+                    min-height: 69px;
+                    background: #729b91;
+                  }
+                  .icon {
+                    grid-area: image;
+                    width: 40px;
+                    height: 40px;
+                    background: #f49f3f;
+                  }
+                  .count {
+                    grid-area: count;
+                    font-size: 20px;
+                    font-weight: 700;
+                    background: #5c7edb;
+                    white-space: nowrap;
+                  }
+                  .description {
+                    grid-area: description;
+                    font-size: 14px;
+                    background: #f6df73;
+                    white-space: nowrap;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="shell">
+                  <div class="panel">
+                    <a class="item" href="#">
+                      <div class="counter">
+                        <div class="icon"></div>
+                        <div class="count">251,792,100</div>
+                        <div class="description">trees planted by Ecosia</div>
+                      </div>
+                    </a>
+                    <a class="item" href="#">
+                      <div class="counter">
+                        <div class="icon"></div>
+                        <div class="count">€101,719,760</div>
+                        <div class="description">dedicated to climate action</div>
+                      </div>
+                    </a>
+                  </div>
+                </div>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let description_rects = document
+            .canvas_graph
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0xf6, 0xdf, 0x73) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            description_rects.len(),
+            2,
+            "expected two description boxes: {description_rects:?}"
+        );
+        assert!(
+            description_rects[0].right() <= description_rects[1].left(),
+            "intrinsic fr track bases should prevent adjacent counter descriptions from overlapping: {description_rects:?}"
+        );
+        assert!(
+            description_rects.iter().all(|rect| rect.width() > 140.0),
+            "description boxes should keep max-content width inside fr tracks: {description_rects:?}"
+        );
+    }
+
+    #[test]
+    fn grid_blockifies_inline_anchor_items_before_laying_out_nested_counter() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .hero {
+                    position: relative;
+                    width: 760px;
+                    height: 520px;
+                    background: #4f8d5a;
+                  }
+                  .detached {
+                    position: absolute;
+                    left: 120px;
+                    bottom: 48px;
+                    display: flex;
+                    align-items: center;
+                  }
+                  .panel {
+                    display: grid;
+                    grid-template-columns: auto 1px auto;
+                    overflow: hidden;
+                    border: 1px solid #ffffff;
+                    border-radius: 10px;
+                    background: #365e57;
+                  }
+                  .item {
+                    display: inline;
+                    min-width: 0;
+                    color: #ffffff;
+                    text-decoration: none;
+                  }
+                  .counter {
+                    display: grid;
+                    grid-template-areas:
+                      "image count"
+                      "image description";
+                    grid-template-columns: max-content;
+                    grid-template-rows: auto auto;
+                    min-height: 69px;
+                    padding: 16px;
+                    flex: 1 1 0%;
+                    background: #729b91;
+                    column-gap: 10px;
+                  }
+                  .icon {
+                    grid-area: image;
+                    width: 40px;
+                    height: 40px;
+                    background: #f49f3f;
+                    align-self: center;
+                  }
+                  .count {
+                    grid-area: count;
+                    display: flex;
+                    align-items: center;
+                    font-size: 20px;
+                    font-weight: 700;
+                    background: #5c7edb;
+                  }
+                  .description {
+                    grid-area: description;
+                    display: block;
+                    font-size: 14px;
+                    background: #f6df73;
+                  }
+                  .divider {
+                    width: 1px;
+                    margin: 16px 0;
+                    background: #ffffff;
+                  }
+                </style>
+              </head>
+              <body>
+                <section class="hero">
+                  <div class="detached">
+                    <div class="panel">
+                      <a class="item" href="#">
+                        <div class="counter">
+                          <div class="icon"></div>
+                          <div class="count">251,792,100</div>
+                          <div class="description">trees planted by Ecosia</div>
+                        </div>
+                      </a>
+                      <div class="divider"></div>
+                      <a class="item" href="#">
+                        <div class="counter">
+                          <div class="icon"></div>
+                          <div class="count">€101,719,760</div>
+                          <div class="description">dedicated to climate action</div>
+                        </div>
+                      </a>
+                    </div>
+                  </div>
+                </section>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let panel = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x36, 0x5e, 0x57),
+        )
+        .expect("expected counter panel background");
+        let description_lines = document
+            .canvas_graph
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                CanvasObject::RichTextLine(line) => Some(
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>(),
+                ),
+                CanvasObject::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            panel.rect.width() > 430.0,
+            "grid panel should use nested counter max-content widths, not collapsed inline item widths: {:?}",
+            panel.rect
+        );
+        assert!(
+            description_lines
+                .iter()
+                .any(|text| text == "trees planted by Ecosia")
+                && description_lines
+                    .iter()
+                    .any(|text| text == "dedicated to climate action"),
+            "grid item inline anchors should be blockified so nested counter text stays on full lines: {description_lines:?}"
+        );
+    }
+
+    #[test]
+    fn slashless_grid_template_areas_place_counter_description_in_text_column() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .panel {
+                    display: grid;
+                    grid-template-columns: auto 1px auto;
+                    width: 460px;
+                    background: #365e57;
+                  }
+                  .item {
+                    display: inline;
+                    min-width: 0;
+                    color: #ffffff;
+                  }
+                  .counter[data-v-test] {
+                    display: grid;
+                    grid-template:
+                      "image count"
+                      "image description";
+                    grid-template-columns: 40px auto;
+                    padding: 16px;
+                    min-height: 69px;
+                    background: #729b91;
+                  }
+                  .counter__image[data-v-test] {
+                    grid-area: image;
+                    width: 40px;
+                    height: 40px;
+                    background: #f49f3f;
+                  }
+                  .counter__count[data-v-test] {
+                    grid-area: count;
+                    display: flex;
+                    font-size: 20px;
+                    font-weight: 700;
+                    background: #5c7edb;
+                  }
+                  .counter__description[data-v-test] {
+                    grid-area: description;
+                    display: block;
+                    font-size: 14px;
+                    background: #f6df73;
+                  }
+                  .divider {
+                    width: 1px;
+                    background: #ffffff;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="panel">
+                  <a class="item" href="#">
+                    <div class="counter" data-v-test>
+                      <div class="counter__image" data-v-test></div>
+                      <div class="counter__count" data-v-test>251,792,100</div>
+                      <div class="counter__description" data-v-test>trees planted by Ecosia</div>
+                    </div>
+                  </a>
+                  <div class="divider"></div>
+                  <a class="item" href="#">
+                    <div class="counter" data-v-test>
+                      <div class="counter__image" data-v-test></div>
+                      <div class="counter__count" data-v-test>101,719,760</div>
+                      <div class="counter__description" data-v-test>dedicated to climate action</div>
+                    </div>
+                  </a>
+                </div>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let description_rects = document
+            .canvas_graph
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0xf6, 0xdf, 0x73) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let description_lines = document
+            .canvas_graph
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                CanvasObject::RichTextLine(line) => Some(
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>(),
+                ),
+                CanvasObject::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            description_rects.len(),
+            2,
+            "expected description cells to render: {description_rects:?}"
+        );
+        assert!(
+            description_rects.iter().all(|rect| rect.width() > 130.0),
+            "slashless grid-template areas should place descriptions in the text column, not a one-character implicit column: {description_rects:?}"
+        );
+        assert!(
+            description_lines
+                .iter()
+                .any(|text| text == "trees planted by Ecosia")
+                && description_lines
+                    .iter()
+                    .any(|text| text == "dedicated to climate action"),
+            "counter description text should remain complete lines: {description_lines:?}"
         );
     }
 
@@ -28949,20 +29716,56 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
     }
 
     fn find_canvas_text<'a>(graph: &'a CanvasGraph, value: &str) -> Option<&'a CanvasTextObject> {
-        graph.objects.iter().find_map(|object| match object {
-            CanvasObject::Text(text) if text.text == value => Some(text),
-            _ => None,
-        })
+        graph
+            .objects
+            .iter()
+            .find_map(|object| canvas_object_text_sample(object, |text| text == value))
     }
 
     fn find_canvas_text_containing<'a>(
         graph: &'a CanvasGraph,
         value: &str,
     ) -> Option<&'a CanvasTextObject> {
-        graph.objects.iter().find_map(|object| match object {
-            CanvasObject::Text(text) if text.text.contains(value) => Some(text),
+        graph
+            .objects
+            .iter()
+            .find_map(|object| canvas_object_text_sample(object, |text| text.contains(value)))
+    }
+
+    fn canvas_object_text_sample<'a>(
+        object: &'a CanvasObject,
+        matches_text: impl Fn(&str) -> bool,
+    ) -> Option<&'a CanvasTextObject> {
+        match object {
+            CanvasObject::Text(text) if matches_text(&text.text) => Some(text),
+            CanvasObject::RichTextLine(line) => {
+                let text = line
+                    .spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>();
+                if !matches_text(&text) {
+                    return None;
+                }
+                let span = line.spans.first()?;
+                Some(Box::leak(Box::new(CanvasTextObject {
+                    text,
+                    rect: line.rect,
+                    text_inset_x: 0.0,
+                    color: span.color,
+                    font_size: span.font_size,
+                    font_weight_bold: span.font_weight_bold,
+                    font_style_italic: span.font_style_italic,
+                    text_decoration_underline: span.text_decoration_underline,
+                    text_decoration_strikethrough: span.text_decoration_strikethrough,
+                    text_background: span.text_background,
+                    text_align: line.text_align,
+                    href: span.href.clone(),
+                    element_id: span.element_id.clone(),
+                })))
+            }
             _ => None,
-        })
+        }
     }
 
     fn canvas_graph_visible_text(graph: &CanvasGraph) -> String {

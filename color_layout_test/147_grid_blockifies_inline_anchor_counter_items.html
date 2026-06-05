@@ -1,0 +1,113 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>147 grid blockifies inline anchor counter items</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #eef1f4;
+    }
+
+    .hero {
+      position: relative;
+      width: 760px;
+      height: 520px;
+      margin: 32px;
+      background: #4f8d5a;
+    }
+
+    .detached {
+      position: absolute;
+      left: 120px;
+      bottom: 48px;
+      display: flex;
+      align-items: center;
+    }
+
+    .panel {
+      display: grid;
+      grid-template-columns: auto 1px auto;
+      overflow: hidden;
+      border: 1px solid #ffffff;
+      border-radius: 10px;
+      background: #365e57;
+    }
+
+    .item {
+      display: inline;
+      min-width: 0;
+      color: #ffffff;
+      text-decoration: none;
+    }
+
+    .counter {
+      display: grid;
+      grid-template-areas:
+        "image count"
+        "image description";
+      grid-template-columns: 40px auto;
+      grid-template-rows: auto auto;
+      min-height: 69px;
+      padding: 16px;
+      flex: 1 1 0%;
+      background: #729b91;
+      column-gap: 10px;
+    }
+
+    .icon {
+      grid-area: image;
+      width: 40px;
+      height: 40px;
+      background: #f49f3f;
+      align-self: center;
+    }
+
+    .count {
+      grid-area: count;
+      display: flex;
+      align-items: center;
+      font-size: 20px;
+      font-weight: 700;
+      background: #5c7edb;
+    }
+
+    .description {
+      grid-area: description;
+      display: block;
+      font-size: 14px;
+      background: #f6df73;
+    }
+
+    .divider {
+      width: 1px;
+      margin: 16px 0;
+      background: #ffffff;
+    }
+  </style>
+</head>
+<body>
+  <section class="hero">
+    <div class="detached">
+      <div class="panel">
+        <a class="item" href="#">
+          <div class="counter">
+            <div class="icon"></div>
+            <div class="count">251,792,100</div>
+            <div class="description">trees planted by Ecosia</div>
+          </div>
+        </a>
+        <div class="divider"></div>
+        <a class="item" href="#">
+          <div class="counter">
+            <div class="icon"></div>
+            <div class="count">€101,719,760</div>
+            <div class="description">dedicated to climate action</div>
+          </div>
+        </a>
+      </div>
+    </div>
+  </section>
+</body>
+</html>

@@ -6527,7 +6527,10 @@ fn parse_grid_template_shorthand_areas(value: &str) -> Option<Vec<Vec<String>>> 
 fn parse_grid_template_shorthand_area_rows(
     value: &str,
 ) -> Option<(Vec<Vec<String>>, Vec<CssLength>)> {
-    let (rows, _) = value.rsplit_once('/')?;
+    let rows = value
+        .rsplit_once('/')
+        .map(|(rows, _)| rows)
+        .unwrap_or(value);
     let mut areas = Vec::new();
     let mut row_tracks = Vec::new();
     let mut cursor = 0usize;
@@ -8857,6 +8860,53 @@ mod tests {
         assert_eq!(
             computed.grid_template_column_tracks,
             Some(vec![CssLength::Px(256.0), CssLength::Fr(1.0)])
+        );
+    }
+
+    #[test]
+    fn parse_basic_css_carries_slashless_grid_template_shorthand_areas() {
+        let style = parse_basic_css(
+            r#"
+            .counter[data-v-test] {
+                display: grid;
+                grid-template:
+                    "image count"
+                    "image description";
+                grid-template-columns: 40px auto;
+            }
+            .counter__image[data-v-test] { grid-area: image; }
+            .counter__count[data-v-test] { grid-area: count; }
+            .counter__description[data-v-test] { grid-area: description; }
+            "#,
+        );
+        let counter = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["counter".to_owned()],
+            attributes: vec!["data-v-test".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let description = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["counter__description".to_owned()],
+            attributes: vec!["data-v-test".to_owned()],
+            ..ElementStyleKey::default()
+        };
+
+        let computed = computed_box_style(&style, &counter);
+        assert_eq!(
+            computed.grid_template_areas,
+            Some(vec![
+                vec!["image".to_owned(), "count".to_owned()],
+                vec!["image".to_owned(), "description".to_owned()],
+            ])
+        );
+        assert_eq!(
+            computed.grid_template_column_tracks,
+            Some(vec![CssLength::Px(40.0), CssLength::Auto])
+        );
+        assert_eq!(
+            computed_box_style(&style, &description).grid_area,
+            Some("description".to_owned())
         );
     }
 
