@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>166 - Flex Basis Max Width Double Clamp Columns</title>
+<style>
+body { margin: 0; font-family: Arial, sans-serif; background: #f1f3f5; }
+.shell { width: 960px; margin: 32px auto; background: #ffffff; }
+.row { display: flex; flex-wrap: wrap; margin-left: -8px; margin-right: -8px; background: #e9ecef; }
+.main { box-sizing: border-box; flex: 0 0 66.666%; max-width: 66.666%; padding-left: 8px; padding-right: 8px; }
+.side { box-sizing: border-box; flex: 0 0 33.333%; max-width: 33.333%; padding-left: 8px; padding-right: 8px; }
+.main > .panel { height: 260px; background: #74c0fc; }
+.side > .panel { height: 260px; background: #ffd43b; }
+.label { padding: 16px; font-weight: 700; color: #1f2933; }
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="row">
+    <div class="main"><div class="panel"><div class="label">main 66 percent column</div></div></div>
+    <aside class="side"><div class="panel"><div class="label">sidebar 33 percent column</div></div></aside>
+  </div>
+</div>
+</body>
+</html>

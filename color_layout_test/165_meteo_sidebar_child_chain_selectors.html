@@ -1,0 +1,50 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>165 - Meteo Sidebar Child Chain Selectors</title>
+<style>
+body { margin: 0; font-family: Arial, sans-serif; background: #eeeeee; }
+.page { display: flex; flex-wrap: wrap; width: 960px; margin: 24px auto; gap: 0; }
+.main { flex: 0 0 66.666%; max-width: 66.666%; height: 420px; background: #55c6ff; }
+.itcVQh { box-sizing: border-box; flex: 0 0 33.333%; max-width: 33.333%; padding-left: 8px; padding-right: 8px; }
+.llWYdN { position: relative; border-radius: 13px; background: #ffffff; overflow: hidden; }
+.llWYdN > ul { padding-top: 50px; padding-left: 0; margin: 0; display: flex; width: 100%; flex-direction: column; justify-content: space-between; }
+.llWYdN > ul .containerSliderLink { display: flex; flex-direction: column; }
+.llWYdN > ul > div > a { display: flex; align-items: center; width: 100%; padding-left: 20px; padding-right: 20px; height: 50px; box-sizing: border-box; background: #ffe066; }
+.llWYdN > ul > div > a > span { display: flex; width: 50px; background: #ff922b; }
+.llWYdN > ul > div > a > span > span { display: flex; width: 25px; }
+.llWYdN > ul > div > a > div:not(.containerSliderLink):not(.dividerLocation) { flex-grow: 2; height: 50px; display: flex; align-items: center; background: #69db7c; }
+.llWYdN > ul > div > a > div:not(.containerSliderLink):not(.dividerLocation) > p { margin: 0 0 0 5px; font-weight: bold; font-size: 14px; }
+.iconLocationCard { width: 32px; height: 32px; flex: 0 0 auto; background: #748ffc; }
+.dividerLocation { margin-left: 20px; height: 1px; background: #222222; }
+.jrOoie { position: absolute; left: 0; top: 0; min-width: 160px; height: 40px; display: flex; align-items: center; padding-left: 14px; padding-right: 22px; box-sizing: border-box; background: #1155a3; color: #ffffff; }
+a { color: #111111; text-decoration: none; }
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="main">main content</div>
+  <aside class="itcVQh">
+    <div class="llWYdN">
+      <span class="jrOoie">Meteo citta italiane</span>
+      <ul>
+        <div class="containerSliderLink">
+          <a href="#">
+            <div><span class="iconLocationCard"></span><p>Torino</p></div>
+            <span><span>14</span><span>25</span></span>
+          </a>
+          <div class="dividerLocation"></div>
+        </div>
+        <div class="containerSliderLink">
+          <a href="#">
+            <div><span class="iconLocationCard"></span><p>Palermo</p></div>
+            <span><span>20</span><span>27</span></span>
+          </a>
+        </div>
+      </ul>
+    </div>
+  </aside>
+</div>
+</body>
+</html>

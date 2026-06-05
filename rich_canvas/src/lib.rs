@@ -134,12 +134,19 @@ pub struct CssSelector {
     pub not_selectors: Vec<SimpleCssSelector>,
     pub is_selectors: Vec<SimpleCssSelector>,
     pub where_selectors: Vec<SimpleCssSelector>,
+    pub ancestor_path: Vec<(CssAncestorCombinator, SimpleCssSelector)>,
     pub ancestor_chain: Vec<SimpleCssSelector>,
     pub ancestor: Option<SimpleCssSelector>,
     pub parent: Option<SimpleCssSelector>,
     pub previous_sibling: Option<SimpleCssSelector>,
     pub requires_previous_sibling: bool,
     pub general_previous_sibling: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CssAncestorCombinator {
+    Descendant,
+    Child,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -384,6 +391,15 @@ pub enum CssDisplay {
     Flex,
     Grid,
     Table,
+    InlineTable,
+    TableCaption,
+    TableRowGroup,
+    TableHeaderGroup,
+    TableFooterGroup,
+    TableRow,
+    TableCell,
+    TableColumn,
+    TableColumnGroup,
     ListItem,
 }
 
@@ -4450,6 +4466,9 @@ fn css_selector_matches(selector: &CssSelector, key: &ElementStyleKey) -> bool {
     if !simple_css_selector_matches(&current, key) {
         return false;
     }
+    if !ancestor_path_matches(&selector.ancestor_path, key.parent.as_deref()) {
+        return false;
+    }
     if !ancestor_chain_matches(&selector.ancestor_chain, key.parent.as_deref()) {
         return false;
     }
@@ -4549,6 +4568,58 @@ fn previous_sibling_chain_matches(selector: &SimpleCssSelector, sibling: &Elemen
     false
 }
 
+fn ancestor_path_matches(
+    selectors: &[(CssAncestorCombinator, SimpleCssSelector)],
+    parent: Option<&ElementStyleKey>,
+) -> bool {
+    let mut current = parent;
+    for (combinator, selector) in selectors {
+        match combinator {
+            CssAncestorCombinator::Child => {
+                if simple_selector_is_plain_tag(selector, "tr")
+                    && current.is_some_and(table_section_can_have_implicit_row)
+                {
+                    continue;
+                }
+                let Some(key) = current else {
+                    return false;
+                };
+                if !simple_css_selector_matches(selector, key) {
+                    return false;
+                }
+                current = key.parent.as_deref();
+            }
+            CssAncestorCombinator::Descendant => {
+                if simple_selector_is_plain_tag(selector, "tr")
+                    && current.is_some_and(table_section_can_have_implicit_row)
+                {
+                    continue;
+                }
+                let mut matched = None;
+                while let Some(key) = current {
+                    if simple_css_selector_matches(selector, key) {
+                        matched = Some(key);
+                        break;
+                    }
+                    current = key.parent.as_deref();
+                }
+                let Some(key) = matched else {
+                    return false;
+                };
+                current = key.parent.as_deref();
+            }
+        }
+    }
+    true
+}
+
+fn table_section_can_have_implicit_row(key: &ElementStyleKey) -> bool {
+    matches!(
+        key.tag.as_str(),
+        "table" | "thead" | "tbody" | "tfoot" | "caption" | "colgroup"
+    )
+}
+
 fn ancestor_chain_matches(
     selectors: &[SimpleCssSelector],
     parent: Option<&ElementStyleKey>,
@@ -4556,12 +4627,7 @@ fn ancestor_chain_matches(
     let mut current = parent;
     for selector in selectors.iter().rev() {
         if simple_selector_is_plain_tag(selector, "tr")
-            && current.is_some_and(|key| {
-                matches!(
-                    key.tag.as_str(),
-                    "table" | "thead" | "tbody" | "tfoot" | "caption" | "colgroup"
-                )
-            })
+            && current.is_some_and(table_section_can_have_implicit_row)
         {
             continue;
         }
@@ -4696,6 +4762,11 @@ fn css_selector_specificity(selector: &CssSelector) -> usize {
         where_selectors: selector.where_selectors.clone(),
     };
     simple_css_selector_specificity(&current)
+        + selector
+            .ancestor_path
+            .iter()
+            .map(|(_, selector)| simple_css_selector_specificity(selector))
+            .sum::<usize>()
         + selector
             .ancestor_chain
             .iter()
@@ -4986,6 +5057,7 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             not_selectors: right.not_selectors,
             is_selectors: right.is_selectors,
             where_selectors: right.where_selectors,
+            ancestor_path: Vec::new(),
             ancestor_chain: Vec::new(),
             ancestor: None,
             parent,
@@ -5009,6 +5081,7 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             not_selectors: right.not_selectors,
             is_selectors: right.is_selectors,
             where_selectors: right.where_selectors,
+            ancestor_path: Vec::new(),
             ancestor_chain: Vec::new(),
             ancestor: None,
             parent,
@@ -5019,26 +5092,68 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
     }
 
     if let Some((parent, child)) = split_selector_once(&selector, '>') {
-        let child = parse_simple_css_selector(child)?;
-        let parent = parse_simple_css_selector(parent)?;
-        return Some(CssSelector {
-            tag: child.tag,
-            id: child.id,
-            classes: child.classes,
-            attributes: child.attributes,
-            attribute_selectors: child.attribute_selectors,
-            nth_child: child.nth_child,
-            nth_last_child: child.nth_last_child,
-            not_selectors: child.not_selectors,
-            is_selectors: child.is_selectors,
-            where_selectors: child.where_selectors,
-            ancestor_chain: Vec::new(),
-            ancestor: None,
-            parent: Some(parent),
-            previous_sibling: None,
-            requires_previous_sibling: false,
-            general_previous_sibling: false,
-        });
+        if let (Some(child), Some(parent)) = (
+            parse_simple_css_selector(child),
+            parse_simple_css_selector(parent),
+        ) {
+            return Some(CssSelector {
+                tag: child.tag,
+                id: child.id,
+                classes: child.classes,
+                attributes: child.attributes,
+                attribute_selectors: child.attribute_selectors,
+                nth_child: child.nth_child,
+                nth_last_child: child.nth_last_child,
+                not_selectors: child.not_selectors,
+                is_selectors: child.is_selectors,
+                where_selectors: child.where_selectors,
+                ancestor_path: Vec::new(),
+                ancestor_chain: Vec::new(),
+                ancestor: None,
+                parent: Some(parent),
+                previous_sibling: None,
+                requires_previous_sibling: false,
+                general_previous_sibling: false,
+            });
+        }
+    }
+
+    if selector_has_top_level_relation(&selector) {
+        let parts = parse_selector_relation_chain(&selector)?;
+        if parts.len() >= 2 {
+            let (_, descendant) = parts.last()?.clone();
+            let descendant = parse_simple_css_selector(descendant)?;
+            let ancestor_path = parts[..parts.len() - 1]
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(index, (_, simple))| {
+                    let combinator = parts[index + 1]
+                        .0
+                        .unwrap_or(CssAncestorCombinator::Descendant);
+                    parse_simple_css_selector(simple).map(|selector| (combinator, selector))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            return Some(CssSelector {
+                tag: descendant.tag,
+                id: descendant.id,
+                classes: descendant.classes,
+                attributes: descendant.attributes,
+                attribute_selectors: descendant.attribute_selectors,
+                nth_child: descendant.nth_child,
+                nth_last_child: descendant.nth_last_child,
+                not_selectors: descendant.not_selectors,
+                is_selectors: descendant.is_selectors,
+                where_selectors: descendant.where_selectors,
+                ancestor_path,
+                ancestor_chain: Vec::new(),
+                ancestor: None,
+                parent: None,
+                previous_sibling: None,
+                requires_previous_sibling: false,
+                general_previous_sibling: false,
+            });
+        }
     }
 
     if selector_has_top_level_whitespace(&selector) {
@@ -5059,6 +5174,7 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             not_selectors: descendant.not_selectors,
             is_selectors: descendant.is_selectors,
             where_selectors: descendant.where_selectors,
+            ancestor_path: Vec::new(),
             ancestor_chain,
             ancestor: None,
             parent: None,
@@ -5093,6 +5209,7 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             not_selectors: simple.not_selectors,
             is_selectors: simple.is_selectors,
             where_selectors: simple.where_selectors,
+            ancestor_path: Vec::new(),
             ancestor_chain: Vec::new(),
             ancestor: None,
             parent: None,
@@ -5121,6 +5238,81 @@ fn split_descendant_selector(selector: &str) -> Option<(Vec<&str>, &str)> {
         None
     } else {
         Some((parts, descendant))
+    }
+}
+
+fn selector_has_top_level_relation(selector: &str) -> bool {
+    selector_has_top_level_whitespace(selector) || find_top_level_char(selector, '>').is_some()
+}
+
+fn parse_selector_relation_chain(
+    selector: &str,
+) -> Option<Vec<(Option<CssAncestorCombinator>, &str)>> {
+    let mut parts = Vec::new();
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut token_start = None;
+    let mut pending = None;
+
+    for (index, ch) in selector.char_indices() {
+        match ch {
+            '[' => {
+                bracket_depth += 1;
+                token_start.get_or_insert(index);
+            }
+            ']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                token_start.get_or_insert(index);
+            }
+            '(' if bracket_depth == 0 => {
+                paren_depth += 1;
+                token_start.get_or_insert(index);
+            }
+            ')' if bracket_depth == 0 => {
+                paren_depth = paren_depth.saturating_sub(1);
+                token_start.get_or_insert(index);
+            }
+            '>' if paren_depth == 0 && bracket_depth == 0 => {
+                if let Some(start) = token_start.take() {
+                    let part = selector[start..index].trim();
+                    if !part.is_empty() {
+                        parts.push((pending.take(), part));
+                    }
+                }
+                pending = Some(CssAncestorCombinator::Child);
+            }
+            ch if ch.is_whitespace() && paren_depth == 0 && bracket_depth == 0 => {
+                if let Some(start) = token_start.take() {
+                    let part = selector[start..index].trim();
+                    if !part.is_empty() {
+                        parts.push((pending.take(), part));
+                    }
+                }
+                if !matches!(pending, Some(CssAncestorCombinator::Child)) {
+                    pending = Some(CssAncestorCombinator::Descendant);
+                }
+            }
+            _ => {
+                token_start.get_or_insert(index);
+            }
+        }
+    }
+
+    if let Some(start) = token_start {
+        let part = selector[start..].trim();
+        if !part.is_empty() {
+            parts.push((pending.take(), part));
+        }
+    }
+
+    if parts.len() < 2
+        || parts
+            .first()
+            .is_some_and(|(combinator, _)| combinator.is_some())
+    {
+        None
+    } else {
+        Some(parts)
     }
 }
 
@@ -6224,9 +6416,16 @@ fn parse_display(value: &str) -> Option<CssDisplay> {
         "inline-flex" => Some(CssDisplay::Flex),
         "flex" => Some(CssDisplay::Flex),
         "grid" | "inline-grid" => Some(CssDisplay::Grid),
-        "table" | "inline-table" | "table-row" | "table-cell" | "table-caption"
-        | "table-row-group" | "table-header-group" | "table-footer-group" | "table-column"
-        | "table-column-group" => Some(CssDisplay::Table),
+        "table" => Some(CssDisplay::Table),
+        "inline-table" => Some(CssDisplay::InlineTable),
+        "table-caption" => Some(CssDisplay::TableCaption),
+        "table-row-group" => Some(CssDisplay::TableRowGroup),
+        "table-header-group" => Some(CssDisplay::TableHeaderGroup),
+        "table-footer-group" => Some(CssDisplay::TableFooterGroup),
+        "table-row" => Some(CssDisplay::TableRow),
+        "table-cell" => Some(CssDisplay::TableCell),
+        "table-column" => Some(CssDisplay::TableColumn),
+        "table-column-group" => Some(CssDisplay::TableColumnGroup),
         "list-item" => Some(CssDisplay::ListItem),
         _ => None,
     }
@@ -8060,11 +8259,11 @@ mod tests {
         );
         assert_eq!(
             computed_box_style(&style, &th(10)).display,
-            Some(CssDisplay::Table)
+            Some(CssDisplay::TableCell)
         );
         assert_eq!(
             computed_box_style(&style, &th(14)).display,
-            Some(CssDisplay::Table)
+            Some(CssDisplay::TableCell)
         );
     }
 
@@ -8073,6 +8272,7 @@ mod tests {
         let style = parse_basic_css(
             r#"
             .weather_table thead tr th:nth-last-child(-n+2) { display: none; }
+            .weather_table thead > tr > th:nth-child(2) { color: #e03131; }
             "#,
         );
         let table = ElementStyleKey {
@@ -8100,6 +8300,49 @@ mod tests {
         );
         assert_eq!(
             computed_box_style(&style, &th(4)).display,
+            Some(CssDisplay::None)
+        );
+        assert_eq!(
+            computed_box_style(&style, &th(2)).color,
+            Some(Color32::from_rgb(0xe0, 0x31, 0x31))
+        );
+    }
+
+    #[test]
+    fn weather_table_direct_header_cells_match_implicit_row_hide_selectors() {
+        let style = parse_basic_css(
+            r#"
+            .weather_table tr th:nth-child(11) { display: none; }
+            .weather_table tr th:nth-child(12) { display: none; }
+            .weather_table tr th:nth-child(13) { display: none; }
+            .weather_table tr th:nth-child(14) { display: none; }
+            "#,
+        );
+        let table = ElementStyleKey {
+            tag: "table".to_owned(),
+            classes: vec!["weather_table".to_owned(), "summer".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let thead = ElementStyleKey {
+            tag: "thead".to_owned(),
+            parent: Some(Box::new(table)),
+            ..ElementStyleKey::default()
+        };
+        let th = |child_index| ElementStyleKey {
+            tag: "th".to_owned(),
+            child_index: Some(child_index),
+            child_count: Some(14),
+            parent: Some(Box::new(thead.clone())),
+            ..ElementStyleKey::default()
+        };
+
+        assert_eq!(computed_box_style(&style, &th(10)).display, None);
+        assert_eq!(
+            computed_box_style(&style, &th(11)).display,
+            Some(CssDisplay::None)
+        );
+        assert_eq!(
+            computed_box_style(&style, &th(14)).display,
             Some(CssDisplay::None)
         );
     }
@@ -8561,6 +8804,79 @@ mod tests {
             computed_box_style(&style, &child("footer", "primary")).background,
             Some(Color32::from_rgb(0xff, 0x6b, 0x6b))
         );
+    }
+
+    #[test]
+    fn meteo_sidebar_child_descendant_selector_chains_apply() {
+        let style = parse_basic_css(
+            r#"
+            .llWYdN > ul .containerSliderLink {
+                display: flex;
+                flex-direction: column;
+            }
+            .llWYdN > ul > div > a {
+                display: flex;
+                align-items: center;
+                width: 100%;
+                padding-left: 20px;
+                padding-right: 20px;
+                height: 50px;
+                box-sizing: border-box;
+            }
+            .llWYdN > ul > div > a > span {
+                display: flex;
+                width: 50px;
+            }
+            .llWYdN > ul > div > a > div:not(.containerSliderLink):not(.dividerLocation) {
+                display: flex;
+                flex-grow: 2;
+                align-items: center;
+            }
+            "#,
+        );
+        let card = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["llWYdN".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let list = ElementStyleKey {
+            tag: "ul".to_owned(),
+            parent: Some(Box::new(card)),
+            ..ElementStyleKey::default()
+        };
+        let wrapper = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["containerSliderLink".to_owned()],
+            parent: Some(Box::new(list.clone())),
+            ..ElementStyleKey::default()
+        };
+        let link = ElementStyleKey {
+            tag: "a".to_owned(),
+            parent: Some(Box::new(wrapper.clone())),
+            ..ElementStyleKey::default()
+        };
+        let temps = ElementStyleKey {
+            tag: "span".to_owned(),
+            parent: Some(Box::new(link.clone())),
+            ..ElementStyleKey::default()
+        };
+        let city = ElementStyleKey {
+            tag: "div".to_owned(),
+            parent: Some(Box::new(link)),
+            ..ElementStyleKey::default()
+        };
+
+        let wrapper_style = computed_box_style(&style, &wrapper);
+        assert_eq!(wrapper_style.display, Some(CssDisplay::Flex));
+        assert_eq!(wrapper_style.flex_direction, Some(CssFlexDirection::Column));
+
+        let temps_style = computed_box_style(&style, &temps);
+        assert_eq!(temps_style.display, Some(CssDisplay::Flex));
+        assert_eq!(temps_style.width, Some(CssLength::Px(50.0)));
+
+        let city_style = computed_box_style(&style, &city);
+        assert_eq!(city_style.display, Some(CssDisplay::Flex));
+        assert_eq!(city_style.flex_grow, Some(2.0));
     }
 
     #[test]

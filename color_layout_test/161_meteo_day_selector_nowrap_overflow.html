@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>153 meteo day selector nowrap overflow</title>
+<style>
+body { margin: 0; background: #f5f7fa; font-family: Arial, sans-serif; }
+.strip { width: 520px; margin: 32px auto; display: flex; gap: 10px; overflow-x: auto; background: #ffffff; padding: 12px; }
+.day { flex: 0 0 auto; width: 108px; height: 56px; background: #d0ebff; display: flex; align-items: center; justify-content: center; white-space: nowrap; font-weight: 700; }
+.active { background: #ffd43b; }
+</style>
+</head>
+<body>
+<nav class="strip">
+  <a class="day active">Oggi 27°</a>
+  <a class="day">Domani 26°</a>
+  <a class="day">Domenica 25°</a>
+  <a class="day">Lunedi 28°</a>
+  <a class="day">Martedi 29°</a>
+</nav>
+</body>
+</html>

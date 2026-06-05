@@ -3579,6 +3579,15 @@ fn seed_script_computed_styles_from_html(
                 CssDisplay::Flex => "flex",
                 CssDisplay::Grid => "grid",
                 CssDisplay::Table => "table",
+                CssDisplay::InlineTable => "inline-table",
+                CssDisplay::TableCaption => "table-caption",
+                CssDisplay::TableRowGroup => "table-row-group",
+                CssDisplay::TableHeaderGroup => "table-header-group",
+                CssDisplay::TableFooterGroup => "table-footer-group",
+                CssDisplay::TableRow => "table-row",
+                CssDisplay::TableCell => "table-cell",
+                CssDisplay::TableColumn => "table-column",
+                CssDisplay::TableColumnGroup => "table-column-group",
                 CssDisplay::ListItem => "list-item",
             };
             props.insert("display".to_owned(), display_str.to_owned());
@@ -8146,6 +8155,7 @@ fn dom_start_tag_implicitly_closes(closing_tag: &str, html: &str) -> bool {
             "tbody" | "tfoot" | "thead" | "caption" | "colgroup" | "col"
         ),
         "caption" | "colgroup" => matches!(next, "tbody" | "tfoot" | "thead" | "tr" | "td" | "th"),
+        "li" => matches!(next, "li"),
         _ => {
             // If malformed table markup leaves inline/container tags open inside
             // a cell, a following cell/row boundary must unwind those tags so the
@@ -8177,6 +8187,7 @@ fn dom_end_tag_implicitly_closes(closing_tag: &str, found_tag: &str) -> bool {
     let closing = closing_tag.to_ascii_lowercase();
     let found = found_tag.to_ascii_lowercase();
     match closing.as_str() {
+        "li" => matches!(found.as_str(), "ul" | "ol" | "body" | "html"),
         "td" | "th" => matches!(
             found.as_str(),
             "tr" | "tbody" | "tfoot" | "thead" | "table" | "body" | "html"
@@ -9994,9 +10005,60 @@ fn default_display_for_tag(tag: &str) -> CssDisplay {
         "img" | "input" | "textarea" | "select" | "button" | "svg" => CssDisplay::InlineBlock,
         "li" => CssDisplay::ListItem,
         "table" => CssDisplay::Table,
+        "caption" => CssDisplay::TableCaption,
+        "thead" => CssDisplay::TableHeaderGroup,
+        "tbody" => CssDisplay::TableRowGroup,
+        "tfoot" => CssDisplay::TableFooterGroup,
+        "tr" => CssDisplay::TableRow,
+        "td" | "th" => CssDisplay::TableCell,
+        "col" => CssDisplay::TableColumn,
+        "colgroup" => CssDisplay::TableColumnGroup,
         "script" | "style" | "template" | "noscript" => CssDisplay::None,
         _ => CssDisplay::Block,
     }
+}
+
+fn css_display_is_table_container(display: CssDisplay) -> bool {
+    matches!(display, CssDisplay::Table | CssDisplay::InlineTable)
+}
+
+fn css_display_is_table_row_group(display: CssDisplay) -> bool {
+    matches!(
+        display,
+        CssDisplay::TableRowGroup | CssDisplay::TableHeaderGroup | CssDisplay::TableFooterGroup
+    )
+}
+
+fn css_display_is_table_row(display: CssDisplay) -> bool {
+    matches!(display, CssDisplay::TableRow)
+}
+
+fn css_display_is_table_cell(display: CssDisplay) -> bool {
+    matches!(display, CssDisplay::TableCell)
+}
+
+fn css_display_is_table_caption(display: CssDisplay) -> bool {
+    matches!(display, CssDisplay::TableCaption)
+}
+
+fn css_display_is_block_boundary(display: CssDisplay) -> bool {
+    matches!(
+        display,
+        CssDisplay::Block
+            | CssDisplay::Flex
+            | CssDisplay::Grid
+            | CssDisplay::Table
+            | CssDisplay::InlineTable
+            | CssDisplay::TableCaption
+            | CssDisplay::TableRowGroup
+            | CssDisplay::TableHeaderGroup
+            | CssDisplay::TableFooterGroup
+            | CssDisplay::TableRow
+            | CssDisplay::TableCell
+            | CssDisplay::TableColumn
+            | CssDisplay::TableColumnGroup
+            | CssDisplay::ListItem
+    )
 }
 
 fn apply_css_box_style(
@@ -10329,6 +10391,7 @@ struct CanvasFormMetadata {
 #[derive(Clone, Debug)]
 struct CanvasInlineRun {
     text: String,
+    replaced: Option<CanvasInlineReplaced>,
     style: ResolvedBoxStyle,
     href: Option<String>,
     element_id: Option<String>,
@@ -10336,8 +10399,15 @@ struct CanvasInlineRun {
 }
 
 #[derive(Clone, Debug)]
+struct CanvasInlineReplaced {
+    content: CanvasBlock,
+    size: egui::Vec2,
+}
+
+#[derive(Clone, Debug)]
 struct CanvasLineFragment {
     text: String,
+    replaced: Option<CanvasInlineReplaced>,
     style: ResolvedBoxStyle,
     href: Option<String>,
     element_id: Option<String>,
@@ -10530,6 +10600,15 @@ fn css_layout_kind_from_display(display: CssDisplay) -> CssLayoutKind {
         | CssDisplay::Flex
         | CssDisplay::Grid
         | CssDisplay::Table
+        | CssDisplay::InlineTable
+        | CssDisplay::TableCaption
+        | CssDisplay::TableRowGroup
+        | CssDisplay::TableHeaderGroup
+        | CssDisplay::TableFooterGroup
+        | CssDisplay::TableRow
+        | CssDisplay::TableCell
+        | CssDisplay::TableColumn
+        | CssDisplay::TableColumnGroup
         | CssDisplay::ListItem => CssLayoutKind::Block,
     }
 }
@@ -10897,7 +10976,9 @@ fn layout_css_box(
             layout_css_block_children(box_, source, image_height_auto, text_metrics)
         }
         CssLayoutKind::AnonymousBlock => {
-            if css_layout_box_needs_inline_visual_layout(box_) {
+            if css_layout_box_needs_inline_visual_layout(box_)
+                && !css_layout_box_can_line_flow_replaced_content(box_)
+            {
                 layout_css_inline_visual_children(
                     box_,
                     source,
@@ -10905,10 +10986,16 @@ fn layout_css_box(
                     text_metrics,
                     content_width,
                 )
-            } else if css_layout_box_contains_replaced_or_special(box_) {
+            } else if css_layout_box_contains_text_form_control(box_) {
                 layout_css_block_children(box_, source, image_height_auto, text_metrics)
             } else {
-                measure_css_inline_children_height(&box_.children, content_width, text_metrics)
+                measure_css_inline_children_height(
+                    &box_.children,
+                    content_width,
+                    source,
+                    image_height_auto,
+                    text_metrics,
+                )
             }
         }
         CssLayoutKind::Text => box_
@@ -10936,7 +11023,9 @@ fn layout_css_box(
                     )
                 } else if css_layout_inline_box_should_layout_block_children(box_) {
                     layout_css_block_children(box_, source, image_height_auto, text_metrics)
-                } else if css_layout_box_needs_inline_visual_layout(box_) {
+                } else if css_layout_box_needs_inline_visual_layout(box_)
+                    && !css_layout_box_can_line_flow_replaced_content(box_)
+                {
                     layout_css_inline_visual_children(
                         box_,
                         source,
@@ -10945,13 +11034,21 @@ fn layout_css_box(
                         content_width,
                     )
                 } else {
-                    measure_css_inline_children_height(&box_.children, content_width, text_metrics)
-                        .max((box_.style.font_size * 1.35).max(1.0))
+                    measure_css_inline_children_height(
+                        &box_.children,
+                        content_width,
+                        source,
+                        image_height_auto,
+                        text_metrics,
+                    )
+                    .max((box_.style.font_size * 1.35).max(1.0))
                 }
             } else {
                 if css_layout_inline_box_should_layout_block_children(box_) {
                     layout_css_block_children(box_, source, image_height_auto, text_metrics)
-                } else if css_layout_box_needs_inline_visual_layout(box_) {
+                } else if css_layout_box_needs_inline_visual_layout(box_)
+                    && !css_layout_box_can_line_flow_replaced_content(box_)
+                {
                     layout_css_inline_visual_children(
                         box_,
                         source,
@@ -10960,8 +11057,14 @@ fn layout_css_box(
                         content_width,
                     )
                 } else {
-                    measure_css_inline_children_height(&box_.children, content_width, text_metrics)
-                        .max((box_.style.font_size * 1.35).max(1.0))
+                    measure_css_inline_children_height(
+                        &box_.children,
+                        content_width,
+                        source,
+                        image_height_auto,
+                        text_metrics,
+                    )
+                    .max((box_.style.font_size * 1.35).max(1.0))
                 }
             }
         }
@@ -10984,9 +11087,16 @@ fn layout_css_box(
                     )
                 } else if !box_.children.is_empty()
                     && box_.children.iter().all(css_layout_box_is_inline_level)
-                    && !css_layout_box_needs_inline_visual_layout(box_)
+                    && (!css_layout_box_needs_inline_visual_layout(box_)
+                        || css_layout_box_can_line_flow_replaced_content(box_))
                 {
-                    measure_css_inline_children_height(&box_.children, content_width, text_metrics)
+                    measure_css_inline_children_height(
+                        &box_.children,
+                        content_width,
+                        source,
+                        image_height_auto,
+                        text_metrics,
+                    )
                 } else {
                     layout_css_block_children(box_, source, image_height_auto, text_metrics)
                 }
@@ -10996,9 +11106,14 @@ fn layout_css_box(
         }
     };
 
-    let inline_visual_height =
-        css_layout_inline_flow_visual_height(box_, content_width, text_metrics)
-            .unwrap_or(intrinsic_height);
+    let inline_visual_height = css_layout_inline_flow_visual_height(
+        box_,
+        content_width,
+        source,
+        image_height_auto,
+        text_metrics,
+    )
+    .unwrap_or(intrinsic_height);
     let mut content_height = css_resolve_used_height(
         intrinsic_height,
         &box_.style,
@@ -11067,6 +11182,8 @@ fn apply_css_horizontal_auto_margins(
 fn css_layout_inline_flow_visual_height(
     box_: &CssLayoutBox<'_>,
     content_width: f32,
+    source: &str,
+    image_height_auto: bool,
     text_metrics: Option<&egui::Context>,
 ) -> Option<f32> {
     if box_.kind == CssLayoutKind::Text {
@@ -11074,16 +11191,16 @@ fn css_layout_inline_flow_visual_height(
     }
     if box_.children.is_empty()
         || !box_.children.iter().all(css_layout_box_is_inline_level)
-        || box_
-            .children
-            .iter()
-            .any(css_layout_box_contains_replaced_or_special)
+        || (css_layout_box_needs_inline_visual_layout(box_)
+            && !css_layout_box_can_line_flow_replaced_content(box_))
     {
         return None;
     }
     Some(measure_css_inline_children_height(
         &box_.children,
         content_width,
+        source,
+        image_height_auto,
         text_metrics,
     ))
 }
@@ -11098,6 +11215,22 @@ fn css_layout_box_needs_inline_visual_layout(box_: &CssLayoutBox<'_>) -> bool {
                 || child.style.min_height.is_some()
                 || css_layout_box_needs_inline_visual_layout(child)
         })
+}
+
+fn css_layout_box_can_line_flow_replaced_content(box_: &CssLayoutBox<'_>) -> bool {
+    box_.flags.contains_visual_replaced_content && css_layout_box_has_visible_text(box_)
+}
+
+fn css_layout_box_has_visible_text(box_: &CssLayoutBox<'_>) -> bool {
+    if box_.kind == CssLayoutKind::Text
+        && box_
+            .text
+            .as_deref()
+            .is_some_and(|text| !normalize_ws(text).is_empty())
+    {
+        return true;
+    }
+    box_.children.iter().any(css_layout_box_has_visible_text)
 }
 
 fn css_layout_visible_text_line_height(box_: &CssLayoutBox<'_>) -> f32 {
@@ -11781,13 +11914,12 @@ fn layout_css_flex_item_box(
     text_metrics: Option<&egui::Context>,
 ) {
     let item_width = item_width.max(1.0);
-    let resolved_percentage_width = child.style.width_percent.is_some();
     let old_width = child.style.width;
     let old_width_percent = child.style.width_percent;
-    if resolved_percentage_width {
-        child.style.width = Some(item_width);
-        child.style.width_percent = None;
-    }
+    let old_max_width_percent = child.style.max_width_percent;
+    child.style.width = Some(item_width);
+    child.style.width_percent = None;
+    child.style.max_width_percent = None;
     layout_css_box(
         child,
         0.0,
@@ -11798,10 +11930,9 @@ fn layout_css_flex_item_box(
         image_height_auto,
         text_metrics,
     );
-    if resolved_percentage_width {
-        child.style.width = old_width;
-        child.style.width_percent = old_width_percent;
-    }
+    child.style.width = old_width;
+    child.style.width_percent = old_width_percent;
+    child.style.max_width_percent = old_max_width_percent;
 }
 
 fn css_flex_row_item_widths(
@@ -13869,6 +14000,8 @@ fn layout_css_out_of_flow_child(
 fn measure_css_inline_children_height(
     children: &[CssLayoutBox<'_>],
     width: f32,
+    source: &str,
+    image_height_auto: bool,
     text_metrics: Option<&egui::Context>,
 ) -> f32 {
     let mut runs = Vec::new();
@@ -14281,6 +14414,8 @@ fn push_canvas_graph_layout_box(
             } else {
                 push_canvas_graph_layout_inline_children(
                     &box_.children,
+                    source,
+                    image_height_auto,
                     text_metrics,
                     inherited_href,
                     css_layout_box_preserves_whitespace(box_),
@@ -14430,6 +14565,8 @@ fn push_canvas_graph_layout_box(
                         {
                             push_canvas_graph_layout_inline_children(
                                 &box_.children,
+                                source,
+                                image_height_auto,
                                 text_metrics,
                                 href,
                                 css_layout_box_preserves_whitespace(box_),
@@ -14506,6 +14643,8 @@ fn push_canvas_graph_layout_box(
                         {
                             push_canvas_graph_layout_inline_children(
                                 &box_.children,
+                                source,
+                                image_height_auto,
                                 text_metrics,
                                 href,
                                 css_layout_box_preserves_whitespace(box_),
@@ -15056,7 +15195,7 @@ fn push_canvas_graph_element(
             }
             push_canvas_graph_button_hit_target(element, node, button_rect, cursor, graph);
         }
-        "table" => {
+        _ if css_display_is_table_container(node.style.display) => {
             push_canvas_graph_table(node, text_metrics, cursor, graph);
         }
         "ul" | "ol" if node.style.display == CssDisplay::Block => {
@@ -15402,6 +15541,8 @@ fn is_inline_flow_node(node: &RenderNode) -> bool {
 
 fn push_canvas_graph_layout_inline_children(
     children: &[CssLayoutBox<'_>],
+    source: &str,
+    image_height_auto: bool,
     text_metrics: Option<&egui::Context>,
     inherited_href: Option<&str>,
     preserve_whitespace: bool,
@@ -15445,6 +15586,7 @@ fn collect_canvas_layout_inline_runs(
                     flush_canvas_pending_space(runs, pending_space);
                     runs.push(CanvasInlineRun {
                         text: text.clone(),
+                        replaced: None,
                         style: box_.style.clone(),
                         href: inherited_href.map(str::to_owned),
                         element_id: inherited_link_element_id.map(str::to_owned),
@@ -15479,6 +15621,7 @@ fn collect_canvas_layout_inline_runs(
             }
             runs.push(CanvasInlineRun {
                 text,
+                replaced: None,
                 style: box_.style.clone(),
                 href: inherited_href.map(str::to_owned),
                 element_id: inherited_link_element_id.map(str::to_owned),
@@ -15576,6 +15719,7 @@ fn collect_canvas_inline_runs(
                     flush_canvas_pending_space(runs, pending_space);
                     runs.push(CanvasInlineRun {
                         text: decoded,
+                        replaced: None,
                         style: node.style.clone(),
                         href: inherited_href.map(str::to_owned),
                         element_id: inherited_link_element_id.map(str::to_owned),
@@ -15610,6 +15754,7 @@ fn collect_canvas_inline_runs(
             }
             runs.push(CanvasInlineRun {
                 text,
+                replaced: None,
                 style: node.style.clone(),
                 href: inherited_href.map(str::to_owned),
                 element_id: inherited_link_element_id.map(str::to_owned),
@@ -15670,6 +15815,7 @@ fn mark_canvas_pending_space(
 ) {
     *pending_space = Some(CanvasInlineRun {
         text: " ".to_owned(),
+        replaced: None,
         style: style.clone(),
         href: href.map(str::to_owned),
         element_id: element_id.map(str::to_owned),
@@ -15697,6 +15843,7 @@ fn push_canvas_inline_space_run(
     if !runs.is_empty() {
         runs.push(CanvasInlineRun {
             text: " ".to_owned(),
+            replaced: None,
             style: style.clone(),
             href: href.map(str::to_owned),
             element_id: element_id.map(str::to_owned),
@@ -15986,6 +16133,7 @@ fn push_line_fragment(
     let height = size.y.max((run.style.font_size * 1.35).max(1.0));
     line.fragments.push(CanvasLineFragment {
         text,
+        replaced: run.replaced.clone(),
         style: run.style.clone(),
         href: run.href.clone(),
         element_id: run.element_id.clone(),
@@ -16323,18 +16471,15 @@ fn collect_table_rows(node: &RenderNode) -> Vec<Vec<&RenderNode>> {
 }
 
 fn collect_table_rows_inner<'a>(node: &'a RenderNode, rows: &mut Vec<Vec<&'a RenderNode>>) {
-    if let RenderNodeKind::Element(element) = &node.kind {
-        if element.tag_name == "tr" {
+    if matches!(node.kind, RenderNodeKind::Element(_)) {
+        if css_display_is_table_row(node.style.display) {
             let cells = node
                 .children
                 .iter()
                 .filter(|child| {
-                    matches!(
-                        &child.kind,
-                        RenderNodeKind::Element(element)
-                            if (element.tag_name == "th" || element.tag_name == "td")
-                                && child.style.display != CssDisplay::None
-                    )
+                    matches!(child.kind, RenderNodeKind::Element(_))
+                        && css_display_is_table_cell(child.style.display)
+                        && child.style.display != CssDisplay::None
                 })
                 .collect::<Vec<_>>();
             if !cells.is_empty() {
@@ -16342,17 +16487,14 @@ fn collect_table_rows_inner<'a>(node: &'a RenderNode, rows: &mut Vec<Vec<&'a Ren
             }
             return;
         }
-        if matches!(element.tag_name.as_str(), "thead" | "tbody" | "tfoot") {
+        if css_display_is_table_row_group(node.style.display) {
             let cells = node
                 .children
                 .iter()
                 .filter(|child| {
-                    matches!(
-                        &child.kind,
-                        RenderNodeKind::Element(element)
-                            if (element.tag_name == "th" || element.tag_name == "td")
-                                && child.style.display != CssDisplay::None
-                    )
+                    matches!(child.kind, RenderNodeKind::Element(_))
+                        && css_display_is_table_cell(child.style.display)
+                        && child.style.display != CssDisplay::None
                 })
                 .collect::<Vec<_>>();
             if !cells.is_empty() {
@@ -16368,10 +16510,9 @@ fn collect_table_rows_inner<'a>(node: &'a RenderNode, rows: &mut Vec<Vec<&'a Ren
 
 fn table_caption_text(node: &RenderNode) -> Option<String> {
     node.children.iter().find_map(|child| {
-        if matches!(
-            &child.kind,
-            RenderNodeKind::Element(element) if element.tag_name == "caption"
-        ) {
+        if matches!(child.kind, RenderNodeKind::Element(_))
+            && css_display_is_table_caption(child.style.display)
+        {
             let text = render_node_text_content(child);
             if text.is_empty() { None } else { Some(text) }
         } else {
@@ -16534,7 +16675,10 @@ fn table_cell_span(node: &RenderNode, attr: &str) -> usize {
 fn is_table_header_cell(node: &RenderNode) -> bool {
     matches!(
         &node.kind,
-        RenderNodeKind::Element(element) if element.tag_name == "th"
+        RenderNodeKind::Element(element)
+            if element.tag_name == "th"
+                || (css_display_is_table_cell(node.style.display)
+                    && element.attr("scope").is_some())
     )
 }
 
@@ -17025,10 +17169,7 @@ fn push_render_node_own_inline_text(node: &RenderNode, out: &mut String) {
 }
 
 fn is_block_boundary(node: &RenderNode) -> bool {
-    matches!(
-        node.style.display,
-        CssDisplay::Block | CssDisplay::Flex | CssDisplay::Grid | CssDisplay::Table
-    )
+    css_display_is_block_boundary(node.style.display)
 }
 
 fn paragraph_blocks_from_render_node(
@@ -20355,6 +20496,28 @@ mod tests {
     }
 
     #[test]
+    fn dom_parser_auto_closes_repeated_list_items() {
+        let document = parse_dom_document(
+            r#"<html><body><ul><li><span>First</span><li><span>Second</span><li>Third</ul><p>After</p></body></html>"#,
+        );
+        let list = document.first_descendant_by_tag("ul").unwrap();
+        let items = list
+            .children
+            .iter()
+            .filter_map(|child| match child {
+                DomNode::Element(element) if element.tag_name == "li" => Some(element),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].text_content(), "First");
+        assert_eq!(items[1].text_content(), "Second");
+        assert_eq!(items[2].text_content(), "Third");
+        assert!(document.first_descendant_by_tag("p").is_some());
+    }
+
+    #[test]
     fn image_source_selection_supports_lazy_and_srcset_attributes() {
         assert_eq!(
             preferred_image_source_from_tag(r#"<img data-src="/lazy.png">"#).as_deref(),
@@ -20742,6 +20905,7 @@ mod tests {
         let runs = vec![
             CanvasInlineRun {
                 text: "link".to_owned(),
+                replaced: None,
                 style: style.clone(),
                 href: Some("#link".to_owned()),
                 element_id: None,
@@ -20749,6 +20913,7 @@ mod tests {
             },
             CanvasInlineRun {
                 text: " alpha beta gamma".to_owned(),
+                replaced: None,
                 style,
                 href: None,
                 element_id: None,
@@ -20779,6 +20944,7 @@ mod tests {
         };
         let runs = vec![CanvasInlineRun {
             text: "Link".to_owned(),
+            replaced: None,
             style: style.clone(),
             href: Some("#link".to_owned()),
             element_id: None,
@@ -21058,6 +21224,50 @@ mod tests {
         assert_eq!(top.rect.left(), bottom.rect.left());
         assert!(top.rect.left() >= tall.rect.right());
         assert!(bottom.rect.top() > top.rect.top());
+    }
+
+    #[test]
+    fn css_display_table_roles_generate_table_cells() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  .forecast { display: table; width: 600px; }
+                  .row { display: table-row; }
+                  .cell { display: table-cell; padding: 4px; }
+                  .time { width: 15%; }
+                  .description { width: 55%; }
+                  .temp { width: 30%; }
+                </style>
+              </head>
+              <body style="padding: 0;">
+                <div class="forecast">
+                  <div class="row">
+                    <div class="cell time">15:00</div>
+                    <div class="cell description">Sereno con foschia</div>
+                    <div class="cell temp">25 C</div>
+                  </div>
+                </div>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let time = find_canvas_cell_rect(&document.canvas_graph, "15:00").expect("time cell");
+        let description = find_canvas_cell_rect(&document.canvas_graph, "Sereno con foschia")
+            .expect("description cell");
+        let temp = find_canvas_cell_rect(&document.canvas_graph, "25 C").expect("temp cell");
+
+        assert!(description.rect.left() > time.rect.left());
+        assert!(temp.rect.left() > description.rect.left());
+        assert!(
+            description.rect.width() > time.rect.width(),
+            "CSS table roles should preserve declared table-cell sizing: {:?} vs {:?}",
+            description.rect,
+            time.rect
+        );
     }
 
     #[test]
@@ -26652,6 +26862,49 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
             action.rect.left() > 1100.0,
             "action should be near the full header right edge, got {:?}",
             action.rect
+        );
+    }
+
+    #[test]
+    fn flex_basis_and_matching_max_width_percent_are_not_applied_twice() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .row { display: flex; flex-wrap: wrap; width: 960px; }
+                  .main {
+                    box-sizing: border-box;
+                    flex: 0 0 66.666%;
+                    max-width: 66.666%;
+                    padding: 0 8px;
+                  }
+                  .side {
+                    box-sizing: border-box;
+                    flex: 0 0 33.333%;
+                    max-width: 33.333%;
+                    padding: 0 8px;
+                  }
+                  .card { border-radius: 13px; background: #fff; }
+                </style>
+              </head>
+              <body>
+                <div class="row">
+                  <div class="main"><div class="card">Main column</div></div>
+                  <aside class="side"><div class="card">Side column</div></aside>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let side = find_canvas_text(&document.canvas_graph, "Side column").expect("side text");
+        assert!(
+            side.rect.left() > 620.0,
+            "side column should start after the two-thirds main column, got {:?}",
+            side.rect
         );
     }
 

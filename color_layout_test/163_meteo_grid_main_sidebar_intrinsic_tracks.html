@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>155 meteo grid main sidebar intrinsic tracks</title>
+<style>
+body { margin: 0; background: #f5f7fa; font-family: Arial, sans-serif; }
+.layout { width: 960px; margin: 32px auto; display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 24px; align-items: start; }
+.main { background: #d0ebff; padding: 18px; font-size: 22px; line-height: 1.35; }
+.sidebar { background: #ffffff; display: grid; gap: 10px; padding: 12px; }
+.city { display: flex; justify-content: space-between; background: #b2f2bb; padding: 8px; white-space: nowrap; }
+.temp { background: #ffc9c9; padding: 0 6px; }
+</style>
+</head>
+<body>
+<main class="layout">
+  <section class="main">Forecast article text should keep a broad readable column and not collapse next to the sidebar.</section>
+  <aside class="sidebar">
+    <a class="city"><span>Milano</span><span class="temp">25°</span></a>
+    <a class="city"><span>Napoli</span><span class="temp">26°</span></a>
+    <a class="city"><span>Torino</span><span class="temp">24°</span></a>
+  </aside>
+</main>
+</body>
+</html>

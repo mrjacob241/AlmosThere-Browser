@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>149 CSS display table roles weather strip</title>
+  <style>
+    body { margin: 0; font-family: Arial, sans-serif; background: #f8f9fa; }
+    .page { width: 960px; margin: 32px auto; background: #ffffff; padding: 24px; }
+    .forecast { display: table; width: 100%; border-collapse: collapse; background: #dbe4ff; }
+    .head, .row { display: table-row; }
+    .cell { display: table-cell; padding: 10px 12px; border: 4px solid #ffffff; vertical-align: middle; }
+    .head .cell { background: #748ffc; color: #ffffff; font-weight: bold; }
+    .time { width: 12%; background: #ffd43b; }
+    .icon { width: 12%; background: #ffc9c9; text-align: center; }
+    .desc { width: 36%; background: #d0bfff; }
+    .temp { width: 16%; background: #ff922b; text-align: right; }
+    .wind { width: 24%; background: #63e6be; }
+    .symbol { display: inline-block; width: 32px; height: 32px; background: #5c7cfa; }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="forecast">
+      <div class="head">
+        <div class="cell time">Ora</div>
+        <div class="cell icon">Icona</div>
+        <div class="cell desc">Previsione</div>
+        <div class="cell temp">Temperatura</div>
+        <div class="cell wind">Vento</div>
+      </div>
+      <div class="row">
+        <div class="cell time">15:00</div>
+        <div class="cell icon"><span class="symbol"></span></div>
+        <div class="cell desc">Sereno con foschia leggera</div>
+        <div class="cell temp">25°C</div>
+        <div class="cell wind">Nord Est 9-13 Km/h</div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

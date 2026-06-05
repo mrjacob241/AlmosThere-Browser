@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>152 meteo absolute header controls containing block</title>
+<style>
+body { margin: 0; background: #f5f7fa; font-family: Arial, sans-serif; }
+.header { position: relative; width: 900px; height: 96px; margin: 24px auto; background: #1864ab; }
+.logo { position: absolute; left: 24px; top: 24px; width: 120px; height: 40px; background: #ffd43b; }
+.search { position: absolute; left: 180px; right: 220px; top: 24px; height: 40px; background: #ffffff; }
+.icons { position: absolute; right: 24px; top: 24px; display: flex; gap: 8px; }
+.icon { width: 40px; height: 40px; background: #ffc9c9; }
+.content { width: 900px; margin: 0 auto; height: 140px; background: #b2f2bb; }
+</style>
+</head>
+<body>
+<header class="header">
+  <div class="logo"></div>
+  <div class="search"></div>
+  <div class="icons"><div class="icon"></div><div class="icon"></div><div class="icon"></div></div>
+</header>
+<main class="content"></main>
+</body>
+</html>

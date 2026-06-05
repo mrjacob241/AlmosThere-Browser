@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>151 meteo missing image fixed media slot</title>
+<style>
+body { margin: 0; background: #f5f7fa; font-family: Arial, sans-serif; }
+.card { width: 520px; margin: 32px auto; padding: 16px; background: #ffffff; display: flex; gap: 16px; align-items: center; }
+.media { width: 96px; height: 72px; flex: 0 0 96px; background: #adb5bd; overflow: hidden; }
+.media img { display: block; width: 96px; height: 72px; object-fit: cover; }
+.copy { flex: 1 1 auto; min-width: 0; background: #d0ebff; font-size: 18px; }
+.badge { flex: 0 0 auto; background: #ffc9c9; padding: 8px; white-space: nowrap; }
+</style>
+</head>
+<body>
+<article class="card">
+  <div class="media"><img src="missing-weather-icon-for-diagnostic.png" alt="weather"></div>
+  <div class="copy">Missing icon should reserve the media slot and not become filename text.</div>
+  <div class="badge">UV 7</div>
+</article>
+</body>
+</html>

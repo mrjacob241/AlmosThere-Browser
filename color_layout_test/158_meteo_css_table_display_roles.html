@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>150 meteo css table display roles</title>
+<style>
+body { margin: 0; background: #f5f7fa; font-family: Arial, sans-serif; }
+.table { display: table; width: 720px; margin: 32px auto; border-spacing: 0; background: #ffffff; }
+.row { display: table-row; }
+.cell { display: table-cell; padding: 10px 12px; border: 2px solid #ffffff; background: #d0ebff; font-size: 17px; }
+.time { width: 90px; background: #ffd43b; white-space: nowrap; }
+.temp { width: 80px; background: #ffc9c9; white-space: nowrap; font-weight: 700; }
+.desc { background: #b2f2bb; }
+</style>
+</head>
+<body>
+<section class="table">
+  <div class="row">
+    <span class="cell time">Ora 12</span>
+    <span class="cell desc">Cielo poco nuvoloso con descrizione non collassata</span>
+    <span class="cell temp">27°</span>
+  </div>
+  <div class="row">
+    <span class="cell time">Ora 18</span>
+    <span class="cell desc">Vento moderato da nord-est</span>
+    <span class="cell temp">24°</span>
+  </div>
+</section>
+</body>
+</html>

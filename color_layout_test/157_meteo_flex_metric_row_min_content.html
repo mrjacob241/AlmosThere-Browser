@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>149 meteo flex metric row min content</title>
+<style>
+body { margin: 0; background: #f5f7fa; font-family: Arial, sans-serif; }
+.page { width: 760px; margin: 32px auto; background: #ffffff; padding: 20px; }
+.row { display: flex; align-items: center; gap: 12px; width: 620px; min-height: 56px; background: #d0ebff; }
+.icon { flex: 0 0 48px; height: 40px; background: #ffd43b; }
+.label { flex: 1 1 auto; min-width: 0; background: #b2f2bb; font-size: 18px; }
+.metric { flex: 0 0 auto; background: #ffc9c9; padding: 6px 10px; white-space: nowrap; font-weight: 700; }
+</style>
+</head>
+<body>
+<main class="page">
+  <div class="row">
+    <div class="icon"></div>
+    <div class="label">Previsione oraria con vento e umidita leggibile su una singola riga elastica</div>
+    <div class="metric">26°</div>
+    <div class="metric">76%</div>
+    <div class="metric">9-13 Km/h</div>
+  </div>
+</main>
+</body>
+</html>

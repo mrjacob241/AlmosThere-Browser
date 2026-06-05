@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>150 malformed table cells auto close</title>
+  <style>
+    body { margin: 0; font-family: Arial, sans-serif; background: #f1f3f5; }
+    .page { width: 920px; margin: 28px auto; background: #ffffff; padding: 22px; }
+    table { width: 100%; border-collapse: collapse; background: #e7f5ff; }
+    th, td { padding: 12px; border: 4px solid #ffffff; text-align: left; }
+    th { background: #4dabf7; color: #ffffff; }
+    td:nth-child(1) { background: #ffd43b; width: 18%; }
+    td:nth-child(2) { background: #d0bfff; width: 42%; }
+    td:nth-child(3) { background: #ff922b; width: 18%; }
+    td:nth-child(4) { background: #63e6be; width: 22%; }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <table>
+      <thead>
+        <tr><th>Ora<th>Descrizione<th>Temp<th>Vento
+      </thead>
+      <tbody>
+        <tr><td>15:00<td><span>Sereno</span><span> con velature</span><td>25°C<td>NE 10 Km/h
+        <tr><td>18:00<td>Nuvole sparse<td>23°C<td>NO 8 Km/h
+      </tbody>
+    </table>
+  </main>
+</body>
+</html>
