@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     net::{TcpListener, TcpStream},
@@ -7,7 +7,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex, OnceLock,
-        mpsc::{self, Receiver, TryRecvError},
+        mpsc::{self, Receiver, Sender, TryRecvError},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -416,6 +416,9 @@ struct AlmostThereApp {
     tabs: Vec<BrowserTabState>,
     active_tab_index: usize,
     next_tab_id: u64,
+    late_image_sender: Sender<LateImageResourceResult>,
+    late_image_receiver: Receiver<LateImageResourceResult>,
+    pending_late_images: HashSet<LateImageResourceKey>,
 }
 
 struct BrowserTabState {
@@ -597,6 +600,18 @@ struct PendingNavigation {
     receiver: Receiver<io::Result<PreparedNavigation>>,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct LateImageResourceKey {
+    tab_id: u64,
+    document_source: String,
+    image_url: String,
+}
+
+struct LateImageResourceResult {
+    key: LateImageResourceKey,
+    image: io::Result<ImageBlock>,
+}
+
 struct LoadedPageSource {
     html: String,
     source: String,
@@ -767,6 +782,8 @@ impl AlmostThereApp {
             document.source.clone(),
         );
 
+        let (late_image_sender, late_image_receiver) = mpsc::channel();
+
         let mut app = Self {
             canvas: BrowserCanvas::new(),
             debug_canvas: BrowserCanvas::new(),
@@ -798,6 +815,9 @@ impl AlmostThereApp {
             tabs: vec![initial_tab],
             active_tab_index: 0,
             next_tab_id: 1,
+            late_image_sender,
+            late_image_receiver,
+            pending_late_images: HashSet::new(),
         };
         app.start_navigation(
             initial_url.to_owned(),
@@ -858,6 +878,7 @@ impl AlmostThereApp {
         }
         let closing_active = index == self.active_tab_index;
         let closed = self.tabs.remove(index);
+        self.clear_late_images_for_tab(closed.id);
         self.telemetry.emit(
             "tab.closed",
             &[("id", &closed.id.to_string()), ("url", &closed.url)],
@@ -965,6 +986,7 @@ impl AlmostThereApp {
         fragment: Option<String>,
         history_action: NavigationHistoryAction,
     ) {
+        self.clear_late_images_for_tab(self.active_tab_id());
         let (sender, receiver) = mpsc::channel();
         let thread_url = url.clone();
         let timeout_enabled = self.page_loader_timeout_enabled;
@@ -1008,6 +1030,146 @@ impl AlmostThereApp {
             worker_trace_imported_bytes: 0,
             receiver,
         });
+    }
+
+    fn active_tab_id(&self) -> u64 {
+        self.tabs
+            .get(self.active_tab_index)
+            .map(|tab| tab.id)
+            .unwrap_or(0)
+    }
+
+    fn clear_late_images_for_tab(&mut self, tab_id: u64) {
+        let before = self.pending_late_images.len();
+        self.pending_late_images.retain(|key| key.tab_id != tab_id);
+        let removed = before.saturating_sub(self.pending_late_images.len());
+        if removed > 0 {
+            self.telemetry.emit(
+                "document.image.late.queue_cleared",
+                &[
+                    ("tab_id", &tab_id.to_string()),
+                    ("removed", &removed.to_string()),
+                ],
+            );
+        }
+    }
+
+    fn schedule_late_images_for_current_document(&mut self) {
+        let tab_id = self.active_tab_id();
+        let document_source = self.document.source.clone();
+        let candidates = late_image_candidates_from_document(&self.document);
+        for candidate in candidates {
+            let key = LateImageResourceKey {
+                tab_id,
+                document_source: document_source.clone(),
+                image_url: candidate.src,
+            };
+            if !self.pending_late_images.insert(key.clone()) {
+                continue;
+            }
+            let sender = self.late_image_sender.clone();
+            let requested_size = Some(candidate.size);
+            thread::spawn(move || {
+                emit_global_telemetry(
+                    "document.image.late.fetch.started",
+                    &[
+                        ("tab_id", &key.tab_id.to_string()),
+                        ("document", &key.document_source),
+                        ("url", &key.image_url),
+                    ],
+                );
+                let started = Instant::now();
+                let image = load_image_resource(&key.image_url, requested_size, false);
+                let elapsed_ms = started.elapsed().as_millis().to_string();
+                let status = if image.is_ok() { "ok" } else { "error" };
+                emit_global_telemetry(
+                    "document.image.late.fetch.completed",
+                    &[
+                        ("tab_id", &key.tab_id.to_string()),
+                        ("document", &key.document_source),
+                        ("url", &key.image_url),
+                        ("status", status),
+                        ("elapsed_ms", &elapsed_ms),
+                    ],
+                );
+                let _ = sender.send(LateImageResourceResult { key, image });
+            });
+        }
+    }
+
+    fn poll_late_image_resources(&mut self, ctx: &egui::Context) {
+        while let Ok(result) = self.late_image_receiver.try_recv() {
+            if !self.pending_late_images.remove(&result.key) {
+                self.telemetry.emit(
+                    "document.image.late.ignored",
+                    &[
+                        ("tab_id", &result.key.tab_id.to_string()),
+                        ("document", &result.key.document_source),
+                        ("url", &result.key.image_url),
+                        ("reason", "stale-or-closed"),
+                    ],
+                );
+                continue;
+            }
+            let image = match result.image {
+                Ok(image) => image,
+                Err(error) => {
+                    self.telemetry.emit(
+                        "document.image.late.failed",
+                        &[
+                            ("tab_id", &result.key.tab_id.to_string()),
+                            ("document", &result.key.document_source),
+                            ("url", &result.key.image_url),
+                            ("error", &error.to_string()),
+                        ],
+                    );
+                    continue;
+                }
+            };
+            if self.active_tab_id() == result.key.tab_id
+                && self.document.source == result.key.document_source
+            {
+                if apply_late_image_to_document(&mut self.document, &result.key.image_url, &image) {
+                    self.render_debug.object_limit = self.document.canvas_graph.objects.len();
+                    self.telemetry.emit(
+                        "document.image.late.applied",
+                        &[
+                            ("tab_id", &result.key.tab_id.to_string()),
+                            ("document", &result.key.document_source),
+                            ("url", &result.key.image_url),
+                            ("target", "active"),
+                        ],
+                    );
+                    ctx.request_repaint();
+                }
+                continue;
+            }
+            if let Some(tab) = self.tabs.iter_mut().find(|tab| {
+                tab.id == result.key.tab_id && tab.document.source == result.key.document_source
+            }) {
+                if apply_late_image_to_document(&mut tab.document, &result.key.image_url, &image) {
+                    self.telemetry.emit(
+                        "document.image.late.applied",
+                        &[
+                            ("tab_id", &result.key.tab_id.to_string()),
+                            ("document", &result.key.document_source),
+                            ("url", &result.key.image_url),
+                            ("target", "stored_tab"),
+                        ],
+                    );
+                }
+            } else {
+                self.telemetry.emit(
+                    "document.image.late.ignored",
+                    &[
+                        ("tab_id", &result.key.tab_id.to_string()),
+                        ("document", &result.key.document_source),
+                        ("url", &result.key.image_url),
+                        ("reason", "document-not-current"),
+                    ],
+                );
+            }
+        }
     }
 
     fn pending_loading_summary(&self) -> Option<(f32, String)> {
@@ -1191,6 +1353,7 @@ impl AlmostThereApp {
         if let Some(fragment) = fragment {
             self.scroll_to_fragment(&fragment);
         }
+        self.schedule_late_images_for_current_document();
         if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
             tab.title = if self.document.title.trim().is_empty() {
                 tab_title_from_url(&self.document.source)
@@ -6308,6 +6471,7 @@ impl App for AlmostThereApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         self.record_frame_events(ctx);
         self.poll_pending_navigation(ctx);
+        self.poll_late_image_resources(ctx);
 
         if self.script_state.has_pending_timers() {
             let elapsed_ms = self.page_loaded_at.elapsed().as_millis() as u64;
@@ -6328,6 +6492,7 @@ impl App for AlmostThereApp {
                     self.render_graph_debug_text =
                         parse_render_graph_debug_dump(&self.current_html, &self.document.source);
                 }
+                self.schedule_late_images_for_current_document();
             }
             self.text_metrics_ready = true;
         }
@@ -6391,7 +6556,8 @@ impl App for AlmostThereApp {
                 if let Some((progress, summary)) = self.pending_loading_summary() {
                     ui.separator();
                     ui.scope(|ui| {
-                        ui.visuals_mut().extreme_bg_color = egui::Color32::from_rgb(243, 226, 150);
+                        ui.visuals_mut().extreme_bg_color =
+                            egui::Color32::from_rgb(0xF3, 0xE2, 0x96);
                         ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
                         ui.add(
                             egui::ProgressBar::new(progress)
@@ -17743,6 +17909,141 @@ fn unavailable_image_block(
         src: src.into(),
         image: ImageBlock::from_color_image(PathBuf::from("unavailable-image"), size, color_image),
     }
+}
+
+#[derive(Clone, Debug)]
+struct LateImageCandidate {
+    src: String,
+    size: egui::Vec2,
+}
+
+fn late_image_candidates_from_document(document: &BrowserDocument) -> Vec<LateImageCandidate> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    collect_late_image_candidates_from_graph(&document.canvas_graph, &mut seen, &mut candidates);
+    collect_late_image_candidates_from_blocks(&document.blocks, &mut seen, &mut candidates);
+    candidates
+}
+
+fn collect_late_image_candidates_from_graph(
+    graph: &CanvasGraph,
+    seen: &mut HashSet<String>,
+    candidates: &mut Vec<LateImageCandidate>,
+) {
+    for object in &graph.objects {
+        let CanvasObject::Image(image) = object else {
+            continue;
+        };
+        collect_late_image_candidate(&image.src, image.image.size, &image.image, seen, candidates);
+    }
+}
+
+fn collect_late_image_candidates_from_blocks(
+    blocks: &[CanvasBlock],
+    seen: &mut HashSet<String>,
+    candidates: &mut Vec<LateImageCandidate>,
+) {
+    for block in blocks {
+        match block {
+            CanvasBlock::Image { src, image, .. } => {
+                collect_late_image_candidate(src, image.size, image, seen, candidates);
+            }
+            CanvasBlock::EcosiaHero { hero } => {
+                collect_late_image_candidate(
+                    &hero.background_src,
+                    hero.background.size,
+                    &hero.background,
+                    seen,
+                    candidates,
+                );
+            }
+            CanvasBlock::Panel { children }
+            | CanvasBlock::Box { children, .. }
+            | CanvasBlock::StyledBox { children, .. } => {
+                collect_late_image_candidates_from_blocks(children, seen, candidates);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_late_image_candidate(
+    src: &str,
+    size: egui::Vec2,
+    image: &ImageBlock,
+    seen: &mut HashSet<String>,
+    candidates: &mut Vec<LateImageCandidate>,
+) {
+    if !image_block_is_unavailable(image) || !is_remote_url(src) || !seen.insert(src.to_owned()) {
+        return;
+    }
+    candidates.push(LateImageCandidate {
+        src: src.to_owned(),
+        size,
+    });
+}
+
+fn image_block_is_unavailable(image: &ImageBlock) -> bool {
+    image.path == PathBuf::from("unavailable-image")
+}
+
+fn apply_late_image_to_document(
+    document: &mut BrowserDocument,
+    image_url: &str,
+    image: &ImageBlock,
+) -> bool {
+    let mut changed = false;
+    for object in &mut document.canvas_graph.objects {
+        let CanvasObject::Image(canvas_image) = object else {
+            continue;
+        };
+        if canvas_image.src == image_url && image_block_is_unavailable(&canvas_image.image) {
+            let mut replacement = image.clone();
+            replacement.size = canvas_image.image.size;
+            canvas_image.image = replacement;
+            changed = true;
+        }
+    }
+    changed |= apply_late_image_to_blocks(&mut document.blocks, image_url, image);
+    changed
+}
+
+fn apply_late_image_to_blocks(
+    blocks: &mut [CanvasBlock],
+    image_url: &str,
+    image: &ImageBlock,
+) -> bool {
+    let mut changed = false;
+    for block in blocks {
+        match block {
+            CanvasBlock::Image {
+                src,
+                image: block_image,
+                ..
+            } if src == image_url && image_block_is_unavailable(block_image) => {
+                let mut replacement = image.clone();
+                replacement.size = block_image.size;
+                *block_image = replacement;
+                changed = true;
+            }
+            CanvasBlock::EcosiaHero { hero }
+                if hero.background_src == image_url
+                    && image_block_is_unavailable(&hero.background) =>
+            {
+                let mut replacement = image.clone();
+                replacement.size = hero.background.size;
+                hero.background = replacement;
+                changed = true;
+            }
+            CanvasBlock::Panel { children }
+            | CanvasBlock::Box { children, .. }
+            | CanvasBlock::StyledBox { children, .. } => {
+                changed |= apply_late_image_to_blocks(children, image_url, image);
+            }
+            _ => {}
+        }
+    }
+    changed
 }
 
 fn replaced_content_size(
@@ -29475,8 +29776,64 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
                     && image.size == egui::vec2(250.0, 224.0)
                     && image.color_image.size[0] > 1
                     && image.color_image.size[1] > 1
-                    && image.path != PathBuf::from("unavailable-image")
+            && image.path != PathBuf::from("unavailable-image")
         )));
+    }
+
+    #[test]
+    fn late_image_resource_replaces_unavailable_canvas_image_in_place() {
+        let source = "https://example.test/page.html";
+        let image_url = "https://example.test/late.png";
+        let unavailable = match unavailable_image_block(
+            "late".to_owned(),
+            image_url,
+            Some(egui::vec2(80.0, 40.0)),
+        ) {
+            CanvasBlock::Image { image, .. } => image,
+            _ => panic!("expected image placeholder"),
+        };
+        let mut document = BrowserDocument {
+            title: "Late image".to_owned(),
+            source: source.to_owned(),
+            style: BrowserStyle::default(),
+            canvas_graph: CanvasGraph {
+                viewport: egui::vec2(320.0, 200.0),
+                objects: vec![CanvasObject::Image(CanvasImageObject {
+                    rect: egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(80.0, 40.0)),
+                    src: image_url.to_owned(),
+                    alt: "late".to_owned(),
+                    image: unavailable.clone(),
+                    object_fit: CssObjectFit::Fill,
+                })],
+            },
+            blocks: vec![CanvasBlock::Image {
+                alt: "late".to_owned(),
+                src: image_url.to_owned(),
+                image: unavailable,
+            }],
+        };
+
+        let candidates = late_image_candidates_from_document(&document);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].src, image_url);
+
+        let replacement = ImageBlock::from_color_image(
+            PathBuf::from("late.png"),
+            egui::vec2(10.0, 10.0),
+            egui::ColorImage::new([1, 1], vec![egui::Color32::RED]),
+        );
+        assert!(apply_late_image_to_document(
+            &mut document,
+            image_url,
+            &replacement
+        ));
+
+        let CanvasObject::Image(canvas_image) = &document.canvas_graph.objects[0] else {
+            panic!("expected image object");
+        };
+        assert_eq!(canvas_image.image.path, PathBuf::from("late.png"));
+        assert_eq!(canvas_image.image.size, egui::vec2(80.0, 40.0));
+        assert!(late_image_candidates_from_document(&document).is_empty());
     }
 
     #[test]

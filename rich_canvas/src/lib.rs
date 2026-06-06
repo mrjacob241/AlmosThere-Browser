@@ -1668,13 +1668,14 @@ fn paint_canvas_graph(
                     ),
                 };
                 if let Some(pointer) = pointer_pos {
-                    if text_rect.expand(2.0).contains(pointer) {
+                    if text_rect.expand(6.0).contains(pointer) {
                         pointer_over_text = true;
                         let local = pointer - text_rect.min;
-                        let char_index = galley
-                            .cursor_from_pos(local)
-                            .index
-                            .min(text.text.chars().count());
+                        let char_index = canvas_text_caret_index_from_pointer(
+                            &galley,
+                            local,
+                            text.text.chars().count(),
+                        );
                         pointer_text_caret = Some(CanvasTextCaret {
                             object_index: index,
                             char_index,
@@ -1777,13 +1778,14 @@ fn paint_canvas_graph(
                     ),
                 };
                 if let Some(pointer) = pointer_pos {
-                    if text_rect.expand(2.0).contains(pointer) {
+                    if text_rect.expand(6.0).contains(pointer) {
                         pointer_over_text = true;
                         let local = pointer - text_rect.min;
-                        let char_index = galley
-                            .cursor_from_pos(local)
-                            .index
-                            .min(line_text.chars().count());
+                        let char_index = canvas_text_caret_index_from_pointer(
+                            &galley,
+                            local,
+                            line_text.chars().count(),
+                        );
                         pointer_text_caret = Some(CanvasTextCaret {
                             object_index: index,
                             char_index,
@@ -2143,7 +2145,7 @@ fn paint_canvas_graph(
                             ui.make_persistent_id(("canvas_graph_link_hit", index)),
                             Sense::click(),
                         )
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        .on_hover_cursor(egui::CursorIcon::Default);
                     if response.hovered() {
                         canvas_response.hovered = Some(HitTarget::Link {
                             href: link.href.clone(),
@@ -2160,7 +2162,8 @@ fn paint_canvas_graph(
             }
         }
     }
-    if pointer_over_text && canvas_interaction.hovered() {
+    let hovering_link = matches!(canvas_response.hovered, Some(HitTarget::Link { .. }));
+    if pointer_over_text && canvas_interaction.hovered() && !hovering_link {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
     }
     if let Some(selected_text) = selected_text_for_menu {
@@ -2269,6 +2272,33 @@ fn paint_text_selection_highlight(
             CornerRadius::ZERO,
             Color32::from_rgba_unmultiplied(56, 132, 255, 96),
         );
+    }
+}
+
+fn canvas_text_caret_index_from_pointer(
+    galley: &egui::Galley,
+    local: Vec2,
+    char_count: usize,
+) -> usize {
+    trailing_edge_caret_index(
+        galley.cursor_from_pos(local).index.min(char_count),
+        local.x,
+        galley.size().x,
+        char_count,
+    )
+}
+
+fn trailing_edge_caret_index(
+    raw_index: usize,
+    local_x: f32,
+    text_width: f32,
+    char_count: usize,
+) -> usize {
+    const TRAILING_EDGE_SLOP: f32 = 6.0;
+    if char_count > 0 && local_x >= text_width - TRAILING_EDGE_SLOP {
+        char_count
+    } else {
+        raw_index.min(char_count)
     }
 }
 
@@ -8090,6 +8120,14 @@ mod tests {
             canvas_graph_selected_text(&graph, &selection).as_deref(),
             Some("selectable")
         );
+    }
+
+    #[test]
+    fn trailing_edge_caret_index_allows_selecting_last_character() {
+        assert_eq!(trailing_edge_caret_index(4, 95.0, 100.0, 5), 5);
+        assert_eq!(trailing_edge_caret_index(4, 80.0, 100.0, 5), 4);
+        assert_eq!(trailing_edge_caret_index(8, 95.0, 100.0, 5), 5);
+        assert_eq!(trailing_edge_caret_index(0, 95.0, 100.0, 0), 0);
     }
 
     #[test]

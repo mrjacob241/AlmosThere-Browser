@@ -866,6 +866,279 @@ impl GeneratorState {
     }
 }
 
+// ─── Binary Data Objects (ECMA-262 §25) ─────────────────────────────────────
+
+#[derive(Clone, Debug)]
+struct JsArrayBufferData {
+    bytes: Rc<RefCell<Vec<u8>>>,
+    byte_length: usize,
+    max_byte_length: Option<usize>,
+    detached: bool,
+    resizable: bool,
+    shared: bool,
+}
+
+impl JsArrayBufferData {
+    fn fixed(byte_length: usize, shared: bool) -> Self {
+        Self {
+            bytes: Rc::new(RefCell::new(vec![0; byte_length])),
+            byte_length,
+            max_byte_length: None,
+            detached: false,
+            resizable: false,
+            shared,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypedArrayKind {
+    Int8,
+    Uint8,
+    Uint8Clamped,
+    Int16,
+    Uint16,
+    Int32,
+    Uint32,
+    Float32,
+    Float64,
+    BigInt64,
+    BigUint64,
+}
+
+impl TypedArrayKind {
+    fn from_constructor(name: &str) -> Option<Self> {
+        match name {
+            "Int8Array" => Some(Self::Int8),
+            "Uint8Array" => Some(Self::Uint8),
+            "Uint8ClampedArray" => Some(Self::Uint8Clamped),
+            "Int16Array" => Some(Self::Int16),
+            "Uint16Array" => Some(Self::Uint16),
+            "Int32Array" => Some(Self::Int32),
+            "Uint32Array" => Some(Self::Uint32),
+            "Float32Array" => Some(Self::Float32),
+            "Float64Array" => Some(Self::Float64),
+            "BigInt64Array" => Some(Self::BigInt64),
+            "BigUint64Array" => Some(Self::BigUint64),
+            _ => None,
+        }
+    }
+
+    fn from_data_view_suffix(name: &str) -> Option<Self> {
+        match name {
+            "Int8" => Some(Self::Int8),
+            "Uint8" => Some(Self::Uint8),
+            "Int16" => Some(Self::Int16),
+            "Uint16" => Some(Self::Uint16),
+            "Int32" => Some(Self::Int32),
+            "Uint32" => Some(Self::Uint32),
+            "Float32" => Some(Self::Float32),
+            "Float64" => Some(Self::Float64),
+            "BigInt64" => Some(Self::BigInt64),
+            "BigUint64" => Some(Self::BigUint64),
+            _ => None,
+        }
+    }
+
+    fn constructor_name(self) -> &'static str {
+        match self {
+            Self::Int8 => "Int8Array",
+            Self::Uint8 => "Uint8Array",
+            Self::Uint8Clamped => "Uint8ClampedArray",
+            Self::Int16 => "Int16Array",
+            Self::Uint16 => "Uint16Array",
+            Self::Int32 => "Int32Array",
+            Self::Uint32 => "Uint32Array",
+            Self::Float32 => "Float32Array",
+            Self::Float64 => "Float64Array",
+            Self::BigInt64 => "BigInt64Array",
+            Self::BigUint64 => "BigUint64Array",
+        }
+    }
+
+    fn bytes_per_element(self) -> usize {
+        match self {
+            Self::Int8 | Self::Uint8 | Self::Uint8Clamped => 1,
+            Self::Int16 | Self::Uint16 => 2,
+            Self::Int32 | Self::Uint32 | Self::Float32 => 4,
+            Self::Float64 | Self::BigInt64 | Self::BigUint64 => 8,
+        }
+    }
+
+    fn is_bigint(self) -> bool {
+        matches!(self, Self::BigInt64 | Self::BigUint64)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct JsTypedArrayData {
+    buffer: Rc<RefCell<JsArrayBufferData>>,
+    byte_offset: usize,
+    byte_length: usize,
+    array_length: usize,
+    kind: TypedArrayKind,
+}
+
+#[derive(Clone, Debug)]
+struct JsDataViewData {
+    buffer: Rc<RefCell<JsArrayBufferData>>,
+    byte_offset: usize,
+    byte_length: usize,
+}
+
+impl JsTypedArrayData {
+    fn element_byte_offset(&self, index: usize) -> Option<usize> {
+        if index < self.array_length {
+            Some(self.byte_offset + index * self.kind.bytes_per_element())
+        } else {
+            None
+        }
+    }
+}
+
+fn write_numeric_bytes(
+    kind: TypedArrayKind,
+    bytes: &mut [u8],
+    offset: usize,
+    value: &JsValue,
+    little_endian: bool,
+) -> bool {
+    let width = kind.bytes_per_element();
+    if offset
+        .checked_add(width)
+        .is_none_or(|end| end > bytes.len())
+    {
+        return false;
+    }
+    let target = &mut bytes[offset..offset + width];
+    match kind {
+        TypedArrayKind::Int8 => {
+            target[0] = (BrowserExecutionState::value_to_number(value) as i8) as u8
+        }
+        TypedArrayKind::Uint8 => {
+            target[0] = to_uint8(BrowserExecutionState::value_to_number(value))
+        }
+        TypedArrayKind::Uint8Clamped => {
+            let number = BrowserExecutionState::value_to_number(value);
+            target[0] = if number.is_nan() || number <= 0.0 {
+                0
+            } else if number >= 255.0 {
+                255
+            } else {
+                number.round() as u8
+            };
+        }
+        TypedArrayKind::Int16 => {
+            let data = (BrowserExecutionState::value_to_number(value) as i16).to_ne_bytes();
+            target.copy_from_slice(&ordered_bytes(data, little_endian));
+        }
+        TypedArrayKind::Uint16 => {
+            let data = (BrowserExecutionState::value_to_number(value) as u16).to_ne_bytes();
+            target.copy_from_slice(&ordered_bytes(data, little_endian));
+        }
+        TypedArrayKind::Int32 => {
+            let data = (BrowserExecutionState::value_to_number(value) as i32).to_ne_bytes();
+            target.copy_from_slice(&ordered_bytes(data, little_endian));
+        }
+        TypedArrayKind::Uint32 => {
+            let data = (BrowserExecutionState::value_to_number(value) as u32).to_ne_bytes();
+            target.copy_from_slice(&ordered_bytes(data, little_endian));
+        }
+        TypedArrayKind::Float32 => {
+            let data = (BrowserExecutionState::value_to_number(value) as f32).to_ne_bytes();
+            target.copy_from_slice(&ordered_bytes(data, little_endian));
+        }
+        TypedArrayKind::Float64 => {
+            let data = BrowserExecutionState::value_to_number(value).to_ne_bytes();
+            target.copy_from_slice(&ordered_bytes(data, little_endian));
+        }
+        TypedArrayKind::BigInt64 => {
+            let number = match value {
+                JsValue::BigInt(n) => *n,
+                other => BrowserExecutionState::value_to_number(other) as i64,
+            };
+            let data = number.to_ne_bytes();
+            target.copy_from_slice(&ordered_bytes(data, little_endian));
+        }
+        TypedArrayKind::BigUint64 => {
+            let number = match value {
+                JsValue::BigInt(n) => *n as u64,
+                other => BrowserExecutionState::value_to_number(other) as u64,
+            };
+            let data = number.to_ne_bytes();
+            target.copy_from_slice(&ordered_bytes(data, little_endian));
+        }
+    }
+    true
+}
+
+fn to_uint8(number: f64) -> u8 {
+    if !number.is_finite() || number == 0.0 {
+        return 0;
+    }
+    (number.trunc() as i128).rem_euclid(256) as u8
+}
+
+fn read_numeric_bytes(
+    kind: TypedArrayKind,
+    bytes: &[u8],
+    offset: usize,
+    little_endian: bool,
+) -> Option<JsValue> {
+    let width = kind.bytes_per_element();
+    if offset
+        .checked_add(width)
+        .is_none_or(|end| end > bytes.len())
+    {
+        return None;
+    }
+    let source = &bytes[offset..offset + width];
+    Some(match kind {
+        TypedArrayKind::Int8 => JsValue::Number(i8::from_ne_bytes([source[0]]) as f64),
+        TypedArrayKind::Uint8 | TypedArrayKind::Uint8Clamped => JsValue::Number(source[0] as f64),
+        TypedArrayKind::Int16 => {
+            JsValue::Number(i16::from_ne_bytes(ordered_array(source, little_endian)) as f64)
+        }
+        TypedArrayKind::Uint16 => {
+            JsValue::Number(u16::from_ne_bytes(ordered_array(source, little_endian)) as f64)
+        }
+        TypedArrayKind::Int32 => {
+            JsValue::Number(i32::from_ne_bytes(ordered_array(source, little_endian)) as f64)
+        }
+        TypedArrayKind::Uint32 => {
+            JsValue::Number(u32::from_ne_bytes(ordered_array(source, little_endian)) as f64)
+        }
+        TypedArrayKind::Float32 => {
+            JsValue::Number(f32::from_ne_bytes(ordered_array(source, little_endian)) as f64)
+        }
+        TypedArrayKind::Float64 => {
+            JsValue::Number(f64::from_ne_bytes(ordered_array(source, little_endian)))
+        }
+        TypedArrayKind::BigInt64 => {
+            JsValue::BigInt(i64::from_ne_bytes(ordered_array(source, little_endian)))
+        }
+        TypedArrayKind::BigUint64 => {
+            JsValue::BigInt(u64::from_ne_bytes(ordered_array(source, little_endian)) as i64)
+        }
+    })
+}
+
+fn ordered_bytes<const N: usize>(mut data: [u8; N], little_endian: bool) -> [u8; N] {
+    if cfg!(target_endian = "little") != little_endian {
+        data.reverse();
+    }
+    data
+}
+
+fn ordered_array<const N: usize>(source: &[u8], little_endian: bool) -> [u8; N] {
+    let mut data = [0; N];
+    data.copy_from_slice(source);
+    if cfg!(target_endian = "little") != little_endian {
+        data.reverse();
+    }
+    data
+}
+
 // ─── JsValue ──────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -907,6 +1180,9 @@ enum JsValue {
     CanvasContextRef(String),
     DateInstance,
     Promise(Rc<RefCell<PromiseState>>),
+    ArrayBuffer(Rc<RefCell<JsArrayBufferData>>),
+    TypedArray(Rc<RefCell<JsTypedArrayData>>),
+    DataView(Rc<RefCell<JsDataViewData>>),
     XhrInstance {
         method: String,
         url: String,
@@ -977,6 +1253,9 @@ impl PartialEq for JsValue {
             (JsValue::NavigatorRef, JsValue::NavigatorRef) => true,
             (JsValue::DateInstance, JsValue::DateInstance) => true,
             (JsValue::Promise(a), JsValue::Promise(b)) => Rc::ptr_eq(a, b),
+            (JsValue::ArrayBuffer(a), JsValue::ArrayBuffer(b)) => Rc::ptr_eq(a, b),
+            (JsValue::TypedArray(a), JsValue::TypedArray(b)) => Rc::ptr_eq(a, b),
+            (JsValue::DataView(a), JsValue::DataView(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -1042,8 +1321,342 @@ impl BrowserExecutionState {
     const MAX_POST_SCRIPT_TIMER_DRAIN: usize = 64;
     const DEFAULT_SCRIPT_STATEMENT_BUDGET: usize = 100_000;
     const MAX_CALL_DEPTH: usize = 8;
+    const MAX_BINARY_DATA_BYTES: usize = 16 * 1024 * 1024;
 
     // ── Core object model helpers ─────────────────────────────────────────────
+
+    fn to_index(value: Option<&JsValue>) -> Option<usize> {
+        let Some(value) = value else {
+            return Some(0);
+        };
+        if matches!(value, JsValue::Undefined) {
+            return Some(0);
+        }
+        let n = Self::value_to_number(value);
+        if !n.is_finite() || n < 0.0 || n.fract() != 0.0 {
+            return None;
+        }
+        Some(n.min(usize::MAX as f64) as usize)
+    }
+
+    fn binary_range_error(message: &str) -> JsValue {
+        Self::make_error_obj("RangeError", message.to_owned())
+    }
+
+    fn make_array_buffer(byte_length: usize, shared: bool) -> JsValue {
+        JsValue::ArrayBuffer(Rc::new(RefCell::new(JsArrayBufferData::fixed(
+            byte_length,
+            shared,
+        ))))
+    }
+
+    fn typed_array_get_index_data(view: &JsTypedArrayData, index: usize) -> JsValue {
+        let Some(byte_index) = view.element_byte_offset(index) else {
+            return JsValue::Undefined;
+        };
+        let buffer = view.buffer.borrow();
+        if buffer.detached {
+            return JsValue::Undefined;
+        }
+        let bytes = buffer.bytes.borrow();
+        read_numeric_bytes(view.kind, &bytes, byte_index, true).unwrap_or(JsValue::Undefined)
+    }
+
+    fn typed_array_set_index_data(view: &JsTypedArrayData, index: usize, value: JsValue) -> bool {
+        let Some(byte_index) = view.element_byte_offset(index) else {
+            return false;
+        };
+        let buffer = view.buffer.borrow();
+        if buffer.detached {
+            return false;
+        }
+        write_numeric_bytes(
+            view.kind,
+            &mut buffer.bytes.borrow_mut(),
+            byte_index,
+            &value,
+            true,
+        )
+    }
+
+    fn collect_array_like_values_for_typed_array(&mut self, value: JsValue) -> Vec<JsValue> {
+        match value {
+            JsValue::Array(items) => items,
+            JsValue::RichArray(rc) => rc.borrow().elements.clone(),
+            JsValue::TypedArray(view) => {
+                let view = view.borrow();
+                (0..view.array_length)
+                    .map(|index| Self::typed_array_get_index_data(&view, index))
+                    .collect()
+            }
+            JsValue::Object(rc) => {
+                let len = self.to_length_from_obj(&rc) as usize;
+                (0..len)
+                    .map(|index| self.obj_get(&rc, &index.to_string()))
+                    .collect()
+            }
+            JsValue::String(s) => s
+                .chars()
+                .map(|ch| JsValue::String(ch.to_string()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn construct_typed_array(&mut self, kind: TypedArrayKind, args: Vec<JsValue>) -> JsValue {
+        let element_size = kind.bytes_per_element();
+        let first = args.first().cloned().unwrap_or(JsValue::Undefined);
+        match first {
+            JsValue::ArrayBuffer(buffer) => {
+                let byte_offset = match Self::to_index(args.get(1)) {
+                    Some(value) => value,
+                    None => {
+                        self.early_exit = Some(EarlyExit::Throw(Self::binary_range_error(
+                            "Invalid typed array byteOffset",
+                        )));
+                        return JsValue::Undefined;
+                    }
+                };
+                if byte_offset % element_size != 0 {
+                    self.early_exit = Some(EarlyExit::Throw(Self::binary_range_error(
+                        "Typed array byteOffset is not aligned",
+                    )));
+                    return JsValue::Undefined;
+                }
+                let buffer_len = buffer.borrow().byte_length;
+                if byte_offset > buffer_len {
+                    self.early_exit = Some(EarlyExit::Throw(Self::binary_range_error(
+                        "Typed array byteOffset is out of range",
+                    )));
+                    return JsValue::Undefined;
+                }
+                let available = buffer_len - byte_offset;
+                let length = if let Some(length_arg) = args.get(2) {
+                    match Self::to_index(Some(length_arg)) {
+                        Some(value) => value,
+                        None => {
+                            self.early_exit = Some(EarlyExit::Throw(Self::binary_range_error(
+                                "Invalid typed array length",
+                            )));
+                            return JsValue::Undefined;
+                        }
+                    }
+                } else {
+                    if available % element_size != 0 {
+                        self.early_exit = Some(EarlyExit::Throw(Self::binary_range_error(
+                            "Typed array length is not aligned",
+                        )));
+                        return JsValue::Undefined;
+                    }
+                    available / element_size
+                };
+                let byte_length = length.saturating_mul(element_size);
+                if byte_offset + byte_length > buffer_len {
+                    self.early_exit = Some(EarlyExit::Throw(Self::binary_range_error(
+                        "Typed array length is out of range",
+                    )));
+                    return JsValue::Undefined;
+                }
+                JsValue::TypedArray(Rc::new(RefCell::new(JsTypedArrayData {
+                    buffer,
+                    byte_offset,
+                    byte_length,
+                    array_length: length,
+                    kind,
+                })))
+            }
+            JsValue::Undefined => self.construct_typed_array(kind, vec![JsValue::Number(0.0)]),
+            value if matches!(value, JsValue::Number(_) | JsValue::String(_)) => {
+                let length = match Self::to_index(Some(&value)) {
+                    Some(value) => value,
+                    None => {
+                        self.early_exit = Some(EarlyExit::Throw(Self::binary_range_error(
+                            "Invalid typed array length",
+                        )));
+                        return JsValue::Undefined;
+                    }
+                };
+                let byte_length = length.saturating_mul(element_size);
+                if byte_length > Self::MAX_BINARY_DATA_BYTES {
+                    self.early_exit = Some(EarlyExit::Throw(Self::binary_range_error(
+                        "Typed array allocation is too large",
+                    )));
+                    return JsValue::Undefined;
+                }
+                let buffer = match Self::make_array_buffer(byte_length, false) {
+                    JsValue::ArrayBuffer(buffer) => buffer,
+                    _ => unreachable!(),
+                };
+                JsValue::TypedArray(Rc::new(RefCell::new(JsTypedArrayData {
+                    buffer,
+                    byte_offset: 0,
+                    byte_length,
+                    array_length: length,
+                    kind,
+                })))
+            }
+            value => {
+                let items = self.collect_array_like_values_for_typed_array(value);
+                let byte_length = items.len().saturating_mul(element_size);
+                if byte_length > Self::MAX_BINARY_DATA_BYTES {
+                    self.early_exit = Some(EarlyExit::Throw(Self::binary_range_error(
+                        "Typed array allocation is too large",
+                    )));
+                    return JsValue::Undefined;
+                }
+                let buffer = Rc::new(RefCell::new(JsArrayBufferData::fixed(byte_length, false)));
+                let typed = JsTypedArrayData {
+                    buffer,
+                    byte_offset: 0,
+                    byte_length,
+                    array_length: items.len(),
+                    kind,
+                };
+                for (index, item) in items.into_iter().enumerate() {
+                    Self::typed_array_set_index_data(&typed, index, item);
+                }
+                JsValue::TypedArray(Rc::new(RefCell::new(typed)))
+            }
+        }
+    }
+
+    fn construct_data_view(&mut self, args: Vec<JsValue>) -> JsValue {
+        let Some(JsValue::ArrayBuffer(buffer)) = args.first().cloned() else {
+            self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                "TypeError",
+                "DataView buffer must be an ArrayBuffer".to_owned(),
+            )));
+            return JsValue::Undefined;
+        };
+        let byte_offset = match Self::to_index(args.get(1)) {
+            Some(value) => value,
+            None => {
+                self.early_exit = Some(EarlyExit::Throw(Self::binary_range_error(
+                    "Invalid DataView byteOffset",
+                )));
+                return JsValue::Undefined;
+            }
+        };
+        let buffer_len = buffer.borrow().byte_length;
+        if byte_offset > buffer_len {
+            self.early_exit = Some(EarlyExit::Throw(Self::binary_range_error(
+                "DataView byteOffset is out of range",
+            )));
+            return JsValue::Undefined;
+        }
+        let byte_length = if let Some(length_arg) = args.get(2) {
+            match Self::to_index(Some(length_arg)) {
+                Some(value) => value,
+                None => {
+                    self.early_exit = Some(EarlyExit::Throw(Self::binary_range_error(
+                        "Invalid DataView byteLength",
+                    )));
+                    return JsValue::Undefined;
+                }
+            }
+        } else {
+            buffer_len - byte_offset
+        };
+        if byte_offset + byte_length > buffer_len {
+            self.early_exit = Some(EarlyExit::Throw(Self::binary_range_error(
+                "DataView byteLength is out of range",
+            )));
+            return JsValue::Undefined;
+        }
+        JsValue::DataView(Rc::new(RefCell::new(JsDataViewData {
+            buffer,
+            byte_offset,
+            byte_length,
+        })))
+    }
+
+    fn new_array_buffer(&mut self, args: Vec<JsValue>, shared: bool) -> JsValue {
+        let Some(byte_length) = Self::to_index(args.first()) else {
+            self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                "RangeError",
+                "Invalid array buffer length".to_owned(),
+            )));
+            return JsValue::Undefined;
+        };
+        if byte_length > Self::MAX_BINARY_DATA_BYTES {
+            self.early_exit = Some(EarlyExit::Throw(Self::binary_range_error(
+                "ArrayBuffer allocation is too large",
+            )));
+            return JsValue::Undefined;
+        }
+        Self::make_array_buffer(byte_length, shared)
+    }
+
+    fn new_data_view(&mut self, args: Vec<JsValue>) -> JsValue {
+        self.construct_data_view(args)
+    }
+
+    fn new_typed_array(&mut self, kind: TypedArrayKind, args: Vec<JsValue>) -> JsValue {
+        self.construct_typed_array(kind, args)
+    }
+
+    fn is_array_buffer_view(value: &JsValue) -> bool {
+        matches!(value, JsValue::TypedArray(_) | JsValue::DataView(_))
+    }
+
+    fn binary_data_property(&mut self, receiver: &JsValue, property: &str) -> Option<JsValue> {
+        match receiver {
+            JsValue::ArrayBuffer(buffer) => match property {
+                "byteLength" => {
+                    let buffer = buffer.borrow();
+                    Some(JsValue::Number(if buffer.detached {
+                        0.0
+                    } else {
+                        buffer.byte_length as f64
+                    }))
+                }
+                "maxByteLength" => {
+                    let buffer = buffer.borrow();
+                    Some(JsValue::Number(
+                        buffer.max_byte_length.unwrap_or(buffer.byte_length) as f64,
+                    ))
+                }
+                "resizable" => Some(JsValue::Boolean(buffer.borrow().resizable)),
+                "detached" => Some(JsValue::Boolean(buffer.borrow().detached)),
+                "constructor" => Some(JsValue::HostFunction(if buffer.borrow().shared {
+                    "SharedArrayBuffer".to_owned()
+                } else {
+                    "ArrayBuffer".to_owned()
+                })),
+                _ => self.native_prototype_property("ArrayBuffer", property),
+            },
+            JsValue::TypedArray(view) => {
+                if let Ok(index) = property.parse::<usize>() {
+                    return Some(Self::typed_array_get_index_data(&view.borrow(), index));
+                }
+                let view = view.borrow();
+                match property {
+                    "length" => Some(JsValue::Number(view.array_length as f64)),
+                    "byteLength" => Some(JsValue::Number(view.byte_length as f64)),
+                    "byteOffset" => Some(JsValue::Number(view.byte_offset as f64)),
+                    "buffer" => Some(JsValue::ArrayBuffer(view.buffer.clone())),
+                    "BYTES_PER_ELEMENT" => {
+                        Some(JsValue::Number(view.kind.bytes_per_element() as f64))
+                    }
+                    "constructor" => Some(JsValue::HostFunction(
+                        view.kind.constructor_name().to_owned(),
+                    )),
+                    _ => self.native_prototype_property(view.kind.constructor_name(), property),
+                }
+            }
+            JsValue::DataView(view) => {
+                let view = view.borrow();
+                match property {
+                    "byteLength" => Some(JsValue::Number(view.byte_length as f64)),
+                    "byteOffset" => Some(JsValue::Number(view.byte_offset as f64)),
+                    "buffer" => Some(JsValue::ArrayBuffer(view.buffer.clone())),
+                    "constructor" => Some(JsValue::HostFunction("DataView".to_owned())),
+                    _ => self.native_prototype_property("DataView", property),
+                }
+            }
+            _ => None,
+        }
+    }
 
     /// `[[Get]]` — walks the prototype chain and invokes accessor getters.
     fn obj_get(&mut self, rc: &Rc<RefCell<JsObject>>, key: &str) -> JsValue {
@@ -1192,6 +1805,9 @@ impl BrowserExecutionState {
                 | JsValue::CanvasContextRef(_)
                 | JsValue::DateInstance
                 | JsValue::Promise(_)
+                | JsValue::ArrayBuffer(_)
+                | JsValue::TypedArray(_)
+                | JsValue::DataView(_)
                 | JsValue::XhrInstance { .. }
                 | JsValue::Proxy { .. }
                 | JsValue::WeakMap(_)
@@ -4550,6 +5166,18 @@ impl BrowserExecutionState {
                     } else if fn_name == "URL" {
                         let args = self.eval_args(arguments);
                         self.call_host_function("URL", JsValue::Undefined, args)
+                    } else if fn_name == "ArrayBuffer" {
+                        let args = self.eval_args(arguments);
+                        self.new_array_buffer(args, false)
+                    } else if fn_name == "SharedArrayBuffer" {
+                        let args = self.eval_args(arguments);
+                        self.new_array_buffer(args, true)
+                    } else if fn_name == "DataView" {
+                        let args = self.eval_args(arguments);
+                        self.new_data_view(args)
+                    } else if let Some(kind) = TypedArrayKind::from_constructor(&fn_name) {
+                        let args = self.eval_args(arguments);
+                        self.new_typed_array(kind, args)
                     } else {
                         JsValue::HostObject(fn_name)
                     }
@@ -9226,6 +9854,11 @@ impl BrowserExecutionState {
                     }
                     // Non-numeric key on bare Array: silently ignore.
                 }
+                JsValue::TypedArray(view) => {
+                    if let Ok(idx) = key.parse::<usize>() {
+                        Self::typed_array_set_index_data(&view.borrow(), idx, value);
+                    }
+                }
                 JsValue::Function(mut func) => {
                     let this = JsValue::Function(func.clone());
                     self.function_set(&mut func, this, key, value);
@@ -9734,6 +10367,21 @@ impl BrowserExecutionState {
                             JsValue::Undefined
                         }
                     }
+                    JsValue::TypedArray(view) => {
+                        let key = Self::value_to_string(&index);
+                        let idx = Self::value_to_number(&index);
+                        if idx >= 0.0 && idx.fract() == 0.0 {
+                            Self::typed_array_get_index_data(&view.borrow(), idx as usize)
+                        } else {
+                            self.binary_data_property(&JsValue::TypedArray(view), &key)
+                                .unwrap_or(JsValue::Undefined)
+                        }
+                    }
+                    JsValue::ArrayBuffer(_) | JsValue::DataView(_) => {
+                        let key = Self::value_to_string(&index);
+                        self.binary_data_property(&receiver, &key)
+                            .unwrap_or(JsValue::Undefined)
+                    }
                     JsValue::NodeList(ids) => {
                         let idx = Self::value_to_number(&index);
                         if idx >= 0.0 && idx.fract() == 0.0 {
@@ -9803,6 +10451,9 @@ impl BrowserExecutionState {
             JsValue::Array(items) if property == "length" => JsValue::Number(items.len() as f64),
             JsValue::Array(_) => self
                 .native_prototype_property("Array", property)
+                .unwrap_or(JsValue::Undefined),
+            JsValue::ArrayBuffer(_) | JsValue::TypedArray(_) | JsValue::DataView(_) => self
+                .binary_data_property(&receiver, property)
                 .unwrap_or(JsValue::Undefined),
             JsValue::Function(func) => match property {
                 "name" => func
@@ -10420,6 +11071,9 @@ impl BrowserExecutionState {
                     }
                     JsValue::Array(_) => self
                         .native_prototype_property("Array", property)
+                        .unwrap_or(JsValue::Undefined),
+                    JsValue::ArrayBuffer(_) | JsValue::TypedArray(_) | JsValue::DataView(_) => self
+                        .binary_data_property(&receiver, property)
                         .unwrap_or(JsValue::Undefined),
                     JsValue::RichArray(rc) if property == "length" => {
                         JsValue::Number(rc.borrow().elements.len() as f64)
@@ -14292,6 +14946,16 @@ impl BrowserExecutionState {
                     JsValue::HostFunction(ctor_name) => match &lv {
                         JsValue::HostObject(name) => name == ctor_name,
                         JsValue::Object(rc) => rc.borrow().class_name.as_deref() == Some(ctor_name),
+                        JsValue::ArrayBuffer(buffer) => {
+                            matches!(
+                                (ctor_name.as_str(), buffer.borrow().shared),
+                                ("ArrayBuffer", false) | ("SharedArrayBuffer", true)
+                            )
+                        }
+                        JsValue::TypedArray(view) => {
+                            view.borrow().kind.constructor_name() == ctor_name
+                        }
+                        JsValue::DataView(_) => ctor_name == "DataView",
                         _ => false,
                     },
                     // User constructor: check class_name tag set during new
@@ -14346,6 +15010,9 @@ impl BrowserExecutionState {
             | JsValue::CanvasContextRef(_)
             | JsValue::DateInstance
             | JsValue::Promise(_)
+            | JsValue::ArrayBuffer(_)
+            | JsValue::TypedArray(_)
+            | JsValue::DataView(_)
             | JsValue::XhrInstance { .. }
             | JsValue::Proxy { .. }
             | JsValue::WeakMap(_) => true,
@@ -14381,6 +15048,9 @@ impl BrowserExecutionState {
             | JsValue::CanvasContextRef(_)
             | JsValue::DateInstance
             | JsValue::Promise(_)
+            | JsValue::ArrayBuffer(_)
+            | JsValue::TypedArray(_)
+            | JsValue::DataView(_)
             | JsValue::XhrInstance { .. }
             | JsValue::Proxy { .. }
             | JsValue::WeakMap(_) => f64::NAN,
@@ -14414,6 +15084,9 @@ impl BrowserExecutionState {
             | (JsValue::NavigatorRef, JsValue::NavigatorRef)
             | (JsValue::DateInstance, JsValue::DateInstance) => true,
             (JsValue::Promise(a), JsValue::Promise(b)) => Rc::ptr_eq(a, b),
+            (JsValue::ArrayBuffer(a), JsValue::ArrayBuffer(b)) => Rc::ptr_eq(a, b),
+            (JsValue::TypedArray(a), JsValue::TypedArray(b)) => Rc::ptr_eq(a, b),
+            (JsValue::DataView(a), JsValue::DataView(b)) => Rc::ptr_eq(a, b),
             // HostFunctions with the same name are the same function object.
             (JsValue::HostFunction(a), JsValue::HostFunction(b)) => a == b,
             // HostObjects with the same name are considered the same (best-effort).
@@ -14487,6 +15160,11 @@ impl BrowserExecutionState {
             JsValue::DateInstance => "[object Date]".to_owned(),
             JsValue::RegExp { pattern, flags } => format!("/{pattern}/{flags}"),
             JsValue::Promise(_) => "[object Promise]".to_owned(),
+            JsValue::ArrayBuffer(_) => "[object ArrayBuffer]".to_owned(),
+            JsValue::TypedArray(view) => {
+                format!("[object {}]", view.borrow().kind.constructor_name())
+            }
+            JsValue::DataView(_) => "[object DataView]".to_owned(),
             JsValue::XhrInstance { .. } => "[object XMLHttpRequest]".to_owned(),
             JsValue::Proxy { .. } => "[object Object]".to_owned(),
             JsValue::WeakMap(_) => "[object WeakMap]".to_owned(),
@@ -14833,6 +15511,128 @@ impl BrowserExecutionState {
                     obj.set("reject", capability.reject);
                 }
                 JsValue::Object(rc)
+            }
+            "ArrayBuffer.isView" => {
+                JsValue::Boolean(args.first().is_some_and(Self::is_array_buffer_view))
+            }
+            "ArrayBuffer.prototype.byteLength.get"
+            | "ArrayBuffer.prototype.maxByteLength.get"
+            | "ArrayBuffer.prototype.resizable.get"
+            | "ArrayBuffer.prototype.detached.get"
+            | "DataView.prototype.buffer.get"
+            | "DataView.prototype.byteLength.get"
+            | "DataView.prototype.byteOffset.get" => {
+                let Some(property) = name
+                    .strip_suffix(".get")
+                    .and_then(|base| base.rsplit('.').next())
+                else {
+                    return JsValue::Undefined;
+                };
+                if let Some(value) = self.binary_data_property(&this_arg, property) {
+                    value
+                } else {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        format!("{name} called on incompatible receiver"),
+                    )));
+                    JsValue::Undefined
+                }
+            }
+            name if name.starts_with("DataView.prototype.get") => {
+                let Some(kind_name) = name.strip_prefix("DataView.prototype.get") else {
+                    return JsValue::Undefined;
+                };
+                let Some(kind) = TypedArrayKind::from_data_view_suffix(kind_name) else {
+                    return JsValue::Undefined;
+                };
+                let index = Self::to_index(args.first()).unwrap_or(usize::MAX);
+                let JsValue::DataView(view_rc) = this_arg else {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        format!("{name} called on incompatible receiver"),
+                    )));
+                    return JsValue::Undefined;
+                };
+                let view = view_rc.borrow();
+                let width = kind.bytes_per_element();
+                if index
+                    .checked_add(width)
+                    .is_none_or(|end| end > view.byte_length)
+                {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "RangeError",
+                        "DataView byteOffset is outside the view".to_owned(),
+                    )));
+                    return JsValue::Undefined;
+                }
+                let buffer = view.buffer.borrow();
+                if buffer.detached {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        "ArrayBuffer is detached".to_owned(),
+                    )));
+                    return JsValue::Undefined;
+                }
+                let little_endian = args.get(1).is_some_and(Self::is_truthy);
+                read_numeric_bytes(
+                    kind,
+                    &buffer.bytes.borrow(),
+                    view.byte_offset + index,
+                    little_endian,
+                )
+                .unwrap_or(JsValue::Undefined)
+            }
+            name if name.starts_with("DataView.prototype.set") => {
+                let Some(kind_name) = name.strip_prefix("DataView.prototype.set") else {
+                    return JsValue::Undefined;
+                };
+                let Some(kind) = TypedArrayKind::from_data_view_suffix(kind_name) else {
+                    return JsValue::Undefined;
+                };
+                let index = Self::to_index(args.first()).unwrap_or(usize::MAX);
+                let value = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let JsValue::DataView(view_rc) = this_arg else {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        format!("{name} called on incompatible receiver"),
+                    )));
+                    return JsValue::Undefined;
+                };
+                let view = view_rc.borrow();
+                let width = kind.bytes_per_element();
+                if index
+                    .checked_add(width)
+                    .is_none_or(|end| end > view.byte_length)
+                {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "RangeError",
+                        "DataView byteOffset is outside the view".to_owned(),
+                    )));
+                    return JsValue::Undefined;
+                }
+                let buffer = view.buffer.borrow_mut();
+                if buffer.detached {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        "ArrayBuffer is detached".to_owned(),
+                    )));
+                    return JsValue::Undefined;
+                }
+                let little_endian = args.get(2).is_some_and(Self::is_truthy);
+                if !write_numeric_bytes(
+                    kind,
+                    &mut buffer.bytes.borrow_mut(),
+                    view.byte_offset + index,
+                    &value,
+                    little_endian,
+                ) {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "RangeError",
+                        "DataView byteOffset is outside the view".to_owned(),
+                    )));
+                    return JsValue::Undefined;
+                }
+                JsValue::Undefined
             }
             "requestAnimationFrame" => {
                 if let Some(callback) = args.first().cloned().and_then(Self::function_from_value) {
@@ -16211,6 +17011,19 @@ impl BrowserExecutionState {
                 };
                 obj.set_ne((*method).to_owned(), value);
             }
+            for accessor in Self::native_prototype_accessors(owner) {
+                obj.define(
+                    (*accessor).to_owned(),
+                    Property::Accessor {
+                        get: Some(JsValue::HostFunction(format!(
+                            "{owner}.prototype.{accessor}.get"
+                        ))),
+                        set: None,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                );
+            }
             if owner == "Array" {
                 obj.set_ne(
                     "Symbol(Symbol.iterator)",
@@ -16258,8 +17071,27 @@ impl BrowserExecutionState {
                     "{owner}.prototype.{property}"
                 )))
             }
+        } else if Self::native_prototype_accessors(owner).contains(&property) {
+            self.trace_runtime("prototype.lookup", format!("{owner}.prototype.{property}"));
+            Some(JsValue::HostFunction(format!(
+                "{owner}.prototype.{property}.get"
+            )))
         } else {
             None
+        }
+    }
+
+    fn native_prototype_accessors(owner: &str) -> &'static [&'static str] {
+        match owner {
+            "ArrayBuffer" | "SharedArrayBuffer" => {
+                &["byteLength", "maxByteLength", "resizable", "detached"]
+            }
+            "DataView" => &["buffer", "byteLength", "byteOffset"],
+            "Int8Array" | "Uint8Array" | "Uint8ClampedArray" | "Int16Array" | "Uint16Array"
+            | "Int32Array" | "Uint32Array" | "Float32Array" | "Float64Array" => {
+                &["buffer", "byteLength", "byteOffset", "length"]
+            }
+            _ => &[],
         }
     }
 
@@ -16455,6 +17287,32 @@ impl BrowserExecutionState {
                 "size",
             ],
             "Promise" => &["constructor", "then", "catch", "finally"],
+            "ArrayBuffer" | "SharedArrayBuffer" => &["constructor", "slice"],
+            "DataView" => &[
+                "constructor",
+                "getBigInt64",
+                "getBigUint64",
+                "getFloat32",
+                "getFloat64",
+                "getInt8",
+                "getInt16",
+                "getInt32",
+                "getUint8",
+                "getUint16",
+                "getUint32",
+                "setBigInt64",
+                "setBigUint64",
+                "setFloat32",
+                "setFloat64",
+                "setInt8",
+                "setInt16",
+                "setInt32",
+                "setUint8",
+                "setUint16",
+                "setUint32",
+            ],
+            "Int8Array" | "Uint8Array" | "Uint8ClampedArray" | "Int16Array" | "Uint16Array"
+            | "Int32Array" | "Uint32Array" | "Float32Array" | "Float64Array" => &["constructor"],
             "MediaQueryList" => &[
                 "constructor",
                 "addListener",
@@ -16519,6 +17377,9 @@ impl BrowserExecutionState {
             JsValue::Function(_) | JsValue::HostFunction(_) | JsValue::BoundHostFunction { .. } => {
                 Some("Function")
             }
+            JsValue::ArrayBuffer(_) => Some("ArrayBuffer"),
+            JsValue::DataView(_) => Some("DataView"),
+            JsValue::TypedArray(view) => Some(view.borrow().kind.constructor_name()),
             JsValue::Object(_)
             | JsValue::ElementRef(_)
             | JsValue::NodeList(_)
@@ -16583,6 +17444,9 @@ impl BrowserExecutionState {
             JsValue::CanvasContextRef(_) => "CanvasRenderingContext",
             JsValue::DateInstance => "Date",
             JsValue::Promise(_) => "Promise",
+            JsValue::ArrayBuffer(_) => "ArrayBuffer",
+            JsValue::TypedArray(view) => view.borrow().kind.constructor_name(),
+            JsValue::DataView(_) => "DataView",
             JsValue::XhrInstance { .. } => "XMLHttpRequest",
             JsValue::WeakMap(_) => "WeakMap",
             JsValue::BigInt(_) => "BigInt",
@@ -16612,6 +17476,18 @@ impl BrowserExecutionState {
             | "AggregateError"
             | "URL"
             | "MediaQueryList"
+            | "ArrayBuffer"
+            | "SharedArrayBuffer"
+            | "DataView"
+            | "Int8Array"
+            | "Uint8Array"
+            | "Uint8ClampedArray"
+            | "Int16Array"
+            | "Uint16Array"
+            | "Int32Array"
+            | "Uint32Array"
+            | "Float32Array"
+            | "Float64Array"
             | "MutationObserver"
             | "IntersectionObserver"
             | "ResizeObserver" => Some(Self::native_prototype_object(name)),
@@ -16883,6 +17759,9 @@ impl BrowserExecutionState {
                     | JsValue::DateInstance
                     | JsValue::RegExp { .. }
                     | JsValue::Promise(_)
+                    | JsValue::ArrayBuffer(_)
+                    | JsValue::TypedArray(_)
+                    | JsValue::DataView(_)
                     | JsValue::WeakMap(_)
             ),
             "Function" => matches!(obj, JsValue::Function(_) | JsValue::HostFunction(_)),
@@ -16890,6 +17769,17 @@ impl BrowserExecutionState {
             "Date" => matches!(obj, JsValue::DateInstance),
             "RegExp" => matches!(obj, JsValue::RegExp { .. }),
             "Promise" => matches!(obj, JsValue::Promise(_)),
+            "ArrayBuffer" => {
+                matches!(obj, JsValue::ArrayBuffer(buffer) if !buffer.borrow().shared)
+            }
+            "SharedArrayBuffer" => {
+                matches!(obj, JsValue::ArrayBuffer(buffer) if buffer.borrow().shared)
+            }
+            "DataView" => matches!(obj, JsValue::DataView(_)),
+            "Int8Array" | "Uint8Array" | "Uint8ClampedArray" | "Int16Array" | "Uint16Array"
+            | "Int32Array" | "Uint32Array" | "Float32Array" | "Float64Array" => {
+                matches!(obj, JsValue::TypedArray(view) if view.borrow().kind.constructor_name() == proto_type)
+            }
             "Boolean" => {
                 matches!(obj, JsValue::HostObject(n) if n == "Boolean")
                     || matches!(obj, JsValue::Object(rc) if rc.borrow().class_name.as_deref() == Some("Boolean"))
@@ -17021,10 +17911,19 @@ impl BrowserExecutionState {
             ),
             "Symbol" => matches!(property, "for" | "keyFor"),
             "JSON" => matches!(property, "parse" | "stringify" | "rawJSON" | "isRawJSON"),
+            "ArrayBuffer" => matches!(property, "isView"),
+            name if TypedArrayKind::from_constructor(name).is_some() => {
+                property == "BYTES_PER_ELEMENT"
+            }
             _ => false,
         };
         if known {
-            Some(JsValue::HostFunction(format!("{fn_name}.{property}")))
+            if property == "BYTES_PER_ELEMENT" {
+                TypedArrayKind::from_constructor(fn_name)
+                    .map(|kind| JsValue::Number(kind.bytes_per_element() as f64))
+            } else {
+                Some(JsValue::HostFunction(format!("{fn_name}.{property}")))
+            }
         } else {
             None
         }
@@ -17097,12 +17996,23 @@ impl BrowserExecutionState {
     fn host_fn_short_name(fn_name: &str) -> String {
         match fn_name {
             "Array.@@species.get" | "Promise.@@species.get" => "get [Symbol.species]".to_owned(),
+            name if name.ends_with(".get") && name.contains(".prototype.") => name
+                .strip_suffix(".get")
+                .and_then(|base| base.rsplit('.').next())
+                .map(|property| format!("get {property}"))
+                .unwrap_or_else(|| "get".to_owned()),
             _ => fn_name.rsplit('.').next().unwrap_or(fn_name).to_owned(),
         }
     }
 
     /// Returns the expected `length` (arity) for a known host function, or 0 as default.
     fn host_fn_arity(fn_name: &str) -> u32 {
+        if fn_name.starts_with("DataView.prototype.get") {
+            return 1;
+        }
+        if fn_name.starts_with("DataView.prototype.set") {
+            return 2;
+        }
         match fn_name {
             "Array.from"
             | "Array.of"
@@ -17215,7 +18125,8 @@ impl BrowserExecutionState {
             | "MediaQueryList.prototype.removeEventListener" => 2,
             "Array" | "Object" | "Function" | "String" | "Number" | "Boolean" | "RegExp"
             | "Error" | "TypeError" | "RangeError" | "ReferenceError" | "SyntaxError"
-            | "URIError" | "EvalError" => 1,
+            | "URIError" | "EvalError" | "ArrayBuffer" | "SharedArrayBuffer" | "DataView" => 1,
+            "ArrayBuffer.prototype.slice" => 2,
             "BigInt.asIntN" | "BigInt.asUintN" | "Object.groupBy" => 2,
             "Date.parse" | "Date.UTC" | "Date.now" | "Map.groupBy" | "RegExp.escape" => 1,
             "BigInt" => 1,
@@ -18240,6 +19151,9 @@ fn json_stringify(value: &JsValue) -> String {
         | JsValue::CanvasContextRef(_)
         | JsValue::DateInstance
         | JsValue::Promise(_)
+        | JsValue::ArrayBuffer(_)
+        | JsValue::TypedArray(_)
+        | JsValue::DataView(_)
         | JsValue::XhrInstance { .. }
         | JsValue::Proxy { .. }
         | JsValue::WeakMap(_)
@@ -26406,6 +27320,122 @@ mod tests {
                 BrowserEffect::RuntimeTrace { kind, .. } if kind == expected_kind
             )
         })
+    }
+
+    #[test]
+    fn array_buffer_constructor_sets_zeroed_byte_length() {
+        let effects = run(r#"
+            var buffer = new ArrayBuffer(4);
+            var view = new Uint8Array(buffer);
+            document.getElementById("result").textContent =
+                buffer.byteLength + "/" + view.length + "/" + view[0] + "/" + view[3];
+        "#);
+        assert_eq!(effects, vec![text("result", "4/4/0/0")]);
+    }
+
+    #[test]
+    fn uint8_array_indexed_get_set_and_view_slots() {
+        let effects = run(r#"
+            var buffer = new ArrayBuffer(6);
+            var view = new Uint8Array(buffer, 2, 3);
+            view[0] = 257;
+            view[2] = 7;
+            var all = new Uint8Array(buffer);
+            document.getElementById("result").textContent =
+                view.length + "/" + view.byteLength + "/" + view.byteOffset + "/" +
+                (view.buffer === buffer) + "/" + view[0] + "/" + view[2] + "/" + all[2];
+        "#);
+        assert_eq!(effects, vec![text("result", "3/3/2/true/1/7/1")]);
+    }
+
+    #[test]
+    fn array_buffer_is_view_detects_typed_arrays_and_data_views() {
+        let effects = run(r#"
+            var buffer = new ArrayBuffer(2);
+            var bytes = new Uint8Array(buffer);
+            var view = new DataView(buffer);
+            document.getElementById("result").textContent =
+                ArrayBuffer.isView(bytes) + "/" +
+                ArrayBuffer.isView(view) + "/" +
+                ArrayBuffer.isView(buffer) + "/" +
+                ArrayBuffer.isView({});
+        "#);
+        assert_eq!(effects, vec![text("result", "true/true/false/false")]);
+    }
+
+    #[test]
+    fn data_view_get_uint8_set_uint8_share_array_buffer_storage() {
+        let effects = run(r#"
+            var buffer = new ArrayBuffer(4);
+            var view = new DataView(buffer, 1, 2);
+            var bytes = new Uint8Array(buffer);
+            view.setUint8(0, 300);
+            bytes[2] = 9;
+            document.getElementById("result").textContent =
+                view.byteLength + "/" + view.byteOffset + "/" + (view.buffer === buffer) + "/" +
+                view.getUint8(0) + "/" + view.getUint8(1) + "/" + bytes[1];
+        "#);
+        assert_eq!(effects, vec![text("result", "2/1/true/44/9/44")]);
+    }
+
+    #[test]
+    fn uint8_array_constructs_from_array_like_object() {
+        let effects = run(r#"
+            var source = {0: 5, 1: 260, 2: 9, length: 3};
+            var view = new Uint8Array(source);
+            document.getElementById("result").textContent =
+                view.length + "/" + view.byteLength + "/" + view.byteOffset + "/" +
+                view[0] + "/" + view[1] + "/" + view[2] + "/" + Uint8Array.BYTES_PER_ELEMENT;
+        "#);
+        assert_eq!(effects, vec![text("result", "3/3/0/5/4/9/1")]);
+    }
+
+    #[test]
+    fn binary_data_accessors_have_standard_descriptor_shape() {
+        let effects = run(r#"
+            var ab = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength");
+            var dv = Object.getOwnPropertyDescriptor(DataView.prototype, "buffer");
+            var buffer = new ArrayBuffer(3);
+            var view = new DataView(buffer, 1, 2);
+            document.getElementById("result").textContent =
+                ab.get.name + "/" + ab.enumerable + "/" + ab.configurable + "/" +
+                String(ab.set) + "/" +
+                dv.get.name + "/" + dv.enumerable + "/" + dv.configurable + "/" +
+                (dv.get.call(view) === buffer) + "/" + ab.get.call(buffer);
+        "#);
+        assert_eq!(
+            effects,
+            vec![text(
+                "result",
+                "get byteLength/false/true/undefined/get buffer/false/true/true/3",
+            )],
+        );
+    }
+
+    #[test]
+    fn data_view_numeric_methods_share_standard_dispatch_and_metadata() {
+        let effects = run(r#"
+            var buffer = new ArrayBuffer(10);
+            var view = new DataView(buffer);
+            var bytes = new Uint8Array(buffer);
+            view.setUint16(0, 0x1234, false);
+            view.setUint16(2, 0x1234, true);
+            view.setInt8(4, -1);
+            view.setFloat32(5, 1.5, true);
+            document.getElementById("result").textContent =
+                DataView.prototype.getInt16.name + "/" +
+                DataView.prototype.getInt16.length + "/" +
+                DataView.prototype.setUint16.name + "/" +
+                DataView.prototype.setUint16.length + "/" +
+                view.getFloat32(5, true) + "/" +
+                view.getUint16(2, true) + "/" +
+                view.getInt8(4) + "/" +
+                bytes[2] + ":" + bytes[3];
+        "#);
+        assert_eq!(
+            effects,
+            vec![text("result", "getInt16/1/setUint16/2/1.5/4660/-1/52:18",)],
+        );
     }
 
     #[test]

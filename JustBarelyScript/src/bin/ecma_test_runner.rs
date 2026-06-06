@@ -218,8 +218,6 @@ struct Frontmatter {
 /// skipped instead of timing out burning through the step budget.
 static UNSUPPORTED_FEATURES: &[&str] = &[
     // TypedArrays / binary data
-    "ArrayBuffer",
-    "DataView",
     "SharedArrayBuffer",
     "TypedArray",
     "Float16Array",
@@ -228,7 +226,6 @@ static UNSUPPORTED_FEATURES: &[&str] = &[
     "Int8Array",
     "Int16Array",
     "Int32Array",
-    "Uint8Array",
     "Uint8ClampedArray",
     "Uint16Array",
     "Uint32Array",
@@ -458,9 +455,7 @@ fn run_test(
     // Many tests in these dirs have no `features:` tag, so path-based detection
     // avoids burning the step budget on them.
     const UNSUPPORTED_DIRS: &[&str] = &[
-        "/built-ins/ArrayBuffer/",
         "/built-ins/SharedArrayBuffer/",
-        "/built-ins/DataView/",
         "/built-ins/TypedArray/",
         "/built-ins/Float16Array/",
         "/built-ins/Float32Array/",
@@ -468,7 +463,6 @@ fn run_test(
         "/built-ins/Int8Array/",
         "/built-ins/Int16Array/",
         "/built-ins/Int32Array/",
-        "/built-ins/Uint8Array/",
         "/built-ins/Uint16Array/",
         "/built-ins/Uint32Array/",
         "/built-ins/Uint8ClampedArray/",
