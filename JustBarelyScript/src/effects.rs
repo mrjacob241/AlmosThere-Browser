@@ -175,22 +175,22 @@ enum PromiseReaction {
         index: usize,
         values: Rc<RefCell<Vec<JsValue>>>,
         remaining: Rc<RefCell<usize>>,
-        result: Rc<RefCell<PromiseState>>,
+        result: PromiseCapability,
     },
     AllSettledElement {
         index: usize,
         values: Rc<RefCell<Vec<JsValue>>>,
         remaining: Rc<RefCell<usize>>,
-        result: Rc<RefCell<PromiseState>>,
+        result: PromiseCapability,
     },
     RaceElement {
-        result: Rc<RefCell<PromiseState>>,
+        result: PromiseCapability,
     },
     AnyElement {
         index: usize,
         errors: Rc<RefCell<Vec<JsValue>>>,
         remaining: Rc<RefCell<usize>>,
-        result: Rc<RefCell<PromiseState>>,
+        result: PromiseCapability,
     },
     AsyncContinuation {
         id: u64,
@@ -208,6 +208,14 @@ enum PromiseStatus {
 struct PromiseState {
     status: PromiseStatus,
     reactions: Vec<PromiseReaction>,
+}
+
+#[derive(Clone, Debug)]
+struct PromiseCapability {
+    promise: JsValue,
+    resolve: JsValue,
+    reject: JsValue,
+    native: Option<Rc<RefCell<PromiseState>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1159,6 +1167,34 @@ impl BrowserExecutionState {
         matches!(
             value,
             JsValue::Function(_) | JsValue::HostFunction(_) | JsValue::BoundHostFunction { .. }
+        )
+    }
+
+    fn is_object_like(value: &JsValue) -> bool {
+        matches!(
+            value,
+            JsValue::Object(_)
+                | JsValue::Array(_)
+                | JsValue::RichArray(_)
+                | JsValue::GeneratorObject(_)
+                | JsValue::Function(_)
+                | JsValue::ElementRef(_)
+                | JsValue::NodeList(_)
+                | JsValue::StyleRef(_)
+                | JsValue::StorageRef(_)
+                | JsValue::DocumentRef
+                | JsValue::WindowRef
+                | JsValue::NavigatorRef
+                | JsValue::HostFunction(_)
+                | JsValue::BoundHostFunction { .. }
+                | JsValue::HostObject(_)
+                | JsValue::RegExp { .. }
+                | JsValue::CanvasContextRef(_)
+                | JsValue::DateInstance
+                | JsValue::Promise(_)
+                | JsValue::XhrInstance { .. }
+                | JsValue::Proxy { .. }
+                | JsValue::WeakMap(_)
         )
     }
 
@@ -2410,6 +2446,101 @@ impl BrowserExecutionState {
         (resolve, reject, guard_id)
     }
 
+    fn native_promise_capability(&mut self) -> PromiseCapability {
+        let promise = Self::pending_promise();
+        let (resolve, reject, _guard) = self.promise_capability_functions(&promise);
+        PromiseCapability {
+            promise: JsValue::Promise(Rc::clone(&promise)),
+            resolve,
+            reject,
+            native: Some(promise),
+        }
+    }
+
+    fn new_promise_capability(&mut self, constructor: JsValue) -> PromiseCapability {
+        match constructor {
+            JsValue::Function(func) => {
+                let capture = JsObject::new();
+                let executor = JsValue::BoundHostFunction {
+                    name: "PromiseCapability.captureExecutor".to_owned(),
+                    this_arg: Box::new(JsValue::Undefined),
+                    bound_args: vec![JsValue::Object(Rc::clone(&capture))],
+                };
+                let promise = self.construct_function_object(func, vec![executor]);
+                if self.early_exit.is_some() {
+                    return PromiseCapability {
+                        promise,
+                        resolve: JsValue::Undefined,
+                        reject: JsValue::Undefined,
+                        native: None,
+                    };
+                }
+                let (resolve, reject) = {
+                    let captured = capture.borrow();
+                    (
+                        captured
+                            .get_own_data("resolve")
+                            .unwrap_or(JsValue::Undefined),
+                        captured
+                            .get_own_data("reject")
+                            .unwrap_or(JsValue::Undefined),
+                    )
+                };
+                if !Self::is_callable_value(&resolve) || !Self::is_callable_value(&reject) {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        "Promise constructor did not provide resolving functions".to_owned(),
+                    )));
+                }
+                PromiseCapability {
+                    promise,
+                    resolve,
+                    reject,
+                    native: None,
+                }
+            }
+            _ => self.native_promise_capability(),
+        }
+    }
+
+    fn construct_function_object(&mut self, func: JsFunction, args: Vec<JsValue>) -> JsValue {
+        let ctor_name = func.name.clone();
+        let this_rc = JsObject::new();
+        if let Some(JsValue::Object(proto_rc)) = func.properties.get("prototype") {
+            this_rc.borrow_mut().prototype = Some(Rc::clone(proto_rc));
+        }
+        let this_obj = JsValue::Object(this_rc);
+        let (result, this_after) = self.call_function_with_this(func, args, this_obj);
+        let instance = if matches!(result, JsValue::Object(_)) {
+            result
+        } else {
+            this_after
+        };
+        if let (JsValue::Object(rc), Some(name)) = (&instance, ctor_name) {
+            let mut obj = rc.borrow_mut();
+            if obj.class_name.is_none() {
+                obj.class_name = Some(name);
+            }
+        }
+        instance
+    }
+
+    fn promise_capability_resolve(&mut self, capability: &PromiseCapability, value: JsValue) {
+        if let Some(native) = &capability.native {
+            self.promise_resolve_to(native, value);
+        } else {
+            self.call_value(capability.resolve.clone(), JsValue::Undefined, vec![value]);
+        }
+    }
+
+    fn promise_capability_reject(&mut self, capability: &PromiseCapability, reason: JsValue) {
+        if let Some(native) = &capability.native {
+            self.settle_promise(native, PromiseStatus::Rejected(reason));
+        } else {
+            self.call_value(capability.reject.clone(), JsValue::Undefined, vec![reason]);
+        }
+    }
+
     fn fulfilled_promise(value: JsValue) -> JsValue {
         Self::new_promise(PromiseStatus::Fulfilled(value))
     }
@@ -2648,11 +2779,14 @@ impl BrowserExecutionState {
                     let mut remaining = remaining.borrow_mut();
                     *remaining = remaining.saturating_sub(1);
                     if *remaining == 0 {
-                        self.promise_resolve_to(&result, JsValue::Array(values.borrow().clone()));
+                        self.promise_capability_resolve(
+                            &result,
+                            JsValue::Array(values.borrow().clone()),
+                        );
                     }
                 }
                 PromiseStatus::Rejected(reason) => {
-                    self.settle_promise(&result, PromiseStatus::Rejected(reason));
+                    self.promise_capability_reject(&result, reason);
                 }
                 PromiseStatus::Pending => {}
             },
@@ -2677,15 +2811,18 @@ impl BrowserExecutionState {
                 let mut remaining = remaining.borrow_mut();
                 *remaining = remaining.saturating_sub(1);
                 if *remaining == 0 {
-                    self.promise_resolve_to(&result, JsValue::Array(values.borrow().clone()));
+                    self.promise_capability_resolve(
+                        &result,
+                        JsValue::Array(values.borrow().clone()),
+                    );
                 }
             }
             PromiseReaction::RaceElement { result } => match status {
                 PromiseStatus::Fulfilled(value) => {
-                    self.promise_resolve_to(&result, value);
+                    self.promise_capability_resolve(&result, value);
                 }
                 PromiseStatus::Rejected(reason) => {
-                    self.settle_promise(&result, PromiseStatus::Rejected(reason));
+                    self.promise_capability_reject(&result, reason);
                 }
                 PromiseStatus::Pending => {}
             },
@@ -2696,7 +2833,7 @@ impl BrowserExecutionState {
                 result,
             } => match status {
                 PromiseStatus::Fulfilled(value) => {
-                    self.promise_resolve_to(&result, value);
+                    self.promise_capability_resolve(&result, value);
                 }
                 PromiseStatus::Rejected(reason) => {
                     errors.borrow_mut()[index] = reason;
@@ -2711,7 +2848,7 @@ impl BrowserExecutionState {
                             rc.borrow_mut()
                                 .set_ne("errors", JsValue::Array(errors.borrow().clone()));
                         }
-                        self.settle_promise(&result, PromiseStatus::Rejected(err));
+                        self.promise_capability_reject(&result, err);
                     }
                 }
                 PromiseStatus::Pending => {}
@@ -3152,11 +3289,15 @@ impl BrowserExecutionState {
         }
     }
 
-    fn promise_all(&mut self, items: Vec<JsValue>) -> JsValue {
+    fn promise_all_with_capability(
+        &mut self,
+        items: Vec<JsValue>,
+        capability: PromiseCapability,
+    ) -> JsValue {
         if items.is_empty() {
-            return Self::fulfilled_promise(JsValue::Array(vec![]));
+            self.promise_capability_resolve(&capability, JsValue::Array(vec![]));
+            return capability.promise;
         }
-        let result = Self::pending_promise();
         let values = Rc::new(RefCell::new(vec![JsValue::Undefined; items.len()]));
         let remaining = Rc::new(RefCell::new(items.len()));
         for (index, item) in items.into_iter().enumerate() {
@@ -3167,19 +3308,28 @@ impl BrowserExecutionState {
                         index,
                         values: Rc::clone(&values),
                         remaining: Rc::clone(&remaining),
-                        result: Rc::clone(&result),
+                        result: capability.clone(),
                     },
                 );
             }
         }
-        JsValue::Promise(result)
+        capability.promise
     }
 
-    fn promise_all_settled(&mut self, items: Vec<JsValue>) -> JsValue {
+    fn promise_all(&mut self, items: Vec<JsValue>) -> JsValue {
+        let capability = self.native_promise_capability();
+        self.promise_all_with_capability(items, capability)
+    }
+
+    fn promise_all_settled_with_capability(
+        &mut self,
+        items: Vec<JsValue>,
+        capability: PromiseCapability,
+    ) -> JsValue {
         if items.is_empty() {
-            return Self::fulfilled_promise(JsValue::Array(vec![]));
+            self.promise_capability_resolve(&capability, JsValue::Array(vec![]));
+            return capability.promise;
         }
-        let result = Self::pending_promise();
         let values = Rc::new(RefCell::new(vec![JsValue::Undefined; items.len()]));
         let remaining = Rc::new(RefCell::new(items.len()));
         for (index, item) in items.into_iter().enumerate() {
@@ -3190,39 +3340,56 @@ impl BrowserExecutionState {
                         index,
                         values: Rc::clone(&values),
                         remaining: Rc::clone(&remaining),
-                        result: Rc::clone(&result),
+                        result: capability.clone(),
                     },
                 );
             }
         }
-        JsValue::Promise(result)
+        capability.promise
     }
 
-    fn promise_race(&mut self, items: Vec<JsValue>) -> JsValue {
-        let result = Self::pending_promise();
+    fn promise_all_settled(&mut self, items: Vec<JsValue>) -> JsValue {
+        let capability = self.native_promise_capability();
+        self.promise_all_settled_with_capability(items, capability)
+    }
+
+    fn promise_race_with_capability(
+        &mut self,
+        items: Vec<JsValue>,
+        capability: PromiseCapability,
+    ) -> JsValue {
         for item in items {
             if let JsValue::Promise(promise) = self.promise_resolve_input(item) {
                 self.attach_promise_reaction(
                     &promise,
                     PromiseReaction::RaceElement {
-                        result: Rc::clone(&result),
+                        result: capability.clone(),
                     },
                 );
             }
         }
-        JsValue::Promise(result)
+        capability.promise
     }
 
-    fn promise_any(&mut self, items: Vec<JsValue>) -> JsValue {
+    fn promise_race(&mut self, items: Vec<JsValue>) -> JsValue {
+        let capability = self.native_promise_capability();
+        self.promise_race_with_capability(items, capability)
+    }
+
+    fn promise_any_with_capability(
+        &mut self,
+        items: Vec<JsValue>,
+        capability: PromiseCapability,
+    ) -> JsValue {
         if items.is_empty() {
             let err =
                 Self::make_error_obj("AggregateError", "All promises were rejected".to_owned());
             if let JsValue::Object(rc) = &err {
                 rc.borrow_mut().set_ne("errors", JsValue::Array(vec![]));
             }
-            return Self::rejected_promise(err);
+            self.promise_capability_reject(&capability, err);
+            return capability.promise;
         }
-        let result = Self::pending_promise();
         let errors = Rc::new(RefCell::new(vec![JsValue::Undefined; items.len()]));
         let remaining = Rc::new(RefCell::new(items.len()));
         for (index, item) in items.into_iter().enumerate() {
@@ -3233,12 +3400,17 @@ impl BrowserExecutionState {
                         index,
                         errors: Rc::clone(&errors),
                         remaining: Rc::clone(&remaining),
-                        result: Rc::clone(&result),
+                        result: capability.clone(),
                     },
                 );
             }
         }
-        JsValue::Promise(result)
+        capability.promise
+    }
+
+    fn promise_any(&mut self, items: Vec<JsValue>) -> JsValue {
+        let capability = self.native_promise_capability();
+        self.promise_any_with_capability(items, capability)
     }
 
     pub fn drain_effects(&mut self) -> Vec<BrowserEffect> {
@@ -4261,24 +4433,34 @@ impl BrowserExecutionState {
                 {
                     let args = self.eval_args(arguments);
                     let target = args.get(0).cloned().unwrap_or(JsValue::Undefined);
-                    let handler = args.get(1);
+                    let handler = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    if !Self::is_object_like(&target) || !Self::is_object_like(&handler) {
+                        self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                            "TypeError",
+                            "Proxy target and handler must be objects".to_owned(),
+                        )));
+                        return JsValue::Undefined;
+                    }
                     JsValue::Proxy {
                         target: Box::new(target),
                         traps: Box::new(ProxyTraps {
-                            get: Self::handler_trap(handler, "get"),
-                            set: Self::handler_trap(handler, "set"),
-                            has: Self::handler_trap(handler, "has"),
-                            delete_property: Self::handler_trap(handler, "deleteProperty"),
-                            define_property: Self::handler_trap(handler, "defineProperty"),
-                            own_keys: Self::handler_trap(handler, "ownKeys"),
+                            get: Self::handler_trap(Some(&handler), "get"),
+                            set: Self::handler_trap(Some(&handler), "set"),
+                            has: Self::handler_trap(Some(&handler), "has"),
+                            delete_property: Self::handler_trap(Some(&handler), "deleteProperty"),
+                            define_property: Self::handler_trap(Some(&handler), "defineProperty"),
+                            own_keys: Self::handler_trap(Some(&handler), "ownKeys"),
                             get_own_property_descriptor: Self::handler_trap(
-                                handler,
+                                Some(&handler),
                                 "getOwnPropertyDescriptor",
                             ),
-                            get_prototype_of: Self::handler_trap(handler, "getPrototypeOf"),
-                            set_prototype_of: Self::handler_trap(handler, "setPrototypeOf"),
-                            is_extensible: Self::handler_trap(handler, "isExtensible"),
-                            prevent_extensions: Self::handler_trap(handler, "preventExtensions"),
+                            get_prototype_of: Self::handler_trap(Some(&handler), "getPrototypeOf"),
+                            set_prototype_of: Self::handler_trap(Some(&handler), "setPrototypeOf"),
+                            is_extensible: Self::handler_trap(Some(&handler), "isExtensible"),
+                            prevent_extensions: Self::handler_trap(
+                                Some(&handler),
+                                "preventExtensions",
+                            ),
                         }),
                     }
                 } else if matches!(callee.as_ref(), Expression::Identifier(name) if name == "WeakMap" || name == "Map")
@@ -14490,63 +14672,165 @@ impl BrowserExecutionState {
                 }
                 JsValue::Undefined
             }
+            "PromiseCapability.captureExecutor" => {
+                if let Some(JsValue::Object(rc)) = args.first() {
+                    let resolve = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    let reject = args.get(2).cloned().unwrap_or(JsValue::Undefined);
+                    let mut obj = rc.borrow_mut();
+                    obj.set("resolve", resolve);
+                    obj.set("reject", reject);
+                }
+                JsValue::Undefined
+            }
             "Promise.resolve" => {
                 let value = args.first().cloned().unwrap_or(JsValue::Undefined);
-                self.promise_resolve_input(value)
+                match this_arg {
+                    JsValue::Function(_) => {
+                        let capability = self.new_promise_capability(this_arg);
+                        if self.early_exit.is_none() {
+                            self.promise_capability_resolve(&capability, value);
+                        }
+                        capability.promise
+                    }
+                    _ => self.promise_resolve_input(value),
+                }
             }
             "Promise.reject" => {
                 let reason = args.first().cloned().unwrap_or(JsValue::Undefined);
-                Self::rejected_promise(reason)
+                match this_arg {
+                    JsValue::Function(_) => {
+                        let capability = self.new_promise_capability(this_arg);
+                        if self.early_exit.is_none() {
+                            self.promise_capability_reject(&capability, reason);
+                        }
+                        capability.promise
+                    }
+                    _ => Self::rejected_promise(reason),
+                }
             }
             "Promise.all" => {
+                let custom_capability = match this_arg {
+                    JsValue::Function(_) => Some(self.new_promise_capability(this_arg)),
+                    _ => None,
+                };
+                if self.early_exit.is_some() {
+                    return custom_capability
+                        .map(|capability| capability.promise)
+                        .unwrap_or_else(|| Self::rejected_promise(JsValue::Undefined));
+                }
                 let items = match args.first() {
                     Some(value) => match self.promise_collect_iterable_values(value.clone()) {
                         Ok(items) => items,
-                        Err(reason) => return Self::rejected_promise(reason),
+                        Err(reason) => {
+                            if let Some(capability) = custom_capability {
+                                self.promise_capability_reject(&capability, reason);
+                                return capability.promise;
+                            }
+                            return Self::rejected_promise(reason);
+                        }
                     },
                     None => Vec::new(),
                 };
+                if let Some(capability) = custom_capability {
+                    return self.promise_all_with_capability(items, capability);
+                }
                 self.promise_all(items)
             }
             "Promise.allSettled" => {
+                let custom_capability = match this_arg {
+                    JsValue::Function(_) => Some(self.new_promise_capability(this_arg)),
+                    _ => None,
+                };
+                if self.early_exit.is_some() {
+                    return custom_capability
+                        .map(|capability| capability.promise)
+                        .unwrap_or_else(|| Self::rejected_promise(JsValue::Undefined));
+                }
                 let items = match args.first() {
                     Some(value) => match self.promise_collect_iterable_values(value.clone()) {
                         Ok(items) => items,
-                        Err(reason) => return Self::rejected_promise(reason),
+                        Err(reason) => {
+                            if let Some(capability) = custom_capability {
+                                self.promise_capability_reject(&capability, reason);
+                                return capability.promise;
+                            }
+                            return Self::rejected_promise(reason);
+                        }
                     },
                     None => Vec::new(),
                 };
+                if let Some(capability) = custom_capability {
+                    return self.promise_all_settled_with_capability(items, capability);
+                }
                 self.promise_all_settled(items)
             }
             "Promise.race" => {
+                let custom_capability = match this_arg {
+                    JsValue::Function(_) => Some(self.new_promise_capability(this_arg)),
+                    _ => None,
+                };
+                if self.early_exit.is_some() {
+                    return custom_capability
+                        .map(|capability| capability.promise)
+                        .unwrap_or_else(|| Self::rejected_promise(JsValue::Undefined));
+                }
                 let items = match args.first() {
                     Some(value) => match self.promise_collect_iterable_values(value.clone()) {
                         Ok(items) => items,
-                        Err(reason) => return Self::rejected_promise(reason),
+                        Err(reason) => {
+                            if let Some(capability) = custom_capability {
+                                self.promise_capability_reject(&capability, reason);
+                                return capability.promise;
+                            }
+                            return Self::rejected_promise(reason);
+                        }
                     },
                     None => Vec::new(),
                 };
+                if let Some(capability) = custom_capability {
+                    return self.promise_race_with_capability(items, capability);
+                }
                 self.promise_race(items)
             }
             "Promise.any" => {
+                let custom_capability = match this_arg {
+                    JsValue::Function(_) => Some(self.new_promise_capability(this_arg)),
+                    _ => None,
+                };
+                if self.early_exit.is_some() {
+                    return custom_capability
+                        .map(|capability| capability.promise)
+                        .unwrap_or_else(|| Self::rejected_promise(JsValue::Undefined));
+                }
                 let items = match args.first() {
                     Some(value) => match self.promise_collect_iterable_values(value.clone()) {
                         Ok(items) => items,
-                        Err(reason) => return Self::rejected_promise(reason),
+                        Err(reason) => {
+                            if let Some(capability) = custom_capability {
+                                self.promise_capability_reject(&capability, reason);
+                                return capability.promise;
+                            }
+                            return Self::rejected_promise(reason);
+                        }
                     },
                     None => Vec::new(),
                 };
+                if let Some(capability) = custom_capability {
+                    return self.promise_any_with_capability(items, capability);
+                }
                 self.promise_any(items)
             }
             "Promise.withResolvers" => {
-                let promise = Self::pending_promise();
-                let (resolve, reject, _guard) = self.promise_capability_functions(&promise);
+                let capability = match this_arg {
+                    JsValue::Function(_) => self.new_promise_capability(this_arg),
+                    _ => self.native_promise_capability(),
+                };
                 let rc = JsObject::new();
                 {
                     let mut obj = rc.borrow_mut();
-                    obj.set("promise", JsValue::Promise(promise));
-                    obj.set("resolve", resolve);
-                    obj.set("reject", reject);
+                    obj.set("promise", capability.promise);
+                    obj.set("resolve", capability.resolve);
+                    obj.set("reject", capability.reject);
                 }
                 JsValue::Object(rc)
             }
@@ -14663,18 +14947,28 @@ impl BrowserExecutionState {
                     .unwrap_or(JsValue::Null)
             }
             "Promise.try" => {
+                let capability = match this_arg {
+                    JsValue::Function(_) => self.new_promise_capability(this_arg),
+                    _ => self.native_promise_capability(),
+                };
                 let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
                 if !Self::is_callable_value(&callback) {
-                    return Self::rejected_promise(Self::make_error_obj(
-                        "TypeError",
-                        "Promise.try callback is not callable".to_owned(),
-                    ));
+                    self.promise_capability_reject(
+                        &capability,
+                        Self::make_error_obj(
+                            "TypeError",
+                            "Promise.try callback is not callable".to_owned(),
+                        ),
+                    );
+                    return capability.promise;
                 }
                 let result = self.call_value(callback, JsValue::Undefined, Vec::new());
                 if let Some(EarlyExit::Throw(reason)) = self.early_exit.take() {
-                    return Self::rejected_promise(reason);
+                    self.promise_capability_reject(&capability, reason);
+                    return capability.promise;
                 }
-                self.promise_resolve_input(result)
+                self.promise_capability_resolve(&capability, result);
+                capability.promise
             }
             "import" => {
                 let specifier = args
@@ -18924,7 +19218,7 @@ mod tests {
             state.drain_effects(),
             vec![BrowserEffect::SetTextContent {
                 element_id: "result".to_owned(),
-                value: "2:script_a:script_b:".to_owned(),
+                value: "2:script_a:script_b:head".to_owned(),
             }]
         );
     }
@@ -20065,7 +20359,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Block 3 deferred: Promise static receiver constructor capabilities"]
     fn promise_resolve_call_uses_custom_constructor_capability() {
         let program = crate::parse_script(
             r#"
@@ -20097,7 +20390,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Block 3 deferred: Promise static receiver constructor capabilities"]
     fn promise_all_call_uses_custom_constructor_capability() {
         let program = crate::parse_script(
             r#"
@@ -20134,7 +20426,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Block 3 deferred: Promise static receiver constructor capabilities"]
     fn promise_all_call_rejects_custom_capability_when_iterator_throws() {
         let program = crate::parse_script(
             r#"
@@ -21227,6 +21518,54 @@ mod tests {
                 element_id: "result".to_owned(),
                 value: "get:name:B/true/x=Y/true/false/false/gone/b,a/desc:slot/true/newProp=V"
                     .to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn proxy_constructor_rejects_primitive_target_or_handler() {
+        let program = crate::parse_script(
+            r#"
+            let primitiveTarget = "none";
+            let nullHandler = "none";
+            let primitiveHandler = "none";
+            let valid = "missing";
+
+            try {
+                new Proxy(1, {});
+            } catch (e) {
+                primitiveTarget = e.name;
+            }
+
+            try {
+                new Proxy({}, null);
+            } catch (e) {
+                nullHandler = e.name;
+            }
+
+            try {
+                new Proxy({}, 1);
+            } catch (e) {
+                primitiveHandler = e.name;
+            }
+
+            let proxy = new Proxy({ value: "ok" }, {});
+            valid = proxy.value;
+
+            document.getElementById("result").textContent =
+                primitiveTarget + "/" + nullHandler + "/" + primitiveHandler + "/" + valid;
+            "#,
+        )
+        .expect("script should parse");
+
+        let mut state = BrowserExecutionState::default();
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "TypeError/TypeError/TypeError/ok".to_owned(),
             }]
         );
     }

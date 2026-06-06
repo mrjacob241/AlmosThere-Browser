@@ -6390,11 +6390,15 @@ impl App for AlmostThereApp {
                 }
                 if let Some((progress, summary)) = self.pending_loading_summary() {
                     ui.separator();
-                    ui.add(
-                        egui::ProgressBar::new(progress)
-                            .desired_width(120.0)
-                            .animate(true),
-                    );
+                    ui.scope(|ui| {
+                        ui.visuals_mut().extreme_bg_color = egui::Color32::from_rgb(243, 226, 150);
+                        ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                        ui.add(
+                            egui::ProgressBar::new(progress)
+                                .desired_width(120.0)
+                                .animate(true),
+                        );
+                    });
                     ui.label(egui::RichText::new(summary).small());
                 }
                 if let Some(index) = tab_to_close {
@@ -26180,6 +26184,7 @@ mod tests {
                         scroll_offset,
                         hovered_link_href: None,
                         hovered_link_element_id: None,
+                        text_selection: Default::default(),
                     },
                     document,
                     output_path,

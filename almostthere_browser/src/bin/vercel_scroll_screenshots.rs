@@ -134,6 +134,7 @@ fn capture_browser_window_screenshot(
                     scroll_offset: egui::vec2(0.0, scroll_y),
                     hovered_link_href: None,
                     hovered_link_element_id: None,
+                    text_selection: Default::default(),
                 },
                 document,
                 output_path,

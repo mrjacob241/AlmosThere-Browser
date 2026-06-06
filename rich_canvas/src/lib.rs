@@ -9,7 +9,7 @@ use egui::{
     Align2, Button, Color32, ColorImage, CornerRadius, FontFamily, FontId, Frame, Margin, Pos2,
     Rect, RichText, ScrollArea, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2,
     epaint::TextShape,
-    text::{LayoutJob, TextFormat},
+    text::{CCursor, LayoutJob, TextFormat},
     vec2,
 };
 
@@ -23,6 +23,50 @@ pub struct BrowserCanvas {
     pub scroll_offset: Vec2,
     pub hovered_link_href: Option<String>,
     pub hovered_link_element_id: Option<String>,
+    pub text_selection: CanvasTextSelection,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CanvasTextCaret {
+    pub object_index: usize,
+    pub char_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CanvasTextRange {
+    pub start: CanvasTextCaret,
+    pub end: CanvasTextCaret,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CanvasTextSelection {
+    pub anchor: Option<CanvasTextCaret>,
+    pub focus: Option<CanvasTextCaret>,
+    pub dragging: bool,
+    pub drag_exceeded_click: bool,
+}
+
+impl CanvasTextSelection {
+    fn clear(&mut self) {
+        self.anchor = None;
+        self.focus = None;
+        self.dragging = false;
+        self.drag_exceeded_click = false;
+    }
+
+    fn sorted_range(&self) -> Option<(CanvasTextCaret, CanvasTextCaret)> {
+        let anchor = self.anchor?;
+        let focus = self.focus?;
+        if anchor <= focus {
+            Some((anchor, focus))
+        } else {
+            Some((focus, anchor))
+        }
+    }
+
+    fn has_non_empty_range(&self) -> bool {
+        self.sorted_range().is_some_and(|(start, end)| start != end)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1256,6 +1300,7 @@ impl BrowserCanvas {
             scroll_offset: Vec2::ZERO,
             hovered_link_href: None,
             hovered_link_element_id: None,
+            text_selection: CanvasTextSelection::default(),
         }
     }
 
@@ -1300,6 +1345,7 @@ impl BrowserCanvas {
                                 content_width,
                                 font_scale,
                                 &mut canvas_response,
+                                &mut self.text_selection,
                                 false,
                                 self.hovered_link_href.as_deref(),
                                 self.hovered_link_element_id.as_deref(),
@@ -1353,6 +1399,7 @@ impl BrowserCanvas {
                             content_width,
                             font_scale,
                             &mut canvas_response,
+                            &mut self.text_selection,
                             true,
                             self.hovered_link_href.as_deref(),
                             self.hovered_link_element_id.as_deref(),
@@ -1375,6 +1422,116 @@ fn hovered_link_identity(target: Option<&HitTarget>) -> (Option<String>, Option<
     }
 }
 
+pub fn canvas_graph_selected_text(
+    graph: &CanvasGraph,
+    selection: &CanvasTextSelection,
+) -> Option<String> {
+    let range = normalized_canvas_text_selection_range(graph, selection)?;
+    Some(canvas_graph_text_for_range(graph, range))
+}
+
+pub fn normalized_canvas_text_selection_range(
+    graph: &CanvasGraph,
+    selection: &CanvasTextSelection,
+) -> Option<CanvasTextRange> {
+    let anchor = selection.anchor?;
+    let focus = selection.focus?;
+    let start = normalize_canvas_text_caret(graph, anchor)?;
+    let end = normalize_canvas_text_caret(graph, focus)?;
+    let (start, end) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    (start != end).then_some(CanvasTextRange { start, end })
+}
+
+fn normalize_canvas_text_caret(
+    graph: &CanvasGraph,
+    caret: CanvasTextCaret,
+) -> Option<CanvasTextCaret> {
+    let char_count = canvas_object_selectable_text(graph.objects.get(caret.object_index)?)
+        .map(|text| text.chars().count())?;
+    Some(CanvasTextCaret {
+        object_index: caret.object_index,
+        char_index: caret.char_index.min(char_count),
+    })
+}
+
+fn canvas_graph_text_for_range(graph: &CanvasGraph, range: CanvasTextRange) -> String {
+    let mut selected = String::new();
+    let mut previous_rect: Option<Rect> = None;
+    for object_index in range.start.object_index..=range.end.object_index {
+        let Some(object) = graph.objects.get(object_index) else {
+            continue;
+        };
+        let Some(text) = canvas_object_selectable_text(object) else {
+            continue;
+        };
+        let char_len = text.chars().count();
+        let start_char = if object_index == range.start.object_index {
+            range.start.char_index.min(char_len)
+        } else {
+            0
+        };
+        let end_char = if object_index == range.end.object_index {
+            range.end.char_index.min(char_len)
+        } else {
+            char_len
+        };
+        if start_char >= end_char {
+            continue;
+        }
+        if !selected.is_empty() {
+            if previous_rect
+                .zip(canvas_object_selectable_rect(object))
+                .is_none_or(|(previous, current)| {
+                    !canvas_text_rects_share_visual_line(previous, current)
+                })
+            {
+                selected.push('\n');
+            }
+        }
+        selected.push_str(&text_chars_slice(&text, start_char, end_char));
+        previous_rect = canvas_object_selectable_rect(object);
+    }
+    selected
+}
+
+fn canvas_object_selectable_text(object: &CanvasObject) -> Option<String> {
+    match object {
+        CanvasObject::Text(text) => Some(text.text.clone()),
+        CanvasObject::RichTextLine(line) => {
+            let mut text = String::new();
+            for span in &line.spans {
+                text.push_str(&span.text);
+            }
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
+fn canvas_object_selectable_rect(object: &CanvasObject) -> Option<Rect> {
+    match object {
+        CanvasObject::Text(text) => Some(text.rect),
+        CanvasObject::RichTextLine(line) => Some(line.rect),
+        _ => None,
+    }
+}
+
+fn canvas_text_rects_share_visual_line(a: Rect, b: Rect) -> bool {
+    let tolerance = (a.height().max(b.height()) * 0.5).max(2.0);
+    (a.center().y - b.center().y).abs() <= tolerance
+}
+
+fn text_chars_slice(text: &str, start_char: usize, end_char: usize) -> String {
+    text.chars()
+        .skip(start_char)
+        .take(end_char.saturating_sub(start_char))
+        .collect()
+}
+
 fn document_prefers_wide_layout(document: &BrowserDocument) -> bool {
     document.blocks.iter().any(|block| {
         matches!(
@@ -1390,6 +1547,7 @@ fn paint_canvas_graph(
     content_width: f32,
     font_scale: f32,
     canvas_response: &mut BrowserCanvasResponse,
+    text_selection: &mut CanvasTextSelection,
     read_only: bool,
     hovered_link_href: Option<&str>,
     hovered_link_element_id: Option<&str>,
@@ -1397,10 +1555,34 @@ fn paint_canvas_graph(
     let graph_width = graph.viewport.x.max(1.0);
     let scale = (content_width / graph_width).max(0.1) * font_scale;
     let graph_size = vec2(content_width.max(1.0), (graph.viewport.y * scale).max(1.0));
-    let (canvas_rect, _) = ui.allocate_exact_size(graph_size, Sense::hover());
+    let (canvas_rect, canvas_interaction) =
+        ui.allocate_exact_size(graph_size, Sense::click_and_drag());
     let mut painter = ui.painter().with_clip_rect(canvas_rect);
     let mut current_clip_rect = canvas_rect;
     let mut clip_stack = Vec::new();
+    let pointer_pos = ui.input(|input| input.pointer.interact_pos().or(input.pointer.hover_pos()));
+    let mut pointer_text_caret = None;
+    let mut pointer_text_anchor_caret = None;
+    let mut pointer_over_text = false;
+    let selected_text_for_menu = canvas_graph_selected_text(graph, text_selection);
+    let copy_requested = ui.input(|input| {
+        input
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Copy))
+    });
+    if copy_requested
+        && let Some(selected_text) = selected_text_for_menu.as_deref()
+        && !selected_text.is_empty()
+    {
+        ui.ctx().copy_text(selected_text.to_owned());
+    }
+    if canvas_interaction.drag_started() {
+        text_selection.dragging = false;
+        text_selection.drag_exceeded_click = false;
+    } else if canvas_interaction.dragged() && canvas_interaction.drag_delta().length_sq() > 9.0 {
+        text_selection.drag_exceeded_click = true;
+    }
     let mut submitted_forms: Vec<(
         Option<String>,
         Option<String>,
@@ -1485,6 +1667,33 @@ fn paint_canvas_graph(
                         vec2(text_width, paint_rect.height()),
                     ),
                 };
+                if let Some(pointer) = pointer_pos {
+                    if text_rect.expand(2.0).contains(pointer) {
+                        pointer_over_text = true;
+                        let local = pointer - text_rect.min;
+                        let char_index = galley
+                            .cursor_from_pos(local)
+                            .index
+                            .min(text.text.chars().count());
+                        pointer_text_caret = Some(CanvasTextCaret {
+                            object_index: index,
+                            char_index,
+                        });
+                        pointer_text_anchor_caret = Some(CanvasTextCaret {
+                            object_index: index,
+                            char_index: char_index.saturating_sub(1),
+                        });
+                    }
+                }
+                paint_text_selection_highlight(
+                    &painter,
+                    text_selection,
+                    index,
+                    &text.text,
+                    &galley,
+                    text_rect,
+                    current_clip_rect,
+                );
                 painter.add(TextShape::new(text_rect.left_top(), galley, text_color));
                 if let Some(href) = &text.href {
                     let hit_rect = rect.intersect(current_clip_rect);
@@ -1500,7 +1709,7 @@ fn paint_canvas_graph(
                                 element_id: text.element_id.clone(),
                             });
                         }
-                        if response.clicked() {
+                        if response.clicked() && !text_selection.drag_exceeded_click {
                             canvas_response.clicked = Some(HitTarget::Link {
                                 href: href.clone(),
                                 element_id: text.element_id.clone(),
@@ -1512,7 +1721,9 @@ fn paint_canvas_graph(
             CanvasObject::RichTextLine(line) => {
                 let rect = canvas_object_rect(canvas_rect.min, line.rect, scale);
                 let mut job = LayoutJob::default();
+                let mut line_text = String::new();
                 for span in &line.spans {
+                    line_text.push_str(&span.text);
                     let family = if span.font_weight_bold {
                         browser_bold_family()
                     } else {
@@ -1565,6 +1776,33 @@ fn paint_canvas_graph(
                         vec2(text_width, text_height),
                     ),
                 };
+                if let Some(pointer) = pointer_pos {
+                    if text_rect.expand(2.0).contains(pointer) {
+                        pointer_over_text = true;
+                        let local = pointer - text_rect.min;
+                        let char_index = galley
+                            .cursor_from_pos(local)
+                            .index
+                            .min(line_text.chars().count());
+                        pointer_text_caret = Some(CanvasTextCaret {
+                            object_index: index,
+                            char_index,
+                        });
+                        pointer_text_anchor_caret = Some(CanvasTextCaret {
+                            object_index: index,
+                            char_index: char_index.saturating_sub(1),
+                        });
+                    }
+                }
+                paint_text_selection_highlight(
+                    &painter,
+                    text_selection,
+                    index,
+                    &line_text,
+                    &galley,
+                    text_rect,
+                    current_clip_rect,
+                );
                 painter.add(TextShape::new(text_rect.left_top(), galley, Color32::WHITE));
             }
             CanvasObject::Rect(rect_object) => {
@@ -1769,6 +2007,7 @@ fn paint_canvas_graph(
                                 });
                             }
                             if response.has_focus() {
+                                text_selection.clear();
                                 canvas_response.focused = Some(HitTarget::Input {
                                     label: input.label.clone(),
                                     element_id: input.element_id.clone(),
@@ -1829,6 +2068,7 @@ fn paint_canvas_graph(
                                 });
                             }
                             if response.has_focus() {
+                                text_selection.clear();
                                 canvas_response.focused = Some(HitTarget::Input {
                                     label: input.label.clone(),
                                     element_id: input.element_id.clone(),
@@ -1910,7 +2150,7 @@ fn paint_canvas_graph(
                             element_id: link.element_id.clone(),
                         });
                     }
-                    if response.clicked() {
+                    if response.clicked() && !text_selection.drag_exceeded_click {
                         canvas_response.clicked = Some(HitTarget::Link {
                             href: link.href.clone(),
                             element_id: link.element_id.clone(),
@@ -1919,6 +2159,44 @@ fn paint_canvas_graph(
                 }
             }
         }
+    }
+    if pointer_over_text && canvas_interaction.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+    }
+    if let Some(selected_text) = selected_text_for_menu {
+        if !selected_text.is_empty() {
+            canvas_interaction.clone().context_menu(|ui| {
+                if ui.button("Copy Text").clicked() {
+                    ui.ctx().copy_text(selected_text.clone());
+                    ui.close();
+                }
+            });
+        }
+    }
+    if canvas_interaction.drag_started() {
+        if let Some(caret) = pointer_text_anchor_caret.or(pointer_text_caret) {
+            text_selection.anchor = Some(caret);
+            text_selection.focus = pointer_text_caret.or(Some(caret));
+            text_selection.dragging = true;
+        } else {
+            text_selection.clear();
+        }
+    } else if canvas_interaction.dragged() {
+        if text_selection.dragging {
+            if let Some(caret) = pointer_text_caret {
+                text_selection.focus = Some(caret);
+            }
+            if canvas_interaction.drag_delta().length_sq() > 9.0 {
+                text_selection.drag_exceeded_click = true;
+            }
+        }
+    } else if canvas_interaction.drag_stopped() {
+        text_selection.dragging = false;
+        if !text_selection.has_non_empty_range() {
+            text_selection.clear();
+        }
+    } else if canvas_interaction.clicked() && pointer_text_caret.is_none() {
+        text_selection.clear();
     }
     for (name, element_id) in selected_radios {
         for object in &mut graph.objects {
@@ -1943,6 +2221,53 @@ fn paint_canvas_graph(
             form_method.as_deref(),
             submitter_element_id.as_deref(),
             canvas_response,
+        );
+    }
+}
+
+fn paint_text_selection_highlight(
+    painter: &egui::Painter,
+    selection: &CanvasTextSelection,
+    object_index: usize,
+    text: &str,
+    galley: &egui::Galley,
+    text_rect: Rect,
+    clip_rect: Rect,
+) {
+    let Some((start, end)) = selection.sorted_range() else {
+        return;
+    };
+    if object_index < start.object_index || object_index > end.object_index {
+        return;
+    }
+
+    let char_count = text.chars().count();
+    let start_index = if object_index == start.object_index {
+        start.char_index.min(char_count)
+    } else {
+        0
+    };
+    let end_index = if object_index == end.object_index {
+        end.char_index.min(char_count)
+    } else {
+        char_count
+    };
+    if start_index >= end_index {
+        return;
+    }
+
+    let start_rect = galley.pos_from_cursor(CCursor::new(start_index));
+    let end_rect = galley.pos_from_cursor(CCursor::new(end_index));
+    let highlight = Rect::from_min_max(
+        Pos2::new(text_rect.left() + start_rect.left(), text_rect.top()),
+        Pos2::new(text_rect.left() + end_rect.left(), text_rect.bottom()),
+    )
+    .intersect(clip_rect);
+    if highlight.is_positive() {
+        painter.rect_filled(
+            highlight,
+            CornerRadius::ZERO,
+            Color32::from_rgba_unmultiplied(56, 132, 255, 96),
         );
     }
 }
@@ -7608,6 +7933,259 @@ mod tests {
             kind: CanvasInputKind::Text,
             submit_on_enter: false,
         })
+    }
+
+    fn sample_text_object(text: &str) -> CanvasObject {
+        sample_text_object_at(text, 0.0)
+    }
+
+    fn sample_text_object_at(text: &str, y: f32) -> CanvasObject {
+        CanvasObject::Text(CanvasTextObject {
+            text: text.to_owned(),
+            rect: Rect::from_min_size(Pos2::new(0.0, y), Vec2::new(200.0, 24.0)),
+            text_inset_x: 0.0,
+            color: Color32::BLACK,
+            font_size: 16.0,
+            font_weight_bold: false,
+            font_style_italic: false,
+            text_decoration_underline: false,
+            text_decoration_strikethrough: false,
+            text_background: Color32::TRANSPARENT,
+            text_align: CssTextAlign::Left,
+            href: None,
+            element_id: None,
+        })
+    }
+
+    fn sample_span(text: &str) -> CanvasTextSpan {
+        CanvasTextSpan {
+            text: text.to_owned(),
+            color: Color32::BLACK,
+            font_size: 16.0,
+            font_weight_bold: false,
+            font_style_italic: false,
+            text_decoration_underline: false,
+            text_decoration_strikethrough: false,
+            text_background: Color32::TRANSPARENT,
+            href: None,
+            element_id: None,
+        }
+    }
+
+    fn sample_rich_text_line(spans: &[&str]) -> CanvasObject {
+        sample_rich_text_line_at(spans, 0.0)
+    }
+
+    fn sample_rich_text_line_at(spans: &[&str], y: f32) -> CanvasObject {
+        CanvasObject::RichTextLine(CanvasRichTextLineObject {
+            rect: Rect::from_min_size(Pos2::new(0.0, y), Vec2::new(240.0, 24.0)),
+            spans: spans.iter().map(|span| sample_span(span)).collect(),
+            text_align: CssTextAlign::Left,
+        })
+    }
+
+    #[test]
+    fn canvas_text_selection_range_normalizes_reversed_carets_and_clamps_offsets() {
+        let graph = CanvasGraph {
+            viewport: Vec2::new(320.0, 120.0),
+            objects: vec![
+                sample_text_object("Hello"),
+                sample_rich_text_line(&["world"]),
+            ],
+        };
+        let selection = CanvasTextSelection {
+            anchor: Some(CanvasTextCaret {
+                object_index: 1,
+                char_index: 99,
+            }),
+            focus: Some(CanvasTextCaret {
+                object_index: 0,
+                char_index: 2,
+            }),
+            dragging: false,
+            drag_exceeded_click: false,
+        };
+
+        let range = normalized_canvas_text_selection_range(&graph, &selection).unwrap();
+
+        assert_eq!(
+            range,
+            CanvasTextRange {
+                start: CanvasTextCaret {
+                    object_index: 0,
+                    char_index: 2,
+                },
+                end: CanvasTextCaret {
+                    object_index: 1,
+                    char_index: 5,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn canvas_text_selection_range_rejects_empty_or_non_text_carets() {
+        let graph = CanvasGraph {
+            viewport: Vec2::new(320.0, 120.0),
+            objects: vec![
+                sample_text_object("Hello"),
+                CanvasObject::Rect(CanvasRectObject {
+                    rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(10.0, 10.0)),
+                    fill: Color32::WHITE,
+                    border_color: Color32::BLACK,
+                    border_width: 0.0,
+                    border_radius: 0,
+                }),
+            ],
+        };
+        let empty_selection = CanvasTextSelection {
+            anchor: Some(CanvasTextCaret {
+                object_index: 0,
+                char_index: 3,
+            }),
+            focus: Some(CanvasTextCaret {
+                object_index: 0,
+                char_index: 3,
+            }),
+            dragging: false,
+            drag_exceeded_click: false,
+        };
+        let non_text_selection = CanvasTextSelection {
+            anchor: Some(CanvasTextCaret {
+                object_index: 0,
+                char_index: 1,
+            }),
+            focus: Some(CanvasTextCaret {
+                object_index: 1,
+                char_index: 0,
+            }),
+            dragging: false,
+            drag_exceeded_click: false,
+        };
+
+        assert!(normalized_canvas_text_selection_range(&graph, &empty_selection).is_none());
+        assert!(normalized_canvas_text_selection_range(&graph, &non_text_selection).is_none());
+    }
+
+    #[test]
+    fn canvas_graph_selected_text_extracts_plain_text_subranges() {
+        let graph = CanvasGraph {
+            viewport: Vec2::new(320.0, 120.0),
+            objects: vec![sample_text_object("Hello selectable browser text")],
+        };
+        let selection = CanvasTextSelection {
+            anchor: Some(CanvasTextCaret {
+                object_index: 0,
+                char_index: 6,
+            }),
+            focus: Some(CanvasTextCaret {
+                object_index: 0,
+                char_index: 16,
+            }),
+            dragging: false,
+            drag_exceeded_click: false,
+        };
+
+        assert_eq!(
+            canvas_graph_selected_text(&graph, &selection).as_deref(),
+            Some("selectable")
+        );
+    }
+
+    #[test]
+    fn canvas_graph_selected_text_extracts_rich_spans_without_extra_separators() {
+        let graph = CanvasGraph {
+            viewport: Vec2::new(320.0, 120.0),
+            objects: vec![sample_rich_text_line(&["plain ", "linked", " text"])],
+        };
+        let selection = CanvasTextSelection {
+            anchor: Some(CanvasTextCaret {
+                object_index: 0,
+                char_index: 3,
+            }),
+            focus: Some(CanvasTextCaret {
+                object_index: 0,
+                char_index: 13,
+            }),
+            dragging: false,
+            drag_exceeded_click: false,
+        };
+
+        assert_eq!(
+            canvas_graph_selected_text(&graph, &selection).as_deref(),
+            Some("in linked ")
+        );
+    }
+
+    #[test]
+    fn canvas_graph_selected_text_uses_graph_order_across_text_and_rich_lines() {
+        let graph = CanvasGraph {
+            viewport: Vec2::new(320.0, 120.0),
+            objects: vec![
+                sample_text_object_at("First line", 0.0),
+                CanvasObject::Rect(CanvasRectObject {
+                    rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(10.0, 10.0)),
+                    fill: Color32::WHITE,
+                    border_color: Color32::BLACK,
+                    border_width: 0.0,
+                    border_radius: 0,
+                }),
+                sample_rich_text_line_at(&["Second ", "line"], 28.0),
+                sample_text_object_at("Third line", 56.0),
+            ],
+        };
+        let selection = CanvasTextSelection {
+            anchor: Some(CanvasTextCaret {
+                object_index: 0,
+                char_index: 6,
+            }),
+            focus: Some(CanvasTextCaret {
+                object_index: 3,
+                char_index: 5,
+            }),
+            dragging: false,
+            drag_exceeded_click: false,
+        };
+
+        assert_eq!(
+            canvas_graph_selected_text(&graph, &selection).as_deref(),
+            Some("line\nSecond line\nThird")
+        );
+    }
+
+    #[test]
+    fn canvas_graph_selected_text_keeps_same_visual_line_together() {
+        let graph = CanvasGraph {
+            viewport: Vec2::new(320.0, 120.0),
+            objects: vec![
+                sample_text_object_at("Hello ", 0.0),
+                CanvasObject::Rect(CanvasRectObject {
+                    rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(10.0, 10.0)),
+                    fill: Color32::WHITE,
+                    border_color: Color32::BLACK,
+                    border_width: 0.0,
+                    border_radius: 0,
+                }),
+                sample_text_object_at("world", 0.0),
+            ],
+        };
+        let selection = CanvasTextSelection {
+            anchor: Some(CanvasTextCaret {
+                object_index: 0,
+                char_index: 0,
+            }),
+            focus: Some(CanvasTextCaret {
+                object_index: 2,
+                char_index: 5,
+            }),
+            dragging: false,
+            drag_exceeded_click: false,
+        };
+
+        assert_eq!(
+            canvas_graph_selected_text(&graph, &selection).as_deref(),
+            Some("Hello world")
+        );
     }
 
     #[test]
