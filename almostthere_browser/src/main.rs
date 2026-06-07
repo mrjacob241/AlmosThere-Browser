@@ -49,8 +49,11 @@ const DEFAULT_URL_BOOKMARK_TITLE: &str = "HTML5 Test Page";
 const LOCAL_BOOKMARK_TOKEN: &str = "[local]";
 const LATE_IMAGE_MAX_ACTIVE_GLOBAL: usize = 1;
 const LATE_IMAGE_MAX_ACTIVE_PER_ORIGIN: usize = 1;
+const LATE_IMAGE_HTTP2_MAX_ACTIVE_GLOBAL: usize = 4;
+const LATE_IMAGE_HTTP2_MAX_ACTIVE_PER_ORIGIN: usize = 4;
 const LATE_IMAGE_COMPLETION_COOLDOWN: Duration = Duration::from_millis(130);
 const LATE_IMAGE_ORIGIN_SUCCESS_START_SPACING: Duration = Duration::from_millis(3000);
+const LATE_IMAGE_HTTP2_ORIGIN_SUCCESS_START_SPACING: Duration = Duration::ZERO;
 const LATE_IMAGE_ORIGIN_FAILURE_START_SPACING: Duration = Duration::from_millis(510);
 const LATE_IMAGE_REQUEST_GATE_SLOT: Duration = Duration::from_millis(100);
 const LATE_IMAGE_REQUEST_GATE_LAUNCH_DELAY: Duration = Duration::from_millis(50);
@@ -714,6 +717,21 @@ impl LateImageDelayReason {
             Self::OriginRateLimit => "origin-rate-limit",
             Self::OriginFailureSpacing => "origin-failure-spacing",
             Self::ExactFailureBackoff => "exact-failure-backoff",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LateImageOriginTransport {
+    Conservative,
+    Http2,
+}
+
+impl LateImageOriginTransport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Conservative => "conservative",
+            Self::Http2 => "http2",
         }
     }
 }
@@ -1634,7 +1652,10 @@ impl AlmostThereApp {
                 reason: LateImageDelayReason::BatchRelease,
             });
         }
-        if self.late_image_active_keys.len() >= LATE_IMAGE_MAX_ACTIVE_GLOBAL {
+        let transport = late_image_origin_transport(&queued.origin);
+        let global_limit = late_image_global_limit_for_transport(transport);
+        let origin_limit = late_image_origin_limit_for_transport(transport);
+        if self.late_image_active_keys.len() >= global_limit {
             return Some(LateImageDispatchDelay {
                 duration: Duration::from_millis(100),
                 reason: LateImageDelayReason::GlobalConcurrency,
@@ -1645,7 +1666,7 @@ impl AlmostThereApp {
             .get(&queued.origin)
             .copied()
             .unwrap_or(0);
-        if active >= LATE_IMAGE_MAX_ACTIVE_PER_ORIGIN {
+        if active >= origin_limit {
             return Some(LateImageDispatchDelay {
                 duration: Duration::from_millis(100),
                 reason: LateImageDelayReason::OriginConcurrency,
@@ -1663,16 +1684,21 @@ impl AlmostThereApp {
                 reason: LateImageDelayReason::OriginFailureSpacing,
             });
         }
-        if let Some(next_start) = self
-            .late_image_next_start_by_origin
-            .get(&queued.origin)
-            .copied()
-            && next_start > now
-        {
-            return Some(LateImageDispatchDelay {
-                duration: next_start.saturating_duration_since(now),
-                reason: LateImageDelayReason::OriginRateLimit,
-            });
+        if late_image_origin_success_spacing_for_transport(transport) > Duration::ZERO {
+            if let Some(next_start) = self
+                .late_image_next_start_by_origin
+                .get(&queued.origin)
+                .copied()
+                && next_start > now
+            {
+                return Some(LateImageDispatchDelay {
+                    duration: next_start.saturating_duration_since(now),
+                    reason: LateImageDelayReason::OriginRateLimit,
+                });
+            }
+        }
+        if transport == LateImageOriginTransport::Http2 {
+            return None;
         }
         let next_start = self.late_image_next_serial_start?;
         if next_start <= now {
@@ -1702,6 +1728,9 @@ impl AlmostThereApp {
             .copied()
             .unwrap_or(0);
         let active_global = self.late_image_active_keys.len();
+        let transport = late_image_origin_transport(&queued.origin);
+        let global_limit = late_image_global_limit_for_transport(transport);
+        let origin_limit = late_image_origin_limit_for_transport(transport);
         let reason = delay.reason.as_str();
         let notice_key = format!("{}|{reason}", queued.origin);
         if self
@@ -1722,13 +1751,11 @@ impl AlmostThereApp {
                 ("origin", &queued.origin),
                 ("delay_ms", &delay.duration.as_millis().to_string()),
                 ("reason", reason),
+                ("transport", transport.as_str()),
                 ("active_global", &active_global.to_string()),
-                ("global_limit", &LATE_IMAGE_MAX_ACTIVE_GLOBAL.to_string()),
+                ("global_limit", &global_limit.to_string()),
                 ("active_for_origin", &active.to_string()),
-                (
-                    "origin_limit",
-                    &LATE_IMAGE_MAX_ACTIVE_PER_ORIGIN.to_string(),
-                ),
+                ("origin_limit", &origin_limit.to_string()),
             ],
         );
     }
@@ -1743,10 +1770,16 @@ impl AlmostThereApp {
             .insert(queued.key.clone(), queued.origin.clone());
         let active_for_origin = *active;
         let active_global = self.late_image_active_keys.len();
-        self.late_image_next_start_by_origin.insert(
-            queued.origin.clone(),
-            Instant::now() + LATE_IMAGE_ORIGIN_SUCCESS_START_SPACING,
-        );
+        let transport = late_image_origin_transport(&queued.origin);
+        let global_limit = late_image_global_limit_for_transport(transport);
+        let origin_limit = late_image_origin_limit_for_transport(transport);
+        let origin_spacing = late_image_origin_success_spacing_for_transport(transport);
+        if origin_spacing > Duration::ZERO {
+            self.late_image_next_start_by_origin
+                .insert(queued.origin.clone(), Instant::now() + origin_spacing);
+        } else {
+            self.late_image_next_start_by_origin.remove(&queued.origin);
+        }
         self.late_image_last_delay_notice.remove(&queued.origin);
         let queue_wait_ms = queued.queued_at.elapsed().as_millis().to_string();
         self.telemetry.emit(
@@ -1756,13 +1789,12 @@ impl AlmostThereApp {
                 ("document", &queued.key.document_source),
                 ("url", &queued.key.image_url),
                 ("origin", &queued.origin),
+                ("transport", transport.as_str()),
+                ("origin_spacing_ms", &origin_spacing.as_millis().to_string()),
                 ("active_global", &active_global.to_string()),
-                ("global_limit", &LATE_IMAGE_MAX_ACTIVE_GLOBAL.to_string()),
+                ("global_limit", &global_limit.to_string()),
                 ("active_for_origin", &active_for_origin.to_string()),
-                (
-                    "origin_limit",
-                    &LATE_IMAGE_MAX_ACTIVE_PER_ORIGIN.to_string(),
-                ),
+                ("origin_limit", &origin_limit.to_string()),
                 ("queue_wait_ms", &queue_wait_ms),
                 ("priority", &queued.priority.to_string()),
             ],
@@ -6416,12 +6448,15 @@ fn fetch_remote_script_resource(resolved: &str, started: Instant) -> io::Result<
             let elapsed_ms = started.elapsed().as_millis().to_string();
             let status = response.status().as_u16().to_string();
             let final_url = response.url().to_string();
+            let protocol = http_version_label(response.version());
+            remember_http2_origin_if_negotiated(&final_url, response.version());
             emit_global_telemetry(
                 "js.resource.fetch.response.headers.received",
                 &[
                     ("url", resolved),
                     ("final_url", &final_url),
                     ("status", &status),
+                    ("protocol", protocol),
                     ("elapsed_ms", &elapsed_ms),
                 ],
             );
@@ -6501,11 +6536,17 @@ fn fetch_remote_script_resource(resolved: &str, started: Instant) -> io::Result<
 }
 
 fn script_resource_http_client() -> io::Result<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(SCRIPT_RESOURCE_HARD_TIMEOUT_SECS))
-        .user_agent(format!("{APP_TITLE}/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(io::Error::other)
+    static CLIENT: OnceLock<io::Result<reqwest::blocking::Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            browser_http_client_builder()
+                .timeout(Duration::from_secs(SCRIPT_RESOURCE_HARD_TIMEOUT_SECS))
+                .build()
+                .map_err(io::Error::other)
+        })
+        .as_ref()
+        .map(Clone::clone)
+        .map_err(|error| io::Error::new(error.kind(), error.to_string()))
 }
 
 fn store_script_resource_cache(
@@ -8536,9 +8577,15 @@ fn load_url_source(input: &str) -> io::Result<LoadedPageSource> {
         let request = http_client()?.get(input);
         emit_global_telemetry("navigation.fetch.request.send.started", &[("url", input)]);
         let response = request.send().map_err(io::Error::other)?;
+        let protocol = http_version_label(response.version());
+        remember_http2_origin_if_negotiated(response.url().as_str(), response.version());
         emit_global_telemetry(
             "navigation.fetch.response.headers.received",
-            &[("url", input), ("final_url", response.url().as_str())],
+            &[
+                ("url", input),
+                ("final_url", response.url().as_str()),
+                ("protocol", protocol),
+            ],
         );
         let final_url = response.url().to_string();
         let status_text = response.status().as_u16().to_string();
@@ -8713,11 +8760,86 @@ fn load_http_document_with_text_metrics(
 }
 
 fn http_client() -> io::Result<reqwest::blocking::Client> {
+    static CLIENT: OnceLock<io::Result<reqwest::blocking::Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            browser_http_client_builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .map_err(io::Error::other)
+        })
+        .as_ref()
+        .map(Clone::clone)
+        .map_err(|error| io::Error::new(error.kind(), error.to_string()))
+}
+
+fn browser_http_client_builder() -> reqwest::blocking::ClientBuilder {
     reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
         .user_agent(format!("{APP_TITLE}/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(io::Error::other)
+}
+
+fn http_version_label(version: reqwest::Version) -> &'static str {
+    match version {
+        reqwest::Version::HTTP_09 => "HTTP/0.9",
+        reqwest::Version::HTTP_10 => "HTTP/1.0",
+        reqwest::Version::HTTP_11 => "HTTP/1.1",
+        reqwest::Version::HTTP_2 => "HTTP/2",
+        reqwest::Version::HTTP_3 => "HTTP/3",
+        _ => "HTTP/unknown",
+    }
+}
+
+static HTTP2_ORIGINS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn remember_http2_origin_if_negotiated(url: &str, version: reqwest::Version) {
+    if version != reqwest::Version::HTTP_2 {
+        return;
+    }
+    let Some(origin) = image_resource_origin(url) else {
+        return;
+    };
+    let origins = HTTP2_ORIGINS.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut guard) = origins.lock() {
+        guard.insert(origin);
+    }
+}
+
+fn origin_has_negotiated_http2(origin: &str) -> bool {
+    HTTP2_ORIGINS
+        .get()
+        .and_then(|origins| origins.lock().ok())
+        .is_some_and(|guard| guard.contains(origin))
+}
+
+fn late_image_origin_transport(origin: &str) -> LateImageOriginTransport {
+    if origin_has_negotiated_http2(origin) {
+        LateImageOriginTransport::Http2
+    } else {
+        LateImageOriginTransport::Conservative
+    }
+}
+
+fn late_image_global_limit_for_transport(transport: LateImageOriginTransport) -> usize {
+    match transport {
+        LateImageOriginTransport::Conservative => LATE_IMAGE_MAX_ACTIVE_GLOBAL,
+        LateImageOriginTransport::Http2 => LATE_IMAGE_HTTP2_MAX_ACTIVE_GLOBAL,
+    }
+}
+
+fn late_image_origin_limit_for_transport(transport: LateImageOriginTransport) -> usize {
+    match transport {
+        LateImageOriginTransport::Conservative => LATE_IMAGE_MAX_ACTIVE_PER_ORIGIN,
+        LateImageOriginTransport::Http2 => LATE_IMAGE_HTTP2_MAX_ACTIVE_PER_ORIGIN,
+    }
+}
+
+fn late_image_origin_success_spacing_for_transport(
+    transport: LateImageOriginTransport,
+) -> Duration {
+    match transport {
+        LateImageOriginTransport::Conservative => LATE_IMAGE_ORIGIN_SUCCESS_START_SPACING,
+        LateImageOriginTransport::Http2 => LATE_IMAGE_HTTP2_ORIGIN_SUCCESS_START_SPACING,
+    }
 }
 
 fn load_linked_stylesheets(html: &str, source: &str) -> io::Result<String> {
@@ -20864,6 +20986,8 @@ fn load_image_resource_bytes(url: &str) -> io::Result<Arc<Vec<u8>>> {
             }
         };
         let status = response.status();
+        let protocol_version = response.version();
+        remember_http2_origin_if_negotiated(url, protocol_version);
         let retry_after = response
             .headers()
             .get(reqwest::header::RETRY_AFTER)
@@ -20871,7 +20995,11 @@ fn load_image_resource_bytes(url: &str) -> io::Result<Arc<Vec<u8>>> {
             .and_then(parse_retry_after_delta);
         emit_global_telemetry(
             "document.image.resource.fetch.response",
-            &[("url", url), ("status", &status.as_u16().to_string())],
+            &[
+                ("url", url),
+                ("status", &status.as_u16().to_string()),
+                ("protocol", http_version_label(protocol_version)),
+            ],
         );
         let response = match response.error_for_status() {
             Ok(response) => response,
@@ -31701,10 +31829,16 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
         );
         assert_eq!(LATE_IMAGE_MAX_ACTIVE_GLOBAL, 1);
         assert_eq!(LATE_IMAGE_MAX_ACTIVE_PER_ORIGIN, 1);
+        assert_eq!(LATE_IMAGE_HTTP2_MAX_ACTIVE_GLOBAL, 4);
+        assert_eq!(LATE_IMAGE_HTTP2_MAX_ACTIVE_PER_ORIGIN, 4);
         assert_eq!(LATE_IMAGE_COMPLETION_COOLDOWN, Duration::from_millis(130));
         assert_eq!(
             LATE_IMAGE_ORIGIN_SUCCESS_START_SPACING,
             Duration::from_millis(3000)
+        );
+        assert_eq!(
+            LATE_IMAGE_HTTP2_ORIGIN_SUCCESS_START_SPACING,
+            Duration::ZERO
         );
         assert_eq!(
             LATE_IMAGE_ORIGIN_FAILURE_START_SPACING,
@@ -31723,6 +31857,51 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
             Some(Duration::from_secs(300))
         );
         assert_eq!(parse_retry_after_delta("not-a-number"), None);
+    }
+
+    #[test]
+    fn http_version_label_reports_negotiated_protocols() {
+        assert_eq!(http_version_label(reqwest::Version::HTTP_11), "HTTP/1.1");
+        assert_eq!(http_version_label(reqwest::Version::HTTP_2), "HTTP/2");
+    }
+
+    #[test]
+    fn late_image_policy_uses_http2_multiplexing_after_negotiation() {
+        let origin = "https://h2-policy.example.test";
+        assert_eq!(
+            late_image_origin_transport(origin),
+            LateImageOriginTransport::Conservative
+        );
+        assert_eq!(
+            late_image_global_limit_for_transport(LateImageOriginTransport::Conservative),
+            1
+        );
+        assert_eq!(
+            late_image_origin_success_spacing_for_transport(LateImageOriginTransport::Conservative),
+            Duration::from_millis(3000)
+        );
+
+        remember_http2_origin_if_negotiated(
+            "https://h2-policy.example.test/image.png",
+            reqwest::Version::HTTP_2,
+        );
+
+        assert_eq!(
+            late_image_origin_transport(origin),
+            LateImageOriginTransport::Http2
+        );
+        assert_eq!(
+            late_image_global_limit_for_transport(LateImageOriginTransport::Http2),
+            4
+        );
+        assert_eq!(
+            late_image_origin_limit_for_transport(LateImageOriginTransport::Http2),
+            4
+        );
+        assert_eq!(
+            late_image_origin_success_spacing_for_transport(LateImageOriginTransport::Http2),
+            Duration::ZERO
+        );
     }
 
     #[test]
