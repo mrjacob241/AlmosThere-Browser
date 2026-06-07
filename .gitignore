@@ -1,5 +1,6 @@
 target/
 appdata/
+__pycache__/
 tools/dep_graph_cache.json
 
 #source https://github.com/tc39/test262

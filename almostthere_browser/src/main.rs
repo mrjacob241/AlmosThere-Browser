@@ -47,9 +47,18 @@ const DEFAULT_LAYOUT_VIEWPORT_HEIGHT: f32 = 1800.0;
 const DEFAULT_BOOKMARK_TITLE: &str = "AlmostThere Sample Page";
 const DEFAULT_URL_BOOKMARK_TITLE: &str = "HTML5 Test Page";
 const LOCAL_BOOKMARK_TOKEN: &str = "[local]";
-const LATE_IMAGE_MAX_ACTIVE_PER_ORIGIN: usize = 2;
-const LATE_IMAGE_ORIGIN_START_SPACING: Duration = Duration::from_millis(150);
-const LATE_IMAGE_ORIGIN_FAILURE_START_SPACING: Duration = Duration::from_millis(750);
+const LATE_IMAGE_MAX_ACTIVE_GLOBAL: usize = 1;
+const LATE_IMAGE_MAX_ACTIVE_PER_ORIGIN: usize = 1;
+const LATE_IMAGE_COMPLETION_COOLDOWN: Duration = Duration::from_millis(130);
+const LATE_IMAGE_ORIGIN_SUCCESS_START_SPACING: Duration = Duration::from_millis(3000);
+const LATE_IMAGE_ORIGIN_FAILURE_START_SPACING: Duration = Duration::from_millis(510);
+const LATE_IMAGE_REQUEST_GATE_SLOT: Duration = Duration::from_millis(100);
+const LATE_IMAGE_REQUEST_GATE_LAUNCH_DELAY: Duration = Duration::from_millis(50);
+const LATE_IMAGE_429_FALLBACK_BACKOFF: Duration = Duration::from_secs(30);
+const LATE_IMAGE_BATCH_RELEASE_DELAY: Duration = Duration::from_millis(250);
+const FIRST_PAINT_IMAGE_WAIT_MAX: Duration = Duration::from_millis(500);
+const FIRST_PAINT_IMAGE_TARGET_NUMERATOR: usize = 1;
+const FIRST_PAINT_IMAGE_TARGET_DENOMINATOR: usize = 10;
 const LATE_IMAGE_MAX_ATTEMPTS: usize = 2;
 const LATE_IMAGE_DELAY_NOTICE_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_EVENT_TRACE_ITEMS: &[&str] = &["Hello world - Wikipedia", "Wikipedia"];
@@ -415,6 +424,7 @@ struct AlmostThereApp {
     telemetry: TelemetrySession,
     text_metrics_ready: bool,
     pending_navigation: Option<PendingNavigation>,
+    pending_first_paint_navigation: Option<PendingFirstPaintNavigation>,
     render_debug: PageRenderDebugState,
     page_loaded_at: std::time::Instant,
     record_events: bool,
@@ -433,7 +443,9 @@ struct AlmostThereApp {
     late_image_queue: VecDeque<LateImageQueuedResource>,
     late_image_active_by_origin: HashMap<String, usize>,
     late_image_active_keys: HashMap<LateImageResourceKey, String>,
+    late_image_next_serial_start: Option<Instant>,
     late_image_next_start_by_origin: HashMap<String, Instant>,
+    late_image_batch_release_by_document: HashMap<LateImageDocumentKey, Instant>,
     late_image_last_delay_notice: HashMap<String, Instant>,
     late_image_progress: HashMap<LateImageDocumentKey, LateImageProgress>,
     late_image_statuses: HashMap<LateImageResourceKey, LateImageLoadStatus>,
@@ -461,6 +473,7 @@ struct BrowserTabState {
     status: String,
     text_metrics_ready: bool,
     pending_navigation: Option<PendingNavigation>,
+    pending_first_paint_navigation: Option<PendingFirstPaintNavigation>,
     render_debug: PageRenderDebugState,
     page_loaded_at: std::time::Instant,
 }
@@ -490,6 +503,7 @@ impl BrowserTabState {
             status: format!("Loading {url}..."),
             text_metrics_ready: true,
             pending_navigation: None,
+            pending_first_paint_navigation: None,
             render_debug: PageRenderDebugState::default(),
             page_loaded_at: std::time::Instant::now(),
         }
@@ -518,6 +532,7 @@ impl BrowserTabState {
             status: String::new(),
             text_metrics_ready: true,
             pending_navigation: None,
+            pending_first_paint_navigation: None,
             render_debug: PageRenderDebugState::default(),
             page_loaded_at: std::time::Instant::now(),
         }
@@ -618,6 +633,15 @@ struct PendingNavigation {
     receiver: Receiver<io::Result<PreparedNavigation>>,
 }
 
+struct PendingFirstPaintNavigation {
+    prepared: PreparedNavigation,
+    requested_url: String,
+    fragment: Option<String>,
+    history_action: NavigationHistoryAction,
+    started_at: Instant,
+    document_key: LateImageDocumentKey,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct LateImageResourceKey {
     tab_id: u64,
@@ -666,12 +690,16 @@ struct LateImageQueuedResource {
     origin: String,
     queued_at: Instant,
     attempts: usize,
+    priority: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LateImageDelayReason {
+    BatchRelease,
+    GlobalConcurrency,
     OriginConcurrency,
-    OriginSpacing,
+    SerialCooldown,
+    OriginRateLimit,
     OriginFailureSpacing,
     ExactFailureBackoff,
 }
@@ -679,8 +707,11 @@ enum LateImageDelayReason {
 impl LateImageDelayReason {
     fn as_str(self) -> &'static str {
         match self {
+            Self::BatchRelease => "batch-release",
+            Self::GlobalConcurrency => "global-concurrency",
             Self::OriginConcurrency => "origin-concurrency",
-            Self::OriginSpacing => "origin-spacing",
+            Self::SerialCooldown => "serial-cooldown",
+            Self::OriginRateLimit => "origin-rate-limit",
             Self::OriginFailureSpacing => "origin-failure-spacing",
             Self::ExactFailureBackoff => "exact-failure-backoff",
         }
@@ -885,6 +916,7 @@ impl AlmostThereApp {
             telemetry,
             text_metrics_ready: false,
             pending_navigation: None,
+            pending_first_paint_navigation: None,
             render_debug,
             page_loaded_at: std::time::Instant::now(),
             record_events: config.record_events,
@@ -903,7 +935,9 @@ impl AlmostThereApp {
             late_image_queue: VecDeque::new(),
             late_image_active_by_origin: HashMap::new(),
             late_image_active_keys: HashMap::new(),
+            late_image_next_serial_start: None,
             late_image_next_start_by_origin: HashMap::new(),
+            late_image_batch_release_by_document: HashMap::new(),
             late_image_last_delay_notice: HashMap::new(),
             late_image_progress: HashMap::new(),
             late_image_statuses: HashMap::new(),
@@ -1031,6 +1065,9 @@ impl AlmostThereApp {
             status: std::mem::take(&mut self.status),
             text_metrics_ready: self.text_metrics_ready,
             pending_navigation: std::mem::take(&mut self.pending_navigation),
+            pending_first_paint_navigation: std::mem::take(
+                &mut self.pending_first_paint_navigation,
+            ),
             render_debug: std::mem::take(&mut self.render_debug),
             page_loaded_at: self.page_loaded_at,
         }
@@ -1054,6 +1091,7 @@ impl AlmostThereApp {
         self.status = state.status;
         self.text_metrics_ready = state.text_metrics_ready;
         self.pending_navigation = state.pending_navigation;
+        self.pending_first_paint_navigation = state.pending_first_paint_navigation;
         self.render_debug = state.render_debug;
         self.page_loaded_at = state.page_loaded_at;
     }
@@ -1076,6 +1114,7 @@ impl AlmostThereApp {
         history_action: NavigationHistoryAction,
     ) {
         self.clear_late_images_for_tab(self.active_tab_id());
+        self.pending_first_paint_navigation = None;
         let (sender, receiver) = mpsc::channel();
         let thread_url = url.clone();
         let timeout_enabled = self.page_loader_timeout_enabled;
@@ -1145,6 +1184,12 @@ impl AlmostThereApp {
         }
         self.late_image_progress
             .retain(|key, _| key.tab_id != tab_id);
+        self.late_image_batch_release_by_document
+            .retain(|key, _| key.tab_id != tab_id);
+        if self.late_image_active_keys.is_empty() {
+            self.late_image_next_serial_start = None;
+        }
+        self.late_image_next_start_by_origin.clear();
         self.late_image_statuses
             .retain(|key, _| key.tab_id != tab_id);
         self.late_image_last_delay_notice.clear();
@@ -1162,8 +1207,18 @@ impl AlmostThereApp {
 
     fn schedule_late_images_for_current_document(&mut self) {
         let tab_id = self.active_tab_id();
-        let document_source = self.document.source.clone();
-        let candidates = late_image_candidates_from_document(&self.document);
+        let document = self.document.clone();
+        self.schedule_late_images_for_document(tab_id, &document, self.canvas.scroll_offset);
+    }
+
+    fn schedule_late_images_for_document(
+        &mut self,
+        tab_id: u64,
+        document: &BrowserDocument,
+        scroll_offset: egui::Vec2,
+    ) {
+        let document_source = document.source.clone();
+        let candidates = late_image_candidates_from_document_for_viewport(document, scroll_offset);
         let document_key = LateImageDocumentKey {
             tab_id,
             document_source: document_source.clone(),
@@ -1204,6 +1259,7 @@ impl AlmostThereApp {
                         &(self.late_image_queue.len() + 1).to_string(),
                     ),
                     ("origin_queue_depth", &origin_queue_depth.to_string()),
+                    ("priority", &candidate.priority.to_string()),
                 ],
             );
             self.late_image_queue.push_back(LateImageQueuedResource {
@@ -1212,11 +1268,19 @@ impl AlmostThereApp {
                 origin,
                 queued_at: Instant::now(),
                 attempts: 0,
+                priority: candidate.priority,
             });
         }
         if newly_queued > 0 {
             let progress = self.late_image_progress.entry(document_key).or_default();
             progress.total += newly_queued;
+            self.late_image_batch_release_by_document.insert(
+                LateImageDocumentKey {
+                    tab_id,
+                    document_source: document_source.clone(),
+                },
+                Instant::now() + LATE_IMAGE_BATCH_RELEASE_DELAY,
+            );
         }
         let pending_total = self.pending_late_images_for_document(tab_id, &document_source);
         let progress = self
@@ -1287,14 +1351,7 @@ impl AlmostThereApp {
                     if let Some(retry_delay) =
                         image_resource_exact_retry_delay(&result.key.image_url)
                     {
-                        let origin_spacing =
-                            if cached_image_origin_failure(&result.key.image_url).is_some() {
-                                LATE_IMAGE_ORIGIN_FAILURE_START_SPACING
-                            } else {
-                                LATE_IMAGE_ORIGIN_START_SPACING
-                            };
-                        self.late_image_next_start_by_origin
-                            .insert(result.origin.clone(), Instant::now() + origin_spacing);
+                        let origin_spacing = LATE_IMAGE_ORIGIN_FAILURE_START_SPACING;
                         self.telemetry.emit(
                             "document.image.scheduler.backoff",
                             &[
@@ -1318,10 +1375,6 @@ impl AlmostThereApp {
                             ],
                         );
                     } else if cached_image_origin_failure(&result.key.image_url).is_some() {
-                        self.late_image_next_start_by_origin.insert(
-                            result.origin.clone(),
-                            Instant::now() + LATE_IMAGE_ORIGIN_FAILURE_START_SPACING,
-                        );
                         self.telemetry.emit(
                             "document.image.scheduler.backoff",
                             &[
@@ -1377,6 +1430,7 @@ impl AlmostThereApp {
                             origin: result.origin,
                             queued_at: Instant::now(),
                             attempts: result.attempts,
+                            priority: u32::MAX,
                         });
                         self.refresh_late_image_debug_overlays();
                         ctx.request_repaint();
@@ -1425,6 +1479,32 @@ impl AlmostThereApp {
                 self.refresh_late_image_debug_overlays();
                 continue;
             }
+            if let Some(pending) = self
+                .pending_first_paint_navigation
+                .as_mut()
+                .filter(|pending| {
+                    pending.document_key.tab_id == result.key.tab_id
+                        && pending.document_key.document_source == result.key.document_source
+                })
+            {
+                if apply_late_image_to_document(
+                    &mut pending.prepared.document,
+                    &result.key.image_url,
+                    &image,
+                ) {
+                    self.telemetry.emit(
+                        "document.image.late.applied",
+                        &[
+                            ("tab_id", &result.key.tab_id.to_string()),
+                            ("document", &result.key.document_source),
+                            ("url", &result.key.image_url),
+                            ("target", "pending_first_paint"),
+                        ],
+                    );
+                    ctx.request_repaint();
+                }
+                continue;
+            }
             if let Some(tab) = self.tabs.iter_mut().find(|tab| {
                 tab.id == result.key.tab_id && tab.document.source == result.key.document_source
             }) {
@@ -1460,6 +1540,7 @@ impl AlmostThereApp {
             return;
         }
         self.finish_late_image_fetch_for_origin(origin);
+        self.late_image_next_serial_start = Some(Instant::now() + LATE_IMAGE_COMPLETION_COOLDOWN);
     }
 
     fn finish_late_image_fetch_for_origin(&mut self, origin: &str) {
@@ -1497,7 +1578,7 @@ impl AlmostThereApp {
             } else {
                 let delay = LateImageDispatchDelay {
                     duration: Duration::from_millis(100),
-                    reason: LateImageDelayReason::OriginSpacing,
+                    reason: LateImageDelayReason::SerialCooldown,
                 };
                 ctx.request_repaint_after(delay.duration);
                 if !started_any {
@@ -1509,13 +1590,16 @@ impl AlmostThereApp {
 
     fn next_dispatchable_late_image_index(&mut self) -> Option<usize> {
         let now = Instant::now();
-        for (index, queued) in self.late_image_queue.iter().enumerate() {
-            if self.late_image_dispatch_delay_for(queued, now).is_some() {
-                continue;
-            }
-            return Some(index);
-        }
-        None
+        self.late_image_queue
+            .iter()
+            .enumerate()
+            .filter(|(_, queued)| self.late_image_dispatch_delay_for(queued, now).is_none())
+            .min_by(|(_, a), (_, b)| {
+                a.priority
+                    .cmp(&b.priority)
+                    .then_with(|| a.queued_at.cmp(&b.queued_at))
+            })
+            .map(|(index, _)| index)
     }
 
     fn next_late_image_dispatch_delay(&self) -> Option<(usize, LateImageDispatchDelay)> {
@@ -1535,6 +1619,27 @@ impl AlmostThereApp {
         queued: &LateImageQueuedResource,
         now: Instant,
     ) -> Option<LateImageDispatchDelay> {
+        let document_key = LateImageDocumentKey {
+            tab_id: queued.key.tab_id,
+            document_source: queued.key.document_source.clone(),
+        };
+        if let Some(release_at) = self
+            .late_image_batch_release_by_document
+            .get(&document_key)
+            .copied()
+            && release_at > now
+        {
+            return Some(LateImageDispatchDelay {
+                duration: release_at.saturating_duration_since(now),
+                reason: LateImageDelayReason::BatchRelease,
+            });
+        }
+        if self.late_image_active_keys.len() >= LATE_IMAGE_MAX_ACTIVE_GLOBAL {
+            return Some(LateImageDispatchDelay {
+                duration: Duration::from_millis(100),
+                reason: LateImageDelayReason::GlobalConcurrency,
+            });
+        }
         let active = self
             .late_image_active_by_origin
             .get(&queued.origin)
@@ -1558,24 +1663,24 @@ impl AlmostThereApp {
                 reason: LateImageDelayReason::OriginFailureSpacing,
             });
         }
-        let next_start = self
+        if let Some(next_start) = self
             .late_image_next_start_by_origin
             .get(&queued.origin)
-            .copied()?;
-        if next_start <= now {
-            return None;
+            .copied()
+            && next_start > now
+        {
+            return Some(LateImageDispatchDelay {
+                duration: next_start.saturating_duration_since(now),
+                reason: LateImageDelayReason::OriginRateLimit,
+            });
         }
-        let reason = if cached_image_origin_failure(&queued.key.image_url).is_some() {
-            LateImageDelayReason::OriginFailureSpacing
-        } else {
-            LateImageDelayReason::OriginSpacing
-        };
-        if reason == LateImageDelayReason::OriginSpacing && active > 0 {
+        let next_start = self.late_image_next_serial_start?;
+        if next_start <= now {
             return None;
         }
         Some(LateImageDispatchDelay {
             duration: next_start.saturating_duration_since(now),
-            reason,
+            reason: LateImageDelayReason::SerialCooldown,
         })
     }
 
@@ -1596,6 +1701,7 @@ impl AlmostThereApp {
             .get(&queued.origin)
             .copied()
             .unwrap_or(0);
+        let active_global = self.late_image_active_keys.len();
         let reason = delay.reason.as_str();
         let notice_key = format!("{}|{reason}", queued.origin);
         if self
@@ -1616,6 +1722,8 @@ impl AlmostThereApp {
                 ("origin", &queued.origin),
                 ("delay_ms", &delay.duration.as_millis().to_string()),
                 ("reason", reason),
+                ("active_global", &active_global.to_string()),
+                ("global_limit", &LATE_IMAGE_MAX_ACTIVE_GLOBAL.to_string()),
                 ("active_for_origin", &active.to_string()),
                 (
                     "origin_limit",
@@ -1634,9 +1742,10 @@ impl AlmostThereApp {
         self.late_image_active_keys
             .insert(queued.key.clone(), queued.origin.clone());
         let active_for_origin = *active;
+        let active_global = self.late_image_active_keys.len();
         self.late_image_next_start_by_origin.insert(
             queued.origin.clone(),
-            Instant::now() + LATE_IMAGE_ORIGIN_START_SPACING,
+            Instant::now() + LATE_IMAGE_ORIGIN_SUCCESS_START_SPACING,
         );
         self.late_image_last_delay_notice.remove(&queued.origin);
         let queue_wait_ms = queued.queued_at.elapsed().as_millis().to_string();
@@ -1647,18 +1756,23 @@ impl AlmostThereApp {
                 ("document", &queued.key.document_source),
                 ("url", &queued.key.image_url),
                 ("origin", &queued.origin),
+                ("active_global", &active_global.to_string()),
+                ("global_limit", &LATE_IMAGE_MAX_ACTIVE_GLOBAL.to_string()),
                 ("active_for_origin", &active_for_origin.to_string()),
                 (
                     "origin_limit",
                     &LATE_IMAGE_MAX_ACTIVE_PER_ORIGIN.to_string(),
                 ),
                 ("queue_wait_ms", &queue_wait_ms),
+                ("priority", &queued.priority.to_string()),
             ],
         );
         let sender = self.late_image_sender.clone();
         thread::spawn(move || {
             let started = Instant::now();
             let attempts = queued.attempts.saturating_add(1);
+            let launch_delay = reserve_late_image_request_gate(&queued.key.image_url);
+            thread::sleep(launch_delay);
             let image = load_image_resource(&queued.key.image_url, queued.requested_size, false);
             let elapsed_ms = started.elapsed().as_millis().to_string();
             let status = if image.is_ok() { "ok" } else { "error" };
@@ -1847,9 +1961,9 @@ impl AlmostThereApp {
                 let pending = self.pending_navigation.take().expect("pending navigation");
                 match result {
                     Ok(prepared) => {
-                        self.install_prepared_navigation(
+                        self.begin_prepared_navigation_first_paint(
                             prepared,
-                            &pending.url,
+                            pending.url,
                             pending.fragment,
                             pending.history_action,
                         );
@@ -1880,6 +1994,107 @@ impl AlmostThereApp {
                 ctx.request_repaint();
             }
         }
+    }
+
+    fn begin_prepared_navigation_first_paint(
+        &mut self,
+        mut prepared: PreparedNavigation,
+        requested_url: String,
+        fragment: Option<String>,
+        history_action: NavigationHistoryAction,
+    ) {
+        if prepared.content_kind != PreparedContentKind::Html {
+            self.install_prepared_navigation(prepared, &requested_url, fragment, history_action);
+            return;
+        }
+
+        apply_debug_link_hits(&mut prepared.document.canvas_graph, self.debug_links);
+        let candidate_count =
+            late_image_candidates_from_document_for_viewport(&prepared.document, egui::Vec2::ZERO)
+                .len();
+        if candidate_count == 0 {
+            self.install_prepared_navigation(prepared, &requested_url, fragment, history_action);
+            return;
+        }
+
+        let tab_id = self.active_tab_id();
+        let document_key = LateImageDocumentKey {
+            tab_id,
+            document_source: prepared.document.source.clone(),
+        };
+        self.status = format!("Loading images for {}...", prepared.document.source);
+        self.telemetry.emit(
+            "navigation.first_paint.wait.started",
+            &[
+                ("url", &prepared.document.source),
+                ("requested_url", &requested_url),
+                ("images", &candidate_count.to_string()),
+                (
+                    "target_percent",
+                    &(FIRST_PAINT_IMAGE_TARGET_NUMERATOR * 100
+                        / FIRST_PAINT_IMAGE_TARGET_DENOMINATOR)
+                        .to_string(),
+                ),
+                (
+                    "max_wait_ms",
+                    &FIRST_PAINT_IMAGE_WAIT_MAX.as_millis().to_string(),
+                ),
+            ],
+        );
+        self.schedule_late_images_for_document(tab_id, &prepared.document, egui::Vec2::ZERO);
+        self.pending_first_paint_navigation = Some(PendingFirstPaintNavigation {
+            prepared,
+            requested_url,
+            fragment,
+            history_action,
+            started_at: Instant::now(),
+            document_key,
+        });
+    }
+
+    fn poll_pending_first_paint_navigation(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_first_paint_navigation.as_ref() else {
+            return;
+        };
+        let progress = self
+            .late_image_progress
+            .get(&pending.document_key)
+            .cloned()
+            .unwrap_or_default();
+        let target = first_paint_image_target(progress.total);
+        let timeout = pending.started_at.elapsed() >= FIRST_PAINT_IMAGE_WAIT_MAX;
+        let ready = progress.total == 0 || progress.resolved >= target;
+        if !ready && !timeout {
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return;
+        }
+
+        let reason = if ready { "target-reached" } else { "timeout" };
+        let pending = self
+            .pending_first_paint_navigation
+            .take()
+            .expect("pending first paint navigation");
+        self.telemetry.emit(
+            "navigation.first_paint.wait.completed",
+            &[
+                ("url", &pending.prepared.document.source),
+                ("reason", reason),
+                ("resolved", &progress.resolved.to_string()),
+                ("total", &progress.total.to_string()),
+                ("target", &target.to_string()),
+                (
+                    "elapsed_ms",
+                    &pending.started_at.elapsed().as_millis().to_string(),
+                ),
+            ],
+        );
+        self.install_prepared_navigation(
+            pending.prepared,
+            &pending.requested_url,
+            pending.fragment,
+            pending.history_action,
+        );
+        ctx.request_repaint();
     }
 
     fn install_prepared_navigation(
@@ -7081,6 +7296,7 @@ impl App for AlmostThereApp {
         self.record_frame_events(ctx);
         self.poll_pending_navigation(ctx);
         self.poll_late_image_resources(ctx);
+        self.poll_pending_first_paint_navigation(ctx);
 
         if self.script_state.has_pending_timers() {
             let elapsed_ms = self.page_loaded_at.elapsed().as_millis() as u64;
@@ -18559,26 +18775,66 @@ fn unavailable_image_block(
 struct LateImageCandidate {
     src: String,
     size: egui::Vec2,
+    priority: u32,
 }
 
+#[cfg(test)]
 fn late_image_candidates_from_document(document: &BrowserDocument) -> Vec<LateImageCandidate> {
+    late_image_candidates_from_document_for_viewport(document, egui::Vec2::ZERO)
+}
+
+fn late_image_candidates_from_document_for_viewport(
+    document: &BrowserDocument,
+    scroll_offset: egui::Vec2,
+) -> Vec<LateImageCandidate> {
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
-    collect_late_image_candidates_from_graph(&document.canvas_graph, &mut seen, &mut candidates);
+    collect_late_image_candidates_from_graph(
+        &document.canvas_graph,
+        scroll_offset,
+        &mut seen,
+        &mut candidates,
+    );
     collect_late_image_candidates_from_blocks(&document.blocks, &mut seen, &mut candidates);
+    candidates.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.src.cmp(&b.src)));
     candidates
+}
+
+fn first_paint_image_target(total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    total
+        .saturating_mul(FIRST_PAINT_IMAGE_TARGET_NUMERATOR)
+        .div_ceil(FIRST_PAINT_IMAGE_TARGET_DENOMINATOR)
+        .max(1)
 }
 
 fn collect_late_image_candidates_from_graph(
     graph: &CanvasGraph,
+    scroll_offset: egui::Vec2,
     seen: &mut HashSet<String>,
     candidates: &mut Vec<LateImageCandidate>,
 ) {
+    let viewport = egui::Rect::from_min_size(
+        scroll_offset.to_pos2(),
+        egui::vec2(
+            DEFAULT_LAYOUT_VIEWPORT_WIDTH,
+            DEFAULT_LAYOUT_VIEWPORT_HEIGHT,
+        ),
+    );
     for object in &graph.objects {
         let CanvasObject::Image(image) = object else {
             continue;
         };
-        collect_late_image_candidate(&image.src, image.image.size, &image.image, seen, candidates);
+        collect_late_image_candidate(
+            &image.src,
+            image.image.size,
+            &image.image,
+            late_image_priority_for_rect(image.rect, viewport),
+            seen,
+            candidates,
+        );
     }
 }
 
@@ -18590,13 +18846,21 @@ fn collect_late_image_candidates_from_blocks(
     for block in blocks {
         match block {
             CanvasBlock::Image { src, image, .. } => {
-                collect_late_image_candidate(src, image.size, image, seen, candidates);
+                collect_late_image_candidate(
+                    src,
+                    image.size,
+                    image,
+                    u32::MAX / 2,
+                    seen,
+                    candidates,
+                );
             }
             CanvasBlock::EcosiaHero { hero } => {
                 collect_late_image_candidate(
                     &hero.background_src,
                     hero.background.size,
                     &hero.background,
+                    0,
                     seen,
                     candidates,
                 );
@@ -18615,6 +18879,7 @@ fn collect_late_image_candidate(
     src: &str,
     size: egui::Vec2,
     image: &ImageBlock,
+    priority: u32,
     seen: &mut HashSet<String>,
     candidates: &mut Vec<LateImageCandidate>,
 ) {
@@ -18628,7 +18893,13 @@ fn collect_late_image_candidate(
     candidates.push(LateImageCandidate {
         src: src.to_owned(),
         size,
+        priority,
     });
+}
+
+fn late_image_priority_for_rect(rect: egui::Rect, viewport: egui::Rect) -> u32 {
+    let _ = viewport;
+    rect.top().max(0.0).round() as u32
 }
 
 fn image_block_is_unavailable(image: &ImageBlock) -> bool {
@@ -18788,10 +19059,10 @@ fn late_image_failure_label(error: &io::Error) -> String {
 
 fn image_error_is_retryable(error: &io::Error) -> bool {
     let message = error.to_string();
-    message.contains("429")
-        || message.contains("timed out")
-        || message.contains("connection")
-        || message.contains("network")
+    !message.contains("429")
+        && (message.contains("timed out")
+            || message.contains("connection")
+            || message.contains("network"))
 }
 
 fn replaced_content_size(
@@ -20380,6 +20651,46 @@ fn load_image_resource(
     }
 }
 
+static LATE_IMAGE_REQUEST_GATE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+fn reserve_late_image_request_gate(url: &str) -> Duration {
+    let gate = LATE_IMAGE_REQUEST_GATE.get_or_init(|| Mutex::new(None));
+    let mut waited = Duration::ZERO;
+    loop {
+        let now = Instant::now();
+        let mut guard = match gate.lock() {
+            Ok(guard) => guard,
+            Err(_) => return LATE_IMAGE_REQUEST_GATE_LAUNCH_DELAY,
+        };
+        if let Some(blocked_until) = *guard
+            && blocked_until > now
+        {
+            let wait = blocked_until.saturating_duration_since(now);
+            waited += wait;
+            drop(guard);
+            thread::sleep(wait);
+            continue;
+        }
+        *guard = Some(now + LATE_IMAGE_REQUEST_GATE_SLOT);
+        emit_global_telemetry(
+            "document.image.request_gate.reserved",
+            &[
+                ("url", url),
+                ("waited_ms", &waited.as_millis().to_string()),
+                (
+                    "slot_ms",
+                    &LATE_IMAGE_REQUEST_GATE_SLOT.as_millis().to_string(),
+                ),
+                (
+                    "launch_delay_ms",
+                    &LATE_IMAGE_REQUEST_GATE_LAUNCH_DELAY.as_millis().to_string(),
+                ),
+            ],
+        );
+        return LATE_IMAGE_REQUEST_GATE_LAUNCH_DELAY;
+    }
+}
+
 fn image_resource_is_svg(url: &str, bytes: &[u8]) -> bool {
     let path_is_svg = reqwest::Url::parse(url)
         .ok()
@@ -20553,6 +20864,11 @@ fn load_image_resource_bytes(url: &str) -> io::Result<Arc<Vec<u8>>> {
             }
         };
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_retry_after_delta);
         emit_global_telemetry(
             "document.image.resource.fetch.response",
             &[("url", url), ("status", &status.as_u16().to_string())],
@@ -20560,6 +20876,13 @@ fn load_image_resource_bytes(url: &str) -> io::Result<Arc<Vec<u8>>> {
         let response = match response.error_for_status() {
             Ok(response) => response,
             Err(error) => {
+                let policy_backoff =
+                    image_resource_failure_backoff(Some(status.as_u16()), "status");
+                let backoff = if status.as_u16() == 429 {
+                    retry_after.unwrap_or(policy_backoff).max(policy_backoff)
+                } else {
+                    retry_after.unwrap_or(policy_backoff)
+                };
                 emit_global_telemetry(
                     "document.image.resource.fetch.failed",
                     &[
@@ -20567,19 +20890,12 @@ fn load_image_resource_bytes(url: &str) -> io::Result<Arc<Vec<u8>>> {
                         ("stage", "status"),
                         ("status", &status.as_u16().to_string()),
                         ("error", &error.to_string()),
+                        ("backoff_ms", &backoff.as_millis().to_string()),
                     ],
                 );
-                cache_image_resource_failure(
-                    url,
-                    error.to_string(),
-                    image_resource_failure_backoff(Some(status.as_u16()), "status"),
-                );
+                cache_image_resource_failure(url, error.to_string(), backoff);
                 if status.as_u16() == 429 {
-                    cache_image_origin_failure(
-                        url,
-                        error.to_string(),
-                        image_resource_failure_backoff(Some(status.as_u16()), "status"),
-                    );
+                    cache_image_origin_failure(url, error.to_string(), backoff);
                 }
                 return Err(io::Error::other(error));
             }
@@ -20756,13 +21072,18 @@ fn image_resource_retry_delay_with_telemetry(url: &str, emit_telemetry: bool) ->
 
 fn image_resource_failure_backoff(status: Option<u16>, stage: &str) -> Duration {
     match (stage, status) {
-        ("status", Some(429)) => Duration::from_secs(60),
+        ("status", Some(429)) => LATE_IMAGE_429_FALLBACK_BACKOFF,
         ("status", Some(404)) | ("status", Some(410)) => Duration::from_secs(60),
         ("status", Some(status)) if status >= 500 => Duration::from_secs(5),
         ("status", Some(_)) => Duration::from_secs(10),
         ("send", _) | ("bytes", _) => Duration::from_secs(3),
         _ => Duration::from_secs(1),
     }
+}
+
+fn parse_retry_after_delta(value: &str) -> Option<Duration> {
+    let seconds = value.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds.clamp(1, 300)))
 }
 
 fn image_resource_origin(url: &str) -> Option<String> {
@@ -31364,7 +31685,7 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
     fn image_resource_failure_policy_backs_off_retryable_failures() {
         assert_eq!(
             image_resource_failure_backoff(Some(429), "status"),
-            Duration::from_secs(60)
+            Duration::from_secs(30)
         );
         assert_eq!(
             image_resource_failure_backoff(Some(404), "status"),
@@ -31378,12 +31699,180 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
             image_resource_failure_backoff(None, "send"),
             Duration::from_secs(3)
         );
-        assert_eq!(LATE_IMAGE_MAX_ACTIVE_PER_ORIGIN, 2);
-        assert_eq!(LATE_IMAGE_ORIGIN_START_SPACING, Duration::from_millis(150));
+        assert_eq!(LATE_IMAGE_MAX_ACTIVE_GLOBAL, 1);
+        assert_eq!(LATE_IMAGE_MAX_ACTIVE_PER_ORIGIN, 1);
+        assert_eq!(LATE_IMAGE_COMPLETION_COOLDOWN, Duration::from_millis(130));
+        assert_eq!(
+            LATE_IMAGE_ORIGIN_SUCCESS_START_SPACING,
+            Duration::from_millis(3000)
+        );
         assert_eq!(
             LATE_IMAGE_ORIGIN_FAILURE_START_SPACING,
-            Duration::from_millis(750)
+            Duration::from_millis(510)
         );
+        assert_eq!(LATE_IMAGE_REQUEST_GATE_SLOT, Duration::from_millis(100));
+        assert_eq!(
+            LATE_IMAGE_REQUEST_GATE_LAUNCH_DELAY,
+            Duration::from_millis(50)
+        );
+        assert_eq!(LATE_IMAGE_429_FALLBACK_BACKOFF, Duration::from_secs(30));
+        assert_eq!(LATE_IMAGE_BATCH_RELEASE_DELAY, Duration::from_millis(250));
+        assert_eq!(parse_retry_after_delta("7"), Some(Duration::from_secs(7)));
+        assert_eq!(
+            parse_retry_after_delta("999"),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(parse_retry_after_delta("not-a-number"), None);
+    }
+
+    #[test]
+    fn image_request_policy_is_serial_completion_driven() {
+        assert_eq!(
+            LATE_IMAGE_MAX_ACTIVE_GLOBAL, 1,
+            "late image loading should dispatch only one remote image at a time"
+        );
+        assert_eq!(
+            LATE_IMAGE_COMPLETION_COOLDOWN,
+            Duration::from_millis(130),
+            "next image dispatch should wait for previous completion plus cooldown"
+        );
+    }
+
+    #[test]
+    fn late_image_candidates_prioritize_visible_rendered_images() {
+        let source = "https://example.test/page.html";
+        let top_url = "https://example.test/top.png";
+        let low_url = "https://example.test/low.png";
+        let top = match unavailable_image_block(
+            "top".to_owned(),
+            top_url,
+            Some(egui::vec2(80.0, 40.0)),
+        ) {
+            CanvasBlock::Image { image, .. } => image,
+            _ => panic!("expected image placeholder"),
+        };
+        let low = match unavailable_image_block(
+            "low".to_owned(),
+            low_url,
+            Some(egui::vec2(80.0, 40.0)),
+        ) {
+            CanvasBlock::Image { image, .. } => image,
+            _ => panic!("expected image placeholder"),
+        };
+        let document = BrowserDocument {
+            title: "Late image priority".to_owned(),
+            source: source.to_owned(),
+            style: BrowserStyle::default(),
+            canvas_graph: CanvasGraph {
+                viewport: egui::vec2(320.0, 4000.0),
+                objects: vec![
+                    CanvasObject::Image(CanvasImageObject {
+                        rect: egui::Rect::from_min_size(
+                            egui::pos2(10.0, 2200.0),
+                            egui::vec2(80.0, 40.0),
+                        ),
+                        src: low_url.to_owned(),
+                        alt: "low".to_owned(),
+                        image: low,
+                        object_fit: CssObjectFit::Fill,
+                        debug_overlay: None,
+                    }),
+                    CanvasObject::Image(CanvasImageObject {
+                        rect: egui::Rect::from_min_size(
+                            egui::pos2(10.0, 20.0),
+                            egui::vec2(80.0, 40.0),
+                        ),
+                        src: top_url.to_owned(),
+                        alt: "top".to_owned(),
+                        image: top,
+                        object_fit: CssObjectFit::Fill,
+                        debug_overlay: None,
+                    }),
+                ],
+            },
+            blocks: Vec::new(),
+        };
+
+        let candidates =
+            late_image_candidates_from_document_for_viewport(&document, egui::vec2(0.0, 0.0));
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].src, top_url);
+        assert_eq!(candidates[1].src, low_url);
+        assert!(candidates[0].priority < candidates[1].priority);
+    }
+
+    #[test]
+    fn late_image_candidates_follow_document_y_order_when_scrolled() {
+        let source = "https://example.test/page.html";
+        let early_url = "https://example.test/early.png";
+        let viewport_url = "https://example.test/viewport.png";
+        let early = match unavailable_image_block(
+            "early".to_owned(),
+            early_url,
+            Some(egui::vec2(80.0, 40.0)),
+        ) {
+            CanvasBlock::Image { image, .. } => image,
+            _ => panic!("expected image placeholder"),
+        };
+        let viewport = match unavailable_image_block(
+            "viewport".to_owned(),
+            viewport_url,
+            Some(egui::vec2(80.0, 40.0)),
+        ) {
+            CanvasBlock::Image { image, .. } => image,
+            _ => panic!("expected image placeholder"),
+        };
+        let document = BrowserDocument {
+            title: "Late image document order".to_owned(),
+            source: source.to_owned(),
+            style: BrowserStyle::default(),
+            canvas_graph: CanvasGraph {
+                viewport: egui::vec2(320.0, 4000.0),
+                objects: vec![
+                    CanvasObject::Image(CanvasImageObject {
+                        rect: egui::Rect::from_min_size(
+                            egui::pos2(10.0, 20.0),
+                            egui::vec2(80.0, 40.0),
+                        ),
+                        src: early_url.to_owned(),
+                        alt: "early".to_owned(),
+                        image: early,
+                        object_fit: CssObjectFit::Fill,
+                        debug_overlay: None,
+                    }),
+                    CanvasObject::Image(CanvasImageObject {
+                        rect: egui::Rect::from_min_size(
+                            egui::pos2(10.0, 2200.0),
+                            egui::vec2(80.0, 40.0),
+                        ),
+                        src: viewport_url.to_owned(),
+                        alt: "viewport".to_owned(),
+                        image: viewport,
+                        object_fit: CssObjectFit::Fill,
+                        debug_overlay: None,
+                    }),
+                ],
+            },
+            blocks: Vec::new(),
+        };
+
+        let candidates =
+            late_image_candidates_from_document_for_viewport(&document, egui::vec2(0.0, 2000.0));
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].src, early_url);
+        assert_eq!(candidates[1].src, viewport_url);
+        assert!(candidates[0].priority < candidates[1].priority);
+    }
+
+    #[test]
+    fn first_paint_image_target_uses_ten_percent_ceiling() {
+        assert_eq!(first_paint_image_target(0), 0);
+        assert_eq!(first_paint_image_target(1), 1);
+        assert_eq!(first_paint_image_target(10), 1);
+        assert_eq!(first_paint_image_target(11), 2);
+        assert_eq!(first_paint_image_target(25), 3);
     }
 
     #[test]
