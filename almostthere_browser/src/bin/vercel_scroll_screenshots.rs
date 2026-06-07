@@ -132,6 +132,7 @@ fn capture_browser_window_screenshot(
                 canvas: BrowserCanvas {
                     zoom: 1.0,
                     scroll_offset: egui::vec2(0.0, scroll_y),
+                    last_viewport_rect: None,
                     hovered_link_href: None,
                     hovered_link_element_id: None,
                     text_selection: Default::default(),

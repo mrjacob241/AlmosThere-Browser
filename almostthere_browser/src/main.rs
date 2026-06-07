@@ -64,6 +64,9 @@ const FIRST_PAINT_IMAGE_TARGET_NUMERATOR: usize = 1;
 const FIRST_PAINT_IMAGE_TARGET_DENOMINATOR: usize = 10;
 const LATE_IMAGE_MAX_ATTEMPTS: usize = 2;
 const LATE_IMAGE_DELAY_NOTICE_INTERVAL: Duration = Duration::from_secs(1);
+const PAGE_ZOOM_MIN: f32 = 0.25;
+const PAGE_ZOOM_MAX: f32 = 5.0;
+const PAGE_ZOOM_KEYBOARD_STEP: f32 = 0.10;
 const DEFAULT_EVENT_TRACE_ITEMS: &[&str] = &["Hello world - Wikipedia", "Wikipedia"];
 const SCRIPT_TEST_BOOKMARKS: &[(&str, &str)] = &[
     (
@@ -1112,6 +1115,86 @@ impl AlmostThereApp {
         self.pending_first_paint_navigation = state.pending_first_paint_navigation;
         self.render_debug = state.render_debug;
         self.page_loaded_at = state.page_loaded_at;
+    }
+
+    fn handle_page_zoom_input(&mut self, ctx: &egui::Context) {
+        let mut zoom_steps = 0i32;
+        let mut reset_zoom = false;
+        let mut wheel_delta_y = 0.0f32;
+        let mut pinch_zoom = 1.0f32;
+
+        ctx.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::CTRL, egui::Key::Num0) {
+                reset_zoom = true;
+            }
+            if input.consume_key(egui::Modifiers::CTRL, egui::Key::Plus)
+                || input.consume_key(egui::Modifiers::CTRL, egui::Key::Equals)
+            {
+                zoom_steps += 1;
+            }
+            if input.consume_key(egui::Modifiers::CTRL, egui::Key::Minus) {
+                zoom_steps -= 1;
+            }
+
+            input.events.retain(|event| match event {
+                egui::Event::MouseWheel {
+                    delta, modifiers, ..
+                } if modifiers.ctrl => {
+                    wheel_delta_y += delta.y;
+                    false
+                }
+                egui::Event::Zoom(value) => {
+                    pinch_zoom *= *value;
+                    false
+                }
+                _ => true,
+            });
+        });
+
+        if wheel_delta_y.abs() > f32::EPSILON {
+            zoom_steps += if wheel_delta_y > 0.0 { 1 } else { -1 };
+        }
+
+        let old_zoom = self.canvas.zoom;
+        let zoom_anchor = page_zoom_anchor(ctx, self.canvas.last_viewport_rect);
+        let mut new_zoom = old_zoom;
+        if reset_zoom {
+            new_zoom = 1.0;
+        } else {
+            if zoom_steps != 0 {
+                new_zoom = stepped_page_zoom(new_zoom, zoom_steps);
+            }
+            if (pinch_zoom - 1.0).abs() > f32::EPSILON {
+                new_zoom = clamp_page_zoom(new_zoom * pinch_zoom);
+            }
+        }
+
+        if (new_zoom - old_zoom).abs() > f32::EPSILON {
+            self.canvas.scroll_offset = scroll_offset_after_zoom(
+                self.canvas.scroll_offset,
+                zoom_anchor,
+                old_zoom,
+                new_zoom,
+            );
+            self.debug_canvas.scroll_offset = scroll_offset_after_zoom(
+                self.debug_canvas.scroll_offset,
+                zoom_anchor,
+                old_zoom,
+                new_zoom,
+            );
+            self.canvas.zoom = new_zoom;
+            self.debug_canvas.zoom = new_zoom;
+            self.status = format!("Zoom: {}", page_zoom_label(new_zoom));
+            self.telemetry.emit(
+                "page.zoom.changed",
+                &[
+                    ("from", &format!("{old_zoom:.2}")),
+                    ("to", &format!("{new_zoom:.2}")),
+                    ("percent", &page_zoom_label(new_zoom)),
+                ],
+            );
+            ctx.request_repaint();
+        }
     }
 
     fn load_current_input(&mut self, ctx: &egui::Context) {
@@ -7368,6 +7451,7 @@ impl App for AlmostThereApp {
             "{APP_TITLE} :: {}",
             self.document.title
         )));
+        self.handle_page_zoom_input(ctx);
 
         egui::TopBottomPanel::top("browser_tabs").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -7458,6 +7542,7 @@ impl App for AlmostThereApp {
                 if ui.button("Reload").clicked() {
                     self.reload_current(ctx);
                 }
+                ui.label(egui::RichText::new(page_zoom_label(self.canvas.zoom)).monospace());
                 let debug_label = if self.render_debug.open {
                     "Close Debug"
                 } else {
@@ -22268,6 +22353,44 @@ fn civil_from_days(days_since_epoch: i128) -> (i128, i128, i128) {
     (year, month, day)
 }
 
+fn clamp_page_zoom(zoom: f32) -> f32 {
+    zoom.clamp(PAGE_ZOOM_MIN, PAGE_ZOOM_MAX)
+}
+
+fn stepped_page_zoom(current: f32, steps: i32) -> f32 {
+    let stepped = current + PAGE_ZOOM_KEYBOARD_STEP * steps as f32;
+    clamp_page_zoom((stepped * 10.0).round() / 10.0)
+}
+
+fn page_zoom_label(zoom: f32) -> String {
+    format!("{}%", (clamp_page_zoom(zoom) * 100.0).round() as i32)
+}
+
+fn page_zoom_anchor(ctx: &egui::Context, viewport: Option<egui::Rect>) -> egui::Vec2 {
+    let Some(viewport) = viewport else {
+        return egui::Vec2::ZERO;
+    };
+    let pointer = ctx.input(|input| input.pointer.hover_pos());
+    let anchor = pointer
+        .filter(|pos| viewport.contains(*pos))
+        .unwrap_or_else(|| viewport.center());
+    anchor - viewport.min
+}
+
+fn scroll_offset_after_zoom(
+    scroll_offset: egui::Vec2,
+    anchor_in_viewport: egui::Vec2,
+    old_zoom: f32,
+    new_zoom: f32,
+) -> egui::Vec2 {
+    if old_zoom <= f32::EPSILON || new_zoom <= f32::EPSILON {
+        return scroll_offset;
+    }
+    let scale = new_zoom / old_zoom;
+    let anchored_document_point = scroll_offset + anchor_in_viewport;
+    ((anchored_document_point * scale) - anchor_in_viewport).max(egui::Vec2::ZERO)
+}
+
 fn json_escape(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -22316,6 +22439,27 @@ mod tests {
             config.initial_url.as_deref(),
             Some("https://example.test/images")
         );
+    }
+
+    #[test]
+    fn page_zoom_helpers_follow_browser_style_percent_steps() {
+        assert_eq!(page_zoom_label(1.0), "100%");
+        assert_eq!(page_zoom_label(1.234), "123%");
+        assert_eq!(stepped_page_zoom(1.0, 1), 1.1);
+        assert_eq!(stepped_page_zoom(1.0, -1), 0.9);
+        assert_eq!(page_zoom_label(stepped_page_zoom(1.9, 1)), "200%");
+        assert_eq!(page_zoom_label(stepped_page_zoom(0.26, -1)), "25%");
+        assert_eq!(page_zoom_label(stepped_page_zoom(4.95, 1)), "500%");
+    }
+
+    #[test]
+    fn page_zoom_scroll_offset_keeps_anchor_document_point_stable() {
+        let old_scroll = egui::vec2(100.0, 200.0);
+        let anchor = egui::vec2(50.0, 75.0);
+        let new_scroll = scroll_offset_after_zoom(old_scroll, anchor, 1.0, 2.0);
+
+        assert_eq!(new_scroll, egui::vec2(250.0, 475.0));
+        assert_eq!((old_scroll + anchor) * 2.0, new_scroll + anchor);
     }
 
     #[test]
@@ -28229,6 +28373,7 @@ mod tests {
                     canvas: BrowserCanvas {
                         zoom: 1.0,
                         scroll_offset,
+                        last_viewport_rect: None,
                         hovered_link_href: None,
                         hovered_link_element_id: None,
                         text_selection: Default::default(),

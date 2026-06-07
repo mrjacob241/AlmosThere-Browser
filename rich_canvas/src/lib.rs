@@ -17,13 +17,20 @@ const BROWSER_REGULAR_FONT_NAME: &str = "browser_regular";
 const BROWSER_BOLD_FONT_NAME: &str = "browser_bold";
 const IMAGE_MIN_SIZE: f32 = 24.0;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct BrowserCanvas {
     pub zoom: f32,
     pub scroll_offset: Vec2,
+    pub last_viewport_rect: Option<Rect>,
     pub hovered_link_href: Option<String>,
     pub hovered_link_element_id: Option<String>,
     pub text_selection: CanvasTextSelection,
+}
+
+impl Default for BrowserCanvas {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -1306,6 +1313,7 @@ impl BrowserCanvas {
         Self {
             zoom: 1.0,
             scroll_offset: Vec2::ZERO,
+            last_viewport_rect: None,
             hovered_link_href: None,
             hovered_link_element_id: None,
             text_selection: CanvasTextSelection::default(),
@@ -1314,27 +1322,31 @@ impl BrowserCanvas {
 
     pub fn ui(&mut self, ui: &mut Ui, document: &mut BrowserDocument) -> BrowserCanvasResponse {
         let mut canvas_response = BrowserCanvasResponse::default();
-        let font_scale = self.zoom.clamp(0.75, 2.0);
+        let font_scale = self.zoom.clamp(0.25, 5.0);
         let style = document.style.clone();
 
-        let output = ScrollArea::vertical()
+        let viewport_width = ui.available_width();
+        let output = ScrollArea::both()
             .id_salt("almostthere_browser_canvas")
             .auto_shrink(false)
             .scroll_offset(self.scroll_offset)
             .show(ui, |ui| {
-                let available_width = ui.available_width();
-                ui.set_min_width(available_width);
+                let available_width = viewport_width.max(280.0);
                 let main_max_width = if document_prefers_wide_layout(document)
                     || document.canvas_graph.viewport.x > style.main_max_width
                 {
-                    available_width / font_scale
+                    available_width
                 } else {
                     style.main_max_width
                 };
-                let content_width = (available_width - style.main_padding_x * 2.0 * font_scale)
-                    .min(main_max_width * font_scale)
+                let base_content_width = (available_width - style.main_padding_x * 2.0)
+                    .min(main_max_width)
                     .max(280.0);
-                let left_margin = ((available_width - content_width) * 0.5)
+                let content_width = base_content_width * font_scale;
+                let scroll_content_width =
+                    (content_width + style.main_padding_x * 2.0 * font_scale).max(available_width);
+                ui.set_min_width(scroll_content_width);
+                let left_margin = ((scroll_content_width - content_width) * 0.5)
                     .max(style.main_padding_x * font_scale);
 
                 ui.add_space(style.main_padding_y * font_scale);
@@ -1363,6 +1375,7 @@ impl BrowserCanvas {
                 });
             });
         self.scroll_offset = output.state.offset;
+        self.last_viewport_rect = Some(output.inner_rect);
         (self.hovered_link_href, self.hovered_link_element_id) =
             hovered_link_identity(canvas_response.hovered.as_ref());
 
@@ -1376,24 +1389,28 @@ impl BrowserCanvas {
         graph: &mut CanvasGraph,
     ) -> BrowserCanvasResponse {
         let mut canvas_response = BrowserCanvasResponse::default();
-        let font_scale = self.zoom.clamp(0.75, 2.0);
+        let font_scale = self.zoom.clamp(0.25, 5.0);
 
-        let output = ScrollArea::vertical()
+        let viewport_width = ui.available_width();
+        let output = ScrollArea::both()
             .id_salt("almostthere_browser_debug_canvas")
             .auto_shrink(false)
             .scroll_offset(self.scroll_offset)
             .show(ui, |ui| {
-                let available_width = ui.available_width();
-                ui.set_min_width(available_width);
+                let available_width = viewport_width.max(280.0);
                 let main_max_width = if graph.viewport.x > style.main_max_width {
-                    available_width / font_scale
+                    available_width
                 } else {
                     style.main_max_width
                 };
-                let content_width = (available_width - style.main_padding_x * 2.0 * font_scale)
-                    .min(main_max_width * font_scale)
+                let base_content_width = (available_width - style.main_padding_x * 2.0)
+                    .min(main_max_width)
                     .max(280.0);
-                let left_margin = ((available_width - content_width) * 0.5)
+                let content_width = base_content_width * font_scale;
+                let scroll_content_width =
+                    (content_width + style.main_padding_x * 2.0 * font_scale).max(available_width);
+                ui.set_min_width(scroll_content_width);
+                let left_margin = ((scroll_content_width - content_width) * 0.5)
                     .max(style.main_padding_x * font_scale);
 
                 ui.add_space(style.main_padding_y * font_scale);
@@ -1416,6 +1433,7 @@ impl BrowserCanvas {
                 });
             });
         self.scroll_offset = output.state.offset;
+        self.last_viewport_rect = Some(output.inner_rect);
         (self.hovered_link_href, self.hovered_link_element_id) =
             hovered_link_identity(canvas_response.hovered.as_ref());
 
@@ -1585,7 +1603,8 @@ fn paint_canvas_graph(
 ) {
     let graph_width = graph.viewport.x.max(1.0);
     let scale = (content_width / graph_width).max(0.1) * font_scale;
-    let graph_size = vec2(content_width.max(1.0), (graph.viewport.y * scale).max(1.0));
+    let rendered_graph_width = (graph.viewport.x * scale).max(content_width).max(1.0);
+    let graph_size = vec2(rendered_graph_width, (graph.viewport.y * scale).max(1.0));
     let (canvas_rect, canvas_interaction) =
         ui.allocate_exact_size(graph_size, Sense::click_and_drag());
     let mut painter = ui.painter().with_clip_rect(canvas_rect);
