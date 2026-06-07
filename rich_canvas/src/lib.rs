@@ -609,6 +609,13 @@ pub struct CanvasRichTextLineObject {
     pub rect: Rect,
     pub spans: Vec<CanvasTextSpan>,
     pub text_align: CssTextAlign,
+    pub selection_break_before: CanvasSelectionBreak,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanvasSelectionBreak {
+    Hard,
+    Soft,
 }
 
 #[derive(Clone, Debug)]
@@ -1483,19 +1490,35 @@ fn canvas_graph_text_for_range(graph: &CanvasGraph, range: CanvasTextRange) -> S
             continue;
         }
         if !selected.is_empty() {
-            if previous_rect
-                .zip(canvas_object_selectable_rect(object))
-                .is_none_or(|(previous, current)| {
-                    !canvas_text_rects_share_visual_line(previous, current)
-                })
-            {
-                selected.push('\n');
-            }
+            push_canvas_text_selection_separator(&mut selected, previous_rect, object);
         }
         selected.push_str(&text_chars_slice(&text, start_char, end_char));
         previous_rect = canvas_object_selectable_rect(object);
     }
     selected
+}
+
+fn push_canvas_text_selection_separator(
+    selected: &mut String,
+    previous_rect: Option<Rect>,
+    object: &CanvasObject,
+) {
+    if let Some((previous, current)) = previous_rect.zip(canvas_object_selectable_rect(object)) {
+        if canvas_text_rects_share_visual_line(previous, current) {
+            return;
+        }
+    }
+
+    match canvas_object_selection_break_before(object) {
+        CanvasSelectionBreak::Soft => push_collapsed_selection_space(selected),
+        CanvasSelectionBreak::Hard => selected.push('\n'),
+    }
+}
+
+fn push_collapsed_selection_space(selected: &mut String) {
+    if !selected.ends_with(char::is_whitespace) {
+        selected.push(' ');
+    }
 }
 
 fn canvas_object_selectable_text(object: &CanvasObject) -> Option<String> {
@@ -1517,6 +1540,13 @@ fn canvas_object_selectable_rect(object: &CanvasObject) -> Option<Rect> {
         CanvasObject::Text(text) => Some(text.rect),
         CanvasObject::RichTextLine(line) => Some(line.rect),
         _ => None,
+    }
+}
+
+fn canvas_object_selection_break_before(object: &CanvasObject) -> CanvasSelectionBreak {
+    match object {
+        CanvasObject::RichTextLine(line) => line.selection_break_before,
+        _ => CanvasSelectionBreak::Hard,
     }
 }
 
@@ -8007,10 +8037,19 @@ mod tests {
     }
 
     fn sample_rich_text_line_at(spans: &[&str], y: f32) -> CanvasObject {
+        sample_rich_text_line_at_with_break(spans, y, CanvasSelectionBreak::Hard)
+    }
+
+    fn sample_rich_text_line_at_with_break(
+        spans: &[&str],
+        y: f32,
+        selection_break_before: CanvasSelectionBreak,
+    ) -> CanvasObject {
         CanvasObject::RichTextLine(CanvasRichTextLineObject {
             rect: Rect::from_min_size(Pos2::new(0.0, y), Vec2::new(240.0, 24.0)),
             spans: spans.iter().map(|span| sample_span(span)).collect(),
             text_align: CssTextAlign::Left,
+            selection_break_before,
         })
     }
 
@@ -8223,6 +8262,47 @@ mod tests {
         assert_eq!(
             canvas_graph_selected_text(&graph, &selection).as_deref(),
             Some("Hello world")
+        );
+    }
+
+    #[test]
+    fn canvas_graph_selected_text_uses_spaces_for_soft_wrapped_rich_lines() {
+        let graph = CanvasGraph {
+            viewport: Vec2::new(320.0, 120.0),
+            objects: vec![
+                sample_rich_text_line_at_with_break(
+                    &["A wrapped"],
+                    0.0,
+                    CanvasSelectionBreak::Hard,
+                ),
+                sample_rich_text_line_at_with_break(
+                    &["paragraph continues"],
+                    24.0,
+                    CanvasSelectionBreak::Soft,
+                ),
+                sample_rich_text_line_at_with_break(
+                    &["New paragraph"],
+                    58.0,
+                    CanvasSelectionBreak::Hard,
+                ),
+            ],
+        };
+        let selection = CanvasTextSelection {
+            anchor: Some(CanvasTextCaret {
+                object_index: 0,
+                char_index: 0,
+            }),
+            focus: Some(CanvasTextCaret {
+                object_index: 2,
+                char_index: 13,
+            }),
+            dragging: false,
+            drag_exceeded_click: false,
+        };
+
+        assert_eq!(
+            canvas_graph_selected_text(&graph, &selection).as_deref(),
+            Some("A wrapped paragraph continues\nNew paragraph")
         );
     }
 

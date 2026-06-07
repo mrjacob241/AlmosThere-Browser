@@ -2351,10 +2351,11 @@ fn canvas_graph_debug_string(graph: &CanvasGraph) -> String {
                 let links = line.spans.iter().filter(|span| span.href.is_some()).count();
                 let _ = writeln!(
                     out,
-                    "{index:04} RichTextLine rect={} spans={} links={} text=\"{}\"",
+                    "{index:04} RichTextLine rect={} spans={} links={} copy_break={:?} text=\"{}\"",
                     rect_debug(line.rect),
                     line.spans.len(),
                     links,
+                    line.selection_break_before,
                     shorten_debug_text(&text)
                 );
             }
@@ -16037,11 +16038,16 @@ fn push_canvas_line_boxes(
         return;
     }
 
-    for mut line in line_boxes {
+    for (line_index, mut line) in line_boxes.into_iter().enumerate() {
         coalesce_canvas_line_fragments(&mut line);
         let align_offset = line_align_offset(&line, cursor.width);
         let line_height = line.height.max(1.0);
-        push_canvas_graph_rich_text_line(line, align_offset, cursor, graph);
+        let selection_break_before = if line_index == 0 {
+            rich_canvas::CanvasSelectionBreak::Hard
+        } else {
+            rich_canvas::CanvasSelectionBreak::Soft
+        };
+        push_canvas_graph_rich_text_line(line, align_offset, selection_break_before, cursor, graph);
         cursor.y += line_height;
     }
 }
@@ -16049,6 +16055,7 @@ fn push_canvas_line_boxes(
 fn push_canvas_graph_rich_text_line(
     line: CanvasLineBox,
     align_offset: f32,
+    selection_break_before: rich_canvas::CanvasSelectionBreak,
     cursor: &CanvasLayoutCursor,
     graph: &mut CanvasGraph,
 ) {
@@ -16099,6 +16106,7 @@ fn push_canvas_graph_rich_text_line(
             rect: line_rect,
             spans,
             text_align,
+            selection_break_before,
         }));
     graph.objects.extend(link_hits);
 }
@@ -21236,6 +21244,72 @@ mod tests {
         assert!(
             first_line_text.contains("link alpha"),
             "overflowing run should be tokenized into the remaining line, got {first_line_text:?}"
+        );
+    }
+
+    #[test]
+    fn selected_text_copies_soft_wrapped_paragraph_lines_as_spaces() {
+        let html = r#"
+            <html>
+              <head>
+                <style>
+                  p { width: 140px; font-size: 16px; }
+                </style>
+              </head>
+              <body>
+                <p>Alpha beta gamma delta epsilon zeta eta theta.</p>
+              </body>
+            </html>
+        "#;
+        let document = parse_html_document(html, "https://example.test/soft-wrap-copy");
+        let rich_lines = document
+            .canvas_graph
+            .objects
+            .iter()
+            .enumerate()
+            .filter_map(|(index, object)| match object {
+                CanvasObject::RichTextLine(line) => Some((index, line)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            rich_lines.len() >= 2,
+            "expected paragraph to wrap into rich lines: {rich_lines:?}"
+        );
+        assert_eq!(
+            rich_lines[0].1.selection_break_before,
+            rich_canvas::CanvasSelectionBreak::Hard
+        );
+        assert_eq!(
+            rich_lines[1].1.selection_break_before,
+            rich_canvas::CanvasSelectionBreak::Soft
+        );
+
+        let last_text = rich_lines
+            .last()
+            .expect("expected last rich line")
+            .1
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        let selection = rich_canvas::CanvasTextSelection {
+            anchor: Some(rich_canvas::CanvasTextCaret {
+                object_index: rich_lines[0].0,
+                char_index: 0,
+            }),
+            focus: Some(rich_canvas::CanvasTextCaret {
+                object_index: rich_lines.last().expect("last rich line").0,
+                char_index: last_text.chars().count(),
+            }),
+            dragging: false,
+            drag_exceeded_click: false,
+        };
+
+        assert_eq!(
+            rich_canvas::canvas_graph_selected_text(&document.canvas_graph, &selection).as_deref(),
+            Some("Alpha beta gamma delta epsilon zeta eta theta.")
         );
     }
 
