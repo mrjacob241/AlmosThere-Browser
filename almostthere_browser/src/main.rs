@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     net::{TcpListener, TcpStream},
@@ -47,6 +47,11 @@ const DEFAULT_LAYOUT_VIEWPORT_HEIGHT: f32 = 1800.0;
 const DEFAULT_BOOKMARK_TITLE: &str = "AlmostThere Sample Page";
 const DEFAULT_URL_BOOKMARK_TITLE: &str = "HTML5 Test Page";
 const LOCAL_BOOKMARK_TOKEN: &str = "[local]";
+const LATE_IMAGE_MAX_ACTIVE_PER_ORIGIN: usize = 2;
+const LATE_IMAGE_ORIGIN_START_SPACING: Duration = Duration::from_millis(150);
+const LATE_IMAGE_ORIGIN_FAILURE_START_SPACING: Duration = Duration::from_millis(750);
+const LATE_IMAGE_MAX_ATTEMPTS: usize = 2;
+const LATE_IMAGE_DELAY_NOTICE_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_EVENT_TRACE_ITEMS: &[&str] = &["Hello world - Wikipedia", "Wikipedia"];
 const SCRIPT_TEST_BOOKMARKS: &[(&str, &str)] = &[
     (
@@ -245,6 +250,7 @@ struct AppConfig {
     debug_socket: bool,
     event_trace: bool,
     debug_links: bool,
+    debug_image_loading: bool,
     page_loader_timeout_enabled: bool,
     initial_url: Option<String>,
     trace_items: Vec<String>,
@@ -261,6 +267,7 @@ impl AppConfig {
         let mut debug_socket = false;
         let mut event_trace = false;
         let mut debug_links = false;
+        let mut debug_image_loading = false;
         let mut page_loader_timeout_override = None;
         let mut initial_url = None;
         let mut trace_items = Vec::new();
@@ -275,6 +282,8 @@ impl AppConfig {
                 event_trace = true;
             } else if arg == "--debug-links" {
                 debug_links = true;
+            } else if arg == "--debug-image-loading" {
+                debug_image_loading = true;
             } else if arg == "--page-loader-timeout" || arg == "--debug-page-loader-timeout" {
                 page_loader_timeout_override = Some(true);
             } else if arg == "--no-page-loader-timeout" {
@@ -306,6 +315,7 @@ impl AppConfig {
             debug_socket,
             event_trace,
             debug_links,
+            debug_image_loading,
             page_loader_timeout_enabled: page_loader_timeout_override.unwrap_or(false),
             initial_url,
             trace_items,
@@ -410,6 +420,7 @@ struct AlmostThereApp {
     record_events: bool,
     event_trace: bool,
     debug_links: bool,
+    debug_image_loading: bool,
     page_loader_timeout_enabled: bool,
     trace_items: Vec<String>,
     recorded_event_count: u64,
@@ -419,6 +430,13 @@ struct AlmostThereApp {
     late_image_sender: Sender<LateImageResourceResult>,
     late_image_receiver: Receiver<LateImageResourceResult>,
     pending_late_images: HashSet<LateImageResourceKey>,
+    late_image_queue: VecDeque<LateImageQueuedResource>,
+    late_image_active_by_origin: HashMap<String, usize>,
+    late_image_active_keys: HashMap<LateImageResourceKey, String>,
+    late_image_next_start_by_origin: HashMap<String, Instant>,
+    late_image_last_delay_notice: HashMap<String, Instant>,
+    late_image_progress: HashMap<LateImageDocumentKey, LateImageProgress>,
+    late_image_statuses: HashMap<LateImageResourceKey, LateImageLoadStatus>,
 }
 
 struct BrowserTabState {
@@ -607,9 +625,72 @@ struct LateImageResourceKey {
     image_url: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct LateImageDocumentKey {
+    tab_id: u64,
+    document_source: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LateImageProgress {
+    total: usize,
+    resolved: usize,
+    failed: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LateImageLoadStatus {
+    Pending,
+    Retrying(String),
+    Loaded,
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+struct CachedImageResourceFailure {
+    message: String,
+    expires_at: Instant,
+}
+
 struct LateImageResourceResult {
     key: LateImageResourceKey,
+    origin: String,
+    attempts: usize,
     image: io::Result<ImageBlock>,
+}
+
+#[derive(Clone, Debug)]
+struct LateImageQueuedResource {
+    key: LateImageResourceKey,
+    requested_size: Option<egui::Vec2>,
+    origin: String,
+    queued_at: Instant,
+    attempts: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LateImageDelayReason {
+    OriginConcurrency,
+    OriginSpacing,
+    OriginFailureSpacing,
+    ExactFailureBackoff,
+}
+
+impl LateImageDelayReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OriginConcurrency => "origin-concurrency",
+            Self::OriginSpacing => "origin-spacing",
+            Self::OriginFailureSpacing => "origin-failure-spacing",
+            Self::ExactFailureBackoff => "exact-failure-backoff",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LateImageDispatchDelay {
+    duration: Duration,
+    reason: LateImageDelayReason,
 }
 
 struct LoadedPageSource {
@@ -809,6 +890,7 @@ impl AlmostThereApp {
             record_events: config.record_events,
             event_trace: config.event_trace,
             debug_links: config.debug_links,
+            debug_image_loading: config.debug_image_loading,
             page_loader_timeout_enabled: config.page_loader_timeout_enabled,
             trace_items: config.trace_items,
             recorded_event_count: 0,
@@ -818,6 +900,13 @@ impl AlmostThereApp {
             late_image_sender,
             late_image_receiver,
             pending_late_images: HashSet::new(),
+            late_image_queue: VecDeque::new(),
+            late_image_active_by_origin: HashMap::new(),
+            late_image_active_keys: HashMap::new(),
+            late_image_next_start_by_origin: HashMap::new(),
+            late_image_last_delay_notice: HashMap::new(),
+            late_image_progress: HashMap::new(),
+            late_image_statuses: HashMap::new(),
         };
         app.start_navigation(
             initial_url.to_owned(),
@@ -1042,6 +1131,23 @@ impl AlmostThereApp {
     fn clear_late_images_for_tab(&mut self, tab_id: u64) {
         let before = self.pending_late_images.len();
         self.pending_late_images.retain(|key| key.tab_id != tab_id);
+        self.late_image_queue
+            .retain(|queued| queued.key.tab_id != tab_id);
+        let active_for_tab: Vec<(LateImageResourceKey, String)> = self
+            .late_image_active_keys
+            .iter()
+            .filter(|(key, _)| key.tab_id == tab_id)
+            .map(|(key, origin)| (key.clone(), origin.clone()))
+            .collect();
+        for (key, origin) in active_for_tab {
+            self.late_image_active_keys.remove(&key);
+            self.finish_late_image_fetch_for_origin(&origin);
+        }
+        self.late_image_progress
+            .retain(|key, _| key.tab_id != tab_id);
+        self.late_image_statuses
+            .retain(|key, _| key.tab_id != tab_id);
+        self.late_image_last_delay_notice.clear();
         let removed = before.saturating_sub(self.pending_late_images.len());
         if removed > 0 {
             self.telemetry.emit(
@@ -1058,6 +1164,13 @@ impl AlmostThereApp {
         let tab_id = self.active_tab_id();
         let document_source = self.document.source.clone();
         let candidates = late_image_candidates_from_document(&self.document);
+        let document_key = LateImageDocumentKey {
+            tab_id,
+            document_source: document_source.clone(),
+        };
+        let candidate_count = candidates.len();
+        let mut newly_queued = 0usize;
+        let mut already_pending = 0usize;
         for candidate in candidates {
             let key = LateImageResourceKey {
                 tab_id,
@@ -1065,40 +1178,86 @@ impl AlmostThereApp {
                 image_url: candidate.src,
             };
             if !self.pending_late_images.insert(key.clone()) {
+                already_pending += 1;
                 continue;
             }
-            let sender = self.late_image_sender.clone();
-            let requested_size = Some(candidate.size);
-            thread::spawn(move || {
-                emit_global_telemetry(
-                    "document.image.late.fetch.started",
-                    &[
-                        ("tab_id", &key.tab_id.to_string()),
-                        ("document", &key.document_source),
-                        ("url", &key.image_url),
-                    ],
-                );
-                let started = Instant::now();
-                let image = load_image_resource(&key.image_url, requested_size, false);
-                let elapsed_ms = started.elapsed().as_millis().to_string();
-                let status = if image.is_ok() { "ok" } else { "error" };
-                emit_global_telemetry(
-                    "document.image.late.fetch.completed",
-                    &[
-                        ("tab_id", &key.tab_id.to_string()),
-                        ("document", &key.document_source),
-                        ("url", &key.image_url),
-                        ("status", status),
-                        ("elapsed_ms", &elapsed_ms),
-                    ],
-                );
-                let _ = sender.send(LateImageResourceResult { key, image });
+            self.late_image_statuses
+                .insert(key.clone(), LateImageLoadStatus::Pending);
+            newly_queued += 1;
+            let origin = image_resource_origin(&key.image_url)
+                .unwrap_or_else(|| "local-resource".to_owned());
+            let origin_queue_depth = self
+                .late_image_queue
+                .iter()
+                .filter(|queued| queued.origin == origin)
+                .count()
+                + 1;
+            self.telemetry.emit(
+                "document.image.scheduler.queued",
+                &[
+                    ("tab_id", &key.tab_id.to_string()),
+                    ("document", &key.document_source),
+                    ("url", &key.image_url),
+                    ("origin", &origin),
+                    (
+                        "queue_depth",
+                        &(self.late_image_queue.len() + 1).to_string(),
+                    ),
+                    ("origin_queue_depth", &origin_queue_depth.to_string()),
+                ],
+            );
+            self.late_image_queue.push_back(LateImageQueuedResource {
+                key,
+                requested_size: Some(candidate.size),
+                origin,
+                queued_at: Instant::now(),
+                attempts: 0,
             });
+        }
+        if newly_queued > 0 {
+            let progress = self.late_image_progress.entry(document_key).or_default();
+            progress.total += newly_queued;
+        }
+        let pending_total = self.pending_late_images_for_document(tab_id, &document_source);
+        let progress = self
+            .late_image_progress
+            .get(&LateImageDocumentKey {
+                tab_id,
+                document_source: document_source.clone(),
+            })
+            .cloned()
+            .unwrap_or_default();
+        self.telemetry.emit(
+            "document.image.late.schedule",
+            &[
+                ("tab_id", &tab_id.to_string()),
+                ("document", &document_source),
+                ("candidates", &candidate_count.to_string()),
+                ("queued", &newly_queued.to_string()),
+                ("already_pending", &already_pending.to_string()),
+                ("pending_total", &pending_total.to_string()),
+                ("total", &progress.total.to_string()),
+                ("resolved", &progress.resolved.to_string()),
+                ("failed", &progress.failed.to_string()),
+                ("queued_total", &self.late_image_queue.len().to_string()),
+                (
+                    "debug_image_loading",
+                    if self.debug_image_loading {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                ),
+            ],
+        );
+        if newly_queued > 0 || self.debug_image_loading {
+            self.refresh_late_image_debug_overlays();
         }
     }
 
     fn poll_late_image_resources(&mut self, ctx: &egui::Context) {
         while let Ok(result) = self.late_image_receiver.try_recv() {
+            self.finish_late_image_fetch(&result.key, &result.origin);
             if !self.pending_late_images.remove(&result.key) {
                 self.telemetry.emit(
                     "document.image.late.ignored",
@@ -1112,8 +1271,122 @@ impl AlmostThereApp {
                 continue;
             }
             let image = match result.image {
-                Ok(image) => image,
+                Ok(image) => {
+                    self.record_late_image_resolution(&result.key, false);
+                    self.late_image_statuses
+                        .insert(result.key.clone(), LateImageLoadStatus::Loaded);
+                    self.emit_late_image_progress(
+                        "document.image.late.progress",
+                        &result.key,
+                        "ok",
+                    );
+                    image
+                }
                 Err(error) => {
+                    let failure_label = late_image_failure_label(&error);
+                    if let Some(retry_delay) =
+                        image_resource_exact_retry_delay(&result.key.image_url)
+                    {
+                        let origin_spacing =
+                            if cached_image_origin_failure(&result.key.image_url).is_some() {
+                                LATE_IMAGE_ORIGIN_FAILURE_START_SPACING
+                            } else {
+                                LATE_IMAGE_ORIGIN_START_SPACING
+                            };
+                        self.late_image_next_start_by_origin
+                            .insert(result.origin.clone(), Instant::now() + origin_spacing);
+                        self.telemetry.emit(
+                            "document.image.scheduler.backoff",
+                            &[
+                                ("tab_id", &result.key.tab_id.to_string()),
+                                ("document", &result.key.document_source),
+                                ("url", &result.key.image_url),
+                                ("origin", &result.origin),
+                                ("backoff_ms", &retry_delay.as_millis().to_string()),
+                                ("origin_spacing_ms", &origin_spacing.as_millis().to_string()),
+                                ("reason", &failure_label),
+                                (
+                                    "origin_queue_depth",
+                                    &self
+                                        .late_image_queue
+                                        .iter()
+                                        .filter(|queued| queued.origin == result.origin)
+                                        .count()
+                                        .to_string(),
+                                ),
+                                ("scope", "exact-url"),
+                            ],
+                        );
+                    } else if cached_image_origin_failure(&result.key.image_url).is_some() {
+                        self.late_image_next_start_by_origin.insert(
+                            result.origin.clone(),
+                            Instant::now() + LATE_IMAGE_ORIGIN_FAILURE_START_SPACING,
+                        );
+                        self.telemetry.emit(
+                            "document.image.scheduler.backoff",
+                            &[
+                                ("tab_id", &result.key.tab_id.to_string()),
+                                ("document", &result.key.document_source),
+                                ("url", &result.key.image_url),
+                                ("origin", &result.origin),
+                                (
+                                    "backoff_ms",
+                                    &LATE_IMAGE_ORIGIN_FAILURE_START_SPACING
+                                        .as_millis()
+                                        .to_string(),
+                                ),
+                                ("reason", &failure_label),
+                                (
+                                    "origin_queue_depth",
+                                    &self
+                                        .late_image_queue
+                                        .iter()
+                                        .filter(|queued| queued.origin == result.origin)
+                                        .count()
+                                        .to_string(),
+                                ),
+                                ("scope", "origin-polite-spacing"),
+                            ],
+                        );
+                    }
+                    if image_error_is_retryable(&error) && result.attempts < LATE_IMAGE_MAX_ATTEMPTS
+                    {
+                        self.pending_late_images.insert(result.key.clone());
+                        self.late_image_statuses.insert(
+                            result.key.clone(),
+                            LateImageLoadStatus::Retrying(failure_label.clone()),
+                        );
+                        self.telemetry.emit(
+                            "document.image.scheduler.requeued",
+                            &[
+                                ("tab_id", &result.key.tab_id.to_string()),
+                                ("document", &result.key.document_source),
+                                ("url", &result.key.image_url),
+                                ("origin", &result.origin),
+                                ("attempts", &result.attempts.to_string()),
+                            ],
+                        );
+                        self.emit_late_image_progress(
+                            "document.image.late.progress",
+                            &result.key,
+                            "retrying",
+                        );
+                        self.late_image_queue.push_back(LateImageQueuedResource {
+                            key: result.key,
+                            requested_size: None,
+                            origin: result.origin,
+                            queued_at: Instant::now(),
+                            attempts: result.attempts,
+                        });
+                        self.refresh_late_image_debug_overlays();
+                        ctx.request_repaint();
+                        continue;
+                    }
+                    self.record_late_image_resolution(&result.key, true);
+                    self.late_image_statuses.insert(
+                        result.key.clone(),
+                        LateImageLoadStatus::Failed(failure_label),
+                    );
                     self.telemetry.emit(
                         "document.image.late.failed",
                         &[
@@ -1123,6 +1396,13 @@ impl AlmostThereApp {
                             ("error", &error.to_string()),
                         ],
                     );
+                    self.emit_late_image_progress(
+                        "document.image.late.progress",
+                        &result.key,
+                        "error",
+                    );
+                    self.refresh_late_image_debug_overlays();
+                    ctx.request_repaint();
                     continue;
                 }
             };
@@ -1142,6 +1422,7 @@ impl AlmostThereApp {
                     );
                     ctx.request_repaint();
                 }
+                self.refresh_late_image_debug_overlays();
                 continue;
             }
             if let Some(tab) = self.tabs.iter_mut().find(|tab| {
@@ -1169,6 +1450,332 @@ impl AlmostThereApp {
                     ],
                 );
             }
+            self.refresh_late_image_debug_overlays();
+        }
+        self.dispatch_late_image_resources(ctx);
+    }
+
+    fn finish_late_image_fetch(&mut self, key: &LateImageResourceKey, origin: &str) {
+        if self.late_image_active_keys.remove(key).is_none() {
+            return;
+        }
+        self.finish_late_image_fetch_for_origin(origin);
+    }
+
+    fn finish_late_image_fetch_for_origin(&mut self, origin: &str) {
+        let Some(active) = self.late_image_active_by_origin.get_mut(origin) else {
+            return;
+        };
+        *active = active.saturating_sub(1);
+        if *active == 0 {
+            self.late_image_active_by_origin.remove(origin);
+        }
+    }
+
+    fn dispatch_late_image_resources(&mut self, ctx: &egui::Context) {
+        self.late_image_queue
+            .retain(|queued| self.pending_late_images.contains(&queued.key));
+
+        let mut started_any = false;
+        loop {
+            let Some(index) = self.next_dispatchable_late_image_index() else {
+                break;
+            };
+            let Some(queued) = self.late_image_queue.remove(index) else {
+                break;
+            };
+            self.start_late_image_fetch(queued);
+            started_any = true;
+        }
+
+        if !self.late_image_queue.is_empty() {
+            if let Some((index, delay)) = self.next_late_image_dispatch_delay() {
+                ctx.request_repaint_after(delay.duration);
+                if !started_any {
+                    self.emit_late_image_scheduler_delayed(index, delay);
+                }
+            } else {
+                let delay = LateImageDispatchDelay {
+                    duration: Duration::from_millis(100),
+                    reason: LateImageDelayReason::OriginSpacing,
+                };
+                ctx.request_repaint_after(delay.duration);
+                if !started_any {
+                    self.emit_late_image_scheduler_delayed(0, delay);
+                }
+            }
+        }
+    }
+
+    fn next_dispatchable_late_image_index(&mut self) -> Option<usize> {
+        let now = Instant::now();
+        for (index, queued) in self.late_image_queue.iter().enumerate() {
+            if self.late_image_dispatch_delay_for(queued, now).is_some() {
+                continue;
+            }
+            return Some(index);
+        }
+        None
+    }
+
+    fn next_late_image_dispatch_delay(&self) -> Option<(usize, LateImageDispatchDelay)> {
+        let now = Instant::now();
+        self.late_image_queue
+            .iter()
+            .enumerate()
+            .filter_map(|(index, queued)| {
+                self.late_image_dispatch_delay_for(queued, now)
+                    .map(|delay| (index, delay))
+            })
+            .min_by_key(|(_, delay)| delay.duration)
+    }
+
+    fn late_image_dispatch_delay_for(
+        &self,
+        queued: &LateImageQueuedResource,
+        now: Instant,
+    ) -> Option<LateImageDispatchDelay> {
+        let active = self
+            .late_image_active_by_origin
+            .get(&queued.origin)
+            .copied()
+            .unwrap_or(0);
+        if active >= LATE_IMAGE_MAX_ACTIVE_PER_ORIGIN {
+            return Some(LateImageDispatchDelay {
+                duration: Duration::from_millis(100),
+                reason: LateImageDelayReason::OriginConcurrency,
+            });
+        }
+        if let Some(exact_delay) = image_resource_exact_retry_delay(&queued.key.image_url) {
+            return Some(LateImageDispatchDelay {
+                duration: exact_delay,
+                reason: LateImageDelayReason::ExactFailureBackoff,
+            });
+        }
+        if let Some((_, origin_delay)) = cached_image_origin_failure(&queued.key.image_url) {
+            return Some(LateImageDispatchDelay {
+                duration: origin_delay,
+                reason: LateImageDelayReason::OriginFailureSpacing,
+            });
+        }
+        let next_start = self
+            .late_image_next_start_by_origin
+            .get(&queued.origin)
+            .copied()?;
+        if next_start <= now {
+            return None;
+        }
+        let reason = if cached_image_origin_failure(&queued.key.image_url).is_some() {
+            LateImageDelayReason::OriginFailureSpacing
+        } else {
+            LateImageDelayReason::OriginSpacing
+        };
+        if reason == LateImageDelayReason::OriginSpacing && active > 0 {
+            return None;
+        }
+        Some(LateImageDispatchDelay {
+            duration: next_start.saturating_duration_since(now),
+            reason,
+        })
+    }
+
+    fn emit_late_image_scheduler_delayed(
+        &mut self,
+        queue_index: usize,
+        fallback_delay: LateImageDispatchDelay,
+    ) {
+        let Some(queued) = self.late_image_queue.get(queue_index) else {
+            return;
+        };
+        let now = Instant::now();
+        let delay = self
+            .late_image_dispatch_delay_for(queued, now)
+            .unwrap_or(fallback_delay);
+        let active = self
+            .late_image_active_by_origin
+            .get(&queued.origin)
+            .copied()
+            .unwrap_or(0);
+        let reason = delay.reason.as_str();
+        let notice_key = format!("{}|{reason}", queued.origin);
+        if self
+            .late_image_last_delay_notice
+            .get(&notice_key)
+            .is_some_and(|last| last.elapsed() < LATE_IMAGE_DELAY_NOTICE_INTERVAL)
+        {
+            return;
+        }
+        self.late_image_last_delay_notice
+            .insert(notice_key, Instant::now());
+        self.telemetry.emit(
+            "document.image.scheduler.delayed",
+            &[
+                ("tab_id", &queued.key.tab_id.to_string()),
+                ("document", &queued.key.document_source),
+                ("url", &queued.key.image_url),
+                ("origin", &queued.origin),
+                ("delay_ms", &delay.duration.as_millis().to_string()),
+                ("reason", reason),
+                ("active_for_origin", &active.to_string()),
+                (
+                    "origin_limit",
+                    &LATE_IMAGE_MAX_ACTIVE_PER_ORIGIN.to_string(),
+                ),
+            ],
+        );
+    }
+
+    fn start_late_image_fetch(&mut self, queued: LateImageQueuedResource) {
+        let active = self
+            .late_image_active_by_origin
+            .entry(queued.origin.clone())
+            .or_insert(0);
+        *active += 1;
+        self.late_image_active_keys
+            .insert(queued.key.clone(), queued.origin.clone());
+        let active_for_origin = *active;
+        self.late_image_next_start_by_origin.insert(
+            queued.origin.clone(),
+            Instant::now() + LATE_IMAGE_ORIGIN_START_SPACING,
+        );
+        self.late_image_last_delay_notice.remove(&queued.origin);
+        let queue_wait_ms = queued.queued_at.elapsed().as_millis().to_string();
+        self.telemetry.emit(
+            "document.image.scheduler.started",
+            &[
+                ("tab_id", &queued.key.tab_id.to_string()),
+                ("document", &queued.key.document_source),
+                ("url", &queued.key.image_url),
+                ("origin", &queued.origin),
+                ("active_for_origin", &active_for_origin.to_string()),
+                (
+                    "origin_limit",
+                    &LATE_IMAGE_MAX_ACTIVE_PER_ORIGIN.to_string(),
+                ),
+                ("queue_wait_ms", &queue_wait_ms),
+            ],
+        );
+        let sender = self.late_image_sender.clone();
+        thread::spawn(move || {
+            let started = Instant::now();
+            let attempts = queued.attempts.saturating_add(1);
+            let image = load_image_resource(&queued.key.image_url, queued.requested_size, false);
+            let elapsed_ms = started.elapsed().as_millis().to_string();
+            let status = if image.is_ok() { "ok" } else { "error" };
+            emit_global_telemetry(
+                "document.image.scheduler.completed",
+                &[
+                    ("tab_id", &queued.key.tab_id.to_string()),
+                    ("document", &queued.key.document_source),
+                    ("url", &queued.key.image_url),
+                    ("origin", &queued.origin),
+                    ("status", status),
+                    ("elapsed_ms", &elapsed_ms),
+                    ("attempts", &attempts.to_string()),
+                ],
+            );
+            let _ = sender.send(LateImageResourceResult {
+                key: queued.key,
+                origin: queued.origin,
+                attempts,
+                image,
+            });
+        });
+    }
+
+    fn record_late_image_resolution(&mut self, key: &LateImageResourceKey, failed: bool) {
+        let document_key = LateImageDocumentKey {
+            tab_id: key.tab_id,
+            document_source: key.document_source.clone(),
+        };
+        let progress = self.late_image_progress.entry(document_key).or_default();
+        progress.resolved = progress.resolved.saturating_add(1).min(progress.total);
+        if failed {
+            progress.failed = progress.failed.saturating_add(1).min(progress.resolved);
+        }
+    }
+
+    fn pending_late_images_for_document(&self, tab_id: u64, document_source: &str) -> usize {
+        self.pending_late_images
+            .iter()
+            .filter(|key| key.tab_id == tab_id && key.document_source == document_source)
+            .count()
+    }
+
+    fn retrying_late_images_for_document(&self, tab_id: u64, document_source: &str) -> usize {
+        self.late_image_statuses
+            .iter()
+            .filter(|(key, status)| {
+                key.tab_id == tab_id
+                    && key.document_source == document_source
+                    && matches!(status, LateImageLoadStatus::Retrying(_))
+            })
+            .count()
+    }
+
+    fn emit_late_image_progress(
+        &self,
+        event: &'static str,
+        key: &LateImageResourceKey,
+        status: &'static str,
+    ) {
+        let document_key = LateImageDocumentKey {
+            tab_id: key.tab_id,
+            document_source: key.document_source.clone(),
+        };
+        let progress = self
+            .late_image_progress
+            .get(&document_key)
+            .cloned()
+            .unwrap_or_default();
+        let pending_total = self.pending_late_images_for_document(key.tab_id, &key.document_source);
+        let retrying_total =
+            self.retrying_late_images_for_document(key.tab_id, &key.document_source);
+        let pending_unresolved = pending_total.saturating_sub(retrying_total);
+        let total = progress.total.max(1);
+        let percent =
+            ((progress.resolved.min(total) as f32 / total as f32) * 100.0).round() as usize;
+        self.telemetry.emit(
+            event,
+            &[
+                ("tab_id", &key.tab_id.to_string()),
+                ("document", &key.document_source),
+                ("url", &key.image_url),
+                ("status", status),
+                ("pending_total", &pending_total.to_string()),
+                ("pending_unresolved", &pending_unresolved.to_string()),
+                ("retrying", &retrying_total.to_string()),
+                ("total", &progress.total.to_string()),
+                ("resolved", &progress.resolved.to_string()),
+                ("failed", &progress.failed.to_string()),
+                ("percent", &percent.to_string()),
+            ],
+        );
+    }
+
+    fn refresh_late_image_debug_overlays(&mut self) {
+        let pending_late_images = &self.pending_late_images;
+        let late_image_progress = &self.late_image_progress;
+        let late_image_statuses = &self.late_image_statuses;
+        let debug_image_loading = self.debug_image_loading;
+        let active_tab_id = self.active_tab_id();
+        apply_late_image_debug_overlays(
+            &mut self.document,
+            active_tab_id,
+            debug_image_loading,
+            pending_late_images,
+            late_image_progress,
+            late_image_statuses,
+        );
+        for tab in &mut self.tabs {
+            apply_late_image_debug_overlays(
+                &mut tab.document,
+                tab.id,
+                debug_image_loading,
+                pending_late_images,
+                late_image_progress,
+                late_image_statuses,
+            );
         }
     }
 
@@ -3856,6 +4463,7 @@ fn image_document_from_bytes(
         alt: title.clone(),
         image: image.clone(),
         object_fit: CssObjectFit::Contain,
+        debug_overlay: None,
     };
     let block = CanvasBlock::Image {
         alt: title.clone(),
@@ -6621,12 +7229,16 @@ impl App for AlmostThereApp {
                     if self.bookmarks.is_empty() {
                         ui.add_enabled(false, egui::Button::new("No bookmarks"));
                     } else {
-                        for (index, bookmark) in self.bookmarks.iter().enumerate() {
-                            if ui.button(&bookmark.title).clicked() {
-                                bookmark_to_open = Some(index);
-                                ui.close();
-                            }
-                        }
+                        egui::ScrollArea::vertical()
+                            .max_height(400.0)
+                            .show(ui, |ui| {
+                                for (index, bookmark) in self.bookmarks.iter().enumerate() {
+                                    if ui.button(&bookmark.title).clicked() {
+                                        bookmark_to_open = Some(index);
+                                        ui.close();
+                                    }
+                                }
+                            });
                     }
                 });
                 if let Some(index) = bookmark_to_open {
@@ -8021,6 +8633,10 @@ fn resolve_resource_url(source: &str, href: &str) -> String {
 
 fn resource_allowed_for_document(source: &str, resource: &str) -> bool {
     !(is_local_document_source(source) && is_remote_url(resource))
+}
+
+fn should_defer_initial_image_load(resource: &str) -> bool {
+    is_remote_url(resource)
 }
 
 fn is_local_document_source(source: &str) -> bool {
@@ -16900,6 +17516,7 @@ fn push_canvas_graph_replaced_content(
                 alt: alt.clone(),
                 image: image.clone(),
                 object_fit: style.object_fit,
+                debug_overlay: None,
             }));
         }
         CanvasBlock::Svg { svg } => {
@@ -16930,6 +17547,7 @@ fn push_canvas_graph_replaced_content_in_rect(
                 alt: alt.clone(),
                 image: image.clone(),
                 object_fit: style.object_fit,
+                debug_overlay: None,
             }));
         }
         CanvasBlock::Svg { svg } => {
@@ -17855,6 +18473,19 @@ fn replaced_content_from_dom_element(
         );
         return unavailable_image_block(label, resolved, requested_size);
     }
+    if should_defer_initial_image_load(&resolved) {
+        emit_global_telemetry(
+            "document.image.deferred",
+            &[
+                ("document", source),
+                ("tag", &element.tag_name),
+                ("src", src),
+                ("resolved", &resolved),
+                ("reason", "remote-image-queue"),
+            ],
+        );
+        return unavailable_image_block(label, resolved, requested_size);
+    }
     match load_image_resource(&resolved, requested_size, image_height_auto) {
         Ok(image) => CanvasBlock::Image {
             alt: element.attr("alt").unwrap_or_default().to_owned(),
@@ -17880,9 +18511,14 @@ fn preferred_image_source_from_dom_element(element: &DomElement) -> Option<&str>
     for name in [
         "src",
         "data-src",
+        "data-original-src",
+        "data-lazy",
         "data-original",
         "data-lazy-src",
+        "data-actualsrc",
+        "data-url",
         "data-srcset",
+        "data-lazy-srcset",
         "srcset",
     ] {
         if let Some(value) = element.attr(name).filter(|value| !value.trim().is_empty()) {
@@ -17982,7 +18618,11 @@ fn collect_late_image_candidate(
     seen: &mut HashSet<String>,
     candidates: &mut Vec<LateImageCandidate>,
 ) {
-    if !image_block_is_unavailable(image) || !is_remote_url(src) || !seen.insert(src.to_owned()) {
+    if !image_block_is_unavailable(image)
+        || !is_remote_url(src)
+        || image_resource_has_decode_failure(src)
+        || !seen.insert(src.to_owned())
+    {
         return;
     }
     candidates.push(LateImageCandidate {
@@ -18052,6 +18692,106 @@ fn apply_late_image_to_blocks(
         }
     }
     changed
+}
+
+fn apply_late_image_debug_overlays(
+    document: &mut BrowserDocument,
+    tab_id: u64,
+    debug_image_loading: bool,
+    pending_late_images: &HashSet<LateImageResourceKey>,
+    late_image_progress: &HashMap<LateImageDocumentKey, LateImageProgress>,
+    late_image_statuses: &HashMap<LateImageResourceKey, LateImageLoadStatus>,
+) {
+    for object in &mut document.canvas_graph.objects {
+        let CanvasObject::Image(canvas_image) = object else {
+            continue;
+        };
+        canvas_image.debug_overlay = None;
+        if !debug_image_loading
+            || !image_block_is_unavailable(&canvas_image.image)
+            || !is_remote_url(&canvas_image.src)
+        {
+            continue;
+        }
+        let pending_key = LateImageResourceKey {
+            tab_id,
+            document_source: document.source.clone(),
+            image_url: canvas_image.src.clone(),
+        };
+        let document_key = LateImageDocumentKey {
+            tab_id,
+            document_source: document.source.clone(),
+        };
+        canvas_image.debug_overlay = Some(match late_image_statuses.get(&pending_key) {
+            Some(LateImageLoadStatus::Pending) => late_image_progress
+                .get(&document_key)
+                .map(|progress| late_image_debug_label(progress, 0))
+                .unwrap_or_else(|| "Image queued".to_owned()),
+            Some(LateImageLoadStatus::Retrying(reason)) => {
+                let retrying =
+                    retrying_late_image_status_count(late_image_statuses, tab_id, &document.source);
+                late_image_progress
+                    .get(&document_key)
+                    .map(|progress| late_image_debug_label(progress, retrying))
+                    .unwrap_or_else(|| format!("Image retrying: {reason}"))
+            }
+            Some(LateImageLoadStatus::Failed(reason)) => format!("Image failed: {reason}"),
+            Some(LateImageLoadStatus::Loaded) if pending_late_images.contains(&pending_key) => {
+                "Image finishing".to_owned()
+            }
+            Some(LateImageLoadStatus::Loaded) => "Image unavailable".to_owned(),
+            None => "Image not queued".to_owned(),
+        });
+    }
+}
+
+fn retrying_late_image_status_count(
+    late_image_statuses: &HashMap<LateImageResourceKey, LateImageLoadStatus>,
+    tab_id: u64,
+    document_source: &str,
+) -> usize {
+    late_image_statuses
+        .iter()
+        .filter(|(key, status)| {
+            key.tab_id == tab_id
+                && key.document_source == document_source
+                && matches!(status, LateImageLoadStatus::Retrying(_))
+        })
+        .count()
+}
+
+fn late_image_debug_label(progress: &LateImageProgress, retrying: usize) -> String {
+    let total = progress.total.max(1);
+    let resolved = progress.resolved.min(total);
+    let percent = ((resolved as f32 / total as f32) * 100.0).round() as usize;
+    if progress.failed > 0 {
+        format!("Images {percent}% ({} failed)", progress.failed)
+    } else if retrying > 0 {
+        format!("Images {percent}% ({retrying} retrying)")
+    } else {
+        format!("Images {percent}%")
+    }
+}
+
+fn late_image_failure_label(error: &io::Error) -> String {
+    let message = error.to_string();
+    if message.contains("429") {
+        "429".to_owned()
+    } else if message.contains("format could not be determined") {
+        "decode".to_owned()
+    } else if message.contains("timed out") {
+        "timeout".to_owned()
+    } else {
+        "error".to_owned()
+    }
+}
+
+fn image_error_is_retryable(error: &io::Error) -> bool {
+    let message = error.to_string();
+    message.contains("429")
+        || message.contains("timed out")
+        || message.contains("connection")
+        || message.contains("network")
 }
 
 fn replaced_content_size(
@@ -19423,6 +20163,19 @@ fn image_block_from_tag(open_tag: &str, state: &ParseState) -> CanvasBlock {
         );
         return unavailable_image_block(label, resolved, requested_size);
     }
+    if should_defer_initial_image_load(&resolved) {
+        emit_global_telemetry(
+            "document.image.deferred",
+            &[
+                ("document", &state.source),
+                ("tag", "img"),
+                ("src", &src),
+                ("resolved", &resolved),
+                ("reason", "remote-image-queue"),
+            ],
+        );
+        return unavailable_image_block(label, resolved, requested_size);
+    }
 
     match load_image_resource(&resolved, requested_size, state.image_height_auto) {
         Ok(image) => CanvasBlock::Image {
@@ -19449,9 +20202,14 @@ fn preferred_image_source_from_tag(open_tag: &str) -> Option<String> {
     for name in [
         "src",
         "data-src",
+        "data-original-src",
+        "data-lazy",
         "data-original",
         "data-lazy-src",
+        "data-actualsrc",
+        "data-url",
         "data-srcset",
+        "data-lazy-srcset",
         "srcset",
     ] {
         if let Some(value) = extract_attr(open_tag, name).filter(|value| !value.trim().is_empty()) {
@@ -19580,15 +20338,173 @@ fn load_image_resource(
     requested_size: Option<egui::Vec2>,
     preserve_aspect: bool,
 ) -> io::Result<ImageBlock> {
+    if let Some(message) = cached_image_resource_decode_failure(url) {
+        emit_global_telemetry(
+            "document.image.resource.decode_failure_cache_hit",
+            &[("url", url), ("error", &message)],
+        );
+        return Err(io::Error::other(message));
+    }
     let bytes = load_image_resource_bytes(url)?;
 
-    ImageBlock::from_encoded_bytes_with_aspect(
+    if image_resource_is_svg(url, bytes.as_slice()) {
+        match svg_image_block_from_bytes(url, bytes.as_slice(), requested_size) {
+            Ok(image) => {
+                clear_image_resource_decode_failure(url);
+                return Ok(image);
+            }
+            Err(error) => {
+                emit_global_telemetry(
+                    "document.image.resource.svg_raster.failed",
+                    &[("url", url), ("error", &error.to_string())],
+                );
+            }
+        }
+    }
+
+    match ImageBlock::from_encoded_bytes_with_aspect(
         PathBuf::from(url),
         bytes.as_slice(),
         requested_size,
         preserve_aspect,
-    )
-    .map_err(io::Error::other)
+    ) {
+        Ok(image) => {
+            clear_image_resource_decode_failure(url);
+            Ok(image)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            cache_image_resource_decode_failure(url, message.clone());
+            Err(io::Error::other(message))
+        }
+    }
+}
+
+fn image_resource_is_svg(url: &str, bytes: &[u8]) -> bool {
+    let path_is_svg = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            Path::new(parsed.path())
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.eq_ignore_ascii_case("svg"))
+        })
+        .unwrap_or_else(|| {
+            Path::new(url)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+        });
+    if path_is_svg {
+        return true;
+    }
+    std::str::from_utf8(&bytes[..bytes.len().min(512)])
+        .map(|prefix| {
+            let prefix = prefix.trim_start();
+            prefix.starts_with("<svg") || prefix.starts_with("<?xml") && prefix.contains("<svg")
+        })
+        .unwrap_or(false)
+}
+
+fn svg_image_block_from_bytes(
+    url: &str,
+    bytes: &[u8],
+    requested_size: Option<egui::Vec2>,
+) -> io::Result<ImageBlock> {
+    let svg_text = std::str::from_utf8(bytes)
+        .map_err(|error| io::Error::other(format!("svg is not utf-8: {error}")))?;
+    let document = parse_dom_document(svg_text);
+    let svg = document
+        .first_descendant_by_tag("svg")
+        .ok_or_else(|| io::Error::other("svg root not found"))?;
+    let (mut width, mut height) = svg_size_from_dom_element(svg);
+    if let Some(requested) = requested_size {
+        width = requested.x.max(1.0);
+        height = requested.y.max(1.0);
+    }
+    if let Some(CanvasBlock::Image { image, .. }) =
+        rasterized_svg_image_from_dom_element(svg, width, height)
+    {
+        let mut image = image;
+        image.path = PathBuf::from(url);
+        return Ok(image);
+    }
+
+    let mut shapes = Vec::new();
+    collect_dom_svg_shapes(svg, &mut shapes);
+    if shapes.is_empty() && dom_svg_contains_path(svg) {
+        shapes.push(SvgShape::PathFallback {
+            fill: element_style_current_color(svg).unwrap_or(egui::Color32::WHITE),
+        });
+    }
+    svg_shapes_to_image_block(url, width, height, &shapes)
+        .ok_or_else(|| io::Error::other("svg did not contain supported shapes"))
+}
+
+fn svg_shapes_to_image_block(
+    url: &str,
+    width: f32,
+    height: f32,
+    shapes: &[SvgShape],
+) -> Option<ImageBlock> {
+    if shapes.is_empty() {
+        return None;
+    }
+    let raster_width = width.round().clamp(1.0, 512.0) as usize;
+    let raster_height = height.round().clamp(1.0, 512.0) as usize;
+    let mut pixels = vec![egui::Color32::TRANSPARENT; raster_width * raster_height];
+    let scale_x = raster_width as f32 / width.max(1.0);
+    let scale_y = raster_height as f32 / height.max(1.0);
+    for shape in shapes {
+        match shape {
+            SvgShape::PathFallback { fill } => {
+                pixels.fill(*fill);
+            }
+            SvgShape::Rect {
+                x,
+                y,
+                width,
+                height,
+                fill,
+            } => {
+                let left = (*x * scale_x).floor().max(0.0) as usize;
+                let top = (*y * scale_y).floor().max(0.0) as usize;
+                let right = ((*x + *width) * scale_x).ceil().min(raster_width as f32) as usize;
+                let bottom = ((*y + *height) * scale_y).ceil().min(raster_height as f32) as usize;
+                for py in top..bottom {
+                    for px in left..right {
+                        pixels[py * raster_width + px] = *fill;
+                    }
+                }
+            }
+            SvgShape::Circle {
+                cx, cy, r, fill, ..
+            } => {
+                let cx = *cx * scale_x;
+                let cy = *cy * scale_y;
+                let rx = *r * scale_x;
+                let ry = *r * scale_y;
+                let left = (cx - rx).floor().max(0.0) as usize;
+                let top = (cy - ry).floor().max(0.0) as usize;
+                let right = (cx + rx).ceil().min(raster_width as f32) as usize;
+                let bottom = (cy + ry).ceil().min(raster_height as f32) as usize;
+                for py in top..bottom {
+                    for px in left..right {
+                        let dx = (px as f32 + 0.5 - cx) / rx.max(1.0);
+                        let dy = (py as f32 + 0.5 - cy) / ry.max(1.0);
+                        if dx * dx + dy * dy <= 1.0 {
+                            pixels[py * raster_width + px] = *fill;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some(ImageBlock::from_color_image(
+        PathBuf::from(url),
+        egui::vec2(width, height),
+        egui::ColorImage::new([raster_width, raster_height], pixels),
+    ))
 }
 
 fn load_image_resource_bytes(url: &str) -> io::Result<Arc<Vec<u8>>> {
@@ -19601,6 +20517,17 @@ fn load_image_resource_bytes(url: &str) -> io::Result<Arc<Vec<u8>>> {
             &[("url", url), ("bytes", &cached.len().to_string())],
         );
         return Ok(cached);
+    }
+    if let Some((message, remaining)) = cached_image_resource_failure(url) {
+        emit_global_telemetry(
+            "document.image.resource.failure_cache_hit",
+            &[
+                ("url", url),
+                ("retry_after_ms", &remaining.as_millis().to_string()),
+                ("error", &message),
+            ],
+        );
+        return Err(io::Error::other(message));
     }
 
     emit_global_telemetry("document.image.resource.cache_miss", &[("url", url)]);
@@ -19616,6 +20543,11 @@ fn load_image_resource_bytes(url: &str) -> io::Result<Arc<Vec<u8>>> {
                         ("stage", "send"),
                         ("error", &error.to_string()),
                     ],
+                );
+                cache_image_resource_failure(
+                    url,
+                    error.to_string(),
+                    image_resource_failure_backoff(None, "send"),
                 );
                 return Err(io::Error::other(error));
             }
@@ -19637,6 +20569,18 @@ fn load_image_resource_bytes(url: &str) -> io::Result<Arc<Vec<u8>>> {
                         ("error", &error.to_string()),
                     ],
                 );
+                cache_image_resource_failure(
+                    url,
+                    error.to_string(),
+                    image_resource_failure_backoff(Some(status.as_u16()), "status"),
+                );
+                if status.as_u16() == 429 {
+                    cache_image_origin_failure(
+                        url,
+                        error.to_string(),
+                        image_resource_failure_backoff(Some(status.as_u16()), "status"),
+                    );
+                }
                 return Err(io::Error::other(error));
             }
         };
@@ -19650,6 +20594,11 @@ fn load_image_resource_bytes(url: &str) -> io::Result<Arc<Vec<u8>>> {
                         ("stage", "bytes"),
                         ("error", &error.to_string()),
                     ],
+                );
+                cache_image_resource_failure(
+                    url,
+                    error.to_string(),
+                    image_resource_failure_backoff(None, "bytes"),
                 );
                 Err(io::Error::other(error))
             }
@@ -19665,7 +20614,201 @@ fn load_image_resource_bytes(url: &str) -> io::Result<Arc<Vec<u8>>> {
     if let Ok(mut guard) = cache.lock() {
         guard.insert(url.to_owned(), Arc::clone(&loaded));
     }
+    clear_image_resource_failure(url);
     Ok(loaded)
+}
+
+fn cached_image_resource_failure(url: &str) -> Option<(String, Duration)> {
+    let cache = IMAGE_RESOURCE_FAILURE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    cached_failure_from_cache(cache, url)
+}
+
+fn cached_image_origin_failure(url: &str) -> Option<(String, Duration)> {
+    let origin = image_resource_origin(url)?;
+    let cache = IMAGE_ORIGIN_FAILURE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    cached_failure_from_cache(cache, &origin)
+}
+
+fn cached_failure_from_cache(
+    cache: &Mutex<HashMap<String, CachedImageResourceFailure>>,
+    key: &str,
+) -> Option<(String, Duration)> {
+    let now = Instant::now();
+    let Ok(mut guard) = cache.lock() else {
+        return None;
+    };
+    let failure = guard.get(key)?;
+    if failure.expires_at <= now {
+        guard.remove(key);
+        return None;
+    }
+    Some((
+        failure.message.clone(),
+        failure.expires_at.saturating_duration_since(now),
+    ))
+}
+
+fn cache_image_resource_failure(url: &str, message: String, backoff: Duration) {
+    if backoff.is_zero() {
+        return;
+    }
+    emit_global_telemetry(
+        "document.image.resource.failure_cached",
+        &[
+            ("url", url),
+            ("backoff_ms", &backoff.as_millis().to_string()),
+            ("error", &message),
+        ],
+    );
+    let cache = IMAGE_RESOURCE_FAILURE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    cache_failure_in(cache, url, message, backoff);
+}
+
+fn cache_image_origin_failure(url: &str, message: String, backoff: Duration) {
+    if backoff.is_zero() {
+        return;
+    }
+    let Some(origin) = image_resource_origin(url) else {
+        return;
+    };
+    emit_global_telemetry(
+        "document.image.resource.origin_failure_cached",
+        &[
+            ("origin", &origin),
+            ("url", url),
+            ("backoff_ms", &backoff.as_millis().to_string()),
+            ("error", &message),
+        ],
+    );
+    let cache = IMAGE_ORIGIN_FAILURE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    cache_failure_in(cache, &origin, message, backoff);
+}
+
+fn cache_failure_in(
+    cache: &Mutex<HashMap<String, CachedImageResourceFailure>>,
+    key: &str,
+    message: String,
+    backoff: Duration,
+) {
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(
+            key.to_owned(),
+            CachedImageResourceFailure {
+                message,
+                expires_at: Instant::now() + backoff,
+            },
+        );
+    }
+}
+
+fn clear_image_resource_failure(url: &str) {
+    let Some(cache) = IMAGE_RESOURCE_FAILURE_CACHE.get() else {
+        return;
+    };
+    if let Ok(mut guard) = cache.lock() {
+        guard.remove(url);
+    }
+}
+
+#[cfg(test)]
+fn clear_image_origin_failure(url: &str) {
+    let Some(origin) = image_resource_origin(url) else {
+        return;
+    };
+    let Some(cache) = IMAGE_ORIGIN_FAILURE_CACHE.get() else {
+        return;
+    };
+    if let Ok(mut guard) = cache.lock() {
+        guard.remove(&origin);
+    }
+}
+
+fn image_resource_retry_delay(url: &str) -> Option<Duration> {
+    image_resource_retry_delay_with_telemetry(url, true)
+}
+
+fn image_resource_exact_retry_delay(url: &str) -> Option<Duration> {
+    cached_image_resource_failure(url).map(|(_, delay)| delay)
+}
+
+fn image_resource_retry_delay_with_telemetry(url: &str, emit_telemetry: bool) -> Option<Duration> {
+    let exact = cached_image_resource_failure(url).map(|(_, delay)| delay);
+    let origin = cached_image_origin_failure(url).map(|(message, delay)| {
+        if emit_telemetry && let Some(origin) = image_resource_origin(url) {
+            emit_global_telemetry(
+                "document.image.resource.origin_failure_cache_hit",
+                &[
+                    ("origin", &origin),
+                    ("url", url),
+                    ("retry_after_ms", &delay.as_millis().to_string()),
+                    ("error", &message),
+                ],
+            );
+        }
+        delay
+    });
+    match (exact, origin) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(delay), None) | (None, Some(delay)) => Some(delay),
+        (None, None) => None,
+    }
+}
+
+fn image_resource_failure_backoff(status: Option<u16>, stage: &str) -> Duration {
+    match (stage, status) {
+        ("status", Some(429)) => Duration::from_secs(60),
+        ("status", Some(404)) | ("status", Some(410)) => Duration::from_secs(60),
+        ("status", Some(status)) if status >= 500 => Duration::from_secs(5),
+        ("status", Some(_)) => Duration::from_secs(10),
+        ("send", _) | ("bytes", _) => Duration::from_secs(3),
+        _ => Duration::from_secs(1),
+    }
+}
+
+fn image_resource_origin(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    let port = parsed
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    Some(format!("{scheme}://{host}{port}"))
+}
+
+fn image_resource_has_decode_failure(url: &str) -> bool {
+    cached_image_resource_decode_failure(url).is_some()
+}
+
+fn cached_image_resource_decode_failure(url: &str) -> Option<String> {
+    let cache = IMAGE_RESOURCE_DECODE_FAILURE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(guard) = cache.lock() else {
+        return None;
+    };
+    guard.get(url).cloned()
+}
+
+fn cache_image_resource_decode_failure(url: &str, message: String) {
+    emit_global_telemetry(
+        "document.image.resource.decode_failure_cached",
+        &[("url", url), ("error", &message)],
+    );
+    let cache = IMAGE_RESOURCE_DECODE_FAILURE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(url.to_owned(), message);
+    }
+}
+
+fn clear_image_resource_decode_failure(url: &str) {
+    let Some(cache) = IMAGE_RESOURCE_DECODE_FAILURE_CACHE.get() else {
+        return;
+    };
+    if let Ok(mut guard) = cache.lock() {
+        guard.remove(url);
+    }
 }
 
 fn parse_table(html: &str) -> Option<CanvasBlock> {
@@ -20189,6 +21332,12 @@ static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 static SCRIPT_RESOURCE_CACHE: OnceLock<Mutex<HashMap<String, Result<String, String>>>> =
     OnceLock::new();
 static IMAGE_RESOURCE_BYTES_CACHE: OnceLock<Mutex<HashMap<String, Arc<Vec<u8>>>>> = OnceLock::new();
+static IMAGE_RESOURCE_FAILURE_CACHE: OnceLock<Mutex<HashMap<String, CachedImageResourceFailure>>> =
+    OnceLock::new();
+static IMAGE_ORIGIN_FAILURE_CACHE: OnceLock<Mutex<HashMap<String, CachedImageResourceFailure>>> =
+    OnceLock::new();
+static IMAGE_RESOURCE_DECODE_FAILURE_CACHE: OnceLock<Mutex<HashMap<String, String>>> =
+    OnceLock::new();
 static DEBUG_SERVER: OnceLock<DebugServer> = OnceLock::new();
 
 pub const DEBUG_PORT: u16 = 9876;
@@ -20696,6 +21845,7 @@ mod tests {
 
         assert!(config.debug_socket);
         assert!(config.debug_links);
+        assert!(!config.debug_image_loading);
         assert!(config.record_events);
         assert!(config.event_trace);
         assert_eq!(
@@ -20703,6 +21853,20 @@ mod tests {
             Some("https://www.ecosia.org/search?method=index&q=hello+world")
         );
         assert!(config.trace_items.iter().any(|item| item == "Wikipedia"));
+    }
+
+    #[test]
+    fn debug_image_loading_flag_is_parsed_without_stealing_initial_url() {
+        let config = AppConfig::from_arg_values(vec![
+            "--debug-image-loading".to_owned(),
+            "https://example.test/images".to_owned(),
+        ]);
+
+        assert!(config.debug_image_loading);
+        assert_eq!(
+            config.initial_url.as_deref(),
+            Some("https://example.test/images")
+        );
     }
 
     #[test]
@@ -20850,6 +22014,65 @@ mod tests {
             preferred_image_source_from_dom_element(image),
             Some("/lazy-small.png")
         );
+    }
+
+    #[test]
+    fn remote_images_are_deferred_to_late_queue_during_initial_parse() {
+        let document = parse_html_document(
+            r#"<html><body><img src="https://example.test/remote.png" width="80" height="40" alt="Remote"></body></html>"#,
+            "https://example.test/page.html",
+        );
+
+        let image = document
+            .canvas_graph
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                CanvasObject::Image(image) => Some(image),
+                _ => None,
+            })
+            .expect("expected image object");
+
+        assert_eq!(image.src, "https://example.test/remote.png");
+        assert!(image_block_is_unavailable(&image.image));
+        let candidates = late_image_candidates_from_document(&document);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].src, "https://example.test/remote.png");
+    }
+
+    #[test]
+    fn cached_decode_failures_are_not_requeued_for_late_loading() {
+        let image_url = "https://example.test/logo.svg";
+        clear_image_resource_decode_failure(image_url);
+        cache_image_resource_decode_failure(image_url, "unsupported svg".to_owned());
+        let unavailable = match unavailable_image_block(
+            "logo".to_owned(),
+            image_url,
+            Some(egui::vec2(80.0, 40.0)),
+        ) {
+            CanvasBlock::Image { image, .. } => image,
+            _ => panic!("expected image placeholder"),
+        };
+        let document = BrowserDocument {
+            title: "Decode failure".to_owned(),
+            source: "https://example.test/page.html".to_owned(),
+            style: BrowserStyle::default(),
+            canvas_graph: CanvasGraph {
+                viewport: egui::vec2(320.0, 200.0),
+                objects: vec![CanvasObject::Image(CanvasImageObject {
+                    rect: egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(80.0, 40.0)),
+                    src: image_url.to_owned(),
+                    alt: "logo".to_owned(),
+                    image: unavailable,
+                    object_fit: CssObjectFit::Fill,
+                    debug_overlay: None,
+                })],
+            },
+            blocks: Vec::new(),
+        };
+
+        assert!(late_image_candidates_from_document(&document).is_empty());
+        clear_image_resource_decode_failure(image_url);
     }
 
     #[test]
@@ -29878,6 +31101,7 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
                     alt: "late".to_owned(),
                     image: unavailable.clone(),
                     object_fit: CssObjectFit::Fill,
+                    debug_overlay: None,
                 })],
             },
             blocks: vec![CanvasBlock::Image {
@@ -29908,6 +31132,360 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
         assert_eq!(canvas_image.image.path, PathBuf::from("late.png"));
         assert_eq!(canvas_image.image.size, egui::vec2(80.0, 40.0));
         assert!(late_image_candidates_from_document(&document).is_empty());
+    }
+
+    #[test]
+    fn debug_image_loading_overlays_pending_unavailable_image_placeholders() {
+        let source = "https://example.test/page.html";
+        let image_url = "https://example.test/late.png";
+        let unavailable = match unavailable_image_block(
+            "late".to_owned(),
+            image_url,
+            Some(egui::vec2(80.0, 40.0)),
+        ) {
+            CanvasBlock::Image { image, .. } => image,
+            _ => panic!("expected image placeholder"),
+        };
+        let mut document = BrowserDocument {
+            title: "Late image".to_owned(),
+            source: source.to_owned(),
+            style: BrowserStyle::default(),
+            canvas_graph: CanvasGraph {
+                viewport: egui::vec2(320.0, 200.0),
+                objects: vec![CanvasObject::Image(CanvasImageObject {
+                    rect: egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(80.0, 40.0)),
+                    src: image_url.to_owned(),
+                    alt: "late".to_owned(),
+                    image: unavailable,
+                    object_fit: CssObjectFit::Fill,
+                    debug_overlay: None,
+                })],
+            },
+            blocks: Vec::new(),
+        };
+        let mut pending = HashSet::new();
+        pending.insert(LateImageResourceKey {
+            tab_id: 7,
+            document_source: source.to_owned(),
+            image_url: image_url.to_owned(),
+        });
+        let mut progress = HashMap::new();
+        progress.insert(
+            LateImageDocumentKey {
+                tab_id: 7,
+                document_source: source.to_owned(),
+            },
+            LateImageProgress {
+                total: 4,
+                resolved: 1,
+                failed: 0,
+            },
+        );
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            LateImageResourceKey {
+                tab_id: 7,
+                document_source: source.to_owned(),
+                image_url: image_url.to_owned(),
+            },
+            LateImageLoadStatus::Pending,
+        );
+
+        apply_late_image_debug_overlays(&mut document, 7, true, &pending, &progress, &statuses);
+
+        let CanvasObject::Image(image) = &document.canvas_graph.objects[0] else {
+            panic!("expected image object");
+        };
+        assert_eq!(image.debug_overlay.as_deref(), Some("Images 25%"));
+    }
+
+    #[test]
+    fn debug_image_loading_overlays_retrying_unavailable_image_placeholders() {
+        let source = "https://example.test/page.html";
+        let image_url = "https://example.test/late.png";
+        let unavailable = match unavailable_image_block(
+            "late".to_owned(),
+            image_url,
+            Some(egui::vec2(80.0, 40.0)),
+        ) {
+            CanvasBlock::Image { image, .. } => image,
+            _ => panic!("expected image placeholder"),
+        };
+        let mut document = BrowserDocument {
+            title: "Late image".to_owned(),
+            source: source.to_owned(),
+            style: BrowserStyle::default(),
+            canvas_graph: CanvasGraph {
+                viewport: egui::vec2(320.0, 200.0),
+                objects: vec![CanvasObject::Image(CanvasImageObject {
+                    rect: egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(80.0, 40.0)),
+                    src: image_url.to_owned(),
+                    alt: "late".to_owned(),
+                    image: unavailable,
+                    object_fit: CssObjectFit::Fill,
+                    debug_overlay: None,
+                })],
+            },
+            blocks: Vec::new(),
+        };
+        let mut pending = HashSet::new();
+        let key = LateImageResourceKey {
+            tab_id: 7,
+            document_source: source.to_owned(),
+            image_url: image_url.to_owned(),
+        };
+        pending.insert(key.clone());
+        let mut progress = HashMap::new();
+        progress.insert(
+            LateImageDocumentKey {
+                tab_id: 7,
+                document_source: source.to_owned(),
+            },
+            LateImageProgress {
+                total: 4,
+                resolved: 2,
+                failed: 0,
+            },
+        );
+        let mut statuses = HashMap::new();
+        statuses.insert(key, LateImageLoadStatus::Retrying("429".to_owned()));
+
+        apply_late_image_debug_overlays(&mut document, 7, true, &pending, &progress, &statuses);
+
+        let CanvasObject::Image(image) = &document.canvas_graph.objects[0] else {
+            panic!("expected image object");
+        };
+        assert_eq!(
+            image.debug_overlay.as_deref(),
+            Some("Images 50% (1 retrying)")
+        );
+    }
+
+    #[test]
+    fn debug_image_loading_labels_unqueued_unavailable_remote_placeholders() {
+        let source = "https://example.test/page.html";
+        let image_url = "https://example.test/late.png";
+        let unavailable = match unavailable_image_block(
+            "late".to_owned(),
+            image_url,
+            Some(egui::vec2(80.0, 40.0)),
+        ) {
+            CanvasBlock::Image { image, .. } => image,
+            _ => panic!("expected image placeholder"),
+        };
+        let mut document = BrowserDocument {
+            title: "Late image".to_owned(),
+            source: source.to_owned(),
+            style: BrowserStyle::default(),
+            canvas_graph: CanvasGraph {
+                viewport: egui::vec2(320.0, 200.0),
+                objects: vec![CanvasObject::Image(CanvasImageObject {
+                    rect: egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(80.0, 40.0)),
+                    src: image_url.to_owned(),
+                    alt: "late".to_owned(),
+                    image: unavailable,
+                    object_fit: CssObjectFit::Fill,
+                    debug_overlay: None,
+                })],
+            },
+            blocks: Vec::new(),
+        };
+
+        apply_late_image_debug_overlays(
+            &mut document,
+            7,
+            true,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let CanvasObject::Image(image) = &document.canvas_graph.objects[0] else {
+            panic!("expected image object");
+        };
+        assert_eq!(image.debug_overlay.as_deref(), Some("Image not queued"));
+    }
+
+    #[test]
+    fn debug_image_loading_labels_late_image_failure_reason() {
+        let source = "https://example.test/page.html";
+        let image_url = "https://example.test/late.png";
+        let unavailable = match unavailable_image_block(
+            "late".to_owned(),
+            image_url,
+            Some(egui::vec2(80.0, 40.0)),
+        ) {
+            CanvasBlock::Image { image, .. } => image,
+            _ => panic!("expected image placeholder"),
+        };
+        let mut document = BrowserDocument {
+            title: "Late image".to_owned(),
+            source: source.to_owned(),
+            style: BrowserStyle::default(),
+            canvas_graph: CanvasGraph {
+                viewport: egui::vec2(320.0, 200.0),
+                objects: vec![CanvasObject::Image(CanvasImageObject {
+                    rect: egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(80.0, 40.0)),
+                    src: image_url.to_owned(),
+                    alt: "late".to_owned(),
+                    image: unavailable,
+                    object_fit: CssObjectFit::Fill,
+                    debug_overlay: None,
+                })],
+            },
+            blocks: Vec::new(),
+        };
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            LateImageResourceKey {
+                tab_id: 7,
+                document_source: source.to_owned(),
+                image_url: image_url.to_owned(),
+            },
+            LateImageLoadStatus::Failed("429".to_owned()),
+        );
+
+        apply_late_image_debug_overlays(
+            &mut document,
+            7,
+            true,
+            &HashSet::new(),
+            &HashMap::new(),
+            &statuses,
+        );
+
+        let CanvasObject::Image(image) = &document.canvas_graph.objects[0] else {
+            panic!("expected image object");
+        };
+        assert_eq!(image.debug_overlay.as_deref(), Some("Image failed: 429"));
+    }
+
+    #[test]
+    fn image_resource_failure_policy_backs_off_retryable_failures() {
+        assert_eq!(
+            image_resource_failure_backoff(Some(429), "status"),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            image_resource_failure_backoff(Some(404), "status"),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            image_resource_failure_backoff(Some(503), "status"),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            image_resource_failure_backoff(None, "send"),
+            Duration::from_secs(3)
+        );
+        assert_eq!(LATE_IMAGE_MAX_ACTIVE_PER_ORIGIN, 2);
+        assert_eq!(LATE_IMAGE_ORIGIN_START_SPACING, Duration::from_millis(150));
+        assert_eq!(
+            LATE_IMAGE_ORIGIN_FAILURE_START_SPACING,
+            Duration::from_millis(750)
+        );
+    }
+
+    #[test]
+    fn image_resource_failure_cache_suppresses_immediate_refetch() {
+        let url = "https://example.test/failure-cache-policy-test.png";
+        clear_image_resource_failure(url);
+        cache_image_resource_failure(
+            url,
+            "HTTP status client error (429 Too Many Requests)".to_owned(),
+            Duration::from_secs(15),
+        );
+
+        let cached = cached_image_resource_failure(url).expect("expected cached failure");
+        assert!(cached.0.contains("429"));
+        assert!(cached.1 <= Duration::from_secs(15));
+        assert!(cached.1 > Duration::ZERO);
+
+        clear_image_resource_failure(url);
+        assert!(cached_image_resource_failure(url).is_none());
+    }
+
+    #[test]
+    fn image_origin_failure_cache_delays_same_origin_without_blocking_other_origins() {
+        let throttled_a = "https://upload.example.test/a.png";
+        let throttled_b = "https://upload.example.test/b.png";
+        let other = "https://static.example.test/c.png";
+        clear_image_resource_failure(throttled_a);
+        clear_image_resource_failure(throttled_b);
+        clear_image_origin_failure(throttled_a);
+        clear_image_origin_failure(other);
+        cache_image_origin_failure(
+            throttled_a,
+            "HTTP status client error (429 Too Many Requests)".to_owned(),
+            Duration::from_secs(15),
+        );
+
+        let same_origin_delay =
+            image_resource_retry_delay(throttled_b).expect("same origin should be delayed");
+        assert!(same_origin_delay <= Duration::from_secs(15));
+        assert!(same_origin_delay > Duration::ZERO);
+        assert!(
+            image_resource_retry_delay(other).is_none(),
+            "origin backoff should not block unrelated hosts"
+        );
+
+        clear_image_origin_failure(throttled_a);
+    }
+
+    #[test]
+    fn image_origin_failure_does_not_become_exact_url_retry_delay_for_siblings() {
+        let throttled_a = "https://upload.example.test/exact-a.png";
+        let throttled_b = "https://upload.example.test/sibling-b.png";
+        clear_image_resource_failure(throttled_a);
+        clear_image_resource_failure(throttled_b);
+        clear_image_origin_failure(throttled_a);
+
+        cache_image_resource_failure(
+            throttled_a,
+            "HTTP status client error (429 Too Many Requests)".to_owned(),
+            Duration::from_secs(60),
+        );
+        cache_image_origin_failure(
+            throttled_a,
+            "HTTP status client error (429 Too Many Requests)".to_owned(),
+            Duration::from_secs(60),
+        );
+
+        assert!(
+            image_resource_exact_retry_delay(throttled_a).is_some(),
+            "the failed URL itself should keep its exact retry backoff"
+        );
+        assert!(
+            image_resource_exact_retry_delay(throttled_b).is_none(),
+            "a sibling URL should not inherit the failed URL's exact retry backoff"
+        );
+        assert!(
+            image_resource_retry_delay(throttled_b).is_some(),
+            "the origin-level signal should still exist for polite scheduler spacing"
+        );
+
+        clear_image_resource_failure(throttled_a);
+        clear_image_resource_failure(throttled_b);
+        clear_image_origin_failure(throttled_a);
+    }
+
+    #[test]
+    fn external_svg_bytes_rasterize_to_image_block() {
+        let svg = br##"
+            <svg width="24" height="16" viewBox="0 0 24 16" color="#111111">
+              <path fill="currentColor" d="M0 0h24v16H0z"></path>
+            </svg>
+        "##;
+        let image =
+            svg_image_block_from_bytes("https://example.test/icon.svg", svg, None).expect("svg");
+
+        assert_eq!(image.size, egui::vec2(24.0, 16.0));
+        assert_eq!(image.color_image.size, [24, 16]);
+        assert_eq!(image.path, PathBuf::from("https://example.test/icon.svg"));
+        assert!(
+            image.color_image.pixels.iter().any(|pixel| pixel.a() > 0),
+            "rasterized svg should contain visible pixels"
+        );
     }
 
     #[test]

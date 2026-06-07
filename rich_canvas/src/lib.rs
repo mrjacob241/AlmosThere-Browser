@@ -713,6 +713,7 @@ pub struct CanvasImageObject {
     pub alt: String,
     pub image: ImageBlock,
     pub object_fit: CssObjectFit,
+    pub debug_overlay: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -2136,6 +2137,20 @@ fn paint_canvas_graph(
                     }
                 };
                 painter.image(texture.id(), rect, uv, Color32::WHITE);
+                if let Some(label) = &image.debug_overlay {
+                    painter.rect_filled(
+                        rect.shrink(4.0 * scale),
+                        3.0 * scale,
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 180),
+                    );
+                    painter.text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        label,
+                        FontId::proportional((12.0 * scale).clamp(9.0, 18.0)),
+                        Color32::from_rgb(32, 36, 40),
+                    );
+                }
             }
             CanvasObject::Svg(svg) => {
                 let rect = canvas_object_rect(canvas_rect.min, svg.rect, scale);
