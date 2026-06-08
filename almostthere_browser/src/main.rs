@@ -67,6 +67,12 @@ const LATE_IMAGE_DELAY_NOTICE_INTERVAL: Duration = Duration::from_secs(1);
 const PAGE_ZOOM_MIN: f32 = 0.25;
 const PAGE_ZOOM_MAX: f32 = 5.0;
 const PAGE_ZOOM_KEYBOARD_STEP: f32 = 0.10;
+const PAGE_ZOOM_ONE_SNAP_MIN: f32 = 0.97;
+const PAGE_ZOOM_ONE_SNAP_MAX: f32 = 1.03;
+const PAGE_ZOOM_WHEEL_SENSITIVITY: f32 = 0.036;
+const PAGE_ZOOM_ANIMATION_FACTOR: f32 = 0.28;
+const PAGE_ZOOM_ANIMATION_EPSILON: f32 = 0.001;
+const PAGE_ZOOM_SCROLL_IDLE_STOP: Duration = Duration::from_millis(120);
 const DEFAULT_EVENT_TRACE_ITEMS: &[&str] = &["Hello world - Wikipedia", "Wikipedia"];
 const SCRIPT_TEST_BOOKMARKS: &[(&str, &str)] = &[
     (
@@ -440,6 +446,7 @@ struct AlmostThereApp {
     page_loader_timeout_enabled: bool,
     trace_items: Vec<String>,
     recorded_event_count: u64,
+    page_zoom_animation: Option<PageZoomAnimation>,
     tabs: Vec<BrowserTabState>,
     active_tab_index: usize,
     next_tab_id: u64,
@@ -455,6 +462,13 @@ struct AlmostThereApp {
     late_image_last_delay_notice: HashMap<String, Instant>,
     late_image_progress: HashMap<LateImageDocumentKey, LateImageProgress>,
     late_image_statuses: HashMap<LateImageResourceKey, LateImageLoadStatus>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PageZoomAnimation {
+    target_zoom: f32,
+    anchor: egui::Vec2,
+    last_input_at: Instant,
 }
 
 struct BrowserTabState {
@@ -947,6 +961,7 @@ impl AlmostThereApp {
             page_loader_timeout_enabled: config.page_loader_timeout_enabled,
             trace_items: config.trace_items,
             recorded_event_count: 0,
+            page_zoom_animation: None,
             tabs: vec![initial_tab],
             active_tab_index: 0,
             next_tab_id: 1,
@@ -1095,6 +1110,7 @@ impl AlmostThereApp {
     }
 
     fn install_tab_state(&mut self, state: BrowserTabState) {
+        self.page_zoom_animation = None;
         self.canvas = state.canvas;
         self.debug_canvas = state.debug_canvas;
         self.document = state.document;
@@ -1115,6 +1131,70 @@ impl AlmostThereApp {
         self.pending_first_paint_navigation = state.pending_first_paint_navigation;
         self.render_debug = state.render_debug;
         self.page_loaded_at = state.page_loaded_at;
+    }
+
+    fn apply_page_zoom(
+        &mut self,
+        ctx: &egui::Context,
+        new_zoom: f32,
+        zoom_anchor: egui::Vec2,
+        method: &str,
+        keyboard_steps: i32,
+        wheel_delta_y: f32,
+        pinch_zoom: f32,
+    ) {
+        let old_zoom = self.canvas.zoom;
+        let new_zoom = clamp_page_zoom(new_zoom);
+        if (new_zoom - old_zoom).abs() <= f32::EPSILON {
+            return;
+        }
+
+        let old_scroll = self.canvas.scroll_offset;
+        let new_scroll = scroll_offset_after_zoom(old_scroll, zoom_anchor, old_zoom, new_zoom);
+        self.canvas.scroll_offset = new_scroll;
+        self.debug_canvas.scroll_offset = scroll_offset_after_zoom(
+            self.debug_canvas.scroll_offset,
+            zoom_anchor,
+            old_zoom,
+            new_zoom,
+        );
+        self.canvas.zoom = new_zoom;
+        self.debug_canvas.zoom = new_zoom;
+        self.status = format!("Zoom: {}", page_zoom_label(new_zoom));
+
+        let tab_id = self.active_tab_id().to_string();
+        let from = format!("{old_zoom:.4}");
+        let to = format!("{new_zoom:.4}");
+        let percent = page_zoom_label(new_zoom);
+        let keyboard_steps = keyboard_steps.to_string();
+        let wheel_delta = format!("{wheel_delta_y:.2}");
+        let pinch_factor = format!("{pinch_zoom:.4}");
+        let anchor_x = format!("{:.1}", zoom_anchor.x);
+        let anchor_y = format!("{:.1}", zoom_anchor.y);
+        let scroll_x_before = format!("{:.1}", old_scroll.x);
+        let scroll_y_before = format!("{:.1}", old_scroll.y);
+        let scroll_x_after = format!("{:.1}", new_scroll.x);
+        let scroll_y_after = format!("{:.1}", new_scroll.y);
+        self.telemetry.emit(
+            "page.zoom.changed",
+            &[
+                ("tab_id", &tab_id),
+                ("method", method),
+                ("from", &from),
+                ("to", &to),
+                ("percent", &percent),
+                ("keyboard_steps", &keyboard_steps),
+                ("wheel_delta_y", &wheel_delta),
+                ("pinch_factor", &pinch_factor),
+                ("anchor_x", &anchor_x),
+                ("anchor_y", &anchor_y),
+                ("scroll_x_before", &scroll_x_before),
+                ("scroll_y_before", &scroll_y_before),
+                ("scroll_x_after", &scroll_x_after),
+                ("scroll_y_after", &scroll_y_after),
+            ],
+        );
+        ctx.request_repaint();
     }
 
     fn handle_page_zoom_input(&mut self, ctx: &egui::Context) {
@@ -1151,48 +1231,98 @@ impl AlmostThereApp {
             });
         });
 
-        if wheel_delta_y.abs() > f32::EPSILON {
-            zoom_steps += if wheel_delta_y > 0.0 { 1 } else { -1 };
-        }
-
-        let old_zoom = self.canvas.zoom;
         let zoom_anchor = page_zoom_anchor(ctx, self.canvas.last_viewport_rect);
-        let mut new_zoom = old_zoom;
         if reset_zoom {
-            new_zoom = 1.0;
-        } else {
-            if zoom_steps != 0 {
-                new_zoom = stepped_page_zoom(new_zoom, zoom_steps);
-            }
-            if (pinch_zoom - 1.0).abs() > f32::EPSILON {
-                new_zoom = clamp_page_zoom(new_zoom * pinch_zoom);
-            }
+            self.page_zoom_animation = None;
+            self.apply_page_zoom(
+                ctx,
+                1.0,
+                zoom_anchor,
+                "reset",
+                zoom_steps,
+                wheel_delta_y,
+                pinch_zoom,
+            );
+            return;
         }
 
-        if (new_zoom - old_zoom).abs() > f32::EPSILON {
-            self.canvas.scroll_offset = scroll_offset_after_zoom(
-                self.canvas.scroll_offset,
-                zoom_anchor,
-                old_zoom,
+        if zoom_steps != 0 {
+            self.page_zoom_animation = None;
+            let new_zoom = stepped_page_zoom(self.canvas.zoom, zoom_steps);
+            self.apply_page_zoom(
+                ctx,
                 new_zoom,
-            );
-            self.debug_canvas.scroll_offset = scroll_offset_after_zoom(
-                self.debug_canvas.scroll_offset,
                 zoom_anchor,
-                old_zoom,
-                new_zoom,
+                "keyboard",
+                zoom_steps,
+                wheel_delta_y,
+                pinch_zoom,
             );
-            self.canvas.zoom = new_zoom;
-            self.debug_canvas.zoom = new_zoom;
-            self.status = format!("Zoom: {}", page_zoom_label(new_zoom));
-            self.telemetry.emit(
-                "page.zoom.changed",
-                &[
-                    ("from", &format!("{old_zoom:.2}")),
-                    ("to", &format!("{new_zoom:.2}")),
-                    ("percent", &page_zoom_label(new_zoom)),
-                ],
+        }
+
+        if (pinch_zoom - 1.0).abs() > f32::EPSILON {
+            self.page_zoom_animation = None;
+            self.apply_page_zoom(
+                ctx,
+                self.canvas.zoom * pinch_zoom,
+                zoom_anchor,
+                "pinch",
+                zoom_steps,
+                wheel_delta_y,
+                pinch_zoom,
             );
+        }
+
+        if wheel_delta_y.abs() > f32::EPSILON {
+            let base_zoom = self
+                .page_zoom_animation
+                .map(|animation| animation.target_zoom)
+                .unwrap_or(self.canvas.zoom);
+            self.page_zoom_animation = Some(PageZoomAnimation {
+                target_zoom: smooth_page_zoom(base_zoom, wheel_delta_y),
+                anchor: zoom_anchor,
+                last_input_at: Instant::now(),
+            });
+            self.tick_page_zoom_animation(ctx, "wheel", zoom_steps, wheel_delta_y, pinch_zoom);
+        }
+    }
+
+    fn tick_page_zoom_animation(
+        &mut self,
+        ctx: &egui::Context,
+        method: &str,
+        keyboard_steps: i32,
+        wheel_delta_y: f32,
+        pinch_zoom: f32,
+    ) {
+        let Some(animation) = self.page_zoom_animation else {
+            return;
+        };
+
+        if animation.last_input_at.elapsed() > PAGE_ZOOM_SCROLL_IDLE_STOP {
+            self.page_zoom_animation = None;
+            return;
+        }
+
+        let delta = animation.target_zoom - self.canvas.zoom;
+        let next_zoom = if delta.abs() <= PAGE_ZOOM_ANIMATION_EPSILON {
+            self.page_zoom_animation = None;
+            animation.target_zoom
+        } else {
+            self.canvas.zoom + delta * PAGE_ZOOM_ANIMATION_FACTOR
+        };
+
+        self.apply_page_zoom(
+            ctx,
+            next_zoom,
+            animation.anchor,
+            method,
+            keyboard_steps,
+            wheel_delta_y,
+            pinch_zoom,
+        );
+
+        if self.page_zoom_animation.is_some() {
             ctx.request_repaint();
         }
     }
@@ -1214,6 +1344,7 @@ impl AlmostThereApp {
         fragment: Option<String>,
         history_action: NavigationHistoryAction,
     ) {
+        self.page_zoom_animation = None;
         self.clear_late_images_for_tab(self.active_tab_id());
         self.pending_first_paint_navigation = None;
         let (sender, receiver) = mpsc::channel();
@@ -2817,13 +2948,19 @@ impl AlmostThereApp {
             self.recorded_event_count += 1;
             let sequence = self.recorded_event_count.to_string();
             let (kind, detail) = telemetry_event_kind_and_detail(&event);
+            let zoom = format!("{:.4}", self.canvas.zoom);
+            let zoom_percent = page_zoom_label(self.canvas.zoom);
+            let tab_id = self.active_tab_id().to_string();
             self.telemetry.emit(
                 "input.event",
                 &[
                     ("seq", &sequence),
+                    ("tab_id", &tab_id),
                     ("kind", kind),
                     ("detail", &detail),
                     ("url", &self.document.source),
+                    ("zoom", &zoom),
+                    ("zoom_percent", &zoom_percent),
                 ],
             );
         }
@@ -7451,6 +7588,7 @@ impl App for AlmostThereApp {
             "{APP_TITLE} :: {}",
             self.document.title
         )));
+        self.tick_page_zoom_animation(ctx, "wheel.animation", 0, 0.0, 1.0);
         self.handle_page_zoom_input(ctx);
 
         egui::TopBottomPanel::top("browser_tabs").show(ctx, |ui| {
@@ -7496,13 +7634,6 @@ impl App for AlmostThereApp {
                 {
                     self.open_new_tab(None, ctx);
                 }
-                if ui
-                    .button("Duplicate")
-                    .on_hover_text("Duplicate the current tab in this window")
-                    .clicked()
-                {
-                    self.duplicate_current_tab(ctx);
-                }
                 if let Some((progress, summary)) = self.pending_loading_summary() {
                     ui.separator();
                     ui.scope(|ui| {
@@ -7528,34 +7659,36 @@ impl App for AlmostThereApp {
         egui::TopBottomPanel::top("browser_toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(self.history.can_go_back(), egui::Button::new("Back"))
+                    .add_enabled(self.history.can_go_back(), egui::Button::new("←"))
+                    .on_hover_text("Back")
                     .clicked()
                 {
                     self.go_back(ctx);
                 }
                 if ui
-                    .add_enabled(self.history.can_go_forward(), egui::Button::new("Forward"))
+                    .add_enabled(self.history.can_go_forward(), egui::Button::new("→"))
+                    .on_hover_text("Forward")
                     .clicked()
                 {
                     self.go_forward(ctx);
                 }
-                if ui.button("Reload").clicked() {
+                if ui.button("↻").on_hover_text("Reload").clicked() {
                     self.reload_current(ctx);
                 }
-                ui.label(egui::RichText::new(page_zoom_label(self.canvas.zoom)).monospace());
-                let debug_label = if self.render_debug.open {
+                ui.label(
+                    egui::RichText::new(format!("| {} 🔎 |", page_zoom_label(self.canvas.zoom)))
+                        .monospace(),
+                );
+                let debug_hover = if self.render_debug.open {
                     "Close Debug"
                 } else {
                     "Debug"
                 };
-                if ui.button(debug_label).clicked() {
+                if ui.button("🔧").on_hover_text(debug_hover).clicked() {
                     self.render_debug.open = !self.render_debug.open;
                     if self.render_debug.open {
                         self.render_debug.object_limit = self.document.canvas_graph.objects.len();
                     }
-                }
-                if ui.button("Report Error").clicked() {
-                    self.report_user_error();
                 }
                 let bookmark_label = if self.current_bookmark_index().is_some() {
                     "★"
@@ -22354,12 +22487,29 @@ fn civil_from_days(days_since_epoch: i128) -> (i128, i128, i128) {
 }
 
 fn clamp_page_zoom(zoom: f32) -> f32 {
-    zoom.clamp(PAGE_ZOOM_MIN, PAGE_ZOOM_MAX)
+    let zoom = zoom.clamp(PAGE_ZOOM_MIN, PAGE_ZOOM_MAX);
+    if (PAGE_ZOOM_ONE_SNAP_MIN..=PAGE_ZOOM_ONE_SNAP_MAX).contains(&zoom) {
+        1.0
+    } else {
+        zoom
+    }
 }
 
 fn stepped_page_zoom(current: f32, steps: i32) -> f32 {
     let stepped = current + PAGE_ZOOM_KEYBOARD_STEP * steps as f32;
     clamp_page_zoom((stepped * 10.0).round() / 10.0)
+}
+
+fn smooth_page_zoom(current: f32, wheel_delta_y: f32) -> f32 {
+    if wheel_delta_y.abs() <= f32::EPSILON {
+        return clamp_page_zoom(current);
+    }
+    let factor = (wheel_delta_y * PAGE_ZOOM_WHEEL_SENSITIVITY).exp();
+    if factor.is_finite() {
+        clamp_page_zoom(current * factor)
+    } else {
+        clamp_page_zoom(current)
+    }
 }
 
 fn page_zoom_label(zoom: f32) -> String {
@@ -22450,6 +22600,25 @@ mod tests {
         assert_eq!(page_zoom_label(stepped_page_zoom(1.9, 1)), "200%");
         assert_eq!(page_zoom_label(stepped_page_zoom(0.26, -1)), "25%");
         assert_eq!(page_zoom_label(stepped_page_zoom(4.95, 1)), "500%");
+    }
+
+    #[test]
+    fn page_zoom_snaps_near_one_hundred_percent() {
+        assert_eq!(clamp_page_zoom(0.97), 1.0);
+        assert_eq!(clamp_page_zoom(1.00), 1.0);
+        assert_eq!(clamp_page_zoom(1.03), 1.0);
+        assert!(clamp_page_zoom(0.969) < 1.0);
+        assert!(clamp_page_zoom(1.031) > 1.0);
+    }
+
+    #[test]
+    fn smooth_page_zoom_tracks_fractional_wheel_delta() {
+        let zoomed_in = smooth_page_zoom(1.0, 10.0);
+        assert!(zoomed_in > stepped_page_zoom(1.0, 3));
+        assert!(zoomed_in < PAGE_ZOOM_MAX);
+
+        let zoomed_out = smooth_page_zoom(zoomed_in, -10.0);
+        assert!((zoomed_out - 1.0).abs() < 0.001);
     }
 
     #[test]

@@ -1594,7 +1594,7 @@ fn paint_canvas_graph(
     ui: &mut Ui,
     graph: &mut CanvasGraph,
     content_width: f32,
-    font_scale: f32,
+    _font_scale: f32,
     canvas_response: &mut BrowserCanvasResponse,
     text_selection: &mut CanvasTextSelection,
     read_only: bool,
@@ -1602,7 +1602,7 @@ fn paint_canvas_graph(
     hovered_link_element_id: Option<&str>,
 ) {
     let graph_width = graph.viewport.x.max(1.0);
-    let scale = (content_width / graph_width).max(0.1) * font_scale;
+    let scale = (content_width / graph_width).max(0.1);
     let rendered_graph_width = (graph.viewport.x * scale).max(content_width).max(1.0);
     let graph_size = vec2(rendered_graph_width, (graph.viewport.y * scale).max(1.0));
     let (canvas_rect, canvas_interaction) =
