@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>174 Desktop Closed Absolute Menu Max Height Zero</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #f7f7f7;
+      font-family: sans-serif;
+    }
+
+    .header {
+      position: relative;
+      width: 970px;
+      height: 166px;
+      margin: 0 auto;
+      background: #d9d9d9;
+    }
+
+    .bar {
+      height: 70px;
+      background: #4dabf7;
+    }
+
+    .closed-menu {
+      position: absolute;
+      top: 70px;
+      left: 0;
+      width: 400px;
+      height: 320px;
+      max-height: 0;
+      overflow: hidden;
+      background: #1155a3;
+      z-index: 10;
+    }
+
+    .closed-menu > .panel {
+      height: 160px;
+      background: #ff6b6b;
+    }
+
+    .locations {
+      height: 96px;
+      background: #ffd43b;
+    }
+
+    .content {
+      width: 970px;
+      height: 120px;
+      margin: 0 auto;
+      background: #51cf66;
+    }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <div class="bar"></div>
+    <div class="closed-menu"><div class="panel"></div></div>
+    <div class="locations"></div>
+  </header>
+  <main class="content"></main>
+</body>
+</html>

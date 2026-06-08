@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>173. Column Flex Heading Auto Width No Leak</title>
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; background: #f1f3f5; }
+body { font-family: system-ui, sans-serif; padding: 24px; }
+.shell {
+  width: 978px;
+  margin: 0 auto;
+  background: #f8f9fa;
+}
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  margin: 0 -8px;
+  background: #d0ebff;
+}
+.main {
+  flex: 0 0 66.666%;
+  max-width: 66.666%;
+  padding: 0 8px;
+  background: #b2f2bb;
+}
+.side {
+  flex: 0 0 33.333%;
+  max-width: 33.333%;
+  padding: 0 8px;
+  min-height: 220px;
+  background: #ffd8a8;
+}
+.card {
+  width: 760px;
+  overflow: hidden;
+  background: #ffffff;
+}
+.inner {
+  padding: 32px 24px 0;
+  background: #e7f5ff;
+}
+.header {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  margin-bottom: 15px;
+  background: #fcc2d7;
+}
+.heading {
+  margin: 20px 0 14px;
+  height: 44px;
+  background: #9775fa;
+}
+.after {
+  height: 72px;
+  background: #748ffc;
+}
+.label {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  padding: 6px 8px;
+  background: rgba(255,255,255,0.9);
+  border: 1px solid rgba(0,0,0,0.18);
+  font-size: 12px;
+}
+</style>
+</head>
+<body>
+<main class="shell">
+  <div class="row">
+    <section class="main">
+      <article class="card">
+        <div class="inner">
+          <header class="header">
+            <div class="heading"></div>
+          </header>
+          <div class="after"></div>
+        </div>
+      </article>
+    </section>
+    <aside class="side"></aside>
+  </div>
+</main>
+<div class="label">173 column flex auto child must not leak width</div>
+</body>
+</html>

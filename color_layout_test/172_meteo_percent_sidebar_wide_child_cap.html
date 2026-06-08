@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>172. Meteo Percent Sidebar Wide Child Cap</title>
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; background: #f1f3f5; }
+body { font-family: system-ui, sans-serif; padding: 24px; }
+.page {
+  width: 978px;
+  margin: 0 auto;
+  background: #f8f9fa;
+  min-height: 260px;
+}
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  margin: 0 -8px;
+  background: #d0ebff;
+}
+.main,
+.side {
+  box-sizing: border-box;
+  padding: 0 8px;
+  min-height: 160px;
+}
+.main {
+  flex: 0 0 66.666%;
+  max-width: 66.666%;
+  background: #b2f2bb;
+}
+.side {
+  flex: 0 0 33.333%;
+  max-width: 33.333%;
+  background: #ffd8a8;
+}
+.headline {
+  height: 72px;
+  margin: 20px;
+  background: #69db7c;
+}
+.wide-child {
+  width: 760px;
+  height: 64px;
+  margin-top: 20px;
+  background: #9775fa;
+}
+.city-row {
+  width: 760px;
+  height: 48px;
+  margin-top: 12px;
+  background: #748ffc;
+}
+.label {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  padding: 6px 8px;
+  background: rgba(255,255,255,0.9);
+  border: 1px solid rgba(0,0,0,0.18);
+  font-size: 12px;
+}
+</style>
+</head>
+<body>
+<main class="page">
+  <div class="row">
+    <section class="main">
+      <div class="headline"></div>
+    </section>
+    <aside class="side">
+      <div class="wide-child"></div>
+      <div class="city-row"></div>
+    </aside>
+  </div>
+</main>
+<div class="label">172 percent flex sidebar must cap wide child</div>
+</body>
+</html>

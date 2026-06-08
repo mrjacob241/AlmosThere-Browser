@@ -260,6 +260,7 @@ pub struct CssBoxStyle {
     pub max_width: Option<CssLength>,
     pub min_width: Option<CssLength>,
     pub height: Option<CssLength>,
+    pub max_height: Option<CssLength>,
     pub min_height: Option<CssLength>,
     pub font_size: Option<f32>,
     pub font_weight_bold: Option<bool>,
@@ -294,6 +295,7 @@ pub struct CssBoxStyle {
     pub visibility_visible: Option<bool>,
     pub opacity: Option<f32>,
     pub overflow_hidden: Option<bool>,
+    pub clip_hidden: Option<bool>,
     pub position: Option<CssPosition>,
     pub float: Option<CssFloat>,
     pub clear: Option<CssClear>,
@@ -322,6 +324,7 @@ pub struct ResolvedBoxStyle {
     pub max_width_percent: Option<f32>,
     pub min_width: Option<f32>,
     pub height: Option<CssLength>,
+    pub max_height: Option<CssLength>,
     pub min_height: Option<CssLength>,
     pub font_size: f32,
     pub font_weight_bold: bool,
@@ -356,6 +359,7 @@ pub struct ResolvedBoxStyle {
     pub visibility_visible: bool,
     pub opacity: f32,
     pub overflow_hidden: bool,
+    pub clip_hidden: bool,
     pub position: CssPosition,
     pub float: CssFloat,
     pub clear: CssClear,
@@ -385,6 +389,7 @@ impl Default for ResolvedBoxStyle {
             max_width_percent: None,
             min_width: None,
             height: None,
+            max_height: None,
             min_height: None,
             font_size: BrowserStyle::default().body_font_size,
             font_weight_bold: false,
@@ -419,6 +424,7 @@ impl Default for ResolvedBoxStyle {
             visibility_visible: true,
             opacity: 1.0,
             overflow_hidden: false,
+            clip_hidden: false,
             position: CssPosition::Static,
             float: CssFloat::None,
             clear: CssClear::None,
@@ -4727,7 +4733,7 @@ fn apply_css_rule(
         };
         let property = property.trim();
         let value = resolve_css_vars(value.trim(), &variables);
-        let value = value.as_str();
+        let value = strip_css_declaration_priority(&value);
         match (selector, property) {
             ("body", "color") => apply_color(value, &mut style.text_color),
             ("body", "background") | ("body", "background-color") => {
@@ -5313,6 +5319,9 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
     if source.height.is_some() {
         target.height = source.height;
     }
+    if source.max_height.is_some() {
+        target.max_height = source.max_height;
+    }
     if source.min_height.is_some() {
         target.min_height = source.min_height;
     }
@@ -5414,6 +5423,9 @@ fn merge_css_box_style(target: &mut CssBoxStyle, source: &CssBoxStyle) {
     }
     if source.overflow_hidden.is_some() {
         target.overflow_hidden = source.overflow_hidden;
+    }
+    if source.clip_hidden.is_some() {
+        target.clip_hidden = source.clip_hidden;
     }
     if source.position.is_some() {
         target.position = source.position;
@@ -5976,15 +5988,61 @@ fn normalize_css_selector(selector: &str) -> Option<String> {
     if selector.is_empty() {
         return None;
     }
+    let selector = preserve_negated_dynamic_pseudo_class_specificity(selector)?;
     if selector.contains("::")
         || selector.contains(":before")
         || selector.contains(":after")
-        || selector_contains_dynamic_pseudo_class(selector)
+        || selector_contains_dynamic_pseudo_class(&selector)
     {
         return None;
     }
 
-    Some(selector.to_owned())
+    Some(selector)
+}
+
+fn preserve_negated_dynamic_pseudo_class_specificity(selector: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut index = 0usize;
+    while index < selector.len() {
+        let rest = &selector[index..];
+        if rest.starts_with(":not(") {
+            let open_paren = index + ":not".len();
+            let end = find_function_end(selector, open_paren)?;
+            let inner = selector[open_paren + 1..end].trim();
+            if selector_is_only_dynamic_pseudo_class(inner) {
+                out.push_str(":not(.__almostthere_static_dynamic_state__)");
+                index = end + 1;
+                continue;
+            }
+        }
+        let ch = rest.chars().next()?;
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    Some(out)
+}
+
+fn selector_is_only_dynamic_pseudo_class(selector: &str) -> bool {
+    let selector = selector.trim();
+    [
+        ":active",
+        ":checked",
+        ":disabled",
+        ":enabled",
+        ":focus",
+        ":focus-visible",
+        ":focus-within",
+        ":hover",
+        ":invalid",
+        ":optional",
+        ":placeholder-shown",
+        ":required",
+        ":target",
+        ":valid",
+        ":visited",
+    ]
+    .iter()
+    .any(|pseudo| selector == *pseudo)
 }
 
 fn selector_contains_dynamic_pseudo_class(selector: &str) -> bool {
@@ -6161,7 +6219,7 @@ fn parse_css_box_style_with_vars(
             continue;
         }
         let value = resolve_css_vars(value.trim(), &variables);
-        let value = value.as_str();
+        let value = strip_css_declaration_priority(&value);
         match property {
             "display" => {
                 style.display = parse_display(value);
@@ -6350,6 +6408,10 @@ fn parse_css_box_style_with_vars(
             "height" | "block-size" => {
                 style.height = parse_css_length(value);
                 seen |= style.height.is_some();
+            }
+            "max-height" | "max-block-size" => {
+                style.max_height = parse_css_length(value);
+                seen |= style.max_height.is_some();
             }
             "min-height" | "min-block-size" => {
                 style.min_height = parse_css_length(value);
@@ -6589,8 +6651,20 @@ fn parse_css_box_style_with_vars(
                 seen |= style.opacity.is_some();
             }
             "overflow" | "overflow-x" | "overflow-y" => {
-                if value == "hidden" {
+                if css_overflow_clips(value) {
                     style.overflow_hidden = Some(true);
+                    seen = true;
+                }
+            }
+            "clip-path" | "-webkit-clip-path" => {
+                if css_clip_path_hides_box(value) {
+                    style.clip_hidden = Some(true);
+                    seen = true;
+                }
+            }
+            "clip" => {
+                if css_legacy_clip_hides_box(value) {
+                    style.clip_hidden = Some(true);
                     seen = true;
                 }
             }
@@ -6683,6 +6757,50 @@ fn parse_css_box_style_with_vars(
     }
 
     seen.then_some(style)
+}
+
+fn strip_css_declaration_priority(value: &str) -> &str {
+    let trimmed = value.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(pos) = lower.rfind('!') {
+        if lower[pos + 1..].trim_start() == "important" {
+            return trimmed[..pos].trim_end();
+        }
+    }
+    trimmed
+}
+
+fn css_overflow_clips(value: &str) -> bool {
+    split_css_value_list(value).iter().any(|token| {
+        let token = token.trim();
+        token.eq_ignore_ascii_case("hidden") || token.eq_ignore_ascii_case("clip")
+    })
+}
+
+fn css_clip_path_hides_box(value: &str) -> bool {
+    let normalized = value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    normalized == "inset(50%)"
+        || normalized == "inset(100%)"
+        || normalized.starts_with("inset(0100%100%0")
+        || normalized.starts_with("inset(100%")
+}
+
+fn css_legacy_clip_hides_box(value: &str) -> bool {
+    let normalized = value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    normalized == "rect(0,0,0,0)"
+        || normalized == "rect(0px,0px,0px,0px)"
+        || normalized == "rect(0000)"
+        || normalized == "rect(0px0px0px0px)"
 }
 
 fn apply_logical_margin_pair(value: &str, inline_axis: bool, style: &mut CssBoxStyle) -> bool {
@@ -8819,6 +8937,75 @@ mod tests {
     }
 
     #[test]
+    fn css_declaration_priority_does_not_block_value_parsing() {
+        let style = parse_basic_css(
+            r#"
+            .hidden {
+                display: none !important;
+            }
+            .menu {
+                visibility: hidden !important;
+                opacity: 0 !IMPORTANT;
+                overflow: hidden auto !important;
+                font-weight: bold !important;
+            }
+            "#,
+        );
+        let menu = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["menu".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let hidden = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["hidden".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &menu);
+
+        assert_eq!(
+            computed_box_style(&style, &hidden).display,
+            Some(CssDisplay::None)
+        );
+        assert_eq!(computed.visibility_visible, Some(false));
+        assert_eq!(computed.opacity, Some(0.0));
+        assert_eq!(computed.overflow_hidden, Some(true));
+        assert_eq!(computed.font_weight_bold, Some(true));
+    }
+
+    #[test]
+    fn negated_dynamic_pseudo_class_matches_static_unfocused_state() {
+        let style = parse_basic_css(
+            r#"
+            .skip[data-v-test]:not(:focus) {
+                width: 1px;
+                height: 1px;
+                overflow: hidden;
+            }
+            .skip[data-v-test] {
+                width: 160px;
+                height: auto;
+                overflow: visible;
+            }
+            .skip:focus {
+                width: 160px;
+            }
+            "#,
+        );
+        let skip = ElementStyleKey {
+            tag: "a".to_owned(),
+            classes: vec!["skip".to_owned()],
+            attributes: vec!["data-v-test".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &skip);
+
+        assert_eq!(computed.width, Some(CssLength::Px(1.0)));
+        assert_eq!(computed.height, Some(CssLength::Px(1.0)));
+        assert_eq!(computed.overflow_hidden, Some(true));
+    }
+
+    #[test]
     fn complex_selectors_do_not_collapse_to_their_last_simple_selector() {
         let style = parse_basic_css(
             r#"
@@ -10061,7 +10248,7 @@ mod tests {
     #[test]
     fn parse_basic_css_preserves_viewport_and_function_lengths() {
         let style = parse_basic_css(
-            ".hero { width: 50vw; height: 100vh; min-height: calc(100vh - 2rem); max-width: min(100vw, 72rem); }",
+            ".hero { width: 50vw; height: 100vh; max-height: 0; min-height: calc(100vh - 2rem); max-width: min(100vw, 72rem); }",
         );
         let hero = ElementStyleKey {
             tag: "section".to_owned(),
@@ -10072,6 +10259,7 @@ mod tests {
 
         assert_eq!(computed.width, Some(CssLength::Vw(50.0)));
         assert_eq!(computed.height, Some(CssLength::Vh(100.0)));
+        assert_eq!(computed.max_height, Some(CssLength::Px(0.0)));
         assert_eq!(
             computed.min_height,
             Some(CssLength::Calc(CssLengthExpression {
@@ -10318,6 +10506,43 @@ mod tests {
         assert_eq!(button_style.color, Some(Color32::WHITE));
         assert_eq!(button_style.font_weight_bold, Some(true));
         assert_eq!(outside_button_style.color, None);
+    }
+
+    #[test]
+    fn descendant_attribute_selector_beats_lower_specificity_class_display() {
+        let style = parse_basic_css(
+            r#"
+            .nav *[id^="menu-"] { display: none; }
+            .panel { display: flex; }
+            .nav *[id^="menu-"].selected { display: flex; }
+            "#,
+        );
+        let nav = ElementStyleKey {
+            tag: "nav".to_owned(),
+            classes: vec!["nav".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let hidden_menu = ElementStyleKey {
+            tag: "div".to_owned(),
+            id: Some("menu-weather".to_owned()),
+            classes: vec!["panel".to_owned()],
+            attributes: vec!["id=menu-weather".to_owned()],
+            parent: Some(Box::new(nav.clone())),
+            ..ElementStyleKey::default()
+        };
+        let selected_menu = ElementStyleKey {
+            classes: vec!["panel".to_owned(), "selected".to_owned()],
+            ..hidden_menu.clone()
+        };
+
+        assert_eq!(
+            computed_box_style(&style, &hidden_menu).display,
+            Some(CssDisplay::None)
+        );
+        assert_eq!(
+            computed_box_style(&style, &selected_menu).display,
+            Some(CssDisplay::Flex)
+        );
     }
 
     #[test]

@@ -9613,12 +9613,6 @@ fn dom_element_text_is_visible(element: &DomElement) -> bool {
     if element.has_attr("hidden") {
         return false;
     }
-    if element
-        .attr("aria-hidden")
-        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
-    {
-        return false;
-    }
     if element.attr("class").is_some_and(|classes| {
         classes
             .split_whitespace()
@@ -11371,12 +11365,6 @@ fn dom_element_own_box_is_visible(element: &DomElement) -> bool {
     if element.has_attr("hidden") {
         return false;
     }
-    if element
-        .attr("aria-hidden")
-        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
-    {
-        return false;
-    }
     if element.attr("class").is_some_and(|classes| {
         classes
             .split_whitespace()
@@ -11754,6 +11742,12 @@ fn apply_css_box_style(
             _ => Some(height),
         };
     }
+    if let Some(max_height) = source.max_height {
+        target.max_height = match max_height {
+            CssLength::Auto => None,
+            _ => Some(max_height),
+        };
+    }
     if let Some(min_height) = source.min_height {
         target.min_height = match min_height {
             CssLength::Auto => None,
@@ -11858,6 +11852,9 @@ fn apply_css_box_style(
     }
     if let Some(overflow_hidden) = source.overflow_hidden {
         target.overflow_hidden = overflow_hidden;
+    }
+    if let Some(clip_hidden) = source.clip_hidden {
+        target.clip_hidden = clip_hidden;
     }
     if let Some(position) = source.position {
         target.position = position;
@@ -12683,16 +12680,26 @@ fn layout_css_box(
                     )
                 } else if !box_.children.is_empty()
                     && box_.children.iter().all(css_layout_box_is_inline_level)
-                    && (!css_layout_box_needs_inline_visual_layout(box_)
-                        || css_layout_box_can_line_flow_replaced_content(box_))
                 {
-                    measure_css_inline_children_height(
-                        &box_.children,
-                        content_width,
-                        source,
-                        image_height_auto,
-                        text_metrics,
-                    )
+                    if css_layout_box_needs_inline_visual_layout(box_)
+                        && !css_layout_box_can_line_flow_replaced_content(box_)
+                    {
+                        layout_css_inline_visual_children(
+                            box_,
+                            source,
+                            image_height_auto,
+                            text_metrics,
+                            content_width,
+                        )
+                    } else {
+                        measure_css_inline_children_height(
+                            &box_.children,
+                            content_width,
+                            source,
+                            image_height_auto,
+                            text_metrics,
+                        )
+                    }
                 } else {
                     layout_css_block_children(box_, source, image_height_auto, text_metrics)
                 }
@@ -12702,21 +12709,22 @@ fn layout_css_box(
         }
     };
 
-    let inline_visual_height = css_layout_inline_flow_visual_height(
-        box_,
-        content_width,
-        source,
-        image_height_auto,
-        text_metrics,
-    )
-    .unwrap_or(intrinsic_height);
+    let intrinsic_height = intrinsic_height.max(
+        css_layout_inline_flow_visual_height(
+            box_,
+            content_width,
+            source,
+            image_height_auto,
+            text_metrics,
+        )
+        .unwrap_or(intrinsic_height),
+    );
     let mut content_height = css_resolve_used_height(
         intrinsic_height,
         &box_.style,
         containing_height,
         content_width,
-    )
-    .max(inline_visual_height);
+    );
     if box_.style.height.is_none() && content_height <= 0.5 {
         content_height = content_height.max(css_layout_visible_text_line_height(box_));
     }
@@ -12811,6 +12819,21 @@ fn css_layout_box_needs_inline_visual_layout(box_: &CssLayoutBox<'_>) -> bool {
                 || child.style.min_height.is_some()
                 || css_layout_box_needs_inline_visual_layout(child)
         })
+}
+
+fn css_layout_box_needs_inline_position_replay(box_: &CssLayoutBox<'_>) -> bool {
+    box_.children.iter().any(|child| {
+        let replaced = child
+            .node
+            .is_some_and(css_layout_node_is_visual_replaced_content);
+        (!replaced
+            && (matches!(child.style.display, CssDisplay::InlineBlock)
+                || child.style.width.is_some()
+                || child.style.width_percent.is_some()
+                || child.style.height.is_some()
+                || child.style.min_height.is_some()))
+            || css_layout_box_needs_inline_position_replay(child)
+    })
 }
 
 fn css_layout_box_can_line_flow_replaced_content(box_: &CssLayoutBox<'_>) -> bool {
@@ -12968,12 +12991,7 @@ fn layout_css_inline_visual_box(
         .unwrap_or(children_width)
         .min(available_content_width)
         .max(1.0);
-    let content_height = css_resolve_used_height(content_height, &box_.style, 0.0, content_width)
-        .max(if box_.children.is_empty() {
-            0.0
-        } else {
-            content_height
-        });
+    let content_height = css_resolve_used_height(content_height, &box_.style, 0.0, content_width);
     box_.dimensions.content = egui::Rect::from_min_size(
         egui::pos2(content_x, content_y),
         egui::vec2(content_width, content_height.max(0.0)),
@@ -13142,13 +13160,16 @@ fn layout_css_flex_children(
             .iter()
             .map(|index| {
                 let child = &container.children[*index];
-                child
+                let explicit_width = child
                     .style
                     .width
-                    .or_else(|| css_style_max_width_for_containing(&child.style, content.width()))
+                    .or_else(|| css_style_max_width_for_containing(&child.style, content.width()));
+                let min_width = child.style.min_width.unwrap_or(0.0).max(0.0);
+                explicit_width
                     .unwrap_or(content.width())
                     .min(content.width())
-                    .max(css_flex_item_min_width(child))
+                    .max(min_width)
+                    .max(1.0)
             })
             .collect::<Vec<_>>()
     };
@@ -13347,7 +13368,11 @@ fn layout_css_wrapped_row_flex_children(
             let child = &container.children[*index];
             css_flex_item_base_width(child, content.width(), text_metrics)
                 .min(content.width().max(1.0))
-                .max(css_flex_item_min_width(child))
+                .max(css_flex_item_min_outer_width(
+                    child,
+                    content.width(),
+                    text_metrics,
+                ))
         })
         .collect::<Vec<_>>();
     if base_widths.is_empty() {
@@ -13510,10 +13535,15 @@ fn layout_css_flex_item_box(
     text_metrics: Option<&egui::Context>,
 ) {
     let item_width = item_width.max(1.0);
+    let allocated_content_width = if child.style.box_sizing_border_box {
+        item_width
+    } else {
+        (item_width - css_flex_item_horizontal_non_content(child)).max(1.0)
+    };
     let old_width = child.style.width;
     let old_width_percent = child.style.width_percent;
     let old_max_width_percent = child.style.max_width_percent;
-    child.style.width = Some(item_width);
+    child.style.width = Some(allocated_content_width);
     child.style.width_percent = None;
     child.style.max_width_percent = None;
     layout_css_box(
@@ -13556,10 +13586,14 @@ fn css_flex_row_item_widths(
             .map(|(child, width)| {
                 width
                     .min(available_for_items)
-                    .max(css_flex_item_min_width(child))
+                    .max(css_flex_item_min_outer_width(
+                        child,
+                        available_width,
+                        text_metrics,
+                    ))
             })
             .collect::<Vec<_>>();
-        shrink_css_flex_row_item_widths(&mut widths, children, available_for_items);
+        shrink_css_flex_row_item_widths(&mut widths, children, available_for_items, text_metrics);
         return widths;
     }
 
@@ -13572,14 +13606,19 @@ fn css_flex_row_item_widths(
         .map(|(child, base_width)| {
             let grow = css_flex_item_effective_grow(child);
             if grow > 0.0 {
-                (base_width + grow_available * grow / total_grow)
-                    .max(css_flex_item_min_width(child))
+                (base_width + grow_available * grow / total_grow).max(
+                    css_flex_item_min_outer_width(child, available_width, text_metrics),
+                )
             } else {
-                base_width.max(css_flex_item_min_width(child))
+                base_width.max(css_flex_item_min_outer_width(
+                    child,
+                    available_width,
+                    text_metrics,
+                ))
             }
         })
         .collect::<Vec<_>>();
-    shrink_css_flex_row_item_widths(&mut widths, children, available_for_items);
+    shrink_css_flex_row_item_widths(&mut widths, children, available_for_items, text_metrics);
     widths
 }
 
@@ -13587,6 +13626,7 @@ fn shrink_css_flex_row_item_widths(
     widths: &mut [f32],
     children: &[&CssLayoutBox<'_>],
     available_for_items: f32,
+    text_metrics: Option<&egui::Context>,
 ) {
     let total = widths.iter().sum::<f32>();
     if total <= available_for_items {
@@ -13599,7 +13639,9 @@ fn shrink_css_flex_row_item_widths(
             if child.style.flex_shrink <= 0.0 {
                 0.0
             } else {
-                ((*width - css_flex_item_shrink_floor(child, *width)).max(0.0))
+                ((*width
+                    - css_flex_item_shrink_floor(child, *width, available_for_items, text_metrics))
+                .max(0.0))
                     * child.style.flex_shrink
                     * width.max(1.0)
             }
@@ -13610,7 +13652,8 @@ fn shrink_css_flex_row_item_widths(
     }
     let overflow = total - available_for_items;
     for (width, child) in widths.iter_mut().zip(children) {
-        let min_width = css_flex_item_shrink_floor(child, *width);
+        let min_width =
+            css_flex_item_shrink_floor(child, *width, available_for_items, text_metrics);
         let shrinkable = if child.style.flex_shrink <= 0.0 {
             0.0
         } else {
@@ -13629,22 +13672,51 @@ fn css_flex_item_effective_grow(child: &CssLayoutBox<'_>) -> f32 {
     0.0
 }
 
-fn css_flex_item_min_width(child: &CssLayoutBox<'_>) -> f32 {
+fn css_flex_item_min_outer_width(
+    child: &CssLayoutBox<'_>,
+    available_width: f32,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    let horizontal_non_content = css_flex_item_horizontal_non_content(child);
+    if let Some(min_width) = child.style.min_width {
+        let outer = if child.style.box_sizing_border_box {
+            min_width
+        } else {
+            min_width + horizontal_non_content
+        };
+        return outer.max(0.0);
+    }
     if css_layout_box_contains_text_form_control(child) {
-        child.style.min_width.unwrap_or(0.0)
+        0.0
     } else {
-        child.style.min_width.unwrap_or(1.0)
+        let automatic_min = css_layout_preferred_outer_width(child, text_metrics).max(1.0);
+        if let Some(max_width) = css_style_max_width_for_containing(&child.style, available_width) {
+            let max_outer = if child.style.box_sizing_border_box {
+                max_width
+            } else {
+                max_width + horizontal_non_content
+            };
+            automatic_min.min(max_outer.max(1.0))
+        } else {
+            automatic_min
+        }
     }
 }
 
-fn css_flex_item_shrink_floor(child: &CssLayoutBox<'_>, base_width: f32) -> f32 {
-    if child.style.min_width.is_some() {
-        return css_flex_item_min_width(child);
-    }
-    if css_layout_box_contains_text_form_control(child) {
-        css_flex_item_min_width(child)
+fn css_flex_item_shrink_floor(
+    child: &CssLayoutBox<'_>,
+    base_width: f32,
+    available_width: f32,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    if child.style.min_width.is_some() || css_layout_box_contains_text_form_control(child) {
+        css_flex_item_min_outer_width(child, available_width, text_metrics)
     } else {
-        base_width.max(css_flex_item_min_width(child))
+        base_width.max(css_flex_item_min_outer_width(
+            child,
+            available_width,
+            text_metrics,
+        ))
     }
 }
 
@@ -13653,34 +13725,54 @@ fn css_flex_item_base_width(
     available_width: f32,
     text_metrics: Option<&egui::Context>,
 ) -> f32 {
+    let horizontal_non_content = css_flex_item_horizontal_non_content(child);
+    let outer_width = |width: f32, border_box: bool| {
+        if border_box {
+            width
+        } else {
+            width + horizontal_non_content
+        }
+    };
     if let Some(basis) = child.style.flex_basis {
         if let Some(width) = resolve_css_width(basis, available_width) {
-            return width.min(available_width).max(1.0);
+            return outer_width(width, child.style.box_sizing_border_box)
+                .min(available_width)
+                .max(1.0);
         }
     }
     if let Some(percent) = child.style.width_percent {
-        return (available_width * percent / 100.0)
+        return outer_width(
+            available_width * percent / 100.0,
+            child.style.box_sizing_border_box,
+        )
+        .min(available_width)
+        .max(1.0);
+    }
+    if let Some(width) = child.style.width {
+        return outer_width(width, child.style.box_sizing_border_box)
             .min(available_width)
             .max(1.0);
     }
-    if let Some(width) = child.style.width {
-        return width.min(available_width).max(1.0);
-    }
     if let Some(width) = css_style_max_width_for_containing(&child.style, available_width) {
-        return width.min(available_width).max(1.0);
+        return outer_width(width, child.style.box_sizing_border_box)
+            .min(available_width)
+            .max(1.0);
     }
 
     let content_width = css_layout_preferred_content_width(child, text_metrics)
         .min(available_width)
         .max(1.0);
-    let horizontal_non_content = child.style.margin.left
-        + child.style.margin.right
-        + child.style.border_width * 2.0
-        + child.style.padding.left
-        + child.style.padding.right;
     (content_width + horizontal_non_content)
         .min(available_width)
         .max(1.0)
+}
+
+fn css_flex_item_horizontal_non_content(child: &CssLayoutBox<'_>) -> f32 {
+    child.style.margin.left
+        + child.style.margin.right
+        + child.style.border_width * 2.0
+        + child.style.padding.left
+        + child.style.padding.right
 }
 
 fn css_layout_explicit_content_width_for_available(
@@ -13816,18 +13908,25 @@ fn css_layout_preferred_content_width(
     box_: &CssLayoutBox<'_>,
     text_metrics: Option<&egui::Context>,
 ) -> f32 {
-    if let Some(width) = box_
-        .style
-        .width
-        .or_else(|| box_.style.max_width)
-        .map(|width| {
-            if box_.style.box_sizing_border_box {
-                (width - css_style_horizontal_border_padding(&box_.style)).max(1.0)
-            } else {
-                width.max(1.0)
-            }
-        })
-    {
+    let definite_intrinsic_width = if box_.style.width_percent.is_some() {
+        None
+    } else {
+        box_.style.width
+    }
+    .or_else(|| {
+        if box_.style.max_width_percent.is_some() {
+            None
+        } else {
+            box_.style.max_width
+        }
+    });
+    if let Some(width) = definite_intrinsic_width.map(|width| {
+        if box_.style.box_sizing_border_box {
+            (width - css_style_horizontal_border_padding(&box_.style)).max(1.0)
+        } else {
+            width.max(1.0)
+        }
+    }) {
         return width;
     }
 
@@ -13943,7 +14042,7 @@ fn css_text_preferred_content_width(
         .x
         .max(1.0);
     if text.split_whitespace().count() <= 1 {
-        return measured;
+        return measured.ceil() + 1.0;
     }
 
     measured + (style.font_size * 0.9).max(1.0)
@@ -14124,12 +14223,11 @@ fn css_declared_box_height(style: &ResolvedBoxStyle, containing_width: f32) -> O
         })
 }
 
-fn css_definite_box_height(style: &ResolvedBoxStyle, containing_width: f32) -> Option<f32> {
+fn css_declared_box_max_height(style: &ResolvedBoxStyle, containing_width: f32) -> Option<f32> {
     let vertical_border_padding = css_style_vertical_border_padding(style);
-    [style.height, style.min_height]
-        .into_iter()
-        .flatten()
-        .find_map(|height| match height {
+    style
+        .max_height
+        .and_then(|height| match height {
             CssLength::Px(px) => Some(px),
             CssLength::Vh(vh) => Some(DEFAULT_LAYOUT_VIEWPORT_HEIGHT * vh / 100.0),
             CssLength::Vw(vw) => Some(DEFAULT_LAYOUT_VIEWPORT_WIDTH * vw / 100.0),
@@ -14164,6 +14262,55 @@ fn css_definite_box_height(style: &ResolvedBoxStyle, containing_width: f32) -> O
         })
 }
 
+fn css_definite_box_height(style: &ResolvedBoxStyle, containing_width: f32) -> Option<f32> {
+    let vertical_border_padding = css_style_vertical_border_padding(style);
+    let resolved = [style.height, style.min_height]
+        .into_iter()
+        .flatten()
+        .find_map(|height| match height {
+            CssLength::Px(px) => Some(px),
+            CssLength::Vh(vh) => Some(DEFAULT_LAYOUT_VIEWPORT_HEIGHT * vh / 100.0),
+            CssLength::Vw(vw) => Some(DEFAULT_LAYOUT_VIEWPORT_WIDTH * vw / 100.0),
+            CssLength::Calc(expression) => {
+                Some(resolve_css_length_expression(expression, containing_width))
+            }
+            CssLength::Min(left, right) => Some(
+                resolve_css_length_expression(left, containing_width)
+                    .min(resolve_css_length_expression(right, containing_width)),
+            ),
+            CssLength::Max(left, right) => Some(
+                resolve_css_length_expression(left, containing_width)
+                    .max(resolve_css_length_expression(right, containing_width)),
+            ),
+            CssLength::Clamp(min, preferred, max) => Some(
+                resolve_css_length_expression(preferred, containing_width).clamp(
+                    resolve_css_length_expression(min, containing_width),
+                    resolve_css_length_expression(max, containing_width),
+                ),
+            ),
+            CssLength::FitContent(limit) => {
+                Some(resolve_css_length_expression(limit, containing_width))
+            }
+            CssLength::Auto | CssLength::Percent(_) | CssLength::Fr(_) => None,
+        })
+        .map(|height| {
+            css_used_content_box_extent(
+                height,
+                vertical_border_padding,
+                style.box_sizing_border_box,
+            )
+        });
+    match (
+        resolved,
+        css_declared_box_max_height(style, containing_width),
+    ) {
+        (Some(height), Some(max_height)) => Some(height.min(max_height)),
+        (Some(height), None) => Some(height),
+        (None, Some(max_height)) => Some(max_height),
+        (None, None) => None,
+    }
+}
+
 fn css_provisional_content_height(
     style: &ResolvedBoxStyle,
     containing_height: f32,
@@ -14174,15 +14321,24 @@ fn css_provisional_content_height(
     let height = style
         .height
         .and_then(|height| resolve_css_used_height_length(height, containing_height));
+    let max_height = style
+        .max_height
+        .and_then(|height| resolve_css_used_height_length(height, containing_height));
     let min_height = style
         .min_height
         .and_then(|height| resolve_css_used_height_length(height, containing_height));
-    let used_height = match (height, min_height) {
+    let mut used_height = match (height, min_height) {
         (Some(height), Some(min_height)) => height.max(min_height),
         (Some(height), None) => height,
         (None, Some(min_height)) => min_height,
         (None, None) => return None,
     };
+    if let Some(max_height) = max_height {
+        used_height = used_height.min(max_height);
+    }
+    if let Some(min_height) = min_height {
+        used_height = used_height.max(min_height);
+    }
     Some(css_used_content_box_extent(
         used_height,
         vertical_border_padding,
@@ -15431,6 +15587,19 @@ fn css_resolve_used_height(
             )
         })
         .unwrap_or(intrinsic_height);
+    if let Some(max_height) = style
+        .max_height
+        .and_then(|height| resolve_css_used_height_length(height, containing_height))
+        .map(|height| {
+            css_used_content_box_extent(
+                height,
+                vertical_border_padding,
+                style.box_sizing_border_box,
+            )
+        })
+    {
+        height = height.min(max_height);
+    }
     if let Some(min_height) = style
         .min_height
         .and_then(|height| resolve_css_used_height_length(height, containing_height))
@@ -15603,7 +15772,16 @@ fn measure_css_inline_children_height(
     let mut runs = Vec::new();
     let mut pending_space = None;
     for child in children {
-        collect_canvas_layout_inline_runs(child, None, None, &mut pending_space, &mut runs, false);
+        collect_canvas_layout_inline_runs(
+            child,
+            source,
+            image_height_auto,
+            None,
+            None,
+            &mut pending_space,
+            &mut runs,
+            false,
+        );
     }
     build_canvas_line_boxes(runs, text_metrics, width)
         .iter()
@@ -15982,6 +16160,13 @@ fn push_canvas_graph_layout_box(
         }
         return;
     }
+    if css_layout_box_is_tiny_overflow_clip(box_) {
+        cursor.y = cursor.y.max(css_margin_box(box_).bottom());
+        if pushed_form {
+            cursor.form_stack.pop();
+        }
+        return;
+    }
     match box_.kind {
         CssLayoutKind::Document => {
             for child in &box_.children {
@@ -16066,7 +16251,7 @@ fn push_canvas_graph_layout_box(
                     push_canvas_graph_layout_box_background(box_, graph);
                     let clips_children = push_canvas_graph_layout_clip_start(box_, graph);
                     if !matches!(box_.style.display, CssDisplay::InlineBlock)
-                        && !css_layout_box_needs_inline_visual_layout(box_)
+                        && !css_layout_box_needs_inline_position_replay(box_)
                         && !node.children.is_empty()
                         && children_are_inline_flow(&node.children)
                     {
@@ -16157,7 +16342,7 @@ fn push_canvas_graph_layout_box(
                         push_canvas_graph_layout_list_marker(box_, cursor, graph);
                         if !box_.children.is_empty()
                             && box_.children.iter().all(css_layout_box_is_inline_level)
-                            && !css_layout_box_needs_inline_visual_layout(box_)
+                            && !css_layout_box_needs_inline_position_replay(box_)
                         {
                             push_canvas_graph_layout_inline_children(
                                 &box_.children,
@@ -16235,7 +16420,7 @@ fn push_canvas_graph_layout_box(
                             cursor.y = css_margin_box(box_).bottom();
                         } else if !box_.children.is_empty()
                             && box_.children.iter().all(css_layout_box_is_inline_level)
-                            && !css_layout_box_needs_inline_visual_layout(box_)
+                            && !css_layout_box_needs_inline_position_replay(box_)
                         {
                             push_canvas_graph_layout_inline_children(
                                 &box_.children,
@@ -16273,6 +16458,14 @@ fn push_canvas_graph_layout_box(
     if pushed_form {
         cursor.form_stack.pop();
     }
+}
+
+fn css_layout_box_is_tiny_overflow_clip(box_: &CssLayoutBox<'_>) -> bool {
+    if !box_.style.overflow_hidden {
+        return false;
+    }
+    let rect = css_border_box(&box_.dimensions);
+    rect.width() <= 1.5 || rect.height() <= 1.5
 }
 
 fn push_canvas_form_context_for_layout_box(
@@ -16408,9 +16601,11 @@ fn push_canvas_graph_layout_replaced_or_special(
                 graph,
             );
         }
-        "input" => {
+        "input" | "textarea" | "select" => {
             let input_type = element.attr("type").unwrap_or("text").to_ascii_lowercase();
-            if matches!(input_type.as_str(), "submit" | "button" | "reset") {
+            if element.tag_name == "input"
+                && matches!(input_type.as_str(), "submit" | "button" | "reset")
+            {
                 push_canvas_graph_layout_box_background(box_, graph);
                 let label = canvas_button_label(element, node);
                 push_canvas_graph_text(
@@ -16429,12 +16624,10 @@ fn push_canvas_graph_layout_replaced_or_special(
                     graph,
                 );
             } else {
-                push_canvas_graph_node(
+                push_canvas_graph_layout_form_control(
+                    element,
                     node,
-                    source,
-                    image_height_auto,
-                    text_metrics,
-                    inherited_href,
+                    box_.dimensions.content,
                     cursor,
                     graph,
                 );
@@ -16449,6 +16642,83 @@ fn push_canvas_graph_layout_replaced_or_special(
             cursor,
             graph,
         ),
+    }
+}
+
+fn push_canvas_graph_layout_form_control(
+    element: &DomElement,
+    node: &RenderNode,
+    rect: egui::Rect,
+    cursor: &mut CanvasLayoutCursor,
+    graph: &mut CanvasGraph,
+) {
+    let input_type = element.attr("type").unwrap_or("text");
+    if element.tag_name == "input" && input_type.eq_ignore_ascii_case("hidden") {
+        let (form_id, form_action, form_method) = canvas_form_metadata_for_element(element, cursor);
+        graph.objects.push(CanvasObject::Input(CanvasInputObject {
+            label: element.attr("name").unwrap_or("").to_owned(),
+            name: element.attr("name").map(str::to_owned),
+            default_value: element.attr("value").unwrap_or("").to_owned(),
+            value: element.attr("value").unwrap_or("").to_owned(),
+            rect: egui::Rect::from_min_size(rect.min, egui::Vec2::ZERO),
+            font_size: node.style.font_size,
+            color: node.style.color,
+            form_id,
+            form_action,
+            form_method,
+            element_id: Some(element.effective_id().to_owned()),
+            kind: CanvasInputKind::Hidden,
+            submit_on_enter: false,
+        }));
+        return;
+    }
+
+    let kind = if element.tag_name == "textarea" {
+        CanvasInputKind::TextArea
+    } else if element.tag_name == "select" {
+        let mut options = Vec::new();
+        collect_select_options(&element.children, &mut options);
+        CanvasInputKind::Select { options }
+    } else {
+        match input_type.to_ascii_lowercase().as_str() {
+            "checkbox" => CanvasInputKind::Checkbox,
+            "radio" => CanvasInputKind::Radio,
+            "password" => CanvasInputKind::Password,
+            _ => CanvasInputKind::Text,
+        }
+    };
+    let block = input_block_from_dom_element(element);
+    if let CanvasBlock::Input { label, value } = block {
+        let value = if matches!(kind, CanvasInputKind::Checkbox | CanvasInputKind::Radio) {
+            if element.attr("checked").is_some() {
+                "true".to_owned()
+            } else {
+                "false".to_owned()
+            }
+        } else if let CanvasInputKind::Select { ref options } = kind {
+            let selected = find_selected_option(&element.children);
+            selected.unwrap_or_else(|| options.first().cloned().unwrap_or(value))
+        } else {
+            value
+        };
+        let (form_id, form_action, form_method) = canvas_form_metadata_for_element(element, cursor);
+        let submit_on_enter =
+            input_submits_on_enter(element, &kind, form_id.as_deref(), form_action.as_deref());
+        graph.objects.push(CanvasObject::Input(CanvasInputObject {
+            label,
+            name: element.attr("name").map(str::to_owned),
+            default_value: value.clone(),
+            value,
+            rect,
+            font_size: node.style.font_size,
+            color: node.style.color,
+            form_id,
+            form_action,
+            form_method,
+            element_id: Some(element.effective_id().to_owned()),
+            kind,
+            submit_on_enter,
+        }));
     }
 }
 
@@ -17150,6 +17420,8 @@ fn push_canvas_graph_layout_inline_children(
     for child in children {
         collect_canvas_layout_inline_runs(
             child,
+            source,
+            image_height_auto,
             inherited_href,
             None,
             &mut pending_space,
@@ -17162,6 +17434,8 @@ fn push_canvas_graph_layout_inline_children(
 
 fn collect_canvas_layout_inline_runs(
     box_: &CssLayoutBox<'_>,
+    source: &str,
+    image_height_auto: bool,
     inherited_href: Option<&str>,
     inherited_link_element_id: Option<&str>,
     pending_space: &mut Option<CanvasInlineRun>,
@@ -17170,6 +17444,31 @@ fn collect_canvas_layout_inline_runs(
 ) {
     if !css_style_paints(&box_.style) {
         return;
+    }
+
+    if let Some(node) = box_.node {
+        if css_layout_node_is_visual_replaced_content(node) {
+            let RenderNodeKind::Element(element) = &node.kind else {
+                return;
+            };
+            let content = replaced_content_from_dom_element(element, source, image_height_auto);
+            let content_size = box_.dimensions.content.size();
+            let size = if content_size.x > 0.0 && content_size.y > 0.0 {
+                content_size
+            } else {
+                replaced_content_size(&content, 0.0, box_.style.font_size)
+            };
+            flush_canvas_pending_space(runs, pending_space);
+            runs.push(CanvasInlineRun {
+                text: String::new(),
+                replaced: Some(CanvasInlineReplaced { content, size }),
+                style: box_.style.clone(),
+                href: inherited_href.map(str::to_owned),
+                element_id: inherited_link_element_id.map(str::to_owned),
+                preserve_whitespace: false,
+            });
+            return;
+        }
     }
 
     match box_.kind {
@@ -17249,6 +17548,8 @@ fn collect_canvas_layout_inline_runs(
             for child in &box_.children {
                 collect_canvas_layout_inline_runs(
                     child,
+                    source,
+                    image_height_auto,
                     href,
                     element_id,
                     pending_space,
@@ -17261,6 +17562,8 @@ fn collect_canvas_layout_inline_runs(
             for child in &box_.children {
                 collect_canvas_layout_inline_runs(
                     child,
+                    source,
+                    image_height_auto,
                     inherited_href,
                     inherited_link_element_id,
                     pending_space,
@@ -17449,7 +17752,7 @@ fn push_canvas_inline_space_run(
 }
 
 fn css_style_paints(style: &ResolvedBoxStyle) -> bool {
-    style.visibility_visible && style.opacity > 0.0
+    style.visibility_visible && style.opacity > 0.0 && !style.clip_hidden
 }
 
 fn push_canvas_line_boxes(
@@ -17499,6 +17802,27 @@ fn push_canvas_graph_rich_text_line(
     let mut link_hits = Vec::new();
 
     for fragment in line.fragments {
+        if let Some(replaced) = fragment.replaced {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(line_left + fragment.x_offset, cursor.y),
+                replaced.size,
+            );
+            push_canvas_graph_replaced_content_in_rect(
+                &replaced.content,
+                &fragment.style,
+                rect,
+                graph,
+            );
+            if let Some(href) = fragment.href {
+                link_hits.push(CanvasObject::LinkHit(CanvasLinkHitObject {
+                    rect,
+                    href,
+                    element_id: fragment.element_id,
+                    debug_visible: false,
+                }));
+            }
+            continue;
+        }
         if let Some(href) = fragment.href.clone() {
             let rect = egui::Rect::from_min_size(
                 egui::pos2(line_left + fragment.x_offset, cursor.y),
@@ -17525,14 +17849,16 @@ fn push_canvas_graph_rich_text_line(
         });
     }
 
-    graph
-        .objects
-        .push(CanvasObject::RichTextLine(CanvasRichTextLineObject {
-            rect: line_rect,
-            spans,
-            text_align,
-            selection_break_before,
-        }));
+    if !spans.is_empty() {
+        graph
+            .objects
+            .push(CanvasObject::RichTextLine(CanvasRichTextLineObject {
+                rect: line_rect,
+                spans,
+                text_align,
+                selection_break_before,
+            }));
+    }
     graph.objects.extend(link_hits);
 }
 
@@ -17556,6 +17882,9 @@ fn coalesce_canvas_line_fragments(line: &mut CanvasLineBox) {
 }
 
 fn canvas_line_fragments_can_merge(a: &CanvasLineFragment, b: &CanvasLineFragment) -> bool {
+    if a.replaced.is_some() || b.replaced.is_some() {
+        return false;
+    }
     a.href == b.href
         && a.element_id == b.element_id
         && a.style.color == b.style.color
@@ -17594,6 +17923,11 @@ fn push_line_run(
     text_metrics: Option<&egui::Context>,
     max_width: f32,
 ) {
+    if run.replaced.is_some() {
+        push_replaced_line_run(lines, current, run, max_width);
+        return;
+    }
+
     if run.preserve_whitespace && run.text.contains('\n') {
         push_preserved_newline_run(lines, current, run, text_metrics, max_width);
         return;
@@ -17628,6 +17962,38 @@ fn push_line_run(
     }
 
     push_line_run_tokens(lines, current, run, text, text_metrics, max_width);
+}
+
+fn push_replaced_line_run(
+    lines: &mut Vec<CanvasLineBox>,
+    current: &mut CanvasLineBox,
+    run: &CanvasInlineRun,
+    max_width: f32,
+) {
+    let Some(replaced) = &run.replaced else {
+        return;
+    };
+    let size = replaced.size;
+    if !current.fragments.is_empty() && current.width + size.x > max_width {
+        lines.push(std::mem::take(current));
+    }
+    let advance_x = size.x.max(1.0);
+    current.fragments.push(CanvasLineFragment {
+        text: String::new(),
+        replaced: run.replaced.clone(),
+        style: run.style.clone(),
+        href: run.href.clone(),
+        element_id: run.element_id.clone(),
+        size,
+        advance_x,
+        x_offset: current.width,
+        text_inset_x: 0.0,
+        trailing_bearing_x: 0.0,
+    });
+    current.width += advance_x;
+    current.height = current
+        .height
+        .max(size.y.max((run.style.font_size * 1.35).max(1.0)));
 }
 
 fn push_preserved_newline_run(
@@ -17708,7 +18074,7 @@ fn push_line_token(
         return;
     }
 
-    if size.x <= max_width || token.chars().count() <= 1 {
+    if size.x <= max_width + 2.0 || token.chars().count() <= 1 {
         push_line_fragment(current, run, token, size);
         return;
     }
@@ -18474,7 +18840,7 @@ fn push_render_node_debug(
 
 fn resolved_style_debug(style: &ResolvedBoxStyle) -> String {
     format!(
-        "style(display={:?}, color={}, bg={}, margin={}, margin_auto={}/{}/{}/{}, padding={}, border_width={:.1}, border_color={}, radius={:.1}, width={}, min_width={}, max_width={}, max_width_percent={}, height={}, min_height={}, font_size={:.1}, bold={}, text_align={:?}, flex_direction={:?}, flex_wrap={:?}, flex_grow={:.2}, flex_shrink={:.2}, flex_basis={}, justify={:?}, align_items={:?}, align_self={:?}, visible={}, opacity={:.2}, overflow_hidden={}, position={:?}, z_index={})",
+        "style(display={:?}, color={}, bg={}, margin={}, margin_auto={}/{}/{}/{}, padding={}, border_width={:.1}, border_color={}, radius={:.1}, width={}, min_width={}, max_width={}, max_width_percent={}, height={}, max_height={}, min_height={}, font_size={:.1}, bold={}, text_align={:?}, flex_direction={:?}, flex_wrap={:?}, flex_grow={:.2}, flex_shrink={:.2}, flex_basis={}, justify={:?}, align_items={:?}, align_self={:?}, visible={}, opacity={:.2}, overflow_hidden={}, position={:?}, z_index={})",
         style.display,
         color_debug(style.color),
         color_debug(style.background),
@@ -18492,6 +18858,7 @@ fn resolved_style_debug(style: &ResolvedBoxStyle) -> String {
         optional_f32_debug(style.max_width),
         optional_f32_debug(style.max_width_percent),
         optional_css_length_debug(style.height),
+        optional_css_length_debug(style.max_height),
         optional_css_length_debug(style.min_height),
         style.font_size,
         style.font_weight_bold,
@@ -22116,10 +22483,6 @@ fn tag_is_hidden(open_tag: &str) -> bool {
     if has_attr(open_tag, "hidden") {
         return true;
     }
-    if extract_attr(open_tag, "aria-hidden").is_some_and(|value| value.eq_ignore_ascii_case("true"))
-    {
-        return true;
-    }
     extract_attr(open_tag, "style").is_some_and(|style| {
         let style = style.to_ascii_lowercase().replace(' ', "");
         style.contains("display:none") || style.contains("visibility:hidden")
@@ -25223,6 +25586,131 @@ mod tests {
     }
 
     #[test]
+    fn clipped_skip_link_and_nested_icon_search_bar_render_like_header_controls() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .skip:not(:focus) {
+                    position: absolute;
+                    width: 1px;
+                    height: 1px;
+                    padding: 0;
+                    overflow: hidden;
+                    clip-path: inset(0 100% 100% 0);
+                    white-space: nowrap;
+                  }
+                  .skip {
+                    position: absolute;
+                    top: 75px;
+                    left: 12px;
+                    min-height: 24px;
+                    padding: 8px;
+                  }
+                  .nav {
+                    display: flex;
+                    align-items: center;
+                    width: 900px;
+                    padding: 16px 24px;
+                    gap: 24px;
+                    background: #ffffff;
+                  }
+                  .logo { flex: 0 0 70px; width: 70px; height: 20px; background: #008009; }
+                  form { display: flex; flex: 1 1 auto; min-width: 0; }
+                  .field {
+                    display: flex;
+                    flex: 1 1 auto;
+                    align-items: center;
+                    min-width: 0;
+                    height: 40px;
+                    border: 1px solid #bebeb9;
+                    border-right: 0;
+                    border-radius: 20px 0 0 20px;
+                    padding-left: 16px;
+                  }
+                  input {
+                    flex: 1 1 auto;
+                    min-width: 0;
+                    height: 100%;
+                    border: 0;
+                    padding: 0;
+                  }
+                  button {
+                    flex: 0 0 auto;
+                    min-width: 40px;
+                    height: 40px;
+                    border: 1px solid #bebeb9;
+                    background: #f8c856;
+                  }
+                  .reset {
+                    min-width: 32px;
+                    width: 32px;
+                    height: 32px;
+                    border: 0;
+                    background: #dddddd;
+                  }
+                  svg { width: 16px; height: 16px; }
+                </style>
+              </head>
+              <body>
+                <a class="skip" href="#main">Skip to main content</a>
+                <header class="nav">
+                  <div class="logo"></div>
+                  <form action="/search" method="GET">
+                    <div class="field">
+                      <input name="q" aria-label="Search the web" value="hello world">
+                      <button class="reset" type="reset" aria-label="Clear">
+                        <svg viewBox="0 0 16 16"><path fill="#333333" d="M1 1h14v14H1z"></path></svg>
+                      </button>
+                    </div>
+                    <button type="submit" aria-label="Search">
+                      <svg viewBox="0 0 16 16"><path fill="#333333" d="M1 1h14v14H1z"></path></svg>
+                    </button>
+                  </form>
+                </header>
+                <main id="main">Results</main>
+              </body>
+            </html>
+            "##,
+            "https://example.test/search?q=hello+world",
+        );
+
+        assert!(
+            find_canvas_text_containing(&document.canvas_graph, "Skip to main content").is_none(),
+            "clipped skip link text should not leak into the visible header"
+        );
+        assert!(
+            find_canvas_text_containing(&document.canvas_graph, "Skip").is_none(),
+            "clipped skip link should not leak partial wrapped text"
+        );
+        let input = find_canvas_input(&document.canvas_graph, "Search the web")
+            .expect("expected search input");
+        let reset = find_canvas_button(&document.canvas_graph, "Clear").expect("expected reset");
+        let submit = find_canvas_button(&document.canvas_graph, "Search").expect("expected submit");
+
+        assert!(
+            reset.rect.left() >= input.rect.right() - 1.0,
+            "reset button should stay after the flexible input: input={:?} reset={:?}",
+            input.rect,
+            reset.rect
+        );
+        assert!(
+            submit.rect.left() >= reset.rect.right() - 1.0,
+            "submit button should stay after reset button: reset={:?} submit={:?}",
+            reset.rect,
+            submit.rect
+        );
+        assert!(
+            (input.rect.center().y - submit.rect.center().y).abs() < 8.0,
+            "search controls should remain on the same row: input={:?} submit={:?}",
+            input.rect,
+            submit.rect
+        );
+    }
+
+    #[test]
     fn anonymous_inline_wrapper_does_not_inherit_parent_height() {
         let document = parse_html_document(
             r#"
@@ -25401,6 +25889,86 @@ mod tests {
             (menu_background.rect.width() - 720.0).abs() < 1.0,
             "nested flex list background should keep declared width: {:?}",
             menu_background.rect
+        );
+    }
+
+    #[test]
+    fn percentage_width_flex_descendants_do_not_inflate_intrinsic_size() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  * { box-sizing: border-box; }
+                  body { margin: 0; }
+                  .row { display: flex; align-items: center; width: 820px; }
+                  .list {
+                    display: flex;
+                    flex: 0;
+                    align-items: center;
+                    gap: 2px;
+                    height: 40px;
+                    margin: 0;
+                    padding: 4px;
+                    list-style: none;
+                  }
+                  .item {
+                    display: flex;
+                    flex: 0 1 auto;
+                    min-width: 48px;
+                    align-items: center;
+                    justify-content: center;
+                  }
+                  .link {
+                    display: flex;
+                    align-items: center;
+                    gap: 4px;
+                    width: 100%;
+                    padding: 8px 11px;
+                  }
+                  .icon { flex: 0 0 auto; width: 16px; height: 16px; }
+                  .label { white-space: nowrap; }
+                  .more { margin-left: 12px; padding: 8px 11px; }
+                </style>
+              </head>
+              <body>
+                <nav class="row">
+                  <ul class="list">
+                    <li class="item"><a class="link" href="#"><span class="icon"></span><span class="label">Web</span></a></li>
+                    <li class="item"><a class="link" href="#"><span class="icon"></span><span class="label">AI Chat</span></a></li>
+                    <li class="item"><a class="link" href="#"><span class="icon"></span><span class="label">Images</span></a></li>
+                    <li class="item"><a class="link" href="#"><span class="icon"></span><span class="label">Videos</span></a></li>
+                    <li class="item"><a class="link" href="#"><span class="icon"></span><span class="label">News</span></a></li>
+                  </ul>
+                  <button class="more">More</button>
+                </nav>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let web = find_canvas_text(&document.canvas_graph, "Web").expect("Web");
+        let ai_chat = find_canvas_text(&document.canvas_graph, "AI Chat").expect("AI Chat");
+        let images = find_canvas_text(&document.canvas_graph, "Images").expect("Images");
+        let videos = find_canvas_text(&document.canvas_graph, "Videos").expect("Videos");
+        let news = find_canvas_text(&document.canvas_graph, "News").expect("News");
+        let more = find_canvas_button(&document.canvas_graph, "More").expect("More");
+
+        assert!(
+            web.rect.left() < 120.0,
+            "first pill drifted off row: {:?}",
+            web.rect
+        );
+        assert!(ai_chat.rect.left() > web.rect.right());
+        assert!(images.rect.left() > ai_chat.rect.right());
+        assert!(videos.rect.left() > images.rect.right());
+        assert!(news.rect.left() > videos.rect.right());
+        assert!(more.rect.left() > news.rect.right());
+        assert!(
+            more.rect.right() <= 820.0,
+            "percentage child widths inflated intrinsic flex size: {:?}",
+            more.rect
         );
     }
 
@@ -27394,6 +27962,48 @@ mod tests {
         assert!(
             (auto.rect.height() - 62.0).abs() <= 1.0,
             "inline-block auto height should include child 40 + padding/border 22: auto={auto:?} child={child:?}"
+        );
+    }
+
+    #[test]
+    fn inline_block_breadcrumb_items_use_text_intrinsic_width() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .wrap { width: 360px; overflow: hidden; font-size: 18px; }
+                  .breadcrumbs { float: left; padding: 0; margin: 16px 0 12px 0; }
+                  .breadcrumbs li { display: inline-block; padding-left: 0; }
+                </style>
+              </head>
+              <body>
+                <div class="wrap">
+                  <ol class="breadcrumbs">
+                    <li><a href="/meteo/italia">Meteo</a></li>
+                    <li><a href="/meteo/sicilia">Italia</a></li>
+                    <li><a href="/meteo/palermo">Sicilia</a></li>
+                    <li>Palermo oggi</li>
+                  </ol>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let meteo = find_canvas_text(&document.canvas_graph, "Meteo")
+            .expect("expected the first breadcrumb word as one text line");
+        let palermo = find_canvas_text_containing(&document.canvas_graph, "Palermo")
+            .expect("expected the last breadcrumb text");
+        assert!(
+            meteo.rect.width() >= 40.0,
+            "inline-block breadcrumb text should keep word width, not one-character width: {meteo:?}"
+        );
+        assert!(
+            palermo.rect.top() <= meteo.rect.top() + 4.0,
+            "breadcrumb inline-block items should remain in horizontal inline flow: meteo={meteo:?} palermo={palermo:?}"
         );
     }
 
@@ -29524,6 +30134,140 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
             side.rect.left() > 620.0,
             "side column should start after the two-thirds main column, got {:?}",
             side.rect
+        );
+    }
+
+    #[test]
+    fn flex_percent_max_width_column_caps_wide_child_auto_minimum() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  * { box-sizing: border-box; }
+                  body { margin: 0; padding: 0; }
+                  .page { width: 978px; margin: 0 auto; background: #f8f9fa; }
+                  .row { display: flex; flex-wrap: wrap; margin: 0 -8px; background: #d0ebff; }
+                  .main {
+                    flex: 0 0 66.666%;
+                    max-width: 66.666%;
+                    padding: 0 8px;
+                    background: #b2f2bb;
+                  }
+                  .side {
+                    flex: 0 0 33.333%;
+                    max-width: 33.333%;
+                    padding: 0 8px;
+                    background: #ffd8a8;
+                  }
+                  .wide-child {
+                    width: 760px;
+                    height: 48px;
+                    background: #9775fa;
+                  }
+                </style>
+              </head>
+              <body>
+                <main class="page">
+                  <div class="row">
+                    <section class="main">Main weather column</section>
+                    <aside class="side">
+                      <div class="wide-child">Wide child must not resize sidebar</div>
+                    </aside>
+                  </div>
+                </main>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let main = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0xb2, 0xf2, 0xbb),
+        )
+        .expect("expected main percentage column");
+        let side = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0xff, 0xd8, 0xa8),
+        )
+        .expect("expected sidebar percentage column");
+
+        assert!(
+            (main.rect.width() - 651.9).abs() <= 2.0,
+            "main column should use 66.666% of 978px, got {:?}",
+            main.rect
+        );
+        assert!(
+            (side.rect.width() - 326.0).abs() <= 2.0,
+            "sidebar should stay capped by max-width:33.333%, got {:?}",
+            side.rect
+        );
+        assert!(
+            side.rect.left() > main.rect.left() + 640.0,
+            "sidebar should sit beside the main column, got main={:?} side={:?}",
+            main.rect,
+            side.rect
+        );
+    }
+
+    #[test]
+    fn column_flex_auto_width_child_stretches_instead_of_preferred_text_leak() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  * { box-sizing: border-box; }
+                  body { margin: 0; padding: 0; }
+                  .card {
+                    width: 620px;
+                    padding: 24px;
+                    background: #d0ebff;
+                  }
+                  .header {
+                    display: flex;
+                    flex-direction: column;
+                    align-items: stretch;
+                    background: #ffd8a8;
+                  }
+                  h1 {
+                    margin: 0;
+                    font-size: 28px;
+                    background: #b2f2bb;
+                  }
+                </style>
+              </head>
+              <body>
+                <article class="card">
+                  <header class="header">
+                    <h1>Meteo Palermo oggi. Previsioni del tempo, precipitazioni, temperatura e venti</h1>
+                  </header>
+                </article>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let heading_bg = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0xb2, 0xf2, 0xbb),
+        )
+        .expect("expected heading background");
+        let heading_text =
+            find_canvas_text_containing(&document.canvas_graph, "Meteo Palermo oggi")
+                .expect("expected wrapped heading text");
+
+        assert!(
+            heading_bg.rect.width() <= 574.0,
+            "column flex child should stretch to card content width, not preferred text width: {:?}",
+            heading_bg.rect
+        );
+        assert!(
+            heading_text.rect.width() <= 574.0,
+            "heading text line should stay within the stretched column flex item: {:?}",
+            heading_text.rect
         );
     }
 
@@ -32823,7 +33567,7 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
                 <template>template text</template>
                 <div hidden>hidden attr text</div>
                 <div style="display: none">display none text</div>
-                <div aria-hidden="true">aria hidden text</div>
+                <div aria-hidden="true">aria hidden text stays visual</div>
                 <p>Visible text</p>
               </body>
             </html>
@@ -32836,7 +33580,119 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
         assert!(!rendered_text.contains("template text"));
         assert!(!rendered_text.contains("hidden attr text"));
         assert!(!rendered_text.contains("display none text"));
-        assert!(!rendered_text.contains("aria hidden text"));
+        assert!(rendered_text.contains("aria hidden text stays visual"));
+    }
+
+    #[test]
+    fn css_priority_hides_vector_style_dropdown_content() {
+        let html = r#"
+            <html>
+              <head>
+                <style>
+                  .vector-dropdown .vector-dropdown-content {
+                    position: absolute;
+                    visibility: hidden !important;
+                    opacity: 0 !important;
+                    height: 0;
+                    overflow: hidden auto !important;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="vector-dropdown">
+                  <button>Menu trigger</button>
+                  <div class="vector-dropdown-content">
+                    <a href="/hidden">Hidden dropdown link should not paint</a>
+                  </div>
+                </div>
+                <p>Visible article heading</p>
+              </body>
+            </html>
+        "#;
+        let document = parse_html_document(html, "https://example.test/");
+
+        assert!(find_canvas_text(&document.canvas_graph, "Visible article heading").is_some());
+        assert!(find_canvas_text(&document.canvas_graph, "Menu trigger").is_some());
+        assert!(find_canvas_text(&document.canvas_graph, "Hidden dropdown link").is_none());
+    }
+
+    #[test]
+    fn max_height_zero_clamps_explicit_desktop_dropdown_height() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { margin: 0; padding: 0; }
+                  .nav { position: relative; width: 640px; height: 70px; background: #dddddd; }
+                  .dropdown {
+                    position: absolute;
+                    top: 70px;
+                    left: 0;
+                    width: 400px;
+                    height: 320px;
+                    max-height: 0;
+                    overflow: hidden;
+                    background: #1155a3;
+                  }
+                  .dropdown .content { height: 120px; background: #ff0000; }
+                  .below { width: 160px; height: 40px; background: #00ff00; }
+                </style>
+              </head>
+              <body>
+                <div class="nav"><div class="dropdown"><div class="content"></div></div></div>
+                <div class="below"></div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let dropdown =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(17, 85, 163));
+        assert!(
+            dropdown.is_none_or(|rect| rect.rect.height() <= 1.0),
+            "max-height:0 should clamp an explicit-height closed dropdown before painting: {dropdown:?}"
+        );
+        assert!(
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(255, 0, 0))
+                .is_none(),
+            "overflow:hidden with max-height:0 should clip dropdown children"
+        );
+        let below =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected following block");
+        assert!(
+            (below.rect.top() - 70.0).abs() <= 1.0,
+            "absolute closed dropdown should not push normal flow content: {below:?}"
+        );
+    }
+
+    #[test]
+    fn inline_notice_with_images_keeps_text_in_inline_flow() {
+        let html = r#"
+            <html>
+              <body>
+                <div style="text-align:center">
+                  <span style="font-size:small">
+                    <span><a href="/donate"><img src="missing-logo.png" width="35" height="35"></a></span>
+                    <span style="font-size:140%; vertical-align: middle;">Libera la cultura. Dona il tuo 5x1000 a Wikimedia Italia.</span>
+                    <span><a href="/donate"><img src="missing-logo.png" width="35" height="35"></a></span>
+                  </span>
+                </div>
+              </body>
+            </html>
+        "#;
+        let document = parse_html_document(html, "https://example.test/");
+
+        assert!(find_canvas_text_containing(&document.canvas_graph, "Libera la cultura").is_some());
+        assert!(!document.canvas_graph.objects.iter().any(|object| matches!(
+            object,
+            CanvasObject::RichTextLine(line)
+                if line.rect.left() == 0.0
+                    && line.spans.len() == 1
+                    && line.spans[0].text == "L"
+        )));
     }
 
     #[test]
