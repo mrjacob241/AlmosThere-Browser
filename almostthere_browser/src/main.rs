@@ -39,6 +39,7 @@ const HISTORY_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../appdata/history/history.json"
 );
+const PREFERENCES_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../preferences.json");
 const DEBUG_EXPORT_DIR: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/../target/render_debug_export");
 const URL_SCREENSHOTS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/url_screenshots");
@@ -430,6 +431,10 @@ struct AlmostThereApp {
     url_input: String,
     bookmarks: Vec<Bookmark>,
     history: HistoryState,
+    preferences: BrowserPreferences,
+    preferences_open: bool,
+    preferences_homepage_input: String,
+    preferences_tabpage_input: String,
     console_messages: Vec<justbarelyscript::ConsoleMessage>,
     live_js_debug_text: String,
     status: String,
@@ -784,6 +789,21 @@ struct HistoryEntry {
     visited_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BrowserPreferences {
+    homepage: String,
+    tabpage: String,
+}
+
+impl Default for BrowserPreferences {
+    fn default() -> Self {
+        Self {
+            homepage: DEFAULT_URL.to_owned(),
+            tabpage: DEFAULT_NEW_TAB_URL.to_owned(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NavigationHistoryAction {
     AddEntry,
@@ -885,6 +905,7 @@ impl AlmostThereApp {
 
         let mut bookmarks = load_bookmarks().unwrap_or_default();
         let history = load_history().unwrap_or_default();
+        let preferences = load_preferences().unwrap_or_default();
         let inserted_default_bookmark = ensure_bookmark(&mut bookmarks, default_sample_bookmark())
             | ensure_bookmark(&mut bookmarks, default_url_bookmark());
         if inserted_default_bookmark {
@@ -894,7 +915,7 @@ impl AlmostThereApp {
             .initial_url
             .as_deref()
             .filter(|url| !url.trim().is_empty())
-            .unwrap_or(DEFAULT_URL);
+            .unwrap_or(&preferences.homepage);
         telemetry.emit(
             "navigation.initial_load.deferred",
             &[("url", initial_url), ("reason", "isolated_worker")],
@@ -945,6 +966,10 @@ impl AlmostThereApp {
             url_input,
             bookmarks,
             history,
+            preferences: preferences.clone(),
+            preferences_open: false,
+            preferences_homepage_input: preferences.homepage.clone(),
+            preferences_tabpage_input: preferences.tabpage.clone(),
             console_messages,
             live_js_debug_text,
             status,
@@ -987,7 +1012,7 @@ impl AlmostThereApp {
     }
 
     fn open_new_tab(&mut self, url: Option<String>, ctx: &egui::Context) {
-        let url = url.unwrap_or_else(|| DEFAULT_NEW_TAB_URL.to_owned());
+        let url = url.unwrap_or_else(|| self.preferences.tabpage.clone());
         let id = self.next_tab_id;
         self.next_tab_id += 1;
 
@@ -1006,6 +1031,78 @@ impl AlmostThereApp {
         self.status = format!("Opened tab {id}: {url}");
         self.start_navigation(url, None, NavigationHistoryAction::AddEntry);
         ctx.request_repaint();
+    }
+
+    fn show_preferences_window(&mut self, ctx: &egui::Context) {
+        if !self.preferences_open {
+            return;
+        }
+
+        let mut open = self.preferences_open;
+        egui::Window::new("Preferences")
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("homepage");
+                    ui.add_sized(
+                        [360.0, 24.0],
+                        egui::TextEdit::singleline(&mut self.preferences_homepage_input),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("tabpage");
+                    ui.add_sized(
+                        [360.0, 24.0],
+                        egui::TextEdit::singleline(&mut self.preferences_tabpage_input),
+                    );
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        let defaults = BrowserPreferences::default();
+                        let homepage = self.preferences_homepage_input.trim();
+                        let tabpage = self.preferences_tabpage_input.trim();
+                        self.preferences = BrowserPreferences {
+                            homepage: if homepage.is_empty() {
+                                defaults.homepage
+                            } else {
+                                homepage.to_owned()
+                            },
+                            tabpage: if tabpage.is_empty() {
+                                defaults.tabpage
+                            } else {
+                                tabpage.to_owned()
+                            },
+                        };
+                        self.preferences_homepage_input = self.preferences.homepage.clone();
+                        self.preferences_tabpage_input = self.preferences.tabpage.clone();
+                        match save_preferences(&self.preferences) {
+                            Ok(()) => {
+                                self.status =
+                                    format!("Preferences saved: {}", preferences_path().display());
+                            }
+                            Err(error) => {
+                                self.status = format!("Preferences save failed: {error}");
+                            }
+                        }
+                    }
+                    if ui.button("Reset").clicked() {
+                        match load_preferences() {
+                            Ok(preferences) => {
+                                self.preferences = preferences.clone();
+                                self.preferences_homepage_input = preferences.homepage;
+                                self.preferences_tabpage_input = preferences.tabpage;
+                                self.status = "Preferences reloaded".to_owned();
+                            }
+                            Err(error) => {
+                                self.status = format!("Preferences reload failed: {error}");
+                            }
+                        }
+                    }
+                });
+            });
+        self.preferences_open = open;
     }
 
     fn duplicate_current_tab(&mut self, ctx: &egui::Context) {
@@ -7235,6 +7332,65 @@ fn save_history(history: &HistoryState) -> io::Result<()> {
     fs::write(path, history_to_json(history))
 }
 
+fn preferences_path() -> PathBuf {
+    PathBuf::from(PREFERENCES_PATH)
+}
+
+fn load_preferences() -> io::Result<BrowserPreferences> {
+    let path = preferences_path();
+    if !path.exists() {
+        return Ok(BrowserPreferences::default());
+    }
+    let text = fs::read_to_string(path)?;
+    Ok(parse_preferences_json(&text))
+}
+
+fn save_preferences(preferences: &BrowserPreferences) -> io::Result<()> {
+    let path = preferences_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, preferences_to_json(preferences))
+}
+
+fn parse_preferences_json(text: &str) -> BrowserPreferences {
+    let defaults = BrowserPreferences::default();
+    BrowserPreferences {
+        homepage: parse_json_string_field(text, "homepage")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(defaults.homepage),
+        tabpage: parse_json_string_field(text, "tabpage")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(defaults.tabpage),
+    }
+}
+
+fn preferences_to_json(preferences: &BrowserPreferences) -> String {
+    format!(
+        "{{\n  \"homepage\": \"{}\",\n  \"tabpage\": \"{}\"\n}}\n",
+        json_escape(&preferences.homepage),
+        json_escape(&preferences.tabpage)
+    )
+}
+
+fn history_entry_day(entry: &HistoryEntry) -> String {
+    entry
+        .visited_at
+        .get(..10)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("Unknown day")
+        .to_owned()
+}
+
+fn history_entry_time(entry: &HistoryEntry) -> String {
+    entry
+        .visited_at
+        .get(11..16)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("--:--")
+        .to_owned()
+}
+
 impl HistoryState {
     fn can_go_back(&self) -> bool {
         self.current_index.is_some_and(|index| index > 0)
@@ -7658,6 +7814,101 @@ impl App for AlmostThereApp {
 
         egui::TopBottomPanel::top("browser_toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                let history_menu_entries: Vec<(usize, String, String, String, String)> = self
+                    .history
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .map(|(index, entry)| {
+                        (
+                            index,
+                            history_entry_day(entry),
+                            history_entry_time(entry),
+                            entry.title.clone(),
+                            entry.url.clone(),
+                        )
+                    })
+                    .collect();
+                let mut history_to_open = None;
+                ui.menu_button(" ☰ ", |ui| {
+                    if ui.button("New Tab").clicked() {
+                        self.open_new_tab(None, ctx);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(self.history.can_go_back(), egui::Button::new("Back"))
+                        .clicked()
+                    {
+                        self.go_back(ctx);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(self.history.can_go_forward(), egui::Button::new("Forward"))
+                        .clicked()
+                    {
+                        self.go_forward(ctx);
+                        ui.close();
+                    }
+                    if ui.button("Reload").clicked() {
+                        self.reload_current(ctx);
+                        ui.close();
+                    }
+                    if ui
+                        .button(if self.render_debug.open {
+                            "Close Debug"
+                        } else {
+                            "Debug"
+                        })
+                        .clicked()
+                    {
+                        self.render_debug.open = !self.render_debug.open;
+                        if self.render_debug.open {
+                            self.render_debug.object_limit =
+                                self.document.canvas_graph.objects.len();
+                        }
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.menu_button("History", |ui| {
+                        if history_menu_entries.is_empty() {
+                            ui.add_enabled(false, egui::Button::new("No history"));
+                            return;
+                        }
+                        egui::ScrollArea::vertical()
+                            .max_height(420.0)
+                            .show(ui, |ui| {
+                                let mut current_day = String::new();
+                                for (index, day, time, title, url) in &history_menu_entries {
+                                    if *day != current_day {
+                                        if !current_day.is_empty() {
+                                            ui.separator();
+                                        }
+                                        current_day = day.clone();
+                                        ui.label(egui::RichText::new(day).strong());
+                                    }
+                                    let label = format!("{time} {title}");
+                                    if ui.button(label).on_hover_text(url).clicked() {
+                                        history_to_open = Some((*index, url.clone()));
+                                        ui.close();
+                                    }
+                                }
+                            });
+                    });
+                    if ui.button("Preferences").clicked() {
+                        self.preferences_open = true;
+                        ui.close();
+                    }
+                });
+                if let Some((index, url)) = history_to_open {
+                    self.url_input = url.clone();
+                    self.telemetry
+                        .emit("navigation.history.opened", &[("url", &url)]);
+                    self.status = format!("Loading {url}...");
+                    ctx.request_repaint();
+                    self.start_navigation(url, None, NavigationHistoryAction::TraverseTo(index));
+                }
+                ui.label("|");
                 if ui
                     .add_enabled(self.history.can_go_back(), egui::Button::new("←"))
                     .on_hover_text("Back")
@@ -7746,6 +7997,8 @@ impl App for AlmostThereApp {
                 }
             });
         });
+
+        self.show_preferences_window(ctx);
 
         egui::TopBottomPanel::bottom("browser_status").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -30752,6 +31005,19 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
             portable_bookmark_url(&url),
             "file:///[local]/sample_pages/test_basic_page.html"
         );
+    }
+
+    #[test]
+    fn preferences_json_round_trips_homepage_and_tabpage() {
+        let preferences = BrowserPreferences {
+            homepage: "https://example.com/home".to_owned(),
+            tabpage: "https://example.com/tab".to_owned(),
+        };
+        let text = preferences_to_json(&preferences);
+
+        assert!(text.contains("\"homepage\""));
+        assert!(text.contains("\"tabpage\""));
+        assert_eq!(parse_preferences_json(&text), preferences);
     }
 
     #[test]
