@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>184 Descendant Adjacent No Space Scoped Margin</title>
+<style>
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 16px Arial, sans-serif;
+  background: #f7f7f7;
+}
+.layout__content {
+  display: flex;
+  flex-direction: column;
+  width: 720px;
+}
+.above-fold-section {
+  height: 180px;
+  background: #5fbf7a;
+}
+.layout__content .above-fold-section+.claims-section[data-v-test] {
+  margin: 80px 0;
+}
+.claims-section {
+  min-height: 96px;
+  background: #2f4f6f;
+}
+.section-wrapper {
+  min-height: 96px;
+  background: #d7e8ff;
+}
+</style>
+</head>
+<body>
+<main class="layout__content">
+  <section class="above-fold-section"></section>
+  <section class="claims-section" data-v-test>
+    <div class="section-wrapper"></div>
+  </section>
+</main>
+</body>
+</html>

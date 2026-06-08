@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>182. Ecosia Ancestor Adjacent Claims Margin</title>
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body { background: #f6f7f9; font-family: system-ui, sans-serif; }
+.layout__content {
+  display: flex;
+  flex-direction: column;
+}
+.above-fold-section[data-v-test] {
+  display: flex;
+  position: relative;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  height: 320px;
+  margin: 0 8px 8px;
+  padding: 64px 0 40px;
+  border-radius: 20px;
+  background: #d7eb80;
+}
+.scroll-button {
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  width: 48px;
+  height: 48px;
+  transform: translate(-50%, 50%);
+  border-radius: 24px;
+  background: #2f9e44;
+}
+.layout__content .above-fold-section + .claims-section[data-v-test] {
+  margin: 5rem 0;
+}
+.claims-section[data-v-test] {
+  width: 100%;
+  min-height: 240px;
+  background: #18251d;
+  color: white;
+}
+.section-wrapper {
+  max-width: 960px;
+  min-height: 180px;
+  margin: 0 auto;
+  padding: 40px;
+  background: #51cf66;
+}
+.section-header {
+  min-height: 64px;
+  background: #4dabf7;
+}
+.cards {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 24px;
+  margin-top: 24px;
+}
+.card {
+  min-height: 80px;
+  background: #ffd43b;
+}
+</style>
+</head>
+<body>
+<main class="layout__content" data-v-test>
+  <section class="above-fold-section" data-v-test>
+    <div style="width: 320px; height: 56px; background: #f783ac;"></div>
+    <div class="scroll-button"></div>
+  </section>
+  <section class="claims-section" data-v-test>
+    <div class="section-wrapper">
+      <div class="section-header"></div>
+      <div class="cards">
+        <div class="card"></div>
+        <div class="card"></div>
+        <div class="card"></div>
+        <div class="card"></div>
+      </div>
+    </div>
+  </section>
+</main>
+</body>
+</html>

@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>183. Component Scope Wrapper Gap Margin</title>
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body { background: #f5f7fa; font-family: system-ui, sans-serif; }
+.layout__content {
+  display: flex;
+  flex-direction: column;
+}
+.above-fold-section {
+  position: relative;
+  height: 320px;
+  margin: 0 8px 8px;
+  border-radius: 20px;
+  background: #2b5b3f;
+}
+.hero-chip {
+  position: absolute;
+  left: 50%;
+  bottom: 56px;
+  width: 64px;
+  height: 86px;
+  transform: translateX(-50%);
+  border: 1px solid white;
+  border-radius: 10px;
+  background: #51cf66;
+}
+.scroll-button {
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  width: 48px;
+  height: 48px;
+  transform: translate(-50%, 50%);
+  border-radius: 50%;
+  background: white;
+}
+.layout__content .above-fold-section + .claims-section[data-v-claim] {
+  margin: 5rem 0;
+}
+.claims-section {
+  width: 100%;
+  min-height: 280px;
+  background: white;
+}
+.section-wrapper {
+  max-width: 960px;
+  min-height: 220px;
+  margin: 0 auto;
+  padding: 0 40px;
+  background: #f783ac;
+}
+.section-header {
+  min-height: 96px;
+  background: #4dabf7;
+}
+.claims-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 24px;
+  margin-top: 24px;
+}
+.claim {
+  min-height: 84px;
+  background: #ffd43b;
+}
+</style>
+</head>
+<body>
+<main class="layout__content">
+  <section class="above-fold-section">
+    <div class="hero-chip"></div>
+    <div class="scroll-button"></div>
+  </section>
+  <div class="claims-section">
+    <section class="section-wrapper claims-section" data-v-claim>
+      <div class="section-header"></div>
+      <div class="claims-grid">
+        <div class="claim"></div>
+        <div class="claim"></div>
+        <div class="claim"></div>
+        <div class="claim"></div>
+      </div>
+    </section>
+  </div>
+</main>
+</body>
+</html>

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>179. Grid Fr Percent Width Cards</title>
+<style>
+:root { --line: rgba(20,30,40,.2); }
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body { padding: 24px; font-family: sans-serif; background: #f7f8fa; }
+.label { position: fixed; right: 12px; bottom: 12px; padding: 6px 8px; background: rgba(255,255,255,.9); border: 1px solid var(--line); font-size: 12px; }
+.grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 40px; width: 960px; margin: 0 auto; padding: 0; list-style: none; background: #e9ecef; }
+.card { width: 100%; min-height: 110px; padding: 12px; border: 1px solid var(--line); font-weight: 700; }
+.a { background: #ff6b6b; }
+.b { background: #ffd43b; }
+.c { background: #51cf66; }
+.d { background: #4dabf7; }
+</style>
+</head>
+<body>
+<ol class="grid">
+  <li class="card a">one</li>
+  <li class="card b">two</li>
+  <li class="card c">three</li>
+  <li class="card d">four</li>
+</ol>
+<div class="label">179 grid fr percent width cards</div>
+</body>
+</html>

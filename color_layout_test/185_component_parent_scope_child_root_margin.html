@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>185 Component Parent Scope Child Root Margin</title>
+<style>
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: #f4f6f8;
+}
+.layout__content[data-v-layout] {
+  display: flex;
+  flex-direction: column;
+  width: 720px;
+}
+.above-fold-section {
+  height: 180px;
+  background: #79c58a;
+}
+.layout__content .above-fold-section+.claims-section[data-v-layout] {
+  margin-top: 80px;
+  margin-bottom: 80px;
+}
+.claims-section {
+  min-height: 96px;
+  background: #345f89;
+}
+.section-wrapper {
+  min-height: 96px;
+  background: #dcecff;
+}
+</style>
+</head>
+<body>
+<main class="layout__content" data-v-layout>
+  <section class="above-fold-section"></section>
+  <section class="claims-section" data-v-claims>
+    <div class="section-wrapper"></div>
+  </section>
+</main>
+</body>
+</html>

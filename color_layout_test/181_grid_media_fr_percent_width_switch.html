@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>181. Grid Media Fr Percent Width Switch</title>
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body { padding: 24px; font-family: sans-serif; background: #f7f8fa; }
+.grid { display: grid; grid-template-columns: 1fr; gap: 40px; width: 960px; margin: 0 auto; padding: 0; list-style: none; background: #dee2e6; }
+@media only screen and (min-width: 48rem) { .grid { grid-template-columns: repeat(2, 1fr); gap: 16px; } }
+@media only screen and (min-width: 67.5rem) { .grid { grid-template-columns: repeat(4, 1fr); gap: 40px; } }
+.item { width: 100%; min-height: 90px; padding: 10px; font-weight: 700; color: #17212b; }
+.one { background: #ff8787; }
+.two { background: #fcc419; }
+.three { background: #69db7c; }
+.four { background: #74c0fc; }
+</style>
+</head>
+<body>
+<ol class="grid">
+  <li class="item one">one</li>
+  <li class="item two">two</li>
+  <li class="item three">three</li>
+  <li class="item four">four</li>
+</ol>
+</body>
+</html>

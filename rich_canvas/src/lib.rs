@@ -4603,7 +4603,7 @@ fn media_query_matches_viewport(query: &str, viewport_width: f32) -> bool {
     let mut matched_any_constraint = false;
     let mut matched_supported_media_type = false;
     for part in query.split("and") {
-        let part = part.trim().trim_matches(|ch| ch == '(' || ch == ')').trim();
+        let part = strip_outer_media_condition_parens(part.trim()).trim();
         if part.is_empty() {
             continue;
         }
@@ -4657,6 +4657,15 @@ fn media_query_matches_viewport(query: &str, viewport_width: f32) -> bool {
         return false;
     }
     matched_any_constraint || matched_supported_media_type
+}
+
+fn strip_outer_media_condition_parens(value: &str) -> &str {
+    let value = value.trim();
+    if value.starts_with('(') && value.ends_with(')') {
+        &value[1..value.len().saturating_sub(1)]
+    } else {
+        value
+    }
 }
 
 fn parse_css_media_length_px(value: &str) -> Option<f32> {
@@ -5476,7 +5485,7 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
 
     if let Some((left, right)) = split_selector_once(&selector, '+') {
         let right = parse_simple_css_selector(right)?;
-        let (parent, previous_sibling) = parse_previous_sibling_selector(left)?;
+        let (parent, ancestor_chain, previous_sibling) = parse_sibling_selector_context(left)?;
         return Some(CssSelector {
             tag: right.tag,
             id: right.id,
@@ -5489,7 +5498,7 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             is_selectors: right.is_selectors,
             where_selectors: right.where_selectors,
             ancestor_path: Vec::new(),
-            ancestor_chain: Vec::new(),
+            ancestor_chain,
             ancestor: None,
             parent,
             previous_sibling: Some(previous_sibling),
@@ -5500,7 +5509,7 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
 
     if let Some((left, right)) = split_selector_once(&selector, '~') {
         let right = parse_simple_css_selector(right)?;
-        let (parent, previous_sibling) = parse_previous_sibling_selector(left)?;
+        let (parent, ancestor_chain, previous_sibling) = parse_sibling_selector_context(left)?;
         return Some(CssSelector {
             tag: right.tag,
             id: right.id,
@@ -5513,7 +5522,7 @@ fn parse_css_selector(selector: &str) -> Option<CssSelector> {
             is_selectors: right.is_selectors,
             where_selectors: right.where_selectors,
             ancestor_path: Vec::new(),
-            ancestor_chain: Vec::new(),
+            ancestor_chain,
             ancestor: None,
             parent,
             previous_sibling: Some(previous_sibling),
@@ -5758,6 +5767,29 @@ fn parse_previous_sibling_selector(
     } else {
         Some((None, parse_simple_css_selector(selector)?))
     }
+}
+
+fn parse_sibling_selector_context(
+    selector: &str,
+) -> Option<(
+    Option<SimpleCssSelector>,
+    Vec<SimpleCssSelector>,
+    SimpleCssSelector,
+)> {
+    if let Some((ancestors, previous_sibling)) = split_descendant_selector(selector) {
+        let ancestor_chain = ancestors
+            .iter()
+            .map(|ancestor| parse_simple_css_selector(ancestor))
+            .collect::<Option<Vec<_>>>()?;
+        return Some((
+            None,
+            ancestor_chain,
+            parse_simple_css_selector(previous_sibling)?,
+        ));
+    }
+
+    let (parent, previous_sibling) = parse_previous_sibling_selector(selector)?;
+    Some((parent, Vec::new(), previous_sibling))
 }
 
 fn parse_simple_css_selector(selector: &str) -> Option<SimpleCssSelector> {
@@ -6508,63 +6540,54 @@ fn parse_css_box_style_with_vars(
                 seen |= style.flex_direction.is_some() || style.flex_wrap.is_some();
             }
             "justify-content" => {
-                style.justify_content = match value {
-                    "center" => Some(CssJustifyContent::Center),
-                    "space-between" => Some(CssJustifyContent::SpaceBetween),
-                    "flex-start" | "start" | "left" | "normal" => {
-                        Some(CssJustifyContent::FlexStart)
-                    }
-                    _ => None,
-                };
+                style.justify_content = parse_justify_content(value);
                 seen |= style.justify_content.is_some();
             }
             "align-items" => {
-                style.align_items = match value {
-                    "center" => Some(CssAlignItems::Center),
-                    "flex-start" | "start" | "normal" => Some(CssAlignItems::FlexStart),
-                    "stretch" => Some(CssAlignItems::Stretch),
-                    _ => None,
-                };
+                style.align_items = parse_align_items(value);
                 seen |= style.align_items.is_some();
             }
             "align-self" => {
                 style.align_self = match value {
-                    "auto" | "normal" => None,
+                    "auto" | "normal" | "initial" | "unset" | "revert" => None,
                     "center" => Some(CssAlignItems::Center),
                     "flex-start" | "start" | "self-start" => Some(CssAlignItems::FlexStart),
                     "stretch" => Some(CssAlignItems::Stretch),
                     _ => None,
                 };
-                seen |= value.eq_ignore_ascii_case("auto") || style.align_self.is_some();
+                seen |= matches!(value, "auto" | "normal" | "initial" | "unset" | "revert")
+                    || style.align_self.is_some();
             }
             "justify-items" => {
-                style.justify_items = match value {
-                    "center" => Some(CssJustifyContent::Center),
-                    "start" | "flex-start" | "left" | "normal" => {
-                        Some(CssJustifyContent::FlexStart)
-                    }
-                    "stretch" => Some(CssJustifyContent::FlexStart),
-                    _ => None,
-                };
+                style.justify_items = parse_justify_items(value);
                 seen |= style.justify_items.is_some();
             }
             "align-content" => {
-                style.align_content = match value {
-                    "center" => Some(CssAlignItems::Center),
-                    "start" | "flex-start" | "normal" => Some(CssAlignItems::FlexStart),
-                    "stretch" => Some(CssAlignItems::Stretch),
-                    _ => None,
-                };
+                style.align_content = parse_align_items(value);
                 seen |= style.align_content.is_some();
             }
             "place-items" => {
                 let values = split_css_value_list(value);
-                if values
-                    .iter()
-                    .any(|value| value.trim().eq_ignore_ascii_case("center"))
+                if let Some(align) = values.first().and_then(|value| parse_align_items(value)) {
+                    style.align_items = Some(align);
+                    seen = true;
+                }
+                let justify_value = values.get(1).or_else(|| values.first());
+                if let Some(justify) = justify_value.and_then(|value| parse_justify_items(value)) {
+                    style.justify_items = Some(justify);
+                    seen = true;
+                }
+            }
+            "place-content" => {
+                let values = split_css_value_list(value);
+                if let Some(align) = values.first().and_then(|value| parse_align_items(value)) {
+                    style.align_content = Some(align);
+                    seen = true;
+                }
+                let justify_value = values.get(1).or_else(|| values.first());
+                if let Some(justify) = justify_value.and_then(|value| parse_justify_content(value))
                 {
-                    style.align_items = Some(CssAlignItems::Center);
-                    style.justify_items = Some(CssJustifyContent::Center);
+                    style.justify_content = Some(justify);
                     seen = true;
                 }
             }
@@ -7042,6 +7065,36 @@ fn parse_flex_wrap(value: &str) -> Option<CssFlexWrap> {
     match value.trim() {
         "wrap" | "wrap-reverse" => Some(CssFlexWrap::Wrap),
         "nowrap" => Some(CssFlexWrap::NoWrap),
+        _ => None,
+    }
+}
+
+fn parse_justify_content(value: &str) -> Option<CssJustifyContent> {
+    match value.trim() {
+        "center" => Some(CssJustifyContent::Center),
+        "space-between" => Some(CssJustifyContent::SpaceBetween),
+        "flex-start" | "start" | "left" | "normal" | "initial" | "unset" | "revert" => {
+            Some(CssJustifyContent::FlexStart)
+        }
+        _ => None,
+    }
+}
+
+fn parse_justify_items(value: &str) -> Option<CssJustifyContent> {
+    match value.trim() {
+        "center" => Some(CssJustifyContent::Center),
+        "start" | "flex-start" | "left" | "normal" | "stretch" | "initial" | "unset" | "revert" => {
+            Some(CssJustifyContent::FlexStart)
+        }
+        _ => None,
+    }
+}
+
+fn parse_align_items(value: &str) -> Option<CssAlignItems> {
+    match value.trim() {
+        "center" => Some(CssAlignItems::Center),
+        "flex-start" | "start" | "self-start" => Some(CssAlignItems::FlexStart),
+        "stretch" | "normal" | "initial" | "unset" | "revert" => Some(CssAlignItems::Stretch),
         _ => None,
     }
 }
@@ -9346,6 +9399,64 @@ mod tests {
 
         let auto = computed_box_style(&style, &key("auto"));
         assert_eq!(auto.align_self, None);
+    }
+
+    #[test]
+    fn parse_basic_css_alignment_unset_resets_supported_non_inherited_properties() {
+        let style = parse_basic_css(
+            r#"
+            .tabs {
+                justify-content: center;
+                align-items: center;
+                justify-items: center;
+                align-content: center;
+            }
+            .tabs {
+                justify-content: unset;
+                align-items: unset;
+                justify-items: unset;
+                align-content: unset;
+            }
+            "#,
+        );
+        let key = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["tabs".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let computed = computed_box_style(&style, &key);
+
+        assert_eq!(computed.justify_content, Some(CssJustifyContent::FlexStart));
+        assert_eq!(computed.align_items, Some(CssAlignItems::Stretch));
+        assert_eq!(computed.justify_items, Some(CssJustifyContent::FlexStart));
+        assert_eq!(computed.align_content, Some(CssAlignItems::Stretch));
+    }
+
+    #[test]
+    fn parse_basic_css_mobile_range_alignment_override_survives_unset_base() {
+        let css = r#"
+        .tabs { justify-content: unset; }
+        @media only screen and (width <= calc(67.5rem - 1px)) {
+            .tabs { justify-content: center; }
+        }
+        "#;
+        let key = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["tabs".to_owned()],
+            ..ElementStyleKey::default()
+        };
+
+        let mobile = parse_basic_css_for_viewport(css, 760.0);
+        let desktop = parse_basic_css_for_viewport(css, 1280.0);
+
+        assert_eq!(
+            computed_box_style(&mobile, &key).justify_content,
+            Some(CssJustifyContent::Center)
+        );
+        assert_eq!(
+            computed_box_style(&desktop, &key).justify_content,
+            Some(CssJustifyContent::FlexStart)
+        );
     }
 
     #[test]

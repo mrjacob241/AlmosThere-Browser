@@ -4957,7 +4957,8 @@ fn parse_html_document_from_live_html(
     );
     let live_html = remove_non_visual_metadata_elements(live_html);
     emit_global_telemetry("document.dom_parse.start", &[("source", source)]);
-    let dom = parse_dom_document(&live_html);
+    let mut dom = parse_dom_document(&live_html);
+    normalize_component_scope_attributes(&mut dom);
     emit_global_telemetry("document.dom_parse.finish", &[("source", source)]);
     let title = dom
         .first_descendant_by_tag("title")
@@ -6968,13 +6969,7 @@ fn seed_script_dom_state_from_nodes(
             _ => None,
         };
         let id = tag_alias.unwrap_or(effective_id);
-        let mut attributes = std::collections::HashMap::new();
-        if element.attr("id").is_some() {
-            attributes.insert("id".to_owned(), effective_id.to_owned());
-        }
-        if let Some(classes) = element.attr("class") {
-            attributes.insert("class".to_owned(), classes.to_owned());
-        }
+        let attributes = dom_element_attribute_map(element, effective_id);
         let text_content = dom_node_text_content(&element.children);
         let alias_parent_id = if tag_alias.is_some() && effective_id != id {
             Some(effective_id)
@@ -6999,6 +6994,107 @@ fn seed_script_dom_state_from_nodes(
         }
         seed_script_dom_state_from_nodes(&element.children, state, Some(id));
     }
+}
+
+fn dom_element_attribute_map(
+    element: &DomElement,
+    effective_id: &str,
+) -> std::collections::HashMap<String, String> {
+    let mut attributes = std::collections::HashMap::new();
+    for attribute in &element.attributes {
+        attributes.insert(attribute.name.clone(), attribute.value.clone());
+    }
+    if element.attr("id").is_some() {
+        attributes.insert("id".to_owned(), effective_id.to_owned());
+    }
+    attributes
+}
+
+fn normalize_component_scope_attributes(document: &mut DomDocument) {
+    for child in &mut document.children {
+        normalize_component_scope_attributes_in_node(child);
+    }
+}
+
+fn normalize_component_scope_attributes_in_node(node: &mut DomNode) {
+    let DomNode::Element(element) = node else {
+        return;
+    };
+
+    for child in &mut element.children {
+        normalize_component_scope_attributes_in_node(child);
+    }
+
+    let parent_scopes = element
+        .attributes
+        .iter()
+        .filter(|attribute| dom_is_component_scope_attribute(&attribute.name))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !parent_scopes.is_empty() {
+        for child in &mut element.children {
+            let DomNode::Element(child) = child else {
+                continue;
+            };
+            for scope in &parent_scopes {
+                if !child.has_attr(&scope.name) {
+                    child.attributes.push(scope.clone());
+                }
+            }
+        }
+    }
+
+    let parent_classes = dom_class_tokens(element);
+    if parent_classes.is_empty() {
+        return;
+    }
+
+    let mut inherited_scopes = Vec::new();
+    for child in &element.children {
+        let DomNode::Element(child) = child else {
+            continue;
+        };
+        if !dom_elements_share_class_tokens(&parent_classes, child) {
+            continue;
+        }
+        for attribute in &child.attributes {
+            if dom_is_component_scope_attribute(&attribute.name)
+                && !element.has_attr(&attribute.name)
+                && !inherited_scopes
+                    .iter()
+                    .any(|existing: &DomAttribute| existing.name == attribute.name)
+            {
+                inherited_scopes.push(attribute.clone());
+            }
+        }
+    }
+
+    element.attributes.extend(inherited_scopes);
+}
+
+fn dom_class_tokens(element: &DomElement) -> Vec<String> {
+    element
+        .attr("class")
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn dom_elements_share_class_tokens(parent_classes: &[String], child: &DomElement) -> bool {
+    child
+        .attr("class")
+        .unwrap_or_default()
+        .split_whitespace()
+        .any(|child_class| {
+            parent_classes
+                .iter()
+                .any(|parent_class| parent_class == child_class)
+        })
+}
+
+fn dom_is_component_scope_attribute(name: &str) -> bool {
+    name.starts_with("data-v-")
 }
 
 fn dom_node_text_content(nodes: &[DomNode]) -> String {
@@ -10467,7 +10563,8 @@ fn parse_html_document_with_text_metrics(
     let html = script_result.html;
     let css = collect_document_stylesheets(&html, source).unwrap_or_default();
     let html = remove_non_visual_metadata_elements(&html);
-    let dom = parse_dom_document(&html);
+    let mut dom = parse_dom_document(&html);
+    normalize_component_scope_attributes(&mut dom);
     let title = dom
         .first_descendant_by_tag("title")
         .map(DomElement::text_content)
@@ -10546,7 +10643,8 @@ fn parse_render_graph_debug_dump_from_live_html(live_html: &str, source: &str) -
     }
     let html = remove_non_visual_metadata_elements(&html);
     emit_global_telemetry("render_graph_debug.dom_parse.start", &[("source", source)]);
-    let dom = parse_dom_document(&html);
+    let mut dom = parse_dom_document(&html);
+    normalize_component_scope_attributes(&mut dom);
     emit_global_telemetry("render_graph_debug.dom_parse.finish", &[("source", source)]);
     let root_classes = document_theme_root_classes(&dom, None);
     emit_global_telemetry("render_graph_debug.css_parse.start", &[("source", source)]);
@@ -10599,8 +10697,19 @@ fn pipeline_trace_debug_dump(html: &str, source: &str, needle: &str) -> String {
 
     let html_after_scripts = script_result.html;
     let css = collect_document_stylesheets(&html_after_scripts, source).unwrap_or_default();
+    push_css_occurrence_trace(
+        &css,
+        &[
+            "above-fold-section+.claims-section",
+            "above-fold-section + .claims-section",
+            ".claims-section",
+            "section-wrapper--compact",
+        ],
+        &mut out,
+    );
     let html_visual = remove_non_visual_metadata_elements(&html_after_scripts);
-    let dom = parse_dom_document(&html_visual);
+    let mut dom = parse_dom_document(&html_visual);
+    normalize_component_scope_attributes(&mut dom);
     push_dom_trace(&dom, needle, &mut out);
 
     let root_classes = document_theme_root_classes(&dom, None);
@@ -10636,6 +10745,44 @@ fn pipeline_trace_debug_dump(html: &str, source: &str, needle: &str) -> String {
     push_canvas_graph_trace(&canvas_graph, needle, &mut out);
 
     out
+}
+
+fn push_css_occurrence_trace(css: &str, needles: &[&str], out: &mut String) {
+    use std::fmt::Write as _;
+
+    let _ = writeln!(out, "## CSS Occurrences");
+    let haystack = css.to_ascii_lowercase();
+    let mut count = 0usize;
+    for needle in needles {
+        let needle_lower = needle.to_ascii_lowercase();
+        let mut offset = 0usize;
+        let mut per_needle = 0usize;
+        while !needle_lower.is_empty() && per_needle < 8 && count < 40 {
+            let Some(relative) = haystack[offset..].find(&needle_lower) else {
+                break;
+            };
+            let index = offset + relative;
+            let start = clamp_to_char_boundary(css, index.saturating_sub(160), false);
+            let end =
+                clamp_to_char_boundary(css, (index + needle.len() + 220).min(css.len()), true);
+            let snippet = css[start..end]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let _ = writeln!(
+                out,
+                "- needle={needle:?} byte={index}: {}",
+                shorten_debug_text(&snippet)
+            );
+            offset = index + needle_lower.len();
+            per_needle += 1;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        let _ = writeln!(out, "no CSS occurrences");
+    }
+    let _ = writeln!(out);
 }
 
 fn trace_matches(value: &str, needle: &str) -> bool {
@@ -10784,7 +10931,7 @@ fn dom_trace_attr_text(element: &DomElement) -> String {
             matches!(
                 attr.name.as_str(),
                 "id" | "class" | "href" | "role" | "data-test-id" | "aria-label" | "style"
-            )
+            ) || attr.name.starts_with("data-v-")
         })
         .map(|attr| format!("{}={}", attr.name, shorten_debug_text(&attr.value)))
         .collect::<Vec<_>>()
@@ -14089,8 +14236,13 @@ fn css_grid_preferred_content_width(
                 let span = (bounds.3.saturating_sub(bounds.2) + 1)
                     .max(1)
                     .min(columns - column);
-                let preferred = css_layout_preferred_outer_width(child, text_metrics)
-                    .max(css_layout_minimum_outer_width(child));
+                let track = box_
+                    .style
+                    .grid_template_column_tracks
+                    .as_ref()
+                    .and_then(|tracks| tracks.get(column).copied())
+                    .unwrap_or(CssLength::Auto);
+                let preferred = css_grid_track_child_intrinsic_width(child, track, text_metrics);
                 if span == 1 {
                     column_widths[column] = column_widths[column].max(preferred);
                 } else {
@@ -14130,8 +14282,13 @@ fn css_grid_preferred_content_width(
             continue;
         };
         let span = placement.column_span.max(1).min(columns - placement.column);
-        let preferred = css_layout_preferred_outer_width(child, text_metrics)
-            .max(css_layout_minimum_outer_width(child));
+        let track = box_
+            .style
+            .grid_template_column_tracks
+            .as_ref()
+            .and_then(|tracks| tracks.get(placement.column).copied())
+            .unwrap_or(CssLength::Auto);
+        let preferred = css_grid_track_child_intrinsic_width(child, track, text_metrics);
         if span == 1 {
             column_widths[placement.column] = column_widths[placement.column].max(preferred);
         } else {
@@ -14841,9 +14998,9 @@ fn css_grid_auto_column_base_widths(
         if !matches!(tracks[placement.column], CssLength::Auto | CssLength::Fr(_)) {
             continue;
         }
-        widths[placement.column] = widths[placement.column]
-            .max(css_layout_preferred_outer_width(child, text_metrics))
-            .max(css_layout_minimum_outer_width(child));
+        widths[placement.column] = widths[placement.column].max(
+            css_grid_track_child_intrinsic_width(child, tracks[placement.column], text_metrics),
+        );
     }
 
     widths
@@ -14856,6 +15013,47 @@ fn css_layout_minimum_outer_width(box_: &CssLayoutBox<'_>) -> f32 {
         + box_.style.border_width * 2.0
         + box_.style.padding.left
         + box_.style.padding.right
+}
+
+fn css_grid_track_child_intrinsic_width(
+    child: &CssLayoutBox<'_>,
+    track: CssLength,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    match track {
+        CssLength::Fr(_) => css_grid_child_min_track_contribution(child),
+        CssLength::Auto => css_layout_preferred_outer_width(child, text_metrics)
+            .max(css_grid_child_min_track_contribution(child)),
+        _ => css_layout_preferred_outer_width(child, text_metrics)
+            .max(css_grid_child_min_track_contribution(child)),
+    }
+}
+
+fn css_grid_child_min_track_contribution(child: &CssLayoutBox<'_>) -> f32 {
+    let style = &child.style;
+    let horizontal_extras = style.margin.left
+        + style.margin.right
+        + style.border_width * 2.0
+        + style.padding.left
+        + style.padding.right;
+    let mut content = css_used_content_min_width(style, 0.0);
+    if style.width_percent.is_none() {
+        if let Some(width) = style.width {
+            content = content.max(css_used_content_box_extent(
+                width,
+                css_style_horizontal_border_padding(style),
+                style.box_sizing_border_box,
+            ));
+        }
+    }
+    if let Some(max_width) = style.max_width {
+        content = content.min(css_used_content_box_extent(
+            max_width,
+            css_style_horizontal_border_padding(style),
+            style.box_sizing_border_box,
+        ));
+    }
+    content + horizontal_extras
 }
 
 fn css_resolve_grid_column_tracks(
@@ -23315,6 +23513,77 @@ mod tests {
     }
 
     #[test]
+    fn script_dom_seeding_preserves_non_class_attributes_for_scoped_css() {
+        let document = parse_dom_document(
+            r#"<html><body><div id="hero" class="claims-section" data-v-af835620 data-test-id="claims" aria-expanded="false">Why choose Ecosia?</div></body></html>"#,
+        );
+        let element = document.first_descendant_by_tag("div").unwrap();
+        let attributes = dom_element_attribute_map(element, &element.effective_id());
+
+        assert_eq!(
+            attributes.get("class").map(String::as_str),
+            Some("claims-section")
+        );
+        assert_eq!(
+            attributes.get("data-v-af835620").map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            attributes.get("data-test-id").map(String::as_str),
+            Some("claims")
+        );
+        assert_eq!(
+            attributes.get("aria-expanded").map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn component_scope_normalization_repairs_wrapper_scope_from_matching_child() {
+        let mut document = parse_dom_document(
+            r#"<html><body><div class="claims-section"><section class="section-wrapper claims-section" data-v-claim>Why choose Ecosia?</section></div></body></html>"#,
+        );
+        normalize_component_scope_attributes(&mut document);
+        let wrapper = document.first_descendant_by_tag("div").unwrap();
+
+        assert!(
+            wrapper.has_attr("data-v-claim"),
+            "wrapper should inherit the component scope marker carried by a same-class child"
+        );
+    }
+
+    #[test]
+    fn component_scope_normalization_applies_parent_scope_to_direct_child_roots() {
+        let mut document = parse_dom_document(
+            r#"<html><body><div class="layout__content" data-v-layout><div class="above-fold-section"></div><div class="claims-section" data-v-claims></div></div></body></html>"#,
+        );
+        normalize_component_scope_attributes(&mut document);
+        let layout = document
+            .first_descendant_by_tag("div")
+            .expect("layout wrapper");
+        let claims = layout
+            .children
+            .iter()
+            .filter_map(|child| match child {
+                DomNode::Element(element) if element.attr("class") == Some("claims-section") => {
+                    Some(element)
+                }
+                _ => None,
+            })
+            .next()
+            .expect("claims child");
+
+        assert!(
+            claims.has_attr("data-v-layout"),
+            "direct child roots should retain the parent component scope for scoped child-root selectors"
+        );
+        assert!(
+            claims.has_attr("data-v-claims"),
+            "existing child component scope should be preserved"
+        );
+    }
+
+    #[test]
     fn dom_parser_keeps_angle_brackets_inside_quoted_attributes() {
         let document = parse_dom_document(
             r#"<html><body><input type="submit" value="<input type=submit>"><p>After</p></body></html>"#,
@@ -25973,6 +26242,75 @@ mod tests {
     }
 
     #[test]
+    fn flex_navigation_justify_content_unset_resets_desktop_centering() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  * { box-sizing: border-box; }
+                  body { margin: 0; }
+                  .nav {
+                    display: flex;
+                    gap: 12px;
+                    align-items: center;
+                    justify-content: center;
+                    width: 760px;
+                    padding: 8px;
+                    background: #eeeeee;
+                  }
+                  @media only screen and (min-width: 67.5rem) {
+                    .nav { justify-content: unset; }
+                  }
+                  .tabs {
+                    display: flex;
+                    flex: 0;
+                    gap: 2px;
+                    height: 40px;
+                    margin: 0;
+                    padding: 4px;
+                    list-style: none;
+                  }
+                  .item {
+                    display: flex;
+                    flex-grow: 0;
+                    min-width: 48px;
+                    align-items: center;
+                    justify-content: center;
+                  }
+                  .link {
+                    display: flex;
+                    align-items: center;
+                    gap: 4px;
+                    width: 100%;
+                    padding: 8px 11px;
+                  }
+                  .icon { flex: 0 0 auto; width: 16px; height: 16px; }
+                </style>
+              </head>
+              <body>
+                <nav class="nav">
+                  <ul class="tabs">
+                    <li class="item"><a class="link" href="#"><span class="icon"></span><span>Web</span></a></li>
+                    <li class="item"><a class="link" href="#"><span class="icon"></span><span>Images</span></a></li>
+                    <li class="item"><a class="link" href="#"><span class="icon"></span><span>Videos</span></a></li>
+                  </ul>
+                </nav>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let web = find_canvas_text(&document.canvas_graph, "Web").expect("Web");
+        assert!(
+            web.rect.left() < 48.0,
+            "desktop justify-content: unset should reset inherited center drift: {:?}",
+            web.rect
+        );
+    }
+
+    #[test]
     fn inherited_list_style_none_suppresses_list_item_markers() {
         let document = parse_html_document(
             r#"
@@ -26397,6 +26735,343 @@ mod tests {
         assert!(two.rect.left() > one.rect.right());
         assert!(three.rect.top() > one.rect.top());
         assert!(three.rect.left() <= one.rect.left() + 1.0);
+    }
+
+    #[test]
+    fn fr_grid_tracks_ignore_cyclic_percent_item_width_for_intrinsic_base() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  * { box-sizing: border-box; }
+                  body { padding: 0; margin: 0; }
+                  .claims {
+                    display: grid;
+                    grid-template-columns: repeat(4, 1fr);
+                    gap: 40px;
+                    width: 960px;
+                    margin: 0;
+                    padding: 0;
+                    list-style: none;
+                  }
+                  .claim {
+                    width: 100%;
+                    min-height: 80px;
+                    background: #333333;
+                    padding: 8px;
+                  }
+                </style>
+              </head>
+              <body>
+                <ol class="claims">
+                  <li class="claim">One</li>
+                  <li class="claim">Two</li>
+                  <li class="claim">Three</li>
+                  <li class="claim">Four</li>
+                </ol>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let cards = document
+            .canvas_graph
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0x33, 0x33, 0x33) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(cards.len(), 4, "expected four cards: {cards:?}");
+        assert!(
+            cards
+                .iter()
+                .all(|rect| (180.0..=230.0).contains(&rect.width())),
+            "1fr columns should divide available width instead of using 100% child widths: {cards:?}"
+        );
+        let right_edge = cards.iter().map(|rect| rect.right()).fold(0.0, f32::max);
+        assert!(
+            right_edge <= 961.0,
+            "four cards should remain inside the 960px grid, right edge was {right_edge}: {cards:?}"
+        );
+    }
+
+    #[test]
+    fn adjacent_sibling_margin_preserves_spacing_after_flex_hero() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .layout__content { display: flex; flex-direction: column; }
+                  .above-fold-section {
+                    display: flex;
+                    flex-direction: column;
+                    height: 200px;
+                    background: #51cf66;
+                  }
+                  .above-fold-section + .claims-section { margin: 5rem 0; }
+                  .claims-section { background: #1a1a1a; color: white; }
+                  .section-header { min-height: 40px; }
+                </style>
+              </head>
+              <body>
+                <div class="layout__content">
+                  <div class="above-fold-section">hero</div>
+                  <div class="claims-section">
+                    <div class="section-header">Why choose Ecosia?</div>
+                  </div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let hero = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x51, 0xcf, 0x66),
+        )
+        .expect("hero rect");
+        let claims = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x1a, 0x1a, 0x1a),
+        )
+        .expect("claims rect");
+
+        assert!(
+            claims.rect.top() - hero.rect.bottom() >= 79.0,
+            "adjacent sibling margin should keep a visible band after the hero: hero={:?} claims={:?}",
+            hero.rect,
+            claims.rect
+        );
+    }
+
+    #[test]
+    fn scoped_adjacent_sibling_margin_matches_attribute_selector() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .layout__content { display: flex; flex-direction: column; }
+                  .above-fold-section[data-v-af835620] {
+                    display: flex;
+                    height: 200px;
+                    background: #51cf66;
+                  }
+                  .above-fold-section + .claims-section[data-v-af835620] {
+                    margin: 5rem 0;
+                  }
+                  .claims-section[data-v-af835620] {
+                    background: #1a1a1a;
+                    color: white;
+                    min-height: 40px;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="layout__content" data-v-af835620>
+                  <div class="above-fold-section" data-v-af835620>hero</div>
+                  <div class="claims-section" data-v-af835620>Why choose Ecosia?</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let hero = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x51, 0xcf, 0x66),
+        )
+        .expect("hero rect");
+        let claims = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x1a, 0x1a, 0x1a),
+        )
+        .expect("claims rect");
+
+        assert!(
+            claims.rect.top() - hero.rect.bottom() >= 79.0,
+            "scoped adjacent sibling selector should match Ecosia-style data attributes: hero={:?} claims={:?}",
+            hero.rect,
+            claims.rect
+        );
+    }
+
+    #[test]
+    fn descendant_scoped_adjacent_sibling_margin_matches_ecosia_spacing_rule() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .layout__content { display: flex; flex-direction: column; }
+                  .above-fold-section[data-v-af835620] {
+                    display: flex;
+                    flex-direction: column;
+                    height: 200px;
+                    background: #51cf66;
+                  }
+                  .layout__content .above-fold-section+.claims-section[data-v-af835620] {
+                    margin: 5rem 0;
+                  }
+                  .claims-section[data-v-af835620] {
+                    background: #1a1a1a;
+                    color: white;
+                    min-height: 40px;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="layout__content" data-v-af835620>
+                  <div class="above-fold-section" data-v-af835620>hero</div>
+                  <div class="claims-section" data-v-af835620>Why choose Ecosia?</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let hero = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x51, 0xcf, 0x66),
+        )
+        .expect("hero rect");
+        let claims = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x1a, 0x1a, 0x1a),
+        )
+        .expect("claims rect");
+
+        assert!(
+            claims.rect.top() - hero.rect.bottom() >= 79.0,
+            "descendant-prefixed adjacent sibling selector should preserve the Ecosia hero/claims gap: hero={:?} claims={:?}",
+            hero.rect,
+            claims.rect
+        );
+    }
+
+    #[test]
+    fn scoped_adjacent_margin_survives_hydration_wrapper_scope_gap() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .layout__content { display: flex; flex-direction: column; }
+                  .above-fold-section {
+                    height: 200px;
+                    background: #51cf66;
+                  }
+                  .layout__content .above-fold-section + .claims-section[data-v-claim] {
+                    margin: 5rem 0;
+                  }
+                  .claims-section {
+                    min-height: 40px;
+                    background: #1a1a1a;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="layout__content">
+                  <div class="above-fold-section">hero</div>
+                  <div class="claims-section">
+                    <section class="claims-section" data-v-claim>Why choose Ecosia?</section>
+                  </div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let hero = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x51, 0xcf, 0x66),
+        )
+        .expect("hero rect");
+        let claims = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x1a, 0x1a, 0x1a),
+        )
+        .expect("claims rect");
+
+        assert!(
+            claims.rect.top() - hero.rect.bottom() >= 79.0,
+            "same-class child scope markers should repair wrapper scoped-selector matching: hero={:?} claims={:?}",
+            hero.rect,
+            claims.rect
+        );
+    }
+
+    #[test]
+    fn scoped_adjacent_margin_matches_parent_scope_on_child_component_root() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .layout__content[data-v-layout] {
+                    display: flex;
+                    flex-direction: column;
+                  }
+                  .above-fold-section {
+                    height: 200px;
+                    background: #51cf66;
+                  }
+                  .layout__content .above-fold-section+.claims-section[data-v-layout] {
+                    margin: 5rem 0;
+                  }
+                  .claims-section {
+                    min-height: 40px;
+                    background: #1a1a1a;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="layout__content" data-v-layout>
+                  <div class="above-fold-section">hero</div>
+                  <div class="claims-section" data-v-claims>Why choose Ecosia?</div>
+                </div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let hero = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x51, 0xcf, 0x66),
+        )
+        .expect("hero rect");
+        let claims = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x1a, 0x1a, 0x1a),
+        )
+        .expect("claims rect");
+
+        assert!(
+            claims.rect.top() - hero.rect.bottom() >= 79.0,
+            "parent component scope should apply to direct child roots for scoped adjacent rules: hero={:?} claims={:?}",
+            hero.rect,
+            claims.rect
+        );
     }
 
     #[test]
