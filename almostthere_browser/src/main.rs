@@ -7025,6 +7025,7 @@ fn normalize_component_scope_attributes_in_node(node: &mut DomNode) {
         normalize_component_scope_attributes_in_node(child);
     }
 
+    let parent_classes = dom_class_tokens(element);
     let parent_scopes = element
         .attributes
         .iter()
@@ -7036,6 +7037,17 @@ fn normalize_component_scope_attributes_in_node(node: &mut DomNode) {
             let DomNode::Element(child) = child else {
                 continue;
             };
+            let child_scopes = dom_component_scope_names(child);
+            let child_has_foreign_scope = child_scopes
+                .iter()
+                .any(|child_scope| !parent_scopes.iter().any(|scope| scope.name == *child_scope));
+            let child_can_be_component_root =
+                child_has_foreign_scope && !dom_elements_share_class_tokens(&parent_classes, child);
+            let child_can_be_same_component_repair =
+                child_scopes.is_empty() && parent_scopes.len() == 1;
+            if !child_can_be_component_root && !child_can_be_same_component_repair {
+                continue;
+            }
             for scope in &parent_scopes {
                 if !child.has_attr(&scope.name) {
                     child.attributes.push(scope.clone());
@@ -7044,7 +7056,6 @@ fn normalize_component_scope_attributes_in_node(node: &mut DomNode) {
         }
     }
 
-    let parent_classes = dom_class_tokens(element);
     if parent_classes.is_empty() {
         return;
     }
@@ -7078,6 +7089,15 @@ fn dom_class_tokens(element: &DomElement) -> Vec<String> {
         .unwrap_or_default()
         .split_whitespace()
         .map(str::to_owned)
+        .collect()
+}
+
+fn dom_component_scope_names(element: &DomElement) -> Vec<String> {
+    element
+        .attributes
+        .iter()
+        .filter(|attribute| dom_is_component_scope_attribute(&attribute.name))
+        .map(|attribute| attribute.name.clone())
         .collect()
 }
 
@@ -12640,7 +12660,8 @@ fn layout_css_box(
         }
     });
     let explicit_width = percent_width.or(box_.style.width);
-    let mut content_width = if let Some(width) = explicit_width {
+    let uses_shrink_to_fit_width = css_layout_box_uses_shrink_to_fit_width(box_);
+    let raw_content_width = if let Some(width) = explicit_width {
         if box_.style.box_sizing_border_box {
             (width - border_padding).max(1.0)
         } else {
@@ -12656,7 +12677,7 @@ fn layout_css_box(
         (containing_width - horizontal_non_content).max(1.0)
     } else if matches!(box_.kind, CssLayoutKind::Inline) {
         css_layout_preferred_content_width(box_, text_metrics)
-    } else if css_layout_box_uses_shrink_to_fit_width(box_) {
+    } else if uses_shrink_to_fit_width {
         css_layout_shrink_to_fit_content_width(
             box_,
             containing_width,
@@ -12667,8 +12688,12 @@ fn layout_css_box(
         )
     } else {
         (containing_width - horizontal_non_content).max(1.0)
+    };
+    let mut content_width = if uses_shrink_to_fit_width {
+        raw_content_width
+    } else {
+        raw_content_width.min(containing_width)
     }
-    .min(containing_width)
     .max(css_used_content_min_width(&box_.style, 1.0));
     if let Some(max_width) = css_style_max_width_for_containing(&box_.style, containing_width) {
         let max_content_width = if box_.style.box_sizing_border_box {
@@ -13292,6 +13317,8 @@ fn layout_css_flex_children(
         );
     }
 
+    let shrink_to_fit_column_cross_size =
+        !is_row && css_layout_box_uses_shrink_to_fit_width(container);
     let item_widths = if is_row {
         css_flex_row_item_widths(
             &flow_indices
@@ -13311,10 +13338,21 @@ fn layout_css_flex_children(
                     .style
                     .width
                     .or_else(|| css_style_max_width_for_containing(&child.style, content.width()));
+                let auto_width = if shrink_to_fit_column_cross_size {
+                    css_layout_preferred_outer_width(child, text_metrics)
+                        .max(css_layout_min_content_outer_width(child, text_metrics))
+                } else {
+                    content.width()
+                };
+                let max_width = if shrink_to_fit_column_cross_size {
+                    f32::INFINITY
+                } else {
+                    content.width()
+                };
                 let min_width = child.style.min_width.unwrap_or(0.0).max(0.0);
                 explicit_width
-                    .unwrap_or(content.width())
-                    .min(content.width())
+                    .unwrap_or(auto_width)
+                    .min(max_width)
                     .max(min_width)
                     .max(1.0)
             })
@@ -13354,6 +13392,9 @@ fn layout_css_flex_children(
     } else {
         content.width().max(cross_size)
     };
+    if shrink_to_fit_column_cross_size && available_cross > container.dimensions.content.width() {
+        container.dimensions.content.max.x = container.dimensions.content.min.x + available_cross;
+    }
     let available_main = if is_row {
         content.width()
     } else {
@@ -13992,8 +14033,9 @@ fn css_layout_shrink_to_fit_content_width(
     let preferred =
         css_layout_preferred_visual_replaced_outer_width(box_, source, image_height_auto)
             .unwrap_or_else(|| css_layout_preferred_content_width(box_, text_metrics));
+    let preferred_min = css_layout_min_content_width(box_, text_metrics);
     preferred
-        .min(available)
+        .min(available.max(preferred_min))
         .max(css_used_content_min_width(&box_.style, 1.0))
         .max(1.0)
 }
@@ -14180,6 +14222,112 @@ fn css_layout_preferred_outer_width(
         + box_.style.padding.right
 }
 
+fn css_layout_min_content_width(
+    box_: &CssLayoutBox<'_>,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    if let Some(width) = css_layout_definite_intrinsic_content_width(box_) {
+        return width;
+    }
+
+    match box_.kind {
+        CssLayoutKind::Text => box_
+            .text
+            .as_deref()
+            .map(|text| css_text_min_content_width(text_metrics, &normalize_ws(text), &box_.style))
+            .unwrap_or(1.0),
+        CssLayoutKind::Inline | CssLayoutKind::AnonymousBlock | CssLayoutKind::Block => {
+            if box_
+                .node
+                .is_some_and(css_layout_node_is_replaced_or_special)
+            {
+                return css_layout_preferred_content_width(box_, text_metrics);
+            }
+            if box_.style.display == CssDisplay::Flex
+                && box_.style.flex_direction == CssFlexDirection::Row
+            {
+                let flow_children = box_
+                    .children
+                    .iter()
+                    .filter(|child| !css_layout_box_is_out_of_flow(child))
+                    .collect::<Vec<_>>();
+                if !flow_children.is_empty() {
+                    return flow_children
+                        .iter()
+                        .map(|child| css_layout_min_content_outer_width(child, text_metrics))
+                        .sum::<f32>()
+                        + box_.style.gap.max(0.0) * flow_children.len().saturating_sub(1) as f32;
+                }
+            }
+            if box_.style.display == CssDisplay::Grid {
+                return css_grid_min_content_width(box_, text_metrics);
+            }
+            let child_widths = box_
+                .children
+                .iter()
+                .filter(|child| !css_layout_box_is_out_of_flow(child))
+                .map(|child| css_layout_min_content_outer_width(child, text_metrics));
+            if matches!(
+                box_.kind,
+                CssLayoutKind::Inline | CssLayoutKind::AnonymousBlock
+            ) {
+                child_widths.sum::<f32>().max(1.0)
+            } else {
+                child_widths.fold(1.0, f32::max)
+            }
+        }
+        CssLayoutKind::Document => box_
+            .children
+            .iter()
+            .map(|child| css_layout_min_content_outer_width(child, text_metrics))
+            .fold(1.0, f32::max),
+    }
+}
+
+fn css_layout_min_content_outer_width(
+    box_: &CssLayoutBox<'_>,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    css_layout_min_content_width(box_, text_metrics)
+        + box_.style.margin.left
+        + box_.style.margin.right
+        + box_.style.border_width * 2.0
+        + box_.style.padding.left
+        + box_.style.padding.right
+}
+
+fn css_layout_definite_intrinsic_content_width(box_: &CssLayoutBox<'_>) -> Option<f32> {
+    let style = &box_.style;
+    if style.width_percent.is_some() {
+        return None;
+    }
+    let width = style.width.or_else(|| {
+        if style.max_width_percent.is_some() {
+            None
+        } else {
+            style.max_width
+        }
+    })?;
+    Some(
+        css_used_content_box_extent(
+            width,
+            css_style_horizontal_border_padding(style),
+            style.box_sizing_border_box,
+        )
+        .max(1.0),
+    )
+}
+
+fn css_text_min_content_width(
+    text_metrics: Option<&egui::Context>,
+    text: &str,
+    style: &ResolvedBoxStyle,
+) -> f32 {
+    text.split_whitespace()
+        .map(|word| measure_canvas_text_run(text_metrics, word, style).x.ceil() + 1.0)
+        .fold(1.0, f32::max)
+}
+
 fn css_text_preferred_content_width(
     text_metrics: Option<&egui::Context>,
     text: &str,
@@ -14308,6 +14456,61 @@ fn css_grid_preferred_content_width(
                 }
             };
             column_widths[index] = column_widths[index].max(track_width);
+        }
+    }
+
+    column_widths.iter().sum::<f32>() + gap * columns.saturating_sub(1) as f32
+}
+
+fn css_grid_min_content_width(
+    box_: &CssLayoutBox<'_>,
+    text_metrics: Option<&egui::Context>,
+) -> f32 {
+    let flow_count = box_
+        .children
+        .iter()
+        .filter(|child| !css_layout_box_is_out_of_flow(child))
+        .count();
+    if flow_count == 0 {
+        return 1.0;
+    }
+
+    let gap = box_.style.gap.max(0.0);
+    let columns =
+        css_grid_column_count(&box_.style, flow_count, DEFAULT_LAYOUT_VIEWPORT_WIDTH, gap).max(1);
+    let placements = css_grid_auto_placements(&box_.children, columns);
+    let mut column_widths = vec![0.0_f32; columns];
+
+    for (index, child) in box_.children.iter().enumerate() {
+        if css_layout_box_is_out_of_flow(child) {
+            continue;
+        }
+        let Some(placement) = placements.get(index).copied().flatten() else {
+            continue;
+        };
+        let span = placement.column_span.max(1).min(columns - placement.column);
+        let preferred = css_layout_min_content_outer_width(child, text_metrics);
+        if span == 1 {
+            column_widths[placement.column] = column_widths[placement.column].max(preferred);
+        } else {
+            let share = ((preferred - gap * span.saturating_sub(1) as f32) / span as f32).max(1.0);
+            for column_width in &mut column_widths[placement.column..placement.column + span] {
+                *column_width = (*column_width).max(share);
+            }
+        }
+    }
+
+    if let Some(tracks) = &box_.style.grid_template_column_tracks {
+        for (index, track) in tracks.iter().take(columns).copied().enumerate() {
+            if matches!(track, CssLength::Auto | CssLength::Fr(_)) {
+                continue;
+            }
+            column_widths[index] = column_widths[index]
+                .max(resolve_css_grid_track_min_width(
+                    track,
+                    DEFAULT_LAYOUT_VIEWPORT_WIDTH,
+                ))
+                .max(0.0);
         }
     }
 
@@ -14995,7 +15198,7 @@ fn css_grid_auto_column_base_widths(
         if placement.column >= tracks.len() || placement.column_span != 1 {
             continue;
         }
-        if !matches!(tracks[placement.column], CssLength::Auto | CssLength::Fr(_)) {
+        if !matches!(tracks[placement.column], CssLength::Auto) {
             continue;
         }
         widths[placement.column] = widths[placement.column].max(
@@ -15021,7 +15224,8 @@ fn css_grid_track_child_intrinsic_width(
     text_metrics: Option<&egui::Context>,
 ) -> f32 {
     match track {
-        CssLength::Fr(_) => css_grid_child_min_track_contribution(child),
+        CssLength::Fr(_) => css_layout_preferred_outer_width(child, text_metrics)
+            .max(css_grid_child_min_track_contribution(child)),
         CssLength::Auto => css_layout_preferred_outer_width(child, text_metrics)
             .max(css_grid_child_min_track_contribution(child)),
         _ => css_layout_preferred_outer_width(child, text_metrics)
@@ -15931,15 +16135,30 @@ fn layout_css_out_of_flow_child(
     let top = child.style.inset_sides.top;
     let bottom = child.style.inset_sides.bottom;
     let containing_width = if left.is_some() && right.is_some() {
-        (containing.width() - inset.left - inset.right).max(1.0)
+        let left = left
+            .map(|value| resolve_css_inset_length(value, containing.width()))
+            .unwrap_or(inset.left);
+        let right = right
+            .map(|value| resolve_css_inset_length(value, containing.width()))
+            .unwrap_or(inset.right);
+        (containing.width() - left - right).max(1.0)
     } else {
         containing.width().max(1.0)
     };
-    let containing_height = (containing.height() - inset.top - inset.bottom).max(0.0);
+    let inset_top = top
+        .map(|value| resolve_css_inset_length(value, containing.height()))
+        .unwrap_or(inset.top);
+    let inset_bottom = bottom
+        .map(|value| resolve_css_inset_length(value, containing.height()))
+        .unwrap_or(inset.bottom);
+    let inset_left = left
+        .map(|value| resolve_css_inset_length(value, containing.width()))
+        .unwrap_or(inset.left);
+    let containing_height = (containing.height() - inset_top - inset_bottom).max(0.0);
     layout_css_box(
         child,
-        containing.left() + left.unwrap_or(0.0),
-        containing.top() + top.unwrap_or(0.0),
+        containing.left() + if left.is_some() { inset_left } else { 0.0 },
+        containing.top() + if top.is_some() { inset_top } else { 0.0 },
         containing_width,
         containing_height,
         source,
@@ -15949,15 +16168,39 @@ fn layout_css_out_of_flow_child(
     let child_margin_box = css_margin_box(child);
     let mut delta = egui::Vec2::ZERO;
     if let (Some(right), None) = (right, left) {
+        let right = resolve_css_inset_length(right, containing.width());
         delta.x = containing.right() - right - child_margin_box.right();
     }
     if let (Some(bottom), None) = (bottom, top) {
+        let bottom = resolve_css_inset_length(bottom, containing.height());
         delta.y = containing.bottom() - bottom - child_margin_box.bottom();
     }
     if delta != egui::Vec2::ZERO {
         translate_css_layout_box(child, delta);
     }
     apply_css_layout_transform(child);
+}
+
+fn resolve_css_inset_length(length: CssLength, basis: f32) -> f32 {
+    match length {
+        CssLength::Auto => 0.0,
+        CssLength::Px(px) => px,
+        CssLength::Percent(percent) => basis * percent / 100.0,
+        CssLength::Fr(_) => 0.0,
+        CssLength::Vw(vw) => DEFAULT_LAYOUT_VIEWPORT_WIDTH * vw / 100.0,
+        CssLength::Vh(vh) => DEFAULT_LAYOUT_VIEWPORT_HEIGHT * vh / 100.0,
+        CssLength::Calc(expression) => resolve_css_length_expression(expression, basis),
+        CssLength::Min(left, right) => resolve_css_length_expression(left, basis)
+            .min(resolve_css_length_expression(right, basis)),
+        CssLength::Max(left, right) => resolve_css_length_expression(left, basis)
+            .max(resolve_css_length_expression(right, basis)),
+        CssLength::Clamp(min, preferred, max) => resolve_css_length_expression(preferred, basis)
+            .clamp(
+                resolve_css_length_expression(min, basis),
+                resolve_css_length_expression(max, basis),
+            ),
+        CssLength::FitContent(limit) => resolve_css_length_expression(limit, basis),
+    }
 }
 
 fn measure_css_inline_children_height(
@@ -23584,6 +23827,32 @@ mod tests {
     }
 
     #[test]
+    fn component_scope_normalization_does_not_push_parent_scope_to_same_class_child() {
+        let mut document = parse_dom_document(
+            r#"<html><body><div class="above-fold-section__counter above-fold-section__counter--detached" data-v-parent><div class="above-fold-section__counter above-fold-section__counter--detached global-counter" data-v-counter>trees planted by Ecosia</div></div></body></html>"#,
+        );
+        normalize_component_scope_attributes(&mut document);
+        let wrapper = document
+            .first_descendant_by_tag("div")
+            .expect("counter wrapper");
+        let card = wrapper
+            .children
+            .iter()
+            .filter_map(|child| match child {
+                DomNode::Element(element) => Some(element),
+                _ => None,
+            })
+            .next()
+            .expect("counter card");
+
+        assert!(card.has_attr("data-v-counter"));
+        assert!(
+            !card.has_attr("data-v-parent"),
+            "same-class nested component boxes must not inherit wrapper scope and match wrapper-only selectors"
+        );
+    }
+
+    #[test]
     fn dom_parser_keeps_angle_brackets_inside_quoted_attributes() {
         let document = parse_dom_document(
             r#"<html><body><input type="submit" value="<input type=submit>"><p>After</p></body></html>"#,
@@ -28979,6 +29248,244 @@ mod tests {
     }
 
     #[test]
+    fn absolute_auto_grid_counter_keeps_min_content_when_available_width_is_tiny() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .hero {
+                    position: relative;
+                    width: 640px;
+                    height: 320px;
+                    background: #1b5e46;
+                  }
+                  .wrapper {
+                    position: absolute;
+                    left: 50%;
+                    bottom: 20px;
+                    transform: translateX(-50%);
+                    width: 72px;
+                    height: 0;
+                    background: #ff0000;
+                  }
+                  .card {
+                    position: absolute;
+                    left: 0;
+                    bottom: 0;
+                    display: grid;
+                    grid-template-columns: auto 1px auto;
+                    background: #385d55;
+                    border: 1px solid #ffffff;
+                    border-radius: 10px;
+                    overflow: hidden;
+                  }
+                  .item {
+                    display: inline;
+                    min-width: 0;
+                  }
+                  .counter {
+                    display: grid;
+                    padding: 16px;
+                    min-height: 69px;
+                    background: #8ca69a;
+                  }
+                  .count {
+                    display: flex;
+                    font-size: 20px;
+                    font-weight: 700;
+                  }
+                  .description {
+                    display: block;
+                    font-size: 14px;
+                    background: #f6df73;
+                  }
+                  .divider {
+                    width: 1px;
+                    margin: 16px 0;
+                    background: #ffffff;
+                  }
+                </style>
+              </head>
+              <body>
+                <section class="hero">
+                  <div class="wrapper">
+                    <div class="card">
+                      <a class="item" href="#">
+                        <div class="counter">
+                          <div class="count">251,955,449</div>
+                          <div class="description">trees planted by Ecosia</div>
+                        </div>
+                      </a>
+                      <div class="divider"></div>
+                      <a class="item" href="#">
+                        <div class="counter">
+                          <div class="count">101,806,608</div>
+                          <div class="description">dedicated to climate action</div>
+                        </div>
+                      </a>
+                    </div>
+                  </div>
+                </section>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let card = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x38, 0x5d, 0x55),
+        )
+        .expect("expected absolute counter card background");
+        let descriptions = document
+            .canvas_graph
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0xf6, 0xdf, 0x73) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            card.rect.width() > 280.0,
+            "absolute shrink-to-fit must use min-content when available width is tiny: {card:?}"
+        );
+        assert!(
+            descriptions.iter().all(|rect| rect.width() > 130.0),
+            "counter descriptions should not be compressed by the tiny wrapper width: {descriptions:?}"
+        );
+    }
+
+    #[test]
+    fn absolute_auto_grid_counter_keeps_flexible_track_preferred_width() {
+        let document = parse_html_document(
+            r##"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; margin: 0; }
+                  .hero {
+                    position: relative;
+                    width: 640px;
+                    height: 320px;
+                    background: #1b5e46;
+                  }
+                  .wrapper {
+                    position: absolute;
+                    left: 50%;
+                    bottom: 20px;
+                    transform: translateX(-50%);
+                  }
+                  .card {
+                    display: grid;
+                    grid-template-columns: auto 1px auto;
+                    background: #385d55;
+                    border: 1px solid #ffffff;
+                    border-radius: 10px;
+                    overflow: hidden;
+                  }
+                  .item {
+                    display: inline;
+                    min-width: 0;
+                  }
+                  .counter {
+                    display: grid;
+                    grid-template-columns: auto 1fr;
+                    grid-template-areas: "icon count" "icon description";
+                    padding: 16px;
+                    min-height: 69px;
+                    background: #8ca69a;
+                  }
+                  .icon {
+                    grid-area: icon;
+                    width: 24px;
+                    height: 24px;
+                    background: #f6df73;
+                  }
+                  .count {
+                    grid-area: count;
+                    display: flex;
+                    font-size: 20px;
+                    font-weight: 700;
+                  }
+                  .description {
+                    grid-area: description;
+                    display: block;
+                    font-size: 14px;
+                    background: #f6df73;
+                  }
+                  .divider {
+                    width: 1px;
+                    margin: 16px 0;
+                    background: #ffffff;
+                  }
+                </style>
+              </head>
+              <body>
+                <section class="hero">
+                  <div class="wrapper">
+                    <div class="card">
+                      <a class="item" href="#">
+                        <div class="counter">
+                          <div class="icon"></div>
+                          <div class="count">251,955,449</div>
+                          <div class="description">trees planted by Ecosia</div>
+                        </div>
+                      </a>
+                      <div class="divider"></div>
+                      <a class="item" href="#">
+                        <div class="counter">
+                          <div class="icon"></div>
+                          <div class="count">101,806,608</div>
+                          <div class="description">dedicated to climate action</div>
+                        </div>
+                      </a>
+                    </div>
+                  </div>
+                </section>
+              </body>
+            </html>
+            "##,
+            "https://example.test/",
+        );
+
+        let card = find_canvas_rect_by_fill(
+            &document.canvas_graph,
+            egui::Color32::from_rgb(0x38, 0x5d, 0x55),
+        )
+        .expect("expected counter card background");
+        let descriptions = document
+            .canvas_graph
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                CanvasObject::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgb(0xf6, 0xdf, 0x73) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            card.rect.width() > 420.0,
+            "flexible grid tracks should contribute preferred width to shrink-to-fit: {card:?}"
+        );
+        assert!(
+            descriptions.iter().any(|rect| rect.width() > 140.0),
+            "description track should not collapse to icon/minimum width: {descriptions:?}"
+        );
+    }
+
+    #[test]
     fn definite_grid_stretches_auto_tracks_after_intrinsic_base_sizes() {
         let document = parse_html_document(
             r##"
@@ -29560,6 +30067,89 @@ mod tests {
         assert!((overlay.rect.width() - 240.0).abs() <= 1.0);
         assert!((overlay.rect.left() - 520.0).abs() <= 1.0);
         assert!((overlay.rect.top() - 96.0).abs() <= 1.0);
+    }
+
+    #[test]
+    fn absolute_percent_inset_uses_positioned_containing_block_width() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { margin: 0; padding: 0; }
+                  .host {
+                    position: relative;
+                    width: 600px;
+                    height: 240px;
+                    background: #ff0000;
+                  }
+                  .panel {
+                    position: absolute;
+                    left: 50%;
+                    top: 40px;
+                    transform: translateX(-50%);
+                    width: 200px;
+                    height: 80px;
+                    background: #00ff00;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="host"><div class="panel">Centered panel</div></div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let panel =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected absolute panel background");
+
+        assert!((panel.rect.width() - 200.0).abs() <= 1.0);
+        assert!((panel.rect.left() - 200.0).abs() <= 1.0, "{panel:?}");
+        assert!((panel.rect.top() - 40.0).abs() <= 1.0, "{panel:?}");
+    }
+
+    #[test]
+    fn absolute_percent_right_inset_uses_positioned_containing_block_width() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { margin: 0; padding: 0; }
+                  .host {
+                    position: relative;
+                    width: 600px;
+                    height: 240px;
+                    background: #ff0000;
+                  }
+                  .panel {
+                    position: absolute;
+                    right: 10%;
+                    top: 30px;
+                    width: 100px;
+                    height: 70px;
+                    background: #00ff00;
+                  }
+                </style>
+              </head>
+              <body>
+                <div class="host"><div class="panel">Right panel</div></div>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let panel =
+            find_canvas_rect_by_fill(&document.canvas_graph, egui::Color32::from_rgb(0, 255, 0))
+                .expect("expected absolute panel background");
+
+        assert!((panel.rect.width() - 100.0).abs() <= 1.0);
+        assert!((panel.rect.left() - 440.0).abs() <= 1.0, "{panel:?}");
+        assert!((panel.rect.top() - 30.0).abs() <= 1.0, "{panel:?}");
     }
 
     #[test]
@@ -31530,6 +32120,54 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
             three.rect
         );
         assert!((three.rect.left() - one.rect.left()).abs() < 0.5);
+    }
+
+    #[test]
+    fn grid_fr_columns_do_not_expand_from_percent_width_items() {
+        let document = parse_html_document(
+            r#"
+            <html>
+              <head>
+                <style>
+                  body { padding: 0; }
+                  .scope .claims {
+                    display: grid;
+                    grid-template-columns: repeat(4, 1fr);
+                    gap: 16px;
+                    width: 960px;
+                    padding: 0;
+                    list-style: none;
+                  }
+                  .claim {
+                    width: 100%;
+                    min-width: 0;
+                    background: #00ff00;
+                  }
+                </style>
+              </head>
+              <body>
+                <section class="scope">
+                  <ol class="claims">
+                    <li class="claim">One</li>
+                    <li class="claim">Two</li>
+                    <li class="claim">Three</li>
+                    <li class="claim">Four</li>
+                  </ol>
+                </section>
+              </body>
+            </html>
+            "#,
+            "https://example.test/",
+        );
+
+        let one = find_canvas_text(&document.canvas_graph, "One").expect("expected first claim");
+        let four = find_canvas_text(&document.canvas_graph, "Four").expect("expected fourth claim");
+
+        assert_eq!(one.rect.top(), four.rect.top());
+        assert!(
+            four.rect.left() < 760.0,
+            "fourth 1fr item should stay in the 960px grid instead of being pushed by 100% item widths, got {four:?}"
+        );
     }
 
     #[test]

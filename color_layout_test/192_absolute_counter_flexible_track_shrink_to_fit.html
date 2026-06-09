@@ -1,0 +1,121 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>192 Absolute Counter Flexible Track Shrink To Fit</title>
+  <style>
+    html,
+    body {
+      margin: 0;
+      min-height: 100%;
+      background: #eef2f3;
+      font-family: Arial, sans-serif;
+    }
+
+    .hero {
+      position: relative;
+      width: 760px;
+      height: 360px;
+      margin: 32px auto;
+      background: #b8d870;
+      border-radius: 24px;
+      overflow: hidden;
+    }
+
+    .wrapper {
+      position: absolute;
+      left: 50%;
+      bottom: 32px;
+      transform: translate(-50%, 0);
+      background: #f87171;
+    }
+
+    .card {
+      display: grid;
+      grid-template-columns: auto 2px auto;
+      overflow: hidden;
+      border: 2px solid #111827;
+      border-radius: 12px;
+      background: #2f6f66;
+    }
+
+    .item {
+      display: inline;
+      min-width: 0;
+    }
+
+    .counter {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      grid-template-areas:
+        "icon count"
+        "icon description";
+      column-gap: 12px;
+      min-height: 72px;
+      padding: 16px;
+      background: #436e64;
+      color: white;
+    }
+
+    .icon {
+      grid-area: icon;
+      width: 26px;
+      height: 26px;
+      background: #f6df73;
+      border-radius: 50%;
+    }
+
+    .count {
+      grid-area: count;
+      display: flex;
+      align-items: center;
+      width: max-content;
+      min-width: max-content;
+      background: #7dd3fc;
+      font-size: 20px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .description {
+      grid-area: description;
+      width: max-content;
+      min-width: max-content;
+      background: #fbbf24;
+      color: #111827;
+      font-size: 14px;
+      white-space: nowrap;
+    }
+
+    .divider {
+      width: 2px;
+      margin: 16px 0;
+      background: #111827;
+    }
+  </style>
+</head>
+<body>
+  <section class="hero">
+    <div class="wrapper">
+      <div class="card">
+        <a class="item" href="#">
+          <div class="counter">
+            <div class="icon"></div>
+            <div class="count">251,955,449</div>
+            <div class="description">trees planted by Ecosia</div>
+          </div>
+        </a>
+        <div class="divider"></div>
+        <a class="item" href="#">
+          <div class="counter">
+            <div class="icon"></div>
+            <div class="count">101,806,608</div>
+            <div class="description">dedicated to climate action</div>
+          </div>
+        </a>
+      </div>
+    </div>
+  </section>
+</body>
+</html>

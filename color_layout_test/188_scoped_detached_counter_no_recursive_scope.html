@@ -1,0 +1,95 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>188 Scoped Detached Counter No Recursive Scope</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, sans-serif;
+      background: #1f2933;
+    }
+    .above-fold-section {
+      position: relative;
+      width: 760px;
+      height: 420px;
+      background: #245744;
+      overflow: hidden;
+    }
+    .above-fold-section__counter--detached[data-v-parent] {
+      position: absolute;
+      left: 50%;
+      bottom: 32px;
+      transform: translateX(-50%);
+      z-index: 1;
+    }
+    .global-counter-wrapper {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+    .global-counter {
+      display: grid;
+      grid-template-columns: auto 1px auto;
+      overflow: hidden;
+      border: 2px solid #ffffff;
+      border-radius: 10px;
+      background: #5f7f72;
+      color: #ffffff;
+    }
+    .global-counter__item {
+      display: inline;
+      min-width: 0;
+      color: #ffffff;
+      text-decoration: none;
+    }
+    .counter {
+      display: grid;
+      min-height: 72px;
+      padding: 16px 20px;
+      background: #8ca69a;
+    }
+    .count {
+      display: flex;
+      font-size: 20px;
+      font-weight: 700;
+      background: #c0d85b;
+      color: #1b1b1b;
+    }
+    .description {
+      display: block;
+      margin-top: 4px;
+      font-size: 14px;
+      background: #f6df73;
+      color: #1b1b1b;
+    }
+    .divider {
+      width: 1px;
+      margin: 16px 0;
+      background: #111111;
+    }
+  </style>
+</head>
+<body>
+  <main class="above-fold-section" data-v-parent>
+    <div class="global-counter-wrapper above-fold-section__counter--detached">
+      <div class="above-fold-section__counter--detached global-counter">
+        <a class="global-counter__item" href="#">
+          <div class="counter">
+            <div class="count">251,710,606</div>
+            <div class="description">trees planted by example</div>
+          </div>
+        </a>
+        <div class="divider"></div>
+        <a class="global-counter__item" href="#">
+          <div class="counter">
+            <div class="count">101,676,431</div>
+            <div class="description">dedicated to climate action</div>
+          </div>
+        </a>
+      </div>
+    </div>
+  </main>
+</body>
+</html>

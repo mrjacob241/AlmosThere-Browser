@@ -1,0 +1,99 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>191 Absolute Tiny Available Grid Min Content</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #f5f7fa;
+      font-family: Arial, sans-serif;
+    }
+    .hero {
+      position: relative;
+      width: 760px;
+      height: 360px;
+      margin: 24px;
+      background: #d7eb80;
+      border-radius: 20px;
+      overflow: hidden;
+    }
+    .anchor {
+      position: absolute;
+      left: 50%;
+      bottom: 44px;
+      transform: translateX(-50%);
+      width: 72px;
+      height: 0;
+      background: #ff0000;
+    }
+    .counter-card {
+      position: absolute;
+      left: 0;
+      bottom: 0;
+      display: grid;
+      grid-template-columns: auto 1px auto;
+      background: #385d55;
+      border: 1px solid #ffffff;
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .item {
+      display: inline;
+      min-width: 0;
+    }
+    .counter {
+      display: grid;
+      min-height: 69px;
+      padding: 16px;
+      background: #8ca69a;
+    }
+    .count {
+      display: flex;
+      font-size: 20px;
+      font-weight: 700;
+      color: #ffffff;
+    }
+    .description {
+      display: block;
+      font-size: 14px;
+      color: #111111;
+      background: #f6df73;
+    }
+    .divider {
+      width: 1px;
+      margin: 16px 0;
+      background: #ffffff;
+    }
+    .following {
+      margin: 24px;
+      width: 760px;
+      height: 72px;
+      background: #9bd1ff;
+    }
+  </style>
+</head>
+<body>
+  <section class="hero">
+    <div class="anchor">
+      <div class="counter-card">
+        <a class="item" href="#">
+          <div class="counter">
+            <div class="count">251,955,449</div>
+            <div class="description">trees planted by Ecosia</div>
+          </div>
+        </a>
+        <div class="divider"></div>
+        <a class="item" href="#">
+          <div class="counter">
+            <div class="count">101,806,608</div>
+            <div class="description">dedicated to climate action</div>
+          </div>
+        </a>
+      </div>
+    </div>
+  </section>
+  <div class="following"></div>
+</body>
+</html>

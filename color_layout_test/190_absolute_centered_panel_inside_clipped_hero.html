@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>190 Absolute Centered Panel Inside Clipped Hero</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, sans-serif;
+      background: #202020;
+    }
+    .hero {
+      position: relative;
+      width: 760px;
+      height: 360px;
+      overflow: hidden;
+      border-radius: 20px;
+      background: #1f513d;
+    }
+    .panel {
+      position: absolute;
+      left: 50%;
+      bottom: -18px;
+      transform: translateX(-50%);
+      display: grid;
+      grid-template-columns: auto 1px auto;
+      border: 2px solid #ffffff;
+      border-radius: 10px;
+      overflow: hidden;
+      background: #405c58;
+      color: #ffffff;
+    }
+    .tile {
+      width: 180px;
+      height: 86px;
+      padding: 16px;
+      background: #9dbb72;
+    }
+    .divider {
+      width: 1px;
+      margin: 14px 0;
+      background: #ffffff;
+    }
+    .line {
+      height: 18px;
+      margin-bottom: 10px;
+      background: #f2d66b;
+    }
+    .line:last-child {
+      margin-bottom: 0;
+      background: #bfe3d7;
+    }
+  </style>
+</head>
+<body>
+  <main class="hero">
+    <section class="panel">
+      <div class="tile"><div class="line"></div><div class="line"></div></div>
+      <div class="divider"></div>
+      <div class="tile"><div class="line"></div><div class="line"></div></div>
+    </section>
+  </main>
+</body>
+</html>

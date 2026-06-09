@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>189 Parent Scope Direct Child Not Grandchild</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #27323a;
+    }
+    .layout[data-v-parent] {
+      width: 640px;
+      min-height: 260px;
+      padding: 24px;
+      background: #6aa678;
+    }
+    .component-root[data-v-parent] {
+      width: 420px;
+      min-height: 160px;
+      padding: 20px;
+      background: #d8e68a;
+    }
+    .component-root .same-name[data-v-parent] {
+      position: absolute;
+      left: 50%;
+      top: 20px;
+      transform: translateX(-50%);
+      width: 180px;
+      height: 60px;
+      background: #e05a47;
+    }
+    .same-name {
+      width: 280px;
+      height: 80px;
+      background: #517fd1;
+    }
+  </style>
+</head>
+<body>
+  <main class="layout" data-v-parent>
+    <section class="component-root">
+      <div class="same-name"></div>
+    </section>
+  </main>
+</body>
+</html>

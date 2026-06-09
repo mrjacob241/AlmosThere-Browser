@@ -509,10 +509,10 @@ pub struct CssEdgeAutoSpec {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CssInset {
-    pub top: Option<f32>,
-    pub right: Option<f32>,
-    pub bottom: Option<f32>,
-    pub left: Option<f32>,
+    pub top: Option<CssLength>,
+    pub right: Option<CssLength>,
+    pub bottom: Option<CssLength>,
+    pub left: Option<CssLength>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1709,7 +1709,7 @@ fn paint_canvas_graph(
                 job.wrap.max_width = f32::INFINITY;
                 job.wrap.max_rows = 1;
                 let galley = painter.layout_job(job);
-                let text_width = galley.size().x.min(paint_rect.width()).max(1.0);
+                let text_width = galley.size().x.max(1.0);
                 let text_rect = match text.text_align {
                     CssTextAlign::Left => {
                         Rect::from_min_size(paint_rect.min, vec2(text_width, paint_rect.height()))
@@ -1818,7 +1818,7 @@ fn paint_canvas_graph(
                 job.wrap.max_width = f32::INFINITY;
                 job.wrap.max_rows = 1;
                 let galley = painter.layout_job(job);
-                let text_width = galley.size().x.min(rect.width()).max(1.0);
+                let text_width = galley.size().x.max(1.0);
                 let text_height = galley.size().y.max(rect.height()).max(1.0);
                 let text_rect = match line.text_align {
                     CssTextAlign::Left => {
@@ -6747,9 +6747,9 @@ fn parse_css_box_style_with_vars(
             }
             "top" | "right" | "bottom" | "left" => {
                 let mut edges = style.inset.unwrap_or_default();
-                if let Some(px) = parse_inset_value(value, viewport_width) {
-                    set_edge(&mut edges, property, px);
-                    set_inset_side(&mut style.inset_sides, property, px);
+                if let Some(length) = parse_inset_value(value) {
+                    set_edge(&mut edges, property, css_inset_length_px_fallback(length));
+                    set_inset_side(&mut style.inset_sides, property, length);
                     style.inset = Some(edges);
                     seen = true;
                 }
@@ -6932,18 +6932,18 @@ fn apply_logical_inset_pair(
 fn apply_logical_inset_side(
     value: &str,
     side: &str,
-    viewport_width: Option<f32>,
+    _viewport_width: Option<f32>,
     style: &mut CssBoxStyle,
 ) -> bool {
     if value.trim().eq_ignore_ascii_case("auto") {
         return true;
     }
-    let Some(px) = parse_inset_value(value, viewport_width) else {
+    let Some(length) = parse_inset_value(value) else {
         return false;
     };
     let mut edges = style.inset.unwrap_or_default();
-    set_edge(&mut edges, side, px);
-    set_inset_side(&mut style.inset_sides, side, px);
+    set_edge(&mut edges, side, css_inset_length_px_fallback(length));
+    set_inset_side(&mut style.inset_sides, side, length);
     style.inset = Some(edges);
     true
 }
@@ -7543,17 +7543,17 @@ fn set_edge(edges: &mut CssEdges, property: &str, px: f32) {
     }
 }
 
-fn set_inset_side(inset: &mut CssInset, property: &str, px: f32) {
+fn set_inset_side(inset: &mut CssInset, property: &str, length: CssLength) {
     match property {
-        "top" => inset.top = Some(px),
-        "right" => inset.right = Some(px),
-        "bottom" => inset.bottom = Some(px),
-        "left" => inset.left = Some(px),
+        "top" => inset.top = Some(length),
+        "right" => inset.right = Some(length),
+        "bottom" => inset.bottom = Some(length),
+        "left" => inset.left = Some(length),
         _ => {}
     }
 }
 
-fn parse_inset_edges(value: &str, viewport_width: Option<f32>) -> Option<(CssEdges, CssInset)> {
+fn parse_inset_edges(value: &str, _viewport_width: Option<f32>) -> Option<(CssEdges, CssInset)> {
     let values = split_css_value_list(value);
     let expanded = match values.as_slice() {
         [all] => [all.as_str(), all.as_str(), all.as_str(), all.as_str()],
@@ -7582,24 +7582,25 @@ fn parse_inset_edges(value: &str, viewport_width: Option<f32>) -> Option<(CssEdg
         if token.eq_ignore_ascii_case("auto") {
             continue;
         }
-        let px = parse_inset_value(token, viewport_width)?;
+        let length = parse_inset_value(token)?;
+        let px = css_inset_length_px_fallback(length);
         saw_side = true;
         match index {
             0 => {
                 edges.top = px;
-                sides.top = Some(px);
+                sides.top = Some(length);
             }
             1 => {
                 edges.right = px;
-                sides.right = Some(px);
+                sides.right = Some(length);
             }
             2 => {
                 edges.bottom = px;
-                sides.bottom = Some(px);
+                sides.bottom = Some(length);
             }
             3 => {
                 edges.left = px;
-                sides.left = Some(px);
+                sides.left = Some(length);
             }
             _ => {}
         }
@@ -7607,11 +7608,17 @@ fn parse_inset_edges(value: &str, viewport_width: Option<f32>) -> Option<(CssEdg
     saw_side.then_some((edges, sides))
 }
 
-fn parse_inset_value(value: &str, viewport_width: Option<f32>) -> Option<f32> {
-    parse_px(value).or_else(|| {
-        parse_signed_percent(value)
-            .map(|percent| viewport_width.unwrap_or(1280.0) * percent / 100.0)
-    })
+fn css_inset_length_px_fallback(length: CssLength) -> f32 {
+    match length {
+        CssLength::Px(px) => px,
+        _ => 0.0,
+    }
+}
+
+fn parse_inset_value(value: &str) -> Option<CssLength> {
+    parse_px(value)
+        .map(CssLength::Px)
+        .or_else(|| parse_signed_percent(value).map(CssLength::Percent))
 }
 
 fn parse_css_transform(value: &str) -> Option<CssTransform> {
@@ -7619,14 +7626,30 @@ fn parse_css_transform(value: &str) -> Option<CssTransform> {
     if value.eq_ignore_ascii_case("none") {
         return Some(CssTransform::default());
     }
-    let lower = value.to_ascii_lowercase();
-    let inner = lower
-        .strip_prefix("translatex(")
-        .and_then(|value| value.strip_suffix(')'))?;
-    Some(CssTransform {
-        translate_x: parse_css_transform_length(inner.trim()),
-    })
-    .filter(|transform| transform.translate_x.is_some())
+    let mut remaining = value.trim();
+    let mut transform = CssTransform::default();
+    while !remaining.is_empty() {
+        let Some(open) = remaining.find('(') else {
+            break;
+        };
+        let name = remaining[..open].trim().to_ascii_lowercase();
+        let Some(close) = find_function_end(remaining, open) else {
+            break;
+        };
+        let inner = &remaining[open + 1..close];
+        match name.as_str() {
+            "translatex" => {
+                transform.translate_x = parse_css_transform_length(inner.trim());
+            }
+            "translate" => {
+                transform.translate_x =
+                    parse_css_transform_length(css_transform_first_argument(inner).trim());
+            }
+            _ => {}
+        }
+        remaining = remaining[close + 1..].trim_start();
+    }
+    transform.translate_x.map(|_| transform)
 }
 
 fn parse_css_transform_length(value: &str) -> Option<CssLength> {
@@ -7635,6 +7658,13 @@ fn parse_css_transform_length(value: &str) -> Option<CssLength> {
     } else {
         parse_px(value).map(CssLength::Px)
     }
+}
+
+fn css_transform_first_argument(value: &str) -> &str {
+    value
+        .split_once(',')
+        .map(|(first, _)| first)
+        .unwrap_or_else(|| value.split_whitespace().next().unwrap_or(value))
 }
 
 fn parse_css_length(value: &str) -> Option<CssLength> {
@@ -9616,15 +9646,48 @@ mod tests {
         let computed = computed_box_style(&style, &key);
 
         assert_eq!(computed.position, Some(CssPosition::Fixed));
-        assert_eq!(computed.inset_sides.top, Some(96.0));
+        assert_eq!(computed.inset_sides.top, Some(CssLength::Px(96.0)));
         assert_eq!(computed.inset_sides.right, None);
         assert_eq!(computed.inset_sides.bottom, None);
-        assert_eq!(computed.inset_sides.left, Some(640.0));
+        assert_eq!(computed.inset_sides.left, Some(CssLength::Percent(50.0)));
         assert_eq!(
             computed
                 .transform
                 .and_then(|transform| transform.translate_x),
             Some(CssLength::Percent(-50.0))
+        );
+    }
+
+    #[test]
+    fn parse_basic_css_carries_translate_function_x_component() {
+        let style = parse_basic_css(
+            r#"
+            .comma { transform: translate(-50%, 0); }
+            .list { transform: translate(-25% 0) rotate(2deg); }
+            "#,
+        );
+        let comma = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["comma".to_owned()],
+            ..ElementStyleKey::default()
+        };
+        let list = ElementStyleKey {
+            tag: "div".to_owned(),
+            classes: vec!["list".to_owned()],
+            ..ElementStyleKey::default()
+        };
+
+        assert_eq!(
+            computed_box_style(&style, &comma)
+                .transform
+                .and_then(|transform| transform.translate_x),
+            Some(CssLength::Percent(-50.0))
+        );
+        assert_eq!(
+            computed_box_style(&style, &list)
+                .transform
+                .and_then(|transform| transform.translate_x),
+            Some(CssLength::Percent(-25.0))
         );
     }
 
@@ -9720,9 +9783,9 @@ mod tests {
         assert_eq!(computed.padding_right, Some(20.0));
         assert_eq!(computed.padding_top, Some(6.0));
         assert_eq!(computed.padding_bottom, Some(10.0));
-        assert_eq!(computed.inset_sides.left, Some(14.0));
-        assert_eq!(computed.inset_sides.right, Some(18.0));
-        assert_eq!(computed.inset_sides.top, Some(22.0));
+        assert_eq!(computed.inset_sides.left, Some(CssLength::Px(14.0)));
+        assert_eq!(computed.inset_sides.right, Some(CssLength::Px(18.0)));
+        assert_eq!(computed.inset_sides.top, Some(CssLength::Px(22.0)));
         assert_eq!(responsive_computed.padding_left, Some(160.0));
         assert_eq!(responsive_computed.padding_right, Some(160.0));
     }
