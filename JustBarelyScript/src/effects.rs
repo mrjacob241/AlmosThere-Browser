@@ -419,6 +419,8 @@ pub struct BrowserExecutionState {
     execution_budget_exhausted: bool,
     execution_deadline: Option<std::time::Instant>,
     array_method_overrides: HashMap<String, JsValue>,
+    function_properties: HashMap<u64, HashMap<String, JsValue>>,
+    function_accessors: HashMap<u64, HashMap<String, Property>>,
     symbol_counter: u32,
     pending_dynamic_imports: HashMap<u64, Rc<RefCell<PromiseState>>>,
     next_dynamic_import_id: u64,
@@ -1815,6 +1817,28 @@ impl BrowserExecutionState {
     }
 
     fn function_get(&mut self, func: &JsFunction, receiver: JsValue, key: &str) -> JsValue {
+        if let Some(prop) = self
+            .function_accessors
+            .get(&func.id)
+            .and_then(|props| props.get(key))
+            .cloned()
+        {
+            return match prop {
+                Property::Accessor {
+                    get: Some(getter), ..
+                } => self.call_value(getter, receiver, vec![]),
+                Property::Accessor { get: None, .. } => JsValue::Undefined,
+                Property::Data { value, .. } => value,
+            };
+        }
+        if let Some(value) = self
+            .function_properties
+            .get(&func.id)
+            .and_then(|props| props.get(key))
+            .cloned()
+        {
+            return value;
+        }
         if let Some(prop) = func.static_accessors.get(key).cloned() {
             return match prop {
                 Property::Accessor {
@@ -1830,7 +1854,105 @@ impl BrowserExecutionState {
             .unwrap_or(JsValue::Undefined)
     }
 
+    fn function_own_value(&self, func: &JsFunction, key: &str) -> Option<JsValue> {
+        if let Some(prop) = self
+            .function_accessors
+            .get(&func.id)
+            .and_then(|props| props.get(key))
+        {
+            return match prop {
+                Property::Data { value, .. } => Some(value.clone()),
+                Property::Accessor { get: None, .. } => Some(JsValue::Undefined),
+                Property::Accessor { get: Some(_), .. } => None,
+            };
+        }
+        self.function_properties
+            .get(&func.id)
+            .and_then(|props| props.get(key))
+            .cloned()
+            .or_else(|| func.properties.get(key).cloned())
+    }
+
+    fn function_prototype_object(&self, func: &JsFunction) -> Option<Rc<RefCell<JsObject>>> {
+        match self.function_own_value(func, "prototype") {
+            Some(JsValue::Object(proto_rc)) => Some(proto_rc),
+            _ => None,
+        }
+    }
+
+    fn object_function_coerce(value: JsValue) -> JsValue {
+        match value {
+            JsValue::Undefined | JsValue::Null => JsValue::new_object(),
+            JsValue::Boolean(value) => {
+                let rc = JsObject::new();
+                {
+                    let mut obj = rc.borrow_mut();
+                    obj.class_name = Some("Boolean".to_owned());
+                    obj.set_ne("[[PrimitiveValue]]", JsValue::Boolean(value));
+                }
+                JsValue::Object(rc)
+            }
+            JsValue::Number(value) => {
+                let rc = JsObject::new();
+                {
+                    let mut obj = rc.borrow_mut();
+                    obj.class_name = Some("Number".to_owned());
+                    obj.set_ne("[[PrimitiveValue]]", JsValue::Number(value));
+                }
+                JsValue::Object(rc)
+            }
+            JsValue::BigInt(value) => {
+                let rc = JsObject::new();
+                {
+                    let mut obj = rc.borrow_mut();
+                    obj.class_name = Some("BigInt".to_owned());
+                    obj.set_ne("[[PrimitiveValue]]", JsValue::BigInt(value));
+                }
+                JsValue::Object(rc)
+            }
+            JsValue::String(value) => {
+                let rc = JsObject::new();
+                {
+                    let mut obj = rc.borrow_mut();
+                    obj.class_name = Some("String".to_owned());
+                    obj.set_ne("[[PrimitiveValue]]", JsValue::String(value.clone()));
+                    obj.set_ne("length", JsValue::Number(value.chars().count() as f64));
+                    for (index, ch) in value.chars().enumerate() {
+                        obj.set_ne(index.to_string(), JsValue::String(ch.to_string()));
+                    }
+                }
+                JsValue::Object(rc)
+            }
+            other => other,
+        }
+    }
+
     fn function_set(&mut self, func: &mut JsFunction, this: JsValue, key: String, value: JsValue) {
+        if let Some(prop) = self
+            .function_accessors
+            .get(&func.id)
+            .and_then(|props| props.get(&key))
+            .cloned()
+        {
+            match prop {
+                Property::Accessor {
+                    set: Some(setter), ..
+                } => {
+                    self.call_value(setter, this, vec![value]);
+                }
+                Property::Accessor { set: None, .. }
+                | Property::Data {
+                    writable: false, ..
+                } => {}
+                Property::Data { .. } => {
+                    self.function_properties
+                        .entry(func.id)
+                        .or_default()
+                        .insert(key, value);
+                }
+            }
+            return;
+        }
         if let Some(prop) = func.static_accessors.get(&key).cloned() {
             match prop {
                 Property::Accessor {
@@ -1843,12 +1965,18 @@ impl BrowserExecutionState {
                     writable: false, ..
                 } => {}
                 Property::Data { .. } => {
-                    func.properties.insert(key, value);
+                    self.function_properties
+                        .entry(func.id)
+                        .or_default()
+                        .insert(key, value);
                 }
             }
             return;
         }
-        func.properties.insert(key, value);
+        self.function_properties
+            .entry(func.id)
+            .or_default()
+            .insert(key, value);
     }
 
     /// Create a new empty ordinary object (JsValue convenience).
@@ -2058,13 +2186,29 @@ impl BrowserExecutionState {
             if let Some(ref bid) = info.build_id {
                 obj.set("buildID", JsValue::String(bid.clone()));
             }
-            obj.set("plugins", JsValue::Array(vec![]));
-            obj.set("mimeTypes", JsValue::Array(vec![]));
+            obj.set("onLine", JsValue::Boolean(true));
+            obj.set("webdriver", JsValue::Boolean(false));
+            obj.set("pdfViewerEnabled", JsValue::Boolean(true));
+            obj.set("deviceMemory", JsValue::Number(8.0));
+            obj.set(
+                "javaEnabled",
+                JsValue::HostFunction("navigator.javaEnabled".to_owned()),
+            );
+            obj.set("plugins", JsValue::HostObject("PluginArray".to_owned()));
+            obj.set("mimeTypes", JsValue::HostObject("MimeTypeArray".to_owned()));
         }
         self.globals
             .insert("navigator".into(), JsValue::NavigatorRef);
         self.globals
             .insert("__navigatorData".into(), JsValue::Object(rc));
+    }
+
+    pub fn seed_navigator_debug_id(&mut self, debug_id: &str) {
+        if let Some(JsValue::Object(rc)) = self.globals.get("__navigatorData") {
+            let mut obj = rc.borrow_mut();
+            obj.set("xDebugId", JsValue::String(debug_id.to_owned()));
+            obj.set("almostThereDebugId", JsValue::String(debug_id.to_owned()));
+        }
     }
 
     /// Seed the global `screen` object so scripts can read
@@ -3122,8 +3266,8 @@ impl BrowserExecutionState {
     fn construct_function_object(&mut self, func: JsFunction, args: Vec<JsValue>) -> JsValue {
         let ctor_name = func.name.clone();
         let this_rc = JsObject::new();
-        if let Some(JsValue::Object(proto_rc)) = func.properties.get("prototype") {
-            this_rc.borrow_mut().prototype = Some(Rc::clone(proto_rc));
+        if let Some(proto_rc) = self.function_prototype_object(&func) {
+            this_rc.borrow_mut().prototype = Some(Rc::clone(&proto_rc));
         }
         let this_obj = JsValue::Object(this_rc);
         let (result, this_after) = self.call_function_with_this(func, args, this_obj);
@@ -4140,6 +4284,121 @@ impl BrowserExecutionState {
         }
     }
 
+    fn diagnostic_simple_expression_value(&self, expression: &Expression) -> Option<JsValue> {
+        match expression {
+            Expression::Identifier(name) => Some(self.get_identifier_value(name)),
+            Expression::String(value) => Some(JsValue::String(value.clone())),
+            Expression::Number(value) => Some(JsValue::Number(*value)),
+            Expression::BigInt(value) => value.parse::<i64>().ok().map(JsValue::BigInt),
+            Expression::Boolean(value) => Some(JsValue::Boolean(*value)),
+            Expression::Null => Some(JsValue::Null),
+            Expression::Undefined => Some(JsValue::Undefined),
+            Expression::This => Some(self.get_identifier_value("this")),
+            _ => None,
+        }
+    }
+
+    fn diagnostic_value_summary(value: &JsValue) -> String {
+        let mut text = Self::value_to_string(value);
+        const MAX_VALUE_CHARS: usize = 120;
+        if text.chars().count() > MAX_VALUE_CHARS {
+            text = text.chars().take(MAX_VALUE_CHARS).collect::<String>();
+            text.push_str("...");
+        }
+        text.replace('\n', "\\n")
+    }
+
+    fn diagnostic_member_key_lookup(&self, base: &JsValue, key: &str) -> (bool, JsValue) {
+        match base {
+            JsValue::Object(rc) => {
+                let borrowed = rc.borrow();
+                (
+                    borrowed.has_own(key),
+                    borrowed.get_own_data(key).unwrap_or(JsValue::Undefined),
+                )
+            }
+            JsValue::Array(items) => {
+                let value = key
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| items.get(index).cloned())
+                    .unwrap_or(JsValue::Undefined);
+                (!matches!(value, JsValue::Undefined), value)
+            }
+            JsValue::RichArray(rc) => {
+                let borrowed = rc.borrow();
+                let value = key
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| borrowed.elements.get(index).cloned())
+                    .unwrap_or(JsValue::Undefined);
+                (!matches!(value, JsValue::Undefined), value)
+            }
+            JsValue::Function(func) => {
+                let value = func
+                    .properties
+                    .get(key)
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined);
+                (!matches!(value, JsValue::Undefined), value)
+            }
+            _ => (false, JsValue::Undefined),
+        }
+    }
+
+    fn unsupported_method_detail(
+        &self,
+        method_name: &str,
+        receiver: &JsValue,
+        callee: &Expression,
+        receiver_expression: &Expression,
+    ) -> String {
+        let mut detail = format!(
+            "{} on {} via {:?}; receiver_tag={}",
+            method_name,
+            Self::value_to_string(receiver),
+            callee,
+            Self::object_tag(receiver)
+        );
+
+        if let Expression::Member {
+            object: base_expression,
+            property: MemberProperty::Computed(key_expression),
+            ..
+        } = receiver_expression
+        {
+            detail.push_str(&format!(
+                "; receiver_member_base={:?}; receiver_member_key_expr={:?}",
+                base_expression, key_expression
+            ));
+
+            let key_value = self.diagnostic_simple_expression_value(key_expression);
+            if let Some(key_value) = key_value {
+                let key = Self::value_to_string(&key_value);
+                detail.push_str(&format!(
+                    "; receiver_member_key={} key_tag={}",
+                    key,
+                    Self::object_tag(&key_value)
+                ));
+
+                if let Some(base_value) = self.diagnostic_simple_expression_value(base_expression) {
+                    let (has_own, slot_value) =
+                        self.diagnostic_member_key_lookup(&base_value, &key);
+                    detail.push_str(&format!(
+                        "; receiver_member_base_tag={}; receiver_member_base={}; receiver_member_has_own={}; receiver_member_value_tag={}; receiver_member_value={}",
+                        Self::object_tag(&base_value),
+                        Self::diagnostic_value_summary(&base_value),
+                        has_own,
+                        Self::object_tag(&slot_value),
+                        Self::diagnostic_value_summary(&slot_value)
+                    ));
+                }
+            }
+        }
+
+        detail
+    }
+
     fn emit_network_request(&mut self, method: &str, url: String, body: String) {
         self.effects.push(BrowserEffect::RuntimeTrace {
             kind: "network.request".to_owned(),
@@ -5086,8 +5345,8 @@ impl BrowserExecutionState {
                     let ctor_name = func.name.clone();
                     // Create a fresh instance object whose [[Prototype]] = Class.prototype.
                     let this_rc = JsObject::new();
-                    if let Some(JsValue::Object(proto_rc)) = func.properties.get("prototype") {
-                        this_rc.borrow_mut().prototype = Some(Rc::clone(proto_rc));
+                    if let Some(proto_rc) = self.function_prototype_object(&func) {
+                        this_rc.borrow_mut().prototype = Some(Rc::clone(&proto_rc));
                     }
                     let this_obj = JsValue::Object(this_rc);
                     let args = self.eval_args(arguments);
@@ -6971,19 +7230,15 @@ impl BrowserExecutionState {
                 }
             }
 
-            // Static method call on a class constructor: `ClassName.staticMethod(args)`.
-            // Restricted to is_class_ctor to avoid firing on ad-hoc function properties
-            // that test harnesses assign (assert.sameValue = fn, etc.), which were previously
-            // silent no-ops and must remain so to preserve the existing test score baseline.
+            // Functions are ordinary objects: callable own properties assigned to a function
+            // must be invocable through any alias of that function object.
             if let JsValue::Function(ref func) = receiver {
+                let method_val = self.function_get(func, receiver.clone(), &method_name);
+                if Self::is_callable_value(&method_val) {
+                    let args = self.eval_args(arguments);
+                    return self.call_value(method_val, receiver.clone(), args);
+                }
                 if func.is_class_ctor {
-                    let method_val = self.function_get(func, receiver.clone(), &method_name);
-                    if let JsValue::Function(mfunc) = method_val {
-                        let args = self.eval_args(arguments);
-                        let (result, _) =
-                            self.call_function_with_this(mfunc, args, receiver.clone());
-                        return result;
-                    }
                     if !matches!(method_val, JsValue::Undefined) {
                         return method_val;
                     }
@@ -7060,12 +7315,7 @@ impl BrowserExecutionState {
             // Evaluated receiver but method not found; trace it and still evaluate args for side effects.
             self.trace_runtime(
                 "unsupported.method",
-                format!(
-                    "{} on {} via {:?}",
-                    method_name,
-                    Self::value_to_string(&receiver),
-                    callee
-                ),
+                self.unsupported_method_detail(&method_name, &receiver, callee, object),
             );
             for arg in arguments {
                 self.execute_expression(arg);
@@ -7761,6 +8011,17 @@ impl BrowserExecutionState {
             .unwrap_or(JsValue::Undefined);
 
         match (&target, descriptor) {
+            (JsValue::Function(func), JsValue::Object(desc)) => {
+                if !self.apply_function_property_descriptor(func, key.clone(), &desc) {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        format!("Cannot redefine property: {key}"),
+                    )));
+                    return JsValue::Undefined;
+                }
+                self.assign_target(target_expr, target.clone());
+                target
+            }
             (JsValue::Object(rc), JsValue::Object(desc)) => {
                 let rc = rc.clone();
                 if !Self::apply_property_descriptor(&rc, key.clone(), &desc) {
@@ -8221,12 +8482,22 @@ impl BrowserExecutionState {
                 }
                 JsValue::Object(rc)
             }
-            "defineProperty" => {
+            "defineProperty" | "Object.defineProperty" => {
                 let mut iter = args.into_iter();
                 let obj = iter.next().unwrap_or(JsValue::Undefined);
                 let key = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
                 let descriptor = iter.next().unwrap_or(JsValue::Undefined);
                 match (obj, descriptor) {
+                    (JsValue::Function(func), JsValue::Object(desc)) => {
+                        if !self.apply_function_property_descriptor(&func, key.clone(), &desc) {
+                            self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                                "TypeError",
+                                format!("Cannot redefine property: {key}"),
+                            )));
+                            return JsValue::Undefined;
+                        }
+                        JsValue::Function(func)
+                    }
                     (JsValue::Object(rc), JsValue::Object(desc)) => {
                         if !Self::apply_property_descriptor(&rc, key.clone(), &desc) {
                             self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
@@ -8244,11 +8515,15 @@ impl BrowserExecutionState {
                     _ => JsValue::Undefined,
                 }
             }
-            "getOwnPropertyDescriptor" => {
+            "getOwnPropertyDescriptor" | "Object.getOwnPropertyDescriptor" => {
                 let mut iter = args.into_iter();
                 let obj = iter.next().unwrap_or(JsValue::Undefined);
                 let prop = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
-                Self::static_get_own_property_descriptor(&obj, &prop)
+                self.get_own_property_descriptor(&obj, &prop)
+            }
+            "getOwnPropertyDescriptors" | "Object.getOwnPropertyDescriptors" => {
+                let obj = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                self.get_own_property_descriptors(&obj)
             }
             "defineProperties" => {
                 let mut iter = args.into_iter();
@@ -8272,37 +8547,67 @@ impl BrowserExecutionState {
                 }
                 obj
             }
-            "getOwnPropertyNames" => match args.into_iter().next().unwrap_or(JsValue::Undefined) {
-                JsValue::Object(rc) => JsValue::Array(
-                    rc.borrow()
-                        .all_own_keys()
-                        .into_iter()
-                        .map(JsValue::String)
-                        .collect(),
-                ),
-                JsValue::Array(arr) => {
-                    let mut keys: Vec<JsValue> = (0..arr.len())
-                        .map(|i| JsValue::String(i.to_string()))
-                        .collect();
-                    keys.push(JsValue::String("length".to_string()));
-                    JsValue::Array(keys)
-                }
-                JsValue::HostFunction(fn_name) => {
-                    let mut keys = vec![
+            "getOwnPropertyNames" | "Object.getOwnPropertyNames" => {
+                match args.into_iter().next().unwrap_or(JsValue::Undefined) {
+                    JsValue::Object(rc) => JsValue::Array(
+                        rc.borrow()
+                            .all_own_keys()
+                            .into_iter()
+                            .map(JsValue::String)
+                            .collect(),
+                    ),
+                    JsValue::Array(arr) => {
+                        let mut keys: Vec<JsValue> = (0..arr.len())
+                            .map(|i| JsValue::String(i.to_string()))
+                            .collect();
+                        keys.push(JsValue::String("length".to_string()));
+                        JsValue::Array(keys)
+                    }
+                    JsValue::HostFunction(fn_name) => {
+                        let mut keys = vec![
+                            JsValue::String("length".to_owned()),
+                            JsValue::String("name".to_owned()),
+                        ];
+                        if Self::constructor_prototype_object(&fn_name).is_some() {
+                            keys.push(JsValue::String("prototype".to_owned()));
+                        }
+                        JsValue::Array(keys)
+                    }
+                    JsValue::Function(func) => {
+                        let mut keys = vec![
+                            "length".to_owned(),
+                            "name".to_owned(),
+                            "prototype".to_owned(),
+                        ];
+                        if let Some(props) = self.function_properties.get(&func.id) {
+                            keys.extend(props.keys().cloned());
+                        }
+                        if let Some(props) = self.function_accessors.get(&func.id) {
+                            keys.extend(props.keys().cloned());
+                        }
+                        keys.sort();
+                        keys.dedup();
+                        JsValue::Array(keys.into_iter().map(JsValue::String).collect())
+                    }
+                    JsValue::BoundHostFunction { .. } => JsValue::Array(vec![
                         JsValue::String("length".to_owned()),
                         JsValue::String("name".to_owned()),
-                    ];
-                    if Self::constructor_prototype_object(&fn_name).is_some() {
-                        keys.push(JsValue::String("prototype".to_owned()));
-                    }
-                    JsValue::Array(keys)
+                    ]),
+                    JsValue::NavigatorRef => JsValue::Array(
+                        self.navigator_own_property_names()
+                            .into_iter()
+                            .map(JsValue::String)
+                            .collect(),
+                    ),
+                    JsValue::HostObject(name) => JsValue::Array(
+                        Self::host_object_own_property_names(&name)
+                            .into_iter()
+                            .map(|key| JsValue::String(key.to_owned()))
+                            .collect(),
+                    ),
+                    _ => JsValue::Array(vec![]),
                 }
-                JsValue::BoundHostFunction { .. } => JsValue::Array(vec![
-                    JsValue::String("length".to_owned()),
-                    JsValue::String("name".to_owned()),
-                ]),
-                _ => JsValue::Array(vec![]),
-            },
+            }
             "getOwnPropertySymbols" => JsValue::Array(vec![]),
             "getPrototypeOf" => match args.into_iter().next().unwrap_or(JsValue::Undefined) {
                 JsValue::Object(rc) => rc
@@ -10469,11 +10774,17 @@ impl BrowserExecutionState {
                         .count();
                     JsValue::Number(arity as f64)
                 }
-                "prototype" => func
-                    .properties
-                    .get("prototype")
+                "prototype" => self
+                    .function_properties
+                    .get(&func.id)
+                    .and_then(|props| props.get("prototype"))
                     .cloned()
-                    .unwrap_or_else(JsValue::new_object),
+                    .unwrap_or_else(|| {
+                        func.properties
+                            .get("prototype")
+                            .cloned()
+                            .unwrap_or_else(JsValue::new_object)
+                    }),
                 "call" | "apply" | "bind" => {
                     JsValue::HostFunction(format!("Function.prototype.{property}"))
                 }
@@ -10902,7 +11213,12 @@ impl BrowserExecutionState {
                     JsValue::NavigatorRef => {
                         let nav_val = self.globals.get("__navigatorData").cloned();
                         if let Some(JsValue::Object(rc)) = nav_val {
-                            self.obj_get(&rc, property)
+                            let value = self.obj_get(&rc, property);
+                            if matches!(value, JsValue::Undefined) {
+                                Self::navigator_soft_failure_property(property)
+                            } else {
+                                value
+                            }
                         } else {
                             Self::navigator_soft_failure_property(property)
                         }
@@ -11027,10 +11343,8 @@ impl BrowserExecutionState {
                                 .count();
                             JsValue::Number(arity as f64)
                         }
-                        "prototype" => func
-                            .properties
-                            .get("prototype")
-                            .cloned()
+                        "prototype" => self
+                            .function_own_value(&func, "prototype")
                             .unwrap_or_else(JsValue::new_object),
                         "call" | "apply" | "bind" => {
                             JsValue::HostFunction(format!("Function.prototype.{property}"))
@@ -15228,6 +15542,11 @@ impl BrowserExecutionState {
 
     fn call_host_function(&mut self, name: &str, this_arg: JsValue, args: Vec<JsValue>) -> JsValue {
         match name {
+            "Object" => {
+                return Self::object_function_coerce(
+                    args.into_iter().next().unwrap_or(JsValue::Undefined),
+                );
+            }
             "jQuery" => self.call_jquery_constructor(args),
             "jQuery.ready" => {
                 if let Some(callback) = args.first().cloned().and_then(Self::function_from_value) {
@@ -15983,10 +16302,10 @@ impl BrowserExecutionState {
                         if let Some(trap) = traps.get_own_property_descriptor.clone() {
                             self.call_function(trap, vec![*target, JsValue::String(prop)])
                         } else {
-                            Self::static_get_own_property_descriptor(&target, &prop)
+                            self.get_own_property_descriptor(&target, &prop)
                         }
                     }
-                    other => Self::static_get_own_property_descriptor(&other, &prop),
+                    other => self.get_own_property_descriptor(&other, &prop),
                 }
             }
             "Reflect.defineProperty" => {
@@ -16686,6 +17005,7 @@ impl BrowserExecutionState {
             }
             "Symbol.keyFor" => JsValue::Undefined,
             "performance.now" => JsValue::Number(self.current_time_ms as f64),
+            "navigator.javaEnabled" => JsValue::Boolean(false),
             "escape" => {
                 let s = args.first().map(Self::value_to_string).unwrap_or_default();
                 JsValue::String(js_escape(&s))
@@ -17497,6 +17817,182 @@ impl BrowserExecutionState {
 
     /// Returns a property descriptor Object for a known own property of `obj`.
     /// Returns `JsValue::Undefined` when the property does not exist as an own property.
+    fn get_own_property_descriptor(&self, obj: &JsValue, prop: &str) -> JsValue {
+        if let JsValue::Function(func) = obj {
+            if let Some(descriptor) = self.function_own_property_descriptor(func, prop) {
+                return descriptor;
+            }
+        }
+        Self::static_get_own_property_descriptor(obj, prop)
+    }
+
+    fn get_own_property_descriptors(&self, obj: &JsValue) -> JsValue {
+        let keys: Vec<String> = match obj {
+            JsValue::Object(rc) => rc.borrow().all_own_keys(),
+            JsValue::Array(items) => {
+                let mut keys: Vec<String> = (0..items.len()).map(|i| i.to_string()).collect();
+                keys.push("length".to_owned());
+                keys
+            }
+            JsValue::RichArray(rc) => {
+                let arr = rc.borrow();
+                let mut keys: Vec<String> =
+                    (0..arr.elements.len()).map(|i| i.to_string()).collect();
+                keys.extend(arr.overrides.keys().map(|i| i.to_string()));
+                keys.push("length".to_owned());
+                keys.sort();
+                keys.dedup();
+                keys
+            }
+            JsValue::Function(func) => {
+                let mut keys = vec![
+                    "length".to_owned(),
+                    "name".to_owned(),
+                    "prototype".to_owned(),
+                ];
+                if let Some(props) = self.function_properties.get(&func.id) {
+                    keys.extend(props.keys().cloned());
+                }
+                if let Some(props) = self.function_accessors.get(&func.id) {
+                    keys.extend(props.keys().cloned());
+                }
+                keys.sort();
+                keys.dedup();
+                keys
+            }
+            JsValue::HostFunction(fn_name) => {
+                let mut keys = vec!["length".to_owned(), "name".to_owned()];
+                if Self::constructor_prototype_object(fn_name).is_some() {
+                    keys.push("prototype".to_owned());
+                }
+                keys
+            }
+            _ => Vec::new(),
+        };
+
+        let rc = JsObject::new();
+        {
+            let mut descriptors = rc.borrow_mut();
+            for key in keys {
+                let desc = self.get_own_property_descriptor(obj, &key);
+                if !matches!(desc, JsValue::Undefined) {
+                    descriptors.set(key, desc);
+                }
+            }
+        }
+        JsValue::Object(rc)
+    }
+
+    fn function_own_property_descriptor(&self, func: &JsFunction, prop: &str) -> Option<JsValue> {
+        fn make_data(
+            value: JsValue,
+            writable: bool,
+            enumerable: bool,
+            configurable: bool,
+        ) -> JsValue {
+            JsValue::from_map([
+                ("value".to_owned(), value),
+                ("writable".to_owned(), JsValue::Boolean(writable)),
+                ("enumerable".to_owned(), JsValue::Boolean(enumerable)),
+                ("configurable".to_owned(), JsValue::Boolean(configurable)),
+            ])
+        }
+        fn make_accessor(
+            getter: JsValue,
+            setter: JsValue,
+            enumerable: bool,
+            configurable: bool,
+        ) -> JsValue {
+            JsValue::from_map([
+                ("get".to_owned(), getter),
+                ("set".to_owned(), setter),
+                ("enumerable".to_owned(), JsValue::Boolean(enumerable)),
+                ("configurable".to_owned(), JsValue::Boolean(configurable)),
+            ])
+        }
+
+        if let Some(prop_desc) = self
+            .function_accessors
+            .get(&func.id)
+            .and_then(|props| props.get(prop))
+        {
+            return Some(match prop_desc {
+                Property::Data {
+                    value,
+                    writable,
+                    enumerable,
+                    configurable,
+                } => make_data(value.clone(), *writable, *enumerable, *configurable),
+                Property::Accessor {
+                    get,
+                    set,
+                    enumerable,
+                    configurable,
+                } => make_accessor(
+                    get.clone().unwrap_or(JsValue::Undefined),
+                    set.clone().unwrap_or(JsValue::Undefined),
+                    *enumerable,
+                    *configurable,
+                ),
+            });
+        }
+        if let Some(value) = self
+            .function_properties
+            .get(&func.id)
+            .and_then(|props| props.get(prop))
+        {
+            return Some(make_data(value.clone(), true, true, true));
+        }
+        None
+    }
+
+    fn apply_function_property_descriptor(
+        &mut self,
+        func: &JsFunction,
+        key: String,
+        desc: &Rc<RefCell<JsObject>>,
+    ) -> bool {
+        let desc_ref = desc.borrow();
+        let enumerable = desc_ref
+            .get_own_data("enumerable")
+            .is_some_and(|value| matches!(value, JsValue::Boolean(true)));
+        let configurable = desc_ref
+            .get_own_data("configurable")
+            .is_some_and(|value| matches!(value, JsValue::Boolean(true)));
+        let has_get = desc_ref.has_own("get");
+        let has_set = desc_ref.has_own("set");
+        let property = if has_get || has_set {
+            Property::Accessor {
+                get: desc_ref.get_own_data("get"),
+                set: desc_ref.get_own_data("set"),
+                enumerable,
+                configurable,
+            }
+        } else {
+            let writable = desc_ref
+                .get_own_data("writable")
+                .is_some_and(|value| matches!(value, JsValue::Boolean(true)));
+            let value = desc_ref.get_own_data("value").unwrap_or(JsValue::Undefined);
+            Property::Data {
+                value,
+                writable,
+                enumerable,
+                configurable,
+            }
+        };
+        drop(desc_ref);
+
+        self.function_properties
+            .entry(func.id)
+            .or_default()
+            .remove(&key);
+        self.function_accessors
+            .entry(func.id)
+            .or_default()
+            .insert(key, property);
+        true
+    }
+
     fn static_get_own_property_descriptor(obj: &JsValue, prop: &str) -> JsValue {
         fn make_data(
             value: JsValue,
@@ -18276,11 +18772,22 @@ impl BrowserExecutionState {
                 ),
             ]),
             "getBattery" => JsValue::HostFunction("navigator.getBattery".to_owned()),
+            "javaEnabled" => JsValue::HostFunction("navigator.javaEnabled".to_owned()),
             _ => JsValue::Undefined,
         }
     }
 
     fn host_object_property(name: &str, property: &str) -> JsValue {
+        if matches!(name, "PluginArray" | "MimeTypeArray") {
+            return match property {
+                "length" => JsValue::Number(0.0),
+                "item" | "namedItem" => JsValue::HostFunction(format!("{name}.{property}")),
+                "refresh" if name == "PluginArray" => {
+                    JsValue::HostFunction("PluginArray.refresh".to_owned())
+                }
+                _ => JsValue::Undefined,
+            };
+        }
         if name.contains("AudioContext") {
             return match property {
                 "state" => JsValue::String("suspended".to_owned()),
@@ -18305,6 +18812,13 @@ impl BrowserExecutionState {
     }
 
     fn host_object_method_return(name: &str, method_name: &str) -> JsValue {
+        if matches!(name, "PluginArray" | "MimeTypeArray") {
+            return match method_name {
+                "item" | "namedItem" => JsValue::Null,
+                "refresh" if name == "PluginArray" => JsValue::Undefined,
+                _ => JsValue::Undefined,
+            };
+        }
         if name.contains("AudioContext") {
             return match method_name {
                 "close" | "resume" | "suspend" => Self::fulfilled_promise(JsValue::Undefined),
@@ -18352,6 +18866,29 @@ impl BrowserExecutionState {
             };
         }
         JsValue::Undefined
+    }
+
+    fn host_object_own_property_names(name: &str) -> Vec<&'static str> {
+        match name {
+            "PluginArray" => vec!["length", "item", "namedItem", "refresh"],
+            "MimeTypeArray" => vec!["length", "item", "namedItem"],
+            _ => Vec::new(),
+        }
+    }
+
+    fn navigator_own_property_names(&self) -> Vec<String> {
+        let mut names = if let Some(JsValue::Object(rc)) = self.globals.get("__navigatorData") {
+            rc.borrow().all_own_keys()
+        } else {
+            Vec::new()
+        };
+        for key in ["permissions", "mediaDevices", "getBattery"] {
+            if !names.iter().any(|name| name == key) {
+                names.push(key.to_owned());
+            }
+        }
+        names.sort();
+        names
     }
 
     fn soft_failure_constructor_name(name: &str) -> bool {
@@ -20321,6 +20858,74 @@ mod tests {
     }
 
     #[test]
+    fn seeded_navigator_keeps_standard_soft_failure_surfaces() {
+        let program = crate::parse_script(
+            r#"
+            navigator.permissions.query({ name: "camera" }).then(function () {
+                document.getElementById("permissions").textContent = "ok";
+            });
+            navigator.mediaDevices.enumerateDevices().then(function () {
+                document.getElementById("devices").textContent = "ok";
+            });
+            var navNames = Object.getOwnPropertyNames(navigator);
+            var pluginNames = Object.getOwnPropertyNames(navigator.plugins);
+            document.getElementById("result").textContent = [
+                String(navigator.onLine),
+                String(navigator.webdriver),
+                String(navigator.pdfViewerEnabled),
+                String(navigator.deviceMemory),
+                String(navigator.javaEnabled()),
+                String(navigator.plugins.length),
+                String(navigator.plugins.item(0)),
+                String(navigator.mimeTypes.namedItem("application/pdf")),
+                String(navNames.indexOf("plugins") >= 0),
+                String(navNames.indexOf("xDebugId") >= 0),
+                navigator.xDebugId,
+                navigator.almostThereDebugId,
+                pluginNames.join("|")
+            ].join("/");
+            "#,
+        )
+        .expect("parse error");
+        let mut state = BrowserExecutionState::default();
+        state.seed_browser_basics();
+        state.seed_navigator(&crate::navigator::NavigatorInfo {
+            platform: "Linux x86_64".to_owned(),
+            user_agent: "AlmostThere Browser/0.1.0".to_owned(),
+            app_version: "AlmostThere Browser/0.1.0".to_owned(),
+            app_name: "AlmosThere",
+            app_code_name: "AlmostThere",
+            product: "AlmosThere",
+            product_sub: "20030107",
+            vendor: "MrJacob241 AKA JohnHobbes",
+            vendor_sub: "",
+            languages: vec!["en-US".to_owned(), "en".to_owned()],
+            hardware_concurrency: 8,
+            max_touch_points: 0,
+            cookie_enabled: true,
+            do_not_track: None,
+            oscpu: Some("Linux x86_64".to_owned()),
+            cpu_class: None,
+            build_id: None,
+            os_version: "test".to_owned(),
+        });
+        state.seed_navigator_debug_id("AlmostThere Browser/0.1.0; os=linux/test");
+        state.execute_program(&program);
+
+        assert_eq!(
+            state.drain_effects(),
+            vec![
+                text(
+                    "result",
+                    "true/false/true/8/false/0/null/null/true/true/AlmostThere Browser/0.1.0; os=linux/test/AlmostThere Browser/0.1.0; os=linux/test/length|item|namedItem|refresh",
+                ),
+                text("permissions", "ok"),
+                text("devices", "ok"),
+            ]
+        );
+    }
+
+    #[test]
     fn audio_context_soft_failure_exposes_inert_nodes_and_promises() {
         let effects = run(r#"
             let audio = new window.webkitAudioContext();
@@ -20372,6 +20977,27 @@ mod tests {
                 if kind == "unsupported.method"
                     && detail.contains("replace on undefined via")
                     && detail.contains("replace")
+        )));
+    }
+
+    #[test]
+    fn unsupported_computed_member_method_trace_includes_key_and_base_slot() {
+        let effects = run(r#"
+            let e = {};
+            e["known"] = function () {};
+            let r = "missing-module";
+            e[r].call(null);
+            "#);
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            BrowserEffect::RuntimeTrace { kind, detail }
+                if kind == "unsupported.method"
+                    && detail.contains("call on undefined via")
+                    && detail.contains("receiver_member_key=missing-module")
+                    && detail.contains("receiver_member_base_tag=Object")
+                    && detail.contains("receiver_member_has_own=false")
+                    && detail.contains("receiver_member_value_tag=Undefined")
         )));
     }
 
@@ -29311,6 +29937,133 @@ mod tests {
             vec![text("root", "amiunique-loaded")],
             "full named-window AMIUnique bootstrap must reach module 374: {effects:?}"
         );
+    }
+
+    #[test]
+    fn function_object_properties_persist_across_aliases_and_descriptors() {
+        let effects = run(r#"
+            var modules = {
+                42: function(module, exports, require) {
+                    require.r(exports);
+                    require.d(exports, "answer", function() { return "ok"; });
+                    document.getElementById("result").textContent =
+                        exports.answer + ":" +
+                        String(Object.getOwnPropertyNames(require).indexOf("d") >= 0) + ":" +
+                        typeof Object.getOwnPropertyDescriptor(require, "r").value;
+                }
+            };
+            function require(id) {
+                var module = { exports: {} };
+                modules[id].call(module.exports, module, module.exports, require);
+                return module.exports;
+            }
+            var alias = require;
+            alias.d = function(exports, name, getter) {
+                Object.defineProperty(exports, name, {
+                    enumerable: true,
+                    get: getter
+                });
+            };
+            Object.defineProperty(alias, "r", {
+                value: function(exports) {
+                    Object.defineProperty(exports, "__esModule", { value: true });
+                },
+                enumerable: false,
+                configurable: true,
+                writable: true
+            });
+            require(42);
+            "#);
+
+        assert_eq!(effects, vec![text("result", "ok:true:function")]);
+        assert!(!has_runtime_trace(&effects, "unsupported.method"));
+    }
+
+    #[test]
+    fn object_function_call_preserves_callable_objects_and_descriptors() {
+        let effects = run(r#"
+            function define(target, key, value) {
+                target[key] = value;
+            }
+            var target = {};
+            Object(define)(target, "answer", "ok");
+
+            var source = {};
+            Object.defineProperty(source, "hidden", {
+                value: "secret",
+                enumerable: false,
+                configurable: true,
+                writable: true
+            });
+            Object.defineProperties(target, Object.getOwnPropertyDescriptors(Object(source)));
+
+            document.getElementById("result").textContent =
+                target.answer + ":" +
+                target.hidden + ":" +
+                String(Object.keys(target).indexOf("hidden") < 0);
+            "#);
+
+        assert_eq!(effects, vec![text("result", "ok:secret:true")]);
+        assert!(!has_runtime_trace(&effects, "unsupported.call"));
+    }
+
+    #[test]
+    fn webpack_chunk_registers_object_modules_before_entry_execution() {
+        let effects = run_two_scripts(
+            r#"
+                !function(e) {
+                    var n = {}, o = {77: 0}, f = [];
+                    function r(data) {
+                        for (var r, c = data[0], d = data[1], l = data[2], i = 0; i < c.length; i++) {
+                            o[c[i]] = 0;
+                        }
+                        for (r in d) {
+                            if (Object.prototype.hasOwnProperty.call(d, r)) {
+                                e[r] = d[r];
+                            }
+                        }
+                        f.push.apply(f, l || []);
+                        return t();
+                    }
+                    function t() {
+                        for (var e, i = 0; i < f.length; i++) {
+                            var r = f[i];
+                            e = c(c.s = r[0]);
+                        }
+                        return e;
+                    }
+                    function c(r) {
+                        if (n[r]) return n[r].exports;
+                        var t = n[r] = { i: r, l: false, exports: {} };
+                        e[r].call(t.exports, t, t.exports, c);
+                        t.l = true;
+                        return t.exports;
+                    }
+                    var d = window.webpackJsonp = window.webpackJsonp || [], l = d.push.bind(d);
+                    d.push = r;
+                    d = d.slice();
+                }([]);
+            "#,
+            r#"
+                (window.webpackJsonp = window.webpackJsonp || []).push([
+                    [10],
+                    {
+                        374: function(module, exports, require) {
+                            document.getElementById("result").textContent = "entry-ran";
+                        }
+                    },
+                    [[374, 77, 11, 78]]
+                ]);
+            "#,
+        );
+
+        let dom: Vec<_> = effects
+            .iter()
+            .filter(|effect| !matches!(effect, BrowserEffect::RuntimeTrace { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(dom, vec![text("result", "entry-ran")]);
+        assert!(!has_runtime_trace(&effects, "unsupported.method"));
     }
 
     #[test]

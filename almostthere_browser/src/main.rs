@@ -28,6 +28,7 @@ use rich_canvas::{
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
 
 const APP_TITLE: &str = "AlmostThere Browser";
+const DEBUG_ID_HEADER: &str = "x-debug-id";
 const DEFAULT_PAGE_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../sample_pages/test_basic_page.html"
@@ -5937,6 +5938,7 @@ fn seed_script_browser_globals(
     let fingerprint = justbarelyscript::FingerprintSuite::detect();
     state.seed_browser_basics();
     state.seed_navigator(&navigator);
+    state.seed_navigator_debug_id(&browser_debug_id());
     state.seed_screen(&screen);
     state.seed_fingerprint_suite(fingerprint);
     if let Some(source) = source {
@@ -9363,6 +9365,269 @@ fn http_client() -> io::Result<reqwest::blocking::Client> {
 fn browser_http_client_builder() -> reqwest::blocking::ClientBuilder {
     reqwest::blocking::Client::builder()
         .user_agent(format!("{APP_TITLE}/{}", env!("CARGO_PKG_VERSION")))
+        .default_headers(browser_http_default_headers())
+}
+
+fn browser_http_default_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Ok(value) = reqwest::header::HeaderValue::from_str(&browser_debug_id()) {
+        headers.insert(
+            reqwest::header::HeaderName::from_static(DEBUG_ID_HEADER),
+            value,
+        );
+    }
+    let languages = std::panic::catch_unwind(justbarelyscript::NavigatorInfo::detect)
+        .ok()
+        .map(|info| info.languages)
+        .unwrap_or_else(|| vec!["en-US".to_owned(), "en".to_owned()]);
+    if let Ok(value) = reqwest::header::HeaderValue::from_str(&accept_language_header(&languages)) {
+        headers.insert(reqwest::header::ACCEPT_LANGUAGE, value);
+    }
+    headers
+}
+
+fn accept_language_header(languages: &[String]) -> String {
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+    for language in languages {
+        let tag = normalize_accept_language_tag(language);
+        if !tag.is_empty() && seen.insert(tag.to_ascii_lowercase()) {
+            normalized.push(tag);
+        }
+    }
+    if normalized.is_empty() {
+        normalized.push("en-US".to_owned());
+        normalized.push("en".to_owned());
+    } else if normalized.len() == 1 {
+        if let Some(base) = accept_language_base_tag(&normalized[0]) {
+            if seen.insert(base.to_ascii_lowercase()) {
+                normalized.push(base);
+            }
+        }
+    }
+
+    normalized
+        .into_iter()
+        .enumerate()
+        .map(|(index, tag)| {
+            if index == 0 {
+                tag
+            } else {
+                let q = (10usize.saturating_sub(index)).max(1);
+                format!("{tag};q=0.{q}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn normalize_accept_language_tag(language: &str) -> String {
+    let without_quality = language.split(';').next().unwrap_or(language);
+    let without_encoding = without_quality.split('.').next().unwrap_or(without_quality);
+    let tag = without_encoding.trim().replace('_', "-");
+    if tag.is_empty()
+        || tag.eq_ignore_ascii_case("C")
+        || tag.eq_ignore_ascii_case("POSIX")
+        || !tag
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        return String::new();
+    }
+    tag
+}
+
+fn accept_language_base_tag(language: &str) -> Option<String> {
+    let base = language.split('-').next()?.trim();
+    if base.is_empty() || base == language {
+        None
+    } else {
+        Some(base.to_owned())
+    }
+}
+
+fn browser_debug_id() -> String {
+    let navigator = std::panic::catch_unwind(justbarelyscript::NavigatorInfo::detect).ok();
+    let os_version = navigator
+        .as_ref()
+        .map(|info| info.os_version.clone())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let platform = navigator
+        .as_ref()
+        .map(|info| info.platform.clone())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let hardware_concurrency = navigator
+        .as_ref()
+        .map(|info| info.hardware_concurrency.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let max_touch_points = navigator
+        .as_ref()
+        .map(|info| info.max_touch_points.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let gpu = safe_debug_id_field("unavailable", detect_gpu_model_summary);
+    let audio = safe_debug_id_field("unavailable", detect_audio_io_summary);
+    let value = format!(
+        "{APP_TITLE}/{}; os={}/{}; platform={}; hardware=logical-cpus:{} max-touch-points:{}; gpu={}; audio={}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        os_version,
+        platform,
+        hardware_concurrency,
+        max_touch_points,
+        gpu,
+        audio
+    );
+    truncate_header_value(&sanitize_http_header_value(&value), 768)
+}
+
+fn safe_debug_id_field<F>(fallback: &str, detect: F) -> String
+where
+    F: FnOnce() -> String + std::panic::UnwindSafe,
+{
+    std::panic::catch_unwind(detect)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn sanitize_http_header_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii() && !ch.is_ascii_control() {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn truncate_header_value(value: &str, max_len: usize) -> String {
+    if value.len() <= max_len {
+        return value.to_owned();
+    }
+    let mut truncated = value[..max_len.saturating_sub(3)].to_owned();
+    truncated.push_str("...");
+    truncated
+}
+
+fn detect_gpu_model_summary() -> String {
+    detect_linux_gpu_model_summary().unwrap_or_else(|| "unavailable".to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn detect_linux_gpu_model_summary() -> Option<String> {
+    let entries = fs::read_dir("/sys/class/drm").ok()?;
+    let mut models = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let device = entry.path().join("device");
+        let uevent = fs::read_to_string(device.join("uevent")).unwrap_or_default();
+        let driver = uevent
+            .lines()
+            .find_map(|line| line.strip_prefix("DRIVER="))
+            .unwrap_or("unknown");
+        let pci_id = uevent
+            .lines()
+            .find_map(|line| line.strip_prefix("PCI_ID="))
+            .map(str::to_owned)
+            .or_else(|| {
+                let vendor = fs::read_to_string(device.join("vendor")).ok()?;
+                let device_id = fs::read_to_string(device.join("device")).ok()?;
+                Some(format!(
+                    "{}:{}",
+                    vendor.trim_start_matches("0x").trim(),
+                    device_id.trim_start_matches("0x").trim()
+                ))
+            })
+            .unwrap_or_else(|| "unknown".to_owned());
+        models.push(format!("{name}:{driver}:{pci_id}"));
+    }
+    models.sort();
+    models.dedup();
+    if models.is_empty() {
+        None
+    } else {
+        Some(models.join("|"))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_linux_gpu_model_summary() -> Option<String> {
+    None
+}
+
+fn detect_audio_io_summary() -> String {
+    detect_linux_audio_io_summary().unwrap_or_else(|| "unavailable".to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn detect_linux_audio_io_summary() -> Option<String> {
+    let pcm = fs::read_to_string("/proc/asound/pcm").ok();
+    let output_devices = pcm
+        .as_deref()
+        .map(|content| {
+            content
+                .lines()
+                .filter(|line| line.contains("playback"))
+                .count()
+        })
+        .unwrap_or(0);
+    let input_devices = pcm
+        .as_deref()
+        .map(|content| {
+            content
+                .lines()
+                .filter(|line| line.contains("capture"))
+                .count()
+        })
+        .unwrap_or(0);
+    let cards = fs::read_to_string("/proc/asound/cards")
+        .ok()
+        .map(|content| {
+            content
+                .lines()
+                .filter_map(parse_linux_audio_card_line)
+                .take(4)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if output_devices == 0 && input_devices == 0 && cards.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "outputs:{} inputs:{} cards:{}",
+        output_devices,
+        input_devices,
+        if cards.is_empty() {
+            "unknown".to_owned()
+        } else {
+            cards.join("|")
+        }
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_audio_card_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let first = trimmed.chars().next()?;
+    if !first.is_ascii_digit() || !trimmed.contains("]:") {
+        return None;
+    }
+    trimmed
+        .split_once("]:")
+        .map(|(_, right)| right.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_linux_audio_io_summary() -> Option<String> {
+    None
 }
 
 fn http_version_label(version: reqwest::Version) -> &'static str {
@@ -34500,6 +34765,72 @@ img {{ display: block; width: 100%; height: auto; image-rendering: auto; }}
     fn http_version_label_reports_negotiated_protocols() {
         assert_eq!(http_version_label(reqwest::Version::HTTP_11), "HTTP/1.1");
         assert_eq!(http_version_label(reqwest::Version::HTTP_2), "HTTP/2");
+    }
+
+    #[test]
+    fn browser_debug_id_header_contains_version_os_and_hardware() {
+        let value = browser_debug_id();
+        assert!(value.contains(APP_TITLE));
+        assert!(value.contains(env!("CARGO_PKG_VERSION")));
+        assert!(value.contains(std::env::consts::OS));
+        assert!(value.contains("hardware=logical-cpus:"));
+        assert!(value.contains("; gpu="));
+        assert!(value.contains("; audio="));
+        assert!(reqwest::header::HeaderValue::from_str(&value).is_ok());
+
+        let headers = browser_http_default_headers();
+        assert_eq!(
+            headers
+                .get(reqwest::header::HeaderName::from_static(DEBUG_ID_HEADER))
+                .and_then(|value| value.to_str().ok()),
+            Some(value.as_str())
+        );
+    }
+
+    #[test]
+    fn accept_language_header_uses_browser_style_quality_weights() {
+        let languages = vec![
+            "it_IT.UTF-8".to_owned(),
+            "it".to_owned(),
+            "en-US;q=0.4".to_owned(),
+            "it-it".to_owned(),
+            "C".to_owned(),
+        ];
+        assert_eq!(
+            accept_language_header(&languages),
+            "it-IT,it;q=0.9,en-US;q=0.8"
+        );
+    }
+
+    #[test]
+    fn accept_language_header_adds_base_language_and_fallback() {
+        assert_eq!(
+            accept_language_header(&["fr-FR".to_owned()]),
+            "fr-FR,fr;q=0.9"
+        );
+        assert_eq!(accept_language_header(&[]), "en-US,en;q=0.9");
+    }
+
+    #[test]
+    fn browser_default_headers_include_accept_language() {
+        let headers = browser_http_default_headers();
+        let value = headers
+            .get(reqwest::header::ACCEPT_LANGUAGE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(!value.is_empty());
+        assert!(reqwest::header::HeaderValue::from_str(value).is_ok());
+    }
+
+    #[test]
+    fn debug_id_field_probe_failure_uses_fallback() {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let value = safe_debug_id_field("fallback", || panic!("probe failed"));
+        std::panic::set_hook(previous_hook);
+        assert_eq!(value, "fallback");
+        let empty = safe_debug_id_field("fallback", String::new);
+        assert_eq!(empty, "fallback");
     }
 
     #[test]

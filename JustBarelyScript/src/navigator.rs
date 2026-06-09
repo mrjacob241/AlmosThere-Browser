@@ -206,11 +206,12 @@ fn detect_languages() -> Vec<String> {
     // Linux/macOS: LANGUAGE env var holds a colon-separated ordered list.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Ok(list) = std::env::var("LANGUAGE") {
-        let langs: Vec<String> = list
-            .split(':')
-            .filter(|s| !s.is_empty() && *s != "C")
-            .map(locale_to_bcp47)
-            .collect();
+        let langs: Vec<String> = supplement_language_hints(
+            list.split(':')
+                .filter(|s| !s.is_empty() && *s != "C")
+                .map(locale_to_bcp47)
+                .collect(),
+        );
         if !langs.is_empty() {
             return dedup(langs);
         }
@@ -222,11 +223,12 @@ fn detect_languages() -> Vec<String> {
         if bcp != "en-US" || lang.contains("en") {
             // Add the base language as a fallback.
             let base: String = bcp.split('-').next().unwrap_or("en").to_owned();
-            return if base == bcp {
+            let langs = if base == bcp {
                 vec![bcp]
             } else {
                 vec![bcp, base]
             };
+            return dedup(supplement_language_hints(langs));
         }
     }
 
@@ -235,16 +237,20 @@ fn detect_languages() -> Vec<String> {
     {
         if let Some(lang) = detect_windows_locale() {
             let base: String = lang.split('-').next().unwrap_or("en").to_owned();
-            return if base == lang {
+            let langs = if base == lang {
                 vec![lang]
             } else {
                 vec![lang, base]
             };
+            return dedup(supplement_language_hints(langs));
         }
     }
 
     // Safe default.
-    vec!["en-US".to_owned(), "en".to_owned()]
+    dedup(supplement_language_hints(vec![
+        "en-US".to_owned(),
+        "en".to_owned(),
+    ]))
 }
 
 /// Converts a POSIX locale string to a BCP-47 language tag.
@@ -260,7 +266,152 @@ fn locale_to_bcp47(locale: &str) -> String {
 /// Remove duplicates while preserving order.
 fn dedup(v: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
-    v.into_iter().filter(|s| seen.insert(s.clone())).collect()
+    v.into_iter()
+        .filter(|s| seen.insert(s.to_ascii_lowercase()))
+        .collect()
+}
+
+fn supplement_language_hints(mut languages: Vec<String>) -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        languages.extend(detect_linux_input_source_languages());
+    }
+    if let Some(language) = detect_timezone_language_hint() {
+        languages.push(language);
+    }
+    languages
+}
+
+#[cfg(target_os = "linux")]
+fn detect_linux_input_source_languages() -> Vec<String> {
+    std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.input-sources", "sources"])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|text| linux_input_source_languages_from_gsettings(&text))
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_input_source_languages_from_gsettings(text: &str) -> Vec<String> {
+    let mut languages = Vec::new();
+    for quoted in text.split('\'').skip(1).step_by(2) {
+        if quoted.len() == 2 && quoted.chars().all(|ch| ch.is_ascii_alphabetic()) {
+            languages.push(quoted.to_ascii_lowercase());
+        }
+    }
+    dedup(languages)
+}
+
+fn detect_timezone_language_hint() -> Option<String> {
+    let timezone = detect_iana_timezone_name_for_language_hint()?;
+    timezone_language_hint(&timezone).map(str::to_owned)
+}
+
+fn detect_iana_timezone_name_for_language_hint() -> Option<String> {
+    if let Ok(tz) = std::env::var("TZ") {
+        let tz = tz.trim();
+        if tz.contains('/') && !tz.starts_with(':') {
+            return Some(tz.trim_start_matches(':').to_owned());
+        }
+    }
+    if let Ok(content) = std::fs::read_to_string("/etc/timezone") {
+        let tz = content.trim();
+        if tz.contains('/') {
+            return Some(tz.to_owned());
+        }
+    }
+    if let Ok(link) = std::fs::read_link("/etc/localtime") {
+        let text = link.to_string_lossy();
+        if let Some(index) = text.find("zoneinfo/") {
+            return Some(text[index + "zoneinfo/".len()..].to_owned());
+        }
+    }
+    None
+}
+
+fn timezone_language_hint(timezone: &str) -> Option<&'static str> {
+    match timezone {
+        "Europe/Rome" | "Europe/Vatican" | "Europe/San_Marino" => Some("it"),
+        "Europe/London" | "Europe/Jersey" | "Europe/Guernsey" | "Europe/Isle_of_Man" => {
+            Some("en-GB")
+        }
+        "Europe/Dublin" => Some("en-IE"),
+        "Europe/Paris" | "Europe/Monaco" => Some("fr"),
+        "Europe/Berlin" | "Europe/Vienna" | "Europe/Zurich" | "Europe/Busingen" => Some("de"),
+        "Europe/Madrid" | "Europe/Andorra" => Some("es"),
+        "Europe/Lisbon" => Some("pt-PT"),
+        "Europe/Amsterdam" | "Europe/Brussels" => Some("nl"),
+        "Europe/Warsaw" => Some("pl"),
+        "Europe/Prague" | "Europe/Bratislava" => Some("cs"),
+        "Europe/Budapest" => Some("hu"),
+        "Europe/Bucharest" | "Europe/Chisinau" => Some("ro"),
+        "Europe/Athens" => Some("el"),
+        "Europe/Sofia" => Some("bg"),
+        "Europe/Zagreb" | "Europe/Sarajevo" | "Europe/Podgorica" => Some("hr"),
+        "Europe/Belgrade" => Some("sr"),
+        "Europe/Ljubljana" => Some("sl"),
+        "Europe/Skopje" => Some("mk"),
+        "Europe/Tirane" => Some("sq"),
+        "Europe/Oslo" => Some("nb"),
+        "Europe/Stockholm" => Some("sv"),
+        "Europe/Copenhagen" => Some("da"),
+        "Europe/Helsinki" => Some("fi"),
+        "Europe/Tallinn" => Some("et"),
+        "Europe/Riga" => Some("lv"),
+        "Europe/Vilnius" => Some("lt"),
+        "Europe/Kyiv" | "Europe/Uzhgorod" | "Europe/Zaporozhye" => Some("uk"),
+        "Europe/Minsk" => Some("be"),
+        "Europe/Moscow" | "Europe/Kirov" | "Europe/Volgograd" | "Europe/Astrakhan"
+        | "Europe/Samara" | "Europe/Ulyanovsk" | "Asia/Yekaterinburg" | "Asia/Novosibirsk"
+        | "Asia/Omsk" | "Asia/Krasnoyarsk" | "Asia/Irkutsk" | "Asia/Yakutsk"
+        | "Asia/Vladivostok" | "Asia/Magadan" | "Asia/Kamchatka" => Some("ru"),
+        "Europe/Istanbul" | "Asia/Istanbul" => Some("tr"),
+        "Asia/Tokyo" => Some("ja"),
+        "Asia/Seoul" => Some("ko"),
+        "Asia/Shanghai" | "Asia/Chongqing" | "Asia/Harbin" | "Asia/Urumqi" => Some("zh-CN"),
+        "Asia/Hong_Kong" => Some("zh-HK"),
+        "Asia/Taipei" => Some("zh-TW"),
+        "Asia/Singapore" => Some("en-SG"),
+        "Asia/Jakarta" | "Asia/Makassar" | "Asia/Jayapura" => Some("id"),
+        "Asia/Bangkok" => Some("th"),
+        "Asia/Ho_Chi_Minh" => Some("vi"),
+        "Asia/Kolkata" | "Asia/Calcutta" => Some("hi"),
+        "Asia/Tehran" => Some("fa"),
+        "Asia/Jerusalem" => Some("he"),
+        "Asia/Riyadh" | "Asia/Dubai" | "Asia/Qatar" | "Asia/Bahrain" | "Asia/Kuwait"
+        | "Asia/Baghdad" | "Africa/Cairo" | "Africa/Casablanca" | "Africa/Algiers"
+        | "Africa/Tunis" => Some("ar"),
+        "America/New_York"
+        | "America/Chicago"
+        | "America/Denver"
+        | "America/Los_Angeles"
+        | "America/Phoenix"
+        | "America/Anchorage"
+        | "Pacific/Honolulu" => Some("en-US"),
+        "America/Toronto" | "America/Vancouver" | "America/Edmonton" | "America/Winnipeg"
+        | "America/Halifax" => Some("en-CA"),
+        "America/Mexico_City" | "America/Monterrey" | "America/Tijuana" => Some("es-MX"),
+        "America/Bogota"
+        | "America/Lima"
+        | "America/Santiago"
+        | "America/Argentina/Buenos_Aires"
+        | "America/Caracas"
+        | "America/Guayaquil" => Some("es"),
+        "America/Sao_Paulo" | "America/Fortaleza" | "America/Recife" | "America/Manaus" => {
+            Some("pt-BR")
+        }
+        "Australia/Sydney"
+        | "Australia/Melbourne"
+        | "Australia/Brisbane"
+        | "Australia/Perth"
+        | "Australia/Adelaide"
+        | "Australia/Darwin" => Some("en-AU"),
+        "Pacific/Auckland" | "Pacific/Chatham" => Some("en-NZ"),
+        "Africa/Johannesburg" => Some("en-ZA"),
+        _ => None,
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -422,6 +573,27 @@ mod tests {
         assert_eq!(locale_to_bcp47("C"), "en-US");
         assert_eq!(locale_to_bcp47("POSIX"), "en-US");
         assert_eq!(locale_to_bcp47("zh_CN.UTF-8"), "zh-CN");
+    }
+
+    #[test]
+    fn timezone_language_hint_covers_common_regions() {
+        assert_eq!(timezone_language_hint("Europe/Rome"), Some("it"));
+        assert_eq!(timezone_language_hint("Europe/London"), Some("en-GB"));
+        assert_eq!(timezone_language_hint("Asia/Tokyo"), Some("ja"));
+        assert_eq!(timezone_language_hint("America/Sao_Paulo"), Some("pt-BR"));
+    }
+
+    #[test]
+    fn language_supplements_are_deduplicated_case_insensitively() {
+        assert_eq!(
+            dedup(vec![
+                "en-US".to_owned(),
+                "en".to_owned(),
+                "EN-us".to_owned(),
+                "it".to_owned(),
+            ]),
+            vec!["en-US".to_owned(), "en".to_owned(), "it".to_owned()]
+        );
     }
 
     #[test]

@@ -7,6 +7,5 @@ hello world - Ecosia - Live Unhidden	file:///[local]/sample_pages/diagnostics/ec
 Hello world - Wikipedia	file:///[local]/sample_pages/Hello%20world%20-%20Wikipedia.html
 Ecosia Fixture 03 - Hero Picture AVIF Overlay	file:///[local]/sample_pages/Ecosia_Offline_Test/03_hero_picture_avif_overlay.html
 Hello world - Wikipedia	https://it.wikipedia.org/wiki/Hello_world
-meteo palermo oggi - Ecosia	https://www.3bmeteo.com/meteo/palermo
 Meteo Palermo - Previsioni Oggi, Prossimi 15 Giorni &raquo; iLMeteo.it	https://www.ilmeteo.it/meteo/palermo
 Linguaggio di programmazione - Wikipedia	https://it.wikipedia.org/wiki/Linguaggio_di_programmazione
