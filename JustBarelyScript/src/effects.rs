@@ -1686,35 +1686,46 @@ impl BrowserExecutionState {
     }
 
     /// `[[Get]]` — walks the prototype chain and invokes accessor getters.
+    /// Iterative with a visited guard so cyclic prototype chains terminate
+    /// instead of overflowing the stack.
     fn obj_get(&mut self, rc: &Rc<RefCell<JsObject>>, key: &str) -> JsValue {
-        // Own property lookup.
-        let own = rc.borrow().get_own(key).cloned();
-        match own {
-            Some(Property::Data { value, .. }) => return value,
-            Some(Property::Accessor {
-                get: Some(getter), ..
-            }) => {
-                return self.call_value(getter, JsValue::Object(rc.clone()), vec![]);
+        let mut current = rc.clone();
+        let mut visited: Vec<*const RefCell<JsObject>> = Vec::new();
+        loop {
+            let own = current.borrow().get_own(key).cloned();
+            match own {
+                Some(Property::Data { value, .. }) => return value,
+                Some(Property::Accessor {
+                    get: Some(getter), ..
+                }) => {
+                    return self.call_value(getter, JsValue::Object(current.clone()), vec![]);
+                }
+                Some(Property::Accessor { get: None, .. }) => return JsValue::Undefined,
+                None => {}
             }
-            Some(Property::Accessor { get: None, .. }) => return JsValue::Undefined,
-            None => {}
+            visited.push(Rc::as_ptr(&current));
+            let proto = current.borrow().prototype.clone();
+            match proto {
+                Some(proto) if !visited.contains(&Rc::as_ptr(&proto)) => current = proto,
+                _ => return JsValue::Undefined,
+            }
         }
-        // Walk prototype chain.
-        let proto = rc.borrow().prototype.clone();
-        if let Some(proto) = proto {
-            return self.obj_get(&proto, key);
-        }
-        JsValue::Undefined
     }
 
     fn obj_has_property(rc: &Rc<RefCell<JsObject>>, key: &str) -> bool {
-        if rc.borrow().has_own(key) {
-            return true;
+        let mut current = rc.clone();
+        let mut visited: Vec<*const RefCell<JsObject>> = Vec::new();
+        loop {
+            if current.borrow().has_own(key) {
+                return true;
+            }
+            visited.push(Rc::as_ptr(&current));
+            let proto = current.borrow().prototype.clone();
+            match proto {
+                Some(proto) if !visited.contains(&Rc::as_ptr(&proto)) => current = proto,
+                _ => return false,
+            }
         }
-        let proto = rc.borrow().prototype.clone();
-        proto
-            .as_ref()
-            .is_some_and(|proto| Self::obj_has_property(proto, key))
     }
 
     /// `[[Set]]` — invokes accessor setters or writes a data property.
@@ -5286,12 +5297,12 @@ impl BrowserExecutionState {
             Expression::YieldStar(expr) => {
                 let inner = self.execute_expression(expr);
                 if self.collecting_generator.is_some() {
+                    // collect_iterable_values can run user iterator code, which may
+                    // end collection; re-check instead of unwrapping.
                     let items = self.collect_iterable_values(inner);
-                    let entries = self
-                        .collecting_generator
-                        .as_mut()
-                        .expect("generator collection should still be active");
-                    entries.extend(items);
+                    if let Some(entries) = self.collecting_generator.as_mut() {
+                        entries.extend(items);
+                    }
                     return JsValue::Undefined;
                 }
                 if let Some(mut iterator) = self.get_iterator_record(inner) {
@@ -5480,7 +5491,9 @@ impl BrowserExecutionState {
                         {
                             let mut obj = rc.borrow_mut();
                             obj.class_name = Some(fn_name.clone());
-                            obj.set("[[PrimitiveValue]]", prim_val);
+                            // Internal slot, not an own property: keep it out of
+                            // Object.keys / for-in / property-bag enumeration.
+                            obj.set_ne("[[PrimitiveValue]]", prim_val);
                         }
                         JsValue::Object(rc)
                     } else if fn_name == "URL" {
@@ -5643,11 +5656,36 @@ impl BrowserExecutionState {
         }
 
         if matches!(callee, Expression::Identifier(name) if name == "String") {
+            return match arguments.first() {
+                Some(argument) => {
+                    let value = self.execute_expression(argument);
+                    // Symbol argument is the one case String() does NOT coerce via
+                    // ToString (it would throw); String(sym) returns "Symbol(desc)".
+                    if matches!(&value, JsValue::String(s) if s.starts_with("__sym_")) {
+                        JsValue::String(Self::value_to_string(&value))
+                    } else {
+                        JsValue::String(self.coerce_to_string(&value))
+                    }
+                }
+                None => JsValue::String(String::new()),
+            };
+        }
+
+        // Number(x) / Boolean(x) called as functions return primitives, not
+        // wrapper objects (boxing only happens with `new`).
+        if matches!(callee, Expression::Identifier(name) if name == "Number") {
             return arguments
                 .first()
                 .map(|argument| self.execute_expression(argument))
-                .map(|value| JsValue::String(Self::value_to_string(&value)))
-                .unwrap_or_else(|| JsValue::String(String::new()));
+                .map(|value| JsValue::Number(self.coerce_to_number(value)))
+                .unwrap_or(JsValue::Number(0.0));
+        }
+        if matches!(callee, Expression::Identifier(name) if name == "Boolean") {
+            return arguments
+                .first()
+                .map(|argument| self.execute_expression(argument))
+                .map(|value| JsValue::Boolean(Self::is_truthy(&value)))
+                .unwrap_or(JsValue::Boolean(false));
         }
 
         if matches!(callee, Expression::Identifier(name) if name == "RegExp") {
@@ -5694,7 +5732,17 @@ impl BrowserExecutionState {
                             .first()
                             .map(|a| self.execute_expression(a))
                             .unwrap_or(JsValue::Undefined);
-                        return JsValue::String(json_stringify(&arg));
+                        return match try_json_stringify(&arg, &mut Vec::new()) {
+                            Ok(s) => JsValue::String(s),
+                            Err(()) => {
+                                self.early_exit =
+                                    Some(EarlyExit::Throw(Self::make_error_obj(
+                                        "TypeError",
+                                        "Converting circular structure to JSON".to_owned(),
+                                    )));
+                                JsValue::Undefined
+                            }
+                        };
                     }
                     _ => {}
                 }
@@ -6293,38 +6341,20 @@ impl BrowserExecutionState {
             let method_name = method_name.clone();
 
             // Built-in number instance methods (.toFixed, .toString, etc.)
-            if let JsValue::Number(n) = receiver {
-                let args_vals = self.eval_args(arguments);
-                let result = match method_name.as_str() {
-                    "toFixed" => {
-                        let digits = args_vals
-                            .first()
-                            .map(|v| (Self::value_to_number(v) as usize).min(100))
-                            .unwrap_or(0);
-                        JsValue::String(format!("{n:.digits$}"))
-                    }
-                    "toPrecision" => {
-                        let p = args_vals
-                            .first()
-                            .map(|v| (Self::value_to_number(v) as usize).min(100).max(1))
-                            .unwrap_or(1);
-                        JsValue::String(format!("{n:.p$}"))
-                    }
-                    "toString" => {
-                        let radix = args_vals
-                            .first()
-                            .map(|v| Self::value_to_number(v) as u32)
-                            .unwrap_or(10);
-                        if radix == 10 || radix < 2 || radix > 36 {
-                            JsValue::String(Self::value_to_string(&JsValue::Number(n)))
-                        } else {
-                            JsValue::String(format!("{}", n as i64)) // simplified non-base-10
-                        }
-                    }
-                    "valueOf" => JsValue::Number(n),
-                    _ => JsValue::Undefined,
-                };
-                return result;
+            if let JsValue::Number(_) = receiver {
+                if matches!(
+                    method_name.as_str(),
+                    "toFixed"
+                        | "toPrecision"
+                        | "toExponential"
+                        | "toString"
+                        | "toLocaleString"
+                        | "valueOf"
+                ) {
+                    let args_vals = self.eval_args(arguments);
+                    return self.call_number_proto_method(&method_name, &receiver, &args_vals);
+                }
+                return JsValue::Undefined;
             }
 
             // Built-in array instance methods
@@ -7344,6 +7374,18 @@ impl BrowserExecutionState {
                     return JsValue::Boolean(rc.borrow().has_own(&key));
                 }
             }
+            // String-wrapper objects reuse the full primitive-string method set
+            // (call_string_method implements far more methods than the
+            // String.prototype.* host arms). Unwrap to the primitive and dispatch.
+            if let JsValue::Object(ref rc) = receiver {
+                if Self::wrapper_class_owner(rc) == Some("String") {
+                    if let Some(s) = Self::this_string_value(&receiver) {
+                        if let Some(result) = self.call_string_method(&method_name, &s, arguments) {
+                            return result;
+                        }
+                    }
+                }
+            }
             if let Some(owner) = Self::member_prototype_fallback_owner(&receiver) {
                 let native_owner =
                     if Self::native_prototype_methods(owner).contains(&method_name.as_str()) {
@@ -8235,6 +8277,82 @@ impl BrowserExecutionState {
 
     /// Apply a single property descriptor object to a target object under `key`.
     /// Returns true on success, false if a TypeError should be thrown.
+    /// ECMA-262 ToPropertyDescriptor (§6.2.6): validates that the descriptor input
+    /// is an object, reads attribute fields through `[[Get]]` / HasProperty (so
+    /// inherited attributes and accessor-backed fields are honored), coerces flag
+    /// fields with ToBoolean, and rejects mixed data/accessor descriptors and
+    /// non-callable get/set. Returns a normalized plain record whose own data
+    /// properties hold exact `Boolean` flags, ready for `apply_property_descriptor`.
+    /// `Err(error)` carries the TypeError value to throw; if a field getter threw,
+    /// `self.early_exit` is already set and `Err(JsValue::Undefined)` is returned.
+    fn to_property_descriptor(
+        &mut self,
+        descriptor: &JsValue,
+    ) -> Result<Rc<RefCell<JsObject>>, JsValue> {
+        let JsValue::Object(desc) = descriptor else {
+            return Err(Self::make_error_obj(
+                "TypeError",
+                "Property description must be an object".to_owned(),
+            ));
+        };
+        let record = JsObject::new();
+        let mut has_data_field = false;
+        let mut has_accessor_field = false;
+        for field in ["enumerable", "configurable", "writable"] {
+            if Self::obj_has_property(desc, field) {
+                let value = self.obj_get(desc, field);
+                if self.early_exit.is_some() {
+                    return Err(JsValue::Undefined);
+                }
+                record
+                    .borrow_mut()
+                    .set(field, JsValue::Boolean(Self::is_truthy(&value)));
+                if field == "writable" {
+                    has_data_field = true;
+                }
+            }
+        }
+        if Self::obj_has_property(desc, "value") {
+            let value = self.obj_get(desc, "value");
+            if self.early_exit.is_some() {
+                return Err(JsValue::Undefined);
+            }
+            record.borrow_mut().set("value", value);
+            has_data_field = true;
+        }
+        for field in ["get", "set"] {
+            if Self::obj_has_property(desc, field) {
+                let value = self.obj_get(desc, field);
+                if self.early_exit.is_some() {
+                    return Err(JsValue::Undefined);
+                }
+                if !matches!(value, JsValue::Undefined) && !Self::is_callable_value(&value) {
+                    return Err(Self::make_error_obj(
+                        "TypeError",
+                        format!("Property descriptor {field}ter must be a function"),
+                    ));
+                }
+                record.borrow_mut().set(field, value);
+                has_accessor_field = true;
+            }
+        }
+        if has_data_field && has_accessor_field {
+            return Err(Self::make_error_obj(
+                "TypeError",
+                "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute".to_owned(),
+            ));
+        }
+        Ok(record)
+    }
+
+    /// Throw the error produced by `to_property_descriptor` unless a getter
+    /// already set `early_exit` while reading descriptor fields.
+    fn throw_descriptor_error(&mut self, error: JsValue) {
+        if self.early_exit.is_none() {
+            self.early_exit = Some(EarlyExit::Throw(error));
+        }
+    }
+
     fn apply_property_descriptor(
         target: &Rc<RefCell<JsObject>>,
         key: String,
@@ -8548,8 +8666,22 @@ impl BrowserExecutionState {
                 let obj = iter.next().unwrap_or(JsValue::Undefined);
                 let key = Self::value_to_string(&iter.next().unwrap_or(JsValue::Undefined));
                 let descriptor = iter.next().unwrap_or(JsValue::Undefined);
-                match (obj, descriptor) {
-                    (JsValue::Function(func), JsValue::Object(desc)) => {
+                if !Self::is_object_like(&obj) {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        "Object.defineProperty called on non-object".to_owned(),
+                    )));
+                    return JsValue::Undefined;
+                }
+                let desc = match self.to_property_descriptor(&descriptor) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        self.throw_descriptor_error(error);
+                        return JsValue::Undefined;
+                    }
+                };
+                match obj {
+                    JsValue::Function(func) => {
                         if !self.apply_function_property_descriptor(&func, key.clone(), &desc) {
                             self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
                                 "TypeError",
@@ -8559,7 +8691,7 @@ impl BrowserExecutionState {
                         }
                         JsValue::Function(func)
                     }
-                    (JsValue::Object(rc), JsValue::Object(desc)) => {
+                    JsValue::Object(rc) => {
                         if !Self::apply_property_descriptor(&rc, key.clone(), &desc) {
                             self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
                                 "TypeError",
@@ -8569,11 +8701,10 @@ impl BrowserExecutionState {
                         }
                         JsValue::Object(rc)
                     }
-                    (arr_val @ JsValue::Array(_), JsValue::Object(desc))
-                    | (arr_val @ JsValue::RichArray(_), JsValue::Object(desc)) => {
+                    arr_val @ (JsValue::Array(_) | JsValue::RichArray(_)) => {
                         Self::array_apply_define_property(arr_val, &key, &desc)
                     }
-                    _ => JsValue::Undefined,
+                    other => other,
                 }
             }
             "getOwnPropertyDescriptor" | "Object.getOwnPropertyDescriptor" => {
@@ -8593,16 +8724,25 @@ impl BrowserExecutionState {
                 if let (JsValue::Object(obj_rc), JsValue::Object(props_rc)) = (&obj, props_val) {
                     let keys: Vec<String> = props_rc.borrow().own_enumerable_keys();
                     for key in keys {
-                        if let Some(JsValue::Object(desc)) =
-                            props_rc.borrow().get_own_data(key.as_str())
-                        {
-                            if !Self::apply_property_descriptor(obj_rc, key.clone(), &desc) {
-                                self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
-                                    "TypeError",
-                                    format!("Cannot redefine property: {key}"),
-                                )));
+                        // Spec reads each descriptor through [[Get]] so accessor-backed
+                        // and inherited descriptor values are honored.
+                        let descriptor = self.obj_get(&props_rc, key.as_str());
+                        if self.early_exit.is_some() {
+                            return JsValue::Undefined;
+                        }
+                        let desc = match self.to_property_descriptor(&descriptor) {
+                            Ok(record) => record,
+                            Err(error) => {
+                                self.throw_descriptor_error(error);
                                 return JsValue::Undefined;
                             }
+                        };
+                        if !Self::apply_property_descriptor(obj_rc, key.clone(), &desc) {
+                            self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                                "TypeError",
+                                format!("Cannot redefine property: {key}"),
+                            )));
+                            return JsValue::Undefined;
                         }
                     }
                 }
@@ -8698,18 +8838,42 @@ impl BrowserExecutionState {
                 let props_val = iter.next().unwrap_or(JsValue::Undefined);
                 let new_obj_rc = match proto {
                     JsValue::Object(proto_rc) => JsObject::with_proto(proto_rc),
-                    _ => JsObject::new(),
+                    JsValue::Null => JsObject::new(),
+                    // Functions/host objects keep the permissive legacy path; primitives throw.
+                    other if Self::is_object_like(&other) => JsObject::new(),
+                    _ => {
+                        self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                            "TypeError",
+                            "Object prototype may only be an Object or null".to_owned(),
+                        )));
+                        return JsValue::Undefined;
+                    }
                 };
+                // Spec: ObjectDefineProperties does ToObject(Properties) — null throws,
+                // other primitives coerce to wrappers with no own enumerable keys (no-op).
+                if matches!(props_val, JsValue::Null) {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        "Cannot convert undefined or null to object".to_owned(),
+                    )));
+                    return JsValue::Undefined;
+                }
                 if let JsValue::Object(props_rc) = props_val {
                     let keys: Vec<String> = props_rc.borrow().own_enumerable_keys();
                     for key in keys {
-                        let desc_val = props_rc
-                            .borrow()
-                            .get_own_data(key.as_str())
-                            .unwrap_or(JsValue::Undefined);
-                        if let JsValue::Object(desc) = desc_val {
-                            Self::apply_property_descriptor(&new_obj_rc, key, &desc);
+                        // Spec reads each descriptor through [[Get]] then ToPropertyDescriptor.
+                        let descriptor = self.obj_get(&props_rc, key.as_str());
+                        if self.early_exit.is_some() {
+                            return JsValue::Undefined;
                         }
+                        let desc = match self.to_property_descriptor(&descriptor) {
+                            Ok(record) => record,
+                            Err(error) => {
+                                self.throw_descriptor_error(error);
+                                return JsValue::Undefined;
+                            }
+                        };
+                        Self::apply_property_descriptor(&new_obj_rc, key, &desc);
                     }
                 }
                 JsValue::Object(new_obj_rc)
@@ -8802,13 +8966,18 @@ impl BrowserExecutionState {
     ) -> Option<JsValue> {
         match name {
             "join" => {
-                let sep = arguments
-                    .first()
-                    .map(|a| Self::value_to_string(&self.execute_expression(a)))
-                    .unwrap_or_else(|| ",".to_owned());
+                // Spec: an absent or `undefined` separator means ",". Holes,
+                // `undefined`, and `null` elements stringify to "".
+                let sep = match arguments.first().map(|a| self.execute_expression(a)) {
+                    None | Some(JsValue::Undefined) => ",".to_owned(),
+                    Some(v) => Self::value_to_string(&v),
+                };
                 let s = arr
                     .iter()
-                    .map(Self::value_to_string)
+                    .map(|v| match v {
+                        JsValue::Undefined | JsValue::Null => String::new(),
+                        other => Self::value_to_string(other),
+                    })
                     .collect::<Vec<_>>()
                     .join(&sep);
                 Some(JsValue::String(s))
@@ -8827,7 +8996,15 @@ impl BrowserExecutionState {
                     .first()
                     .map(|a| self.execute_expression(a))
                     .unwrap_or(JsValue::Undefined);
-                let idx = arr.iter().position(|v| Self::js_equal(v, &needle));
+                let len = arr.len() as i64;
+                // fromIndex (ToIntegerOrInfinity): negative counts from the end.
+                let from = arguments
+                    .get(1)
+                    .map(|a| Self::value_to_number(&self.execute_expression(a)))
+                    .map(|n| if n < 0.0 { (len + n as i64).max(0) } else { n as i64 })
+                    .unwrap_or(0)
+                    .clamp(0, len) as usize;
+                let idx = (from..arr.len()).find(|&i| Self::js_equal(&arr[i], &needle));
                 Some(JsValue::Number(idx.map(|i| i as f64).unwrap_or(-1.0)))
             }
             "lastIndexOf" => {
@@ -8835,7 +9012,26 @@ impl BrowserExecutionState {
                     .first()
                     .map(|a| self.execute_expression(a))
                     .unwrap_or(JsValue::Undefined);
-                let idx = arr.iter().rposition(|v| Self::js_equal(v, &needle));
+                let len = arr.len() as i64;
+                // fromIndex defaults to len-1; negative counts from the end.
+                let from = match arguments.get(1).map(|a| self.execute_expression(a)) {
+                    None => len - 1,
+                    Some(v) => {
+                        let n = Self::value_to_number(&v) as i64;
+                        if n < 0 {
+                            len + n
+                        } else {
+                            n.min(len - 1)
+                        }
+                    }
+                };
+                let idx = if from < 0 {
+                    None
+                } else {
+                    (0..=(from as usize).min(arr.len().saturating_sub(1)))
+                        .rev()
+                        .find(|&i| Self::js_equal(&arr[i], &needle))
+                };
                 Some(JsValue::Number(idx.map(|i| i as f64).unwrap_or(-1.0)))
             }
             "slice" => {
@@ -8917,14 +9113,20 @@ impl BrowserExecutionState {
             }
             "forEach" => {
                 let cb = arguments.first().map(|a| self.execute_expression(a));
-                if let Some(JsValue::Function(func)) = cb {
+                let this_arg = arguments
+                    .get(1)
+                    .map(|a| self.execute_expression(a))
+                    .unwrap_or(JsValue::Undefined);
+                if cb.as_ref().is_some_and(Self::is_callable_value) {
+                    let callback = cb.unwrap();
                     let arr_val = JsValue::Array(arr.clone());
                     for (i, item) in arr.into_iter().enumerate() {
                         if self.execution_budget_exhausted {
                             break;
                         }
-                        self.call_function(
-                            func.clone(),
+                        self.call_value(
+                            callback.clone(),
+                            this_arg.clone(),
                             vec![item, JsValue::Number(i as f64), arr_val.clone()],
                         );
                         if matches!(
@@ -8937,20 +9139,28 @@ impl BrowserExecutionState {
                             break;
                         }
                     }
+                } else {
+                    self.throw_not_a_function("Array.prototype.forEach callback");
                 }
                 Some(JsValue::Undefined)
             }
             "map" => {
                 let cb = arguments.first().map(|a| self.execute_expression(a));
-                if let Some(JsValue::Function(func)) = cb {
+                let this_arg = arguments
+                    .get(1)
+                    .map(|a| self.execute_expression(a))
+                    .unwrap_or(JsValue::Undefined);
+                if cb.as_ref().is_some_and(Self::is_callable_value) {
+                    let callback = cb.unwrap();
                     let arr_val = JsValue::Array(arr.clone());
                     let mut result = Vec::new();
                     for (i, item) in arr.into_iter().enumerate() {
                         if self.execution_budget_exhausted {
                             break;
                         }
-                        let v = self.call_function(
-                            func.clone(),
+                        let v = self.call_value(
+                            callback.clone(),
+                            this_arg.clone(),
                             vec![item, JsValue::Number(i as f64), arr_val.clone()],
                         );
                         if self.early_exit.is_some() {
@@ -8960,20 +9170,27 @@ impl BrowserExecutionState {
                     }
                     Some(JsValue::Array(result))
                 } else {
-                    Some(JsValue::Array(arr))
+                    self.throw_not_a_function("Array.prototype.map callback");
+                    Some(JsValue::Undefined)
                 }
             }
             "filter" => {
                 let cb = arguments.first().map(|a| self.execute_expression(a));
-                if let Some(JsValue::Function(func)) = cb {
+                let this_arg = arguments
+                    .get(1)
+                    .map(|a| self.execute_expression(a))
+                    .unwrap_or(JsValue::Undefined);
+                if cb.as_ref().is_some_and(Self::is_callable_value) {
+                    let callback = cb.unwrap();
                     let arr_val = JsValue::Array(arr.clone());
                     let mut result = Vec::new();
                     for (i, item) in arr.into_iter().enumerate() {
                         if self.execution_budget_exhausted {
                             break;
                         }
-                        let keep = self.call_function(
-                            func.clone(),
+                        let keep = self.call_value(
+                            callback.clone(),
+                            this_arg.clone(),
                             vec![item.clone(), JsValue::Number(i as f64), arr_val.clone()],
                         );
                         if self.early_exit.is_some() {
@@ -8985,17 +9202,24 @@ impl BrowserExecutionState {
                     }
                     Some(JsValue::Array(result))
                 } else {
-                    Some(JsValue::Array(arr))
+                    self.throw_not_a_function("Array.prototype.filter callback");
+                    Some(JsValue::Undefined)
                 }
             }
             "reduce" => {
                 let cb = arguments.first().map(|a| self.execute_expression(a));
-                if let Some(JsValue::Function(func)) = cb {
+                if cb.as_ref().is_some_and(Self::is_callable_value) {
+                    let callback = cb.unwrap();
                     let arr_val = JsValue::Array(arr.clone());
                     let has_init = arguments.len() > 1;
                     let (mut acc, start) = if has_init {
                         (self.execute_expression(&arguments[1]), 0)
                     } else if arr.is_empty() {
+                        // Spec: reduce of empty array with no initial value throws.
+                        self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                            "TypeError",
+                            "Reduce of empty array with no initial value".to_owned(),
+                        )));
                         return Some(JsValue::Undefined);
                     } else {
                         (arr[0].clone(), 1)
@@ -9004,8 +9228,9 @@ impl BrowserExecutionState {
                         if self.execution_budget_exhausted {
                             break;
                         }
-                        acc = self.call_function(
-                            func.clone(),
+                        acc = self.call_value(
+                            callback.clone(),
+                            JsValue::Undefined,
                             vec![acc, item, JsValue::Number(i as f64), arr_val.clone()],
                         );
                         if self.early_exit.is_some() {
@@ -9014,18 +9239,24 @@ impl BrowserExecutionState {
                     }
                     Some(acc)
                 } else {
+                    self.throw_not_a_function("Array.prototype.reduce callback");
                     Some(JsValue::Undefined)
                 }
             }
             "reduceRight" => {
                 let cb = arguments.first().map(|a| self.execute_expression(a));
-                if let Some(JsValue::Function(func)) = cb {
+                if cb.as_ref().is_some_and(Self::is_callable_value) {
+                    let callback = cb.unwrap();
                     let arr_val = JsValue::Array(arr.clone());
                     let len = arr.len();
                     let has_init = arguments.len() > 1;
                     let (mut acc, end) = if has_init {
                         (self.execute_expression(&arguments[1]), len)
                     } else if arr.is_empty() {
+                        self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                            "TypeError",
+                            "Reduce of empty array with no initial value".to_owned(),
+                        )));
                         return Some(JsValue::Undefined);
                     } else {
                         (arr[len - 1].clone(), len - 1)
@@ -9034,8 +9265,9 @@ impl BrowserExecutionState {
                         if self.execution_budget_exhausted {
                             break;
                         }
-                        acc = self.call_function(
-                            func.clone(),
+                        acc = self.call_value(
+                            callback.clone(),
+                            JsValue::Undefined,
                             vec![
                                 acc,
                                 arr[i].clone(),
@@ -9049,19 +9281,34 @@ impl BrowserExecutionState {
                     }
                     Some(acc)
                 } else {
+                    self.throw_not_a_function("Array.prototype.reduceRight callback");
                     Some(JsValue::Undefined)
                 }
             }
-            "find" => {
+            "find" | "findLast" => {
+                let reverse = name == "findLast";
                 let cb = arguments.first().map(|a| self.execute_expression(a));
-                if let Some(JsValue::Function(func)) = cb {
+                let this_arg = arguments
+                    .get(1)
+                    .map(|a| self.execute_expression(a))
+                    .unwrap_or(JsValue::Undefined);
+                if cb.as_ref().is_some_and(Self::is_callable_value) {
+                    let callback = cb.unwrap();
                     let arr_val = JsValue::Array(arr.clone());
-                    for (i, item) in arr.into_iter().enumerate() {
+                    let len = arr.len();
+                    let order: Vec<usize> = if reverse {
+                        (0..len).rev().collect()
+                    } else {
+                        (0..len).collect()
+                    };
+                    for i in order {
                         if self.execution_budget_exhausted {
                             break;
                         }
-                        let found = self.call_function(
-                            func.clone(),
+                        let item = arr[i].clone();
+                        let found = self.call_value(
+                            callback.clone(),
+                            this_arg.clone(),
                             vec![item.clone(), JsValue::Number(i as f64), arr_val.clone()],
                         );
                         if self.early_exit.is_some() {
@@ -9071,20 +9318,35 @@ impl BrowserExecutionState {
                             return Some(item);
                         }
                     }
+                } else {
+                    self.throw_not_a_function("Array.prototype.find callback");
                 }
                 Some(JsValue::Undefined)
             }
-            "findIndex" => {
+            "findIndex" | "findLastIndex" => {
+                let reverse = name == "findLastIndex";
                 let cb = arguments.first().map(|a| self.execute_expression(a));
-                if let Some(JsValue::Function(func)) = cb {
+                let this_arg = arguments
+                    .get(1)
+                    .map(|a| self.execute_expression(a))
+                    .unwrap_or(JsValue::Undefined);
+                if cb.as_ref().is_some_and(Self::is_callable_value) {
+                    let callback = cb.unwrap();
                     let arr_val = JsValue::Array(arr.clone());
-                    for (i, item) in arr.into_iter().enumerate() {
+                    let len = arr.len();
+                    let order: Vec<usize> = if reverse {
+                        (0..len).rev().collect()
+                    } else {
+                        (0..len).collect()
+                    };
+                    for i in order {
                         if self.execution_budget_exhausted {
                             break;
                         }
-                        let found = self.call_function(
-                            func.clone(),
-                            vec![item, JsValue::Number(i as f64), arr_val.clone()],
+                        let found = self.call_value(
+                            callback.clone(),
+                            this_arg.clone(),
+                            vec![arr[i].clone(), JsValue::Number(i as f64), arr_val.clone()],
                         );
                         if self.early_exit.is_some() {
                             break;
@@ -9093,19 +9355,27 @@ impl BrowserExecutionState {
                             return Some(JsValue::Number(i as f64));
                         }
                     }
+                } else {
+                    self.throw_not_a_function("Array.prototype.findIndex callback");
                 }
                 Some(JsValue::Number(-1.0))
             }
             "some" => {
                 let cb = arguments.first().map(|a| self.execute_expression(a));
-                if let Some(JsValue::Function(func)) = cb {
+                let this_arg = arguments
+                    .get(1)
+                    .map(|a| self.execute_expression(a))
+                    .unwrap_or(JsValue::Undefined);
+                if cb.as_ref().is_some_and(Self::is_callable_value) {
+                    let callback = cb.unwrap();
                     let arr_val = JsValue::Array(arr.clone());
                     for (i, item) in arr.into_iter().enumerate() {
                         if self.execution_budget_exhausted {
                             break;
                         }
-                        let v = self.call_function(
-                            func.clone(),
+                        let v = self.call_value(
+                            callback.clone(),
+                            this_arg.clone(),
                             vec![item, JsValue::Number(i as f64), arr_val.clone()],
                         );
                         if self.early_exit.is_some() {
@@ -9115,19 +9385,27 @@ impl BrowserExecutionState {
                             return Some(JsValue::Boolean(true));
                         }
                     }
+                } else {
+                    self.throw_not_a_function("Array.prototype.some callback");
                 }
                 Some(JsValue::Boolean(false))
             }
             "every" => {
                 let cb = arguments.first().map(|a| self.execute_expression(a));
-                if let Some(JsValue::Function(func)) = cb {
+                let this_arg = arguments
+                    .get(1)
+                    .map(|a| self.execute_expression(a))
+                    .unwrap_or(JsValue::Undefined);
+                if cb.as_ref().is_some_and(Self::is_callable_value) {
+                    let callback = cb.unwrap();
                     let arr_val = JsValue::Array(arr.clone());
                     for (i, item) in arr.into_iter().enumerate() {
                         if self.execution_budget_exhausted {
                             break;
                         }
-                        let v = self.call_function(
-                            func.clone(),
+                        let v = self.call_value(
+                            callback.clone(),
+                            this_arg.clone(),
                             vec![item, JsValue::Number(i as f64), arr_val.clone()],
                         );
                         if self.early_exit.is_some() {
@@ -9137,20 +9415,28 @@ impl BrowserExecutionState {
                             return Some(JsValue::Boolean(false));
                         }
                     }
+                } else {
+                    self.throw_not_a_function("Array.prototype.every callback");
                 }
                 Some(JsValue::Boolean(true))
             }
             "flatMap" => {
                 let cb = arguments.first().map(|a| self.execute_expression(a));
-                if let Some(JsValue::Function(func)) = cb {
+                let this_arg = arguments
+                    .get(1)
+                    .map(|a| self.execute_expression(a))
+                    .unwrap_or(JsValue::Undefined);
+                if cb.as_ref().is_some_and(Self::is_callable_value) {
+                    let callback = cb.unwrap();
                     let arr_val = JsValue::Array(arr.clone());
                     let mut result = Vec::new();
                     for (i, item) in arr.into_iter().enumerate() {
                         if self.execution_budget_exhausted {
                             break;
                         }
-                        let v = self.call_function(
-                            func.clone(),
+                        let v = self.call_value(
+                            callback.clone(),
+                            this_arg.clone(),
                             vec![item, JsValue::Number(i as f64), arr_val.clone()],
                         );
                         if self.early_exit.is_some() {
@@ -9163,7 +9449,8 @@ impl BrowserExecutionState {
                     }
                     Some(JsValue::Array(result))
                 } else {
-                    Some(JsValue::Array(arr))
+                    self.throw_not_a_function("Array.prototype.flatMap callback");
+                    Some(JsValue::Undefined)
                 }
             }
             "sort" => {
@@ -9222,6 +9509,17 @@ impl BrowserExecutionState {
         }
     }
 
+    /// Set a `TypeError: <fn> is not a function` early-exit for array iteration
+    /// methods invoked with a non-callable callback (ECMA-262 requires this).
+    fn throw_not_a_function(&mut self, context: &str) {
+        if self.early_exit.is_none() {
+            self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                "TypeError",
+                format!("{context} is not a function"),
+            )));
+        }
+    }
+
     fn call_string_method(
         &mut self,
         name: &str,
@@ -9245,9 +9543,15 @@ impl BrowserExecutionState {
                     parts.into_iter().map(JsValue::String).collect(),
                 ))
             }
-            "trim" => Some(JsValue::String(s.trim().to_owned())),
-            "trimStart" | "trimLeft" => Some(JsValue::String(s.trim_start().to_owned())),
-            "trimEnd" | "trimRight" => Some(JsValue::String(s.trim_end().to_owned())),
+            "trim" => Some(JsValue::String(
+                s.trim_matches(Self::is_js_trim_ws).to_owned(),
+            )),
+            "trimStart" | "trimLeft" => Some(JsValue::String(
+                s.trim_start_matches(Self::is_js_trim_ws).to_owned(),
+            )),
+            "trimEnd" | "trimRight" => Some(JsValue::String(
+                s.trim_end_matches(Self::is_js_trim_ws).to_owned(),
+            )),
             "toUpperCase" | "toLocaleUpperCase" => Some(JsValue::String(s.to_uppercase())),
             "toLowerCase" | "toLocaleLowerCase" => Some(JsValue::String(s.to_lowercase())),
             "includes" => {
@@ -10749,7 +11053,10 @@ impl BrowserExecutionState {
                     }
                     JsValue::Object(rc) => {
                         let key = Self::value_to_string(&index);
-                        self.obj_get(&rc, &key)
+                        // Route through the native fallback so primitive-wrapper
+                        // index/length (e.g. new String("ab")[0]) resolve.
+                        self.object_property_or_native_fallback(&rc, &key)
+                            .unwrap_or(JsValue::Undefined)
                     }
                     JsValue::String(s) => {
                         let idx = Self::value_to_number(&index);
@@ -13125,11 +13432,7 @@ impl BrowserExecutionState {
                 }
                 Statement::If(if_stmt) => {
                     let condition = self.execute_expression(&if_stmt.test);
-                    if self.pending_generator_yield.is_some() {
-                        let yielded = self
-                            .pending_generator_yield
-                            .take()
-                            .expect("generator if condition should have yielded");
+                    if let Some(yielded) = self.pending_generator_yield.take() {
                         self.pending_generator_resume_if = Some(if_stmt);
                         let stack = std::mem::replace(&mut self.stack, saved_stack);
                         let pending_if = self.pending_generator_resume_if.take();
@@ -15581,6 +15884,179 @@ impl BrowserExecutionState {
         }
     }
 
+    /// Number::toString(x, radix) for radix 2..=36 (ECMA-262 §6.1.6.1.20).
+    /// Digits use lowercase a-z; the fractional part is emitted to a practical
+    /// precision rather than the spec's shortest-round-trip form.
+    fn number_to_string_radix(n: f64, radix: u32) -> String {
+        if n.is_nan() {
+            return "NaN".to_owned();
+        }
+        if n == f64::INFINITY {
+            return "Infinity".to_owned();
+        }
+        if n == f64::NEG_INFINITY {
+            return "-Infinity".to_owned();
+        }
+        if radix == 10 {
+            return Self::value_to_string(&JsValue::Number(n));
+        }
+        const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let negative = n < 0.0;
+        let value = n.abs();
+        let mut int_part = value.trunc();
+        let mut digits: Vec<u8> = Vec::new();
+        if int_part == 0.0 {
+            digits.push(b'0');
+        }
+        while int_part >= 1.0 {
+            let digit = (int_part % radix as f64) as usize;
+            digits.push(DIGITS[digit.min(35)]);
+            int_part = (int_part / radix as f64).trunc();
+        }
+        digits.reverse();
+        let mut out = String::from_utf8(digits).unwrap_or_default();
+        let mut frac = value.fract();
+        if frac > 0.0 {
+            out.push('.');
+            let mut emitted = 0;
+            while frac > 0.0 && emitted < 32 {
+                frac *= radix as f64;
+                let digit = frac.trunc() as usize;
+                out.push(DIGITS[digit.min(35)] as char);
+                frac -= frac.trunc();
+                emitted += 1;
+            }
+        }
+        if negative {
+            format!("-{out}")
+        } else {
+            out
+        }
+    }
+
+    /// thisNumberValue (ECMA-262 §21.1.3): unwrap a Number primitive or wrapper.
+    fn this_number_value(this: &JsValue) -> Option<f64> {
+        match this {
+            JsValue::Number(n) => Some(*n),
+            JsValue::Object(rc) if rc.borrow().class_name.as_deref() == Some("Number") => {
+                match rc.borrow().get_own_data("[[PrimitiveValue]]") {
+                    Some(JsValue::Number(n)) => Some(n),
+                    _ => Some(0.0),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// ECMAScript TrimString whitespace set = WhiteSpace ∪ LineTerminator.
+    /// Rust's `char::is_whitespace` already covers Zs + tab/VT/FF + LF/CR/LS/PS;
+    /// it omits U+FEFF (ZWNBSP/BOM), which the spec includes.
+    fn is_js_trim_ws(c: char) -> bool {
+        c.is_whitespace() || c == '\u{FEFF}'
+    }
+
+    /// thisStringValue (ECMA-262 §22.1.3): unwrap a String primitive or wrapper.
+    fn this_string_value(this: &JsValue) -> Option<String> {
+        match this {
+            JsValue::String(s) => Some(s.clone()),
+            JsValue::Object(rc) if rc.borrow().class_name.as_deref() == Some("String") => {
+                match rc.borrow().get_own_data("[[PrimitiveValue]]") {
+                    Some(JsValue::String(s)) => Some(s),
+                    _ => Some(String::new()),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// thisBooleanValue (ECMA-262 §20.3.3): unwrap a Boolean primitive or wrapper.
+    fn this_boolean_value(this: &JsValue) -> Option<bool> {
+        match this {
+            JsValue::Boolean(b) => Some(*b),
+            JsValue::Object(rc) if rc.borrow().class_name.as_deref() == Some("Boolean") => {
+                match rc.borrow().get_own_data("[[PrimitiveValue]]") {
+                    Some(JsValue::Boolean(b)) => Some(b),
+                    _ => Some(false),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Shared Number.prototype.* implementation for both the direct method-call
+    /// path and detached `Number.prototype.x.call(...)` host dispatch.
+    fn call_number_proto_method(
+        &mut self,
+        method: &str,
+        this: &JsValue,
+        args: &[JsValue],
+    ) -> JsValue {
+        let Some(n) = Self::this_number_value(this) else {
+            self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                "TypeError",
+                format!("Number.prototype.{method} requires that 'this' be a Number"),
+            )));
+            return JsValue::Undefined;
+        };
+        match method {
+            "toString" | "toLocaleString" => {
+                let radix = match args.first() {
+                    None | Some(JsValue::Undefined) => 10.0,
+                    Some(v) => Self::value_to_number(v).trunc(),
+                };
+                if !(2.0..=36.0).contains(&radix) {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "RangeError",
+                        "toString() radix must be between 2 and 36".to_owned(),
+                    )));
+                    return JsValue::Undefined;
+                }
+                JsValue::String(Self::number_to_string_radix(n, radix as u32))
+            }
+            "valueOf" => JsValue::Number(n),
+            "toFixed" => {
+                let digits = args
+                    .first()
+                    .map(|v| (Self::value_to_number(v) as usize).min(100))
+                    .unwrap_or(0);
+                JsValue::String(format!("{n:.digits$}"))
+            }
+            "toPrecision" => match args.first() {
+                None | Some(JsValue::Undefined) => {
+                    JsValue::String(Self::value_to_string(&JsValue::Number(n)))
+                }
+                Some(v) => {
+                    let p = (Self::value_to_number(v) as usize).clamp(1, 100);
+                    JsValue::String(format!("{n:.p$}"))
+                }
+            },
+            "toExponential" => {
+                let digits = args
+                    .first()
+                    .map(|v| (Self::value_to_number(v) as usize).min(100))
+                    .unwrap_or(6);
+                JsValue::String(format!("{n:.digits$e}").replace('e', "e+").replace("e+-", "e-"))
+            }
+            _ => JsValue::Undefined,
+        }
+    }
+
+    /// Shared Boolean.prototype.* implementation.
+    fn call_boolean_proto_method(&mut self, method: &str, this: &JsValue) -> JsValue {
+        let Some(b) = Self::this_boolean_value(this) else {
+            self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                "TypeError",
+                format!("Boolean.prototype.{method} requires that 'this' be a Boolean"),
+            )));
+            return JsValue::Undefined;
+        };
+        match method {
+            "toString" => JsValue::String(b.to_string()),
+            "valueOf" => JsValue::Boolean(b),
+            _ => JsValue::Undefined,
+        }
+    }
+
     fn host_function_default_return(name: &str) -> JsValue {
         if matches!(
             name,
@@ -15619,6 +16095,34 @@ impl BrowserExecutionState {
                 return Self::object_function_coerce(
                     args.into_iter().next().unwrap_or(JsValue::Undefined),
                 );
+            }
+            // Called as plain functions (e.g. detached references like arr.map(Number)),
+            // these return primitives; boxing only happens through `new`.
+            "Number" => {
+                return args
+                    .into_iter()
+                    .next()
+                    .map(|value| JsValue::Number(self.coerce_to_number(value)))
+                    .unwrap_or(JsValue::Number(0.0));
+            }
+            "Boolean" => {
+                return args
+                    .into_iter()
+                    .next()
+                    .map(|value| JsValue::Boolean(Self::is_truthy(&value)))
+                    .unwrap_or(JsValue::Boolean(false));
+            }
+            "String" => {
+                return match args.into_iter().next() {
+                    Some(value) => {
+                        if matches!(&value, JsValue::String(s) if s.starts_with("__sym_")) {
+                            JsValue::String(Self::value_to_string(&value))
+                        } else {
+                            JsValue::String(self.coerce_to_string(&value))
+                        }
+                    }
+                    None => JsValue::String(String::new()),
+                };
             }
             "jQuery" => self.call_jquery_constructor(args),
             "jQuery.ready" => {
@@ -16403,7 +16907,14 @@ impl BrowserExecutionState {
                             }
                         }
                     }
-                    (JsValue::Object(rc), JsValue::Object(desc)) => {
+                    (JsValue::Object(rc), descriptor) => {
+                        let desc = match self.to_property_descriptor(&descriptor) {
+                            Ok(record) => record,
+                            Err(error) => {
+                                self.throw_descriptor_error(error);
+                                return JsValue::Undefined;
+                            }
+                        };
                         JsValue::Boolean(Self::apply_property_descriptor(&rc, prop, &desc))
                     }
                     _ => JsValue::Boolean(false),
@@ -16650,6 +17161,14 @@ impl BrowserExecutionState {
                 JsValue::String(format!("[object {}]", Self::object_tag(&this_arg)))
             }
             "Object.prototype.valueOf" => this_arg,
+            name if name.starts_with("Number.prototype.") => {
+                let method = &name["Number.prototype.".len()..];
+                return self.call_number_proto_method(method, &this_arg, &args);
+            }
+            name if name.starts_with("Boolean.prototype.") => {
+                let method = &name["Boolean.prototype.".len()..];
+                return self.call_boolean_proto_method(method, &this_arg);
+            }
             "Object.prototype.hasOwnProperty" => {
                 let key = args.first().map(Self::value_to_string).unwrap_or_default();
                 match &this_arg {
@@ -16715,6 +17234,25 @@ impl BrowserExecutionState {
                     ),
                     _ => JsValue::Boolean(false),
                 }
+            }
+            // RequireObjectCoercible guard for every Array.prototype/String.prototype
+            // method dispatched with a detached null/undefined receiver. Placed before
+            // the per-method arms so it intercepts all of them. Chained host names like
+            // "String.prototype.charAt.hasOwnProperty" are excluded — those dispatch a
+            // property of the method object itself, not a String.prototype method.
+            name if matches!(this_arg, JsValue::Undefined | JsValue::Null)
+                && (name
+                    .strip_prefix("Array.prototype.")
+                    .is_some_and(|m| !m.contains('.'))
+                    || name
+                        .strip_prefix("String.prototype.")
+                        .is_some_and(|m| !m.contains('.'))) =>
+            {
+                self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                    "TypeError",
+                    format!("{name} called on null or undefined"),
+                )));
+                JsValue::Undefined
             }
             "Array.prototype.push" => {
                 if let JsValue::Array(mut items) = this_arg {
@@ -16856,76 +17394,94 @@ impl BrowserExecutionState {
                 }
             }
             "String.prototype.fixed" => {
-                let s = Self::value_to_string(&this_arg);
+                let s = self.coerce_to_string(&this_arg);
                 JsValue::String(format!("<tt>{s}</tt>"))
             }
             "String.prototype.bold" => {
-                let s = Self::value_to_string(&this_arg);
+                let s = self.coerce_to_string(&this_arg);
                 JsValue::String(format!("<b>{s}</b>"))
             }
             "String.prototype.italics" => {
-                let s = Self::value_to_string(&this_arg);
+                let s = self.coerce_to_string(&this_arg);
                 JsValue::String(format!("<i>{s}</i>"))
             }
             "String.prototype.small" => {
-                let s = Self::value_to_string(&this_arg);
+                let s = self.coerce_to_string(&this_arg);
                 JsValue::String(format!("<small>{s}</small>"))
             }
             "String.prototype.big" => {
-                let s = Self::value_to_string(&this_arg);
+                let s = self.coerce_to_string(&this_arg);
                 JsValue::String(format!("<big>{s}</big>"))
             }
             "String.prototype.strike" => {
-                let s = Self::value_to_string(&this_arg);
+                let s = self.coerce_to_string(&this_arg);
                 JsValue::String(format!("<strike>{s}</strike>"))
             }
             "String.prototype.sup" => {
-                let s = Self::value_to_string(&this_arg);
+                let s = self.coerce_to_string(&this_arg);
                 JsValue::String(format!("<sup>{s}</sup>"))
             }
             "String.prototype.sub" => {
-                let s = Self::value_to_string(&this_arg);
+                let s = self.coerce_to_string(&this_arg);
                 JsValue::String(format!("<sub>{s}</sub>"))
             }
             "String.prototype.blink" => {
-                let s = Self::value_to_string(&this_arg);
+                let s = self.coerce_to_string(&this_arg);
                 JsValue::String(format!("<blink>{s}</blink>"))
             }
             "String.prototype.link" => {
-                let s = Self::value_to_string(&this_arg);
+                let s = self.coerce_to_string(&this_arg);
                 let url = args.first().map(Self::value_to_string).unwrap_or_default();
                 JsValue::String(format!("<a href=\"{url}\">{s}</a>"))
             }
             "String.prototype.anchor" => {
-                let s = Self::value_to_string(&this_arg);
+                let s = self.coerce_to_string(&this_arg);
                 let name = args.first().map(Self::value_to_string).unwrap_or_default();
                 JsValue::String(format!("<a name=\"{name}\">{s}</a>"))
             }
             "String.prototype.fontcolor" => {
-                let s = Self::value_to_string(&this_arg);
+                let s = self.coerce_to_string(&this_arg);
                 let color = args.first().map(Self::value_to_string).unwrap_or_default();
                 JsValue::String(format!("<font color=\"{color}\">{s}</font>"))
             }
             "String.prototype.fontsize" => {
-                let s = Self::value_to_string(&this_arg);
+                let s = self.coerce_to_string(&this_arg);
                 let size = args.first().map(Self::value_to_string).unwrap_or_default();
                 JsValue::String(format!("<font size=\"{size}\">{s}</font>"))
             }
-            "String.prototype.trimLeft" => {
-                JsValue::String(Self::value_to_string(&this_arg).trim_start().to_owned())
+            "String.prototype.trimLeft" => JsValue::String(
+                self.coerce_to_string(&this_arg)
+                    .trim_start_matches(Self::is_js_trim_ws)
+                    .to_owned(),
+            ),
+            "String.prototype.trimRight" => JsValue::String(
+                self.coerce_to_string(&this_arg)
+                    .trim_end_matches(Self::is_js_trim_ws)
+                    .to_owned(),
+            ),
+            // thisStringValue (ECMA-262 §22.1.3): unwrap the primitive/wrapper
+            // directly. Must NOT route through coerce_to_string, which would call
+            // back into this arm and recurse forever.
+            "String.prototype.toString" | "String.prototype.valueOf" => {
+                match Self::this_string_value(&this_arg) {
+                    Some(s) => JsValue::String(s),
+                    None => {
+                        self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                            "TypeError",
+                            "String.prototype.toString requires that 'this' be a String".to_owned(),
+                        )));
+                        JsValue::Undefined
+                    }
+                }
             }
-            "String.prototype.trimRight" => {
-                JsValue::String(Self::value_to_string(&this_arg).trim_end().to_owned())
-            }
-            "String.prototype.toString" => JsValue::String(Self::value_to_string(&this_arg)),
             "String.prototype.replace" => {
-                let source = Self::value_to_string(&this_arg);
+                let source = self.coerce_to_string(&this_arg);
                 let needle = args.first().map(Self::value_to_string).unwrap_or_default();
                 let replacement = args.get(1).map(Self::value_to_string).unwrap_or_default();
                 JsValue::String(source.replacen(&needle, &replacement, 1))
             }
             "String.prototype.indexOf" => {
-                let source = Self::value_to_string(&this_arg);
+                let source = self.coerce_to_string(&this_arg);
                 let needle = args.first().map(Self::value_to_string).unwrap_or_default();
                 JsValue::Number(
                     source
@@ -16935,12 +17491,12 @@ impl BrowserExecutionState {
                 )
             }
             "String.prototype.includes" => {
-                let source = Self::value_to_string(&this_arg);
+                let source = self.coerce_to_string(&this_arg);
                 let needle = args.first().map(Self::value_to_string).unwrap_or_default();
                 JsValue::Boolean(source.contains(&needle))
             }
             "String.prototype.slice" => {
-                let source = Self::value_to_string(&this_arg);
+                let source = self.coerce_to_string(&this_arg);
                 let len = source.chars().count() as i64;
                 let start = args
                     .first()
@@ -16956,11 +17512,23 @@ impl BrowserExecutionState {
                     .clamp(start as i64, len) as usize;
                 JsValue::String(source.chars().skip(start).take(end - start).collect())
             }
-            "String.prototype.trim" => {
-                JsValue::String(Self::value_to_string(&this_arg).trim().to_owned())
-            }
+            "String.prototype.trim" => JsValue::String(
+                self.coerce_to_string(&this_arg)
+                    .trim_matches(Self::is_js_trim_ws)
+                    .to_owned(),
+            ),
+            "String.prototype.trimStart" => JsValue::String(
+                self.coerce_to_string(&this_arg)
+                    .trim_start_matches(Self::is_js_trim_ws)
+                    .to_owned(),
+            ),
+            "String.prototype.trimEnd" => JsValue::String(
+                self.coerce_to_string(&this_arg)
+                    .trim_end_matches(Self::is_js_trim_ws)
+                    .to_owned(),
+            ),
             "String.prototype.charAt" => {
-                let source = Self::value_to_string(&this_arg);
+                let source = self.coerce_to_string(&this_arg);
                 let index = args.first().map(Self::value_to_number).unwrap_or(0.0) as usize;
                 JsValue::String(
                     source
@@ -16971,7 +17539,7 @@ impl BrowserExecutionState {
                 )
             }
             "String.prototype.split" => {
-                let source = Self::value_to_string(&this_arg);
+                let source = self.coerce_to_string(&this_arg);
                 let sep = args.first().map(Self::value_to_string).unwrap_or_default();
                 if sep.is_empty() {
                     JsValue::Array(
@@ -17057,11 +17625,17 @@ impl BrowserExecutionState {
                             bound_args,
                         }
                     }
-                    _ => JsValue::BoundHostFunction {
-                        name: "Function.prototype.bind".to_owned(),
-                        this_arg: Box::new(bound_this),
-                        bound_args: real_args,
-                    },
+                    // Limited user-function binding: `this` binding is not yet
+                    // modeled for user functions, so return the function itself.
+                    func @ JsValue::Function(_) => func,
+                    // Spec: bind requires a callable receiver.
+                    _ => {
+                        self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                            "TypeError",
+                            "Bind must be called on a function".to_owned(),
+                        )));
+                        JsValue::Undefined
+                    }
                 }
             }
             "Function.prototype.toString" => {
@@ -17241,6 +17815,105 @@ impl BrowserExecutionState {
                     JsValue::Undefined
                 }
             }
+            "Array.prototype.reduce" | "Array.prototype.reduceRight" => {
+                let right = name == "Array.prototype.reduceRight";
+                let has_init = args.len() >= 2;
+                let mut args_iter = args.into_iter();
+                let cb = args_iter.next().unwrap_or(JsValue::Undefined);
+                let init = args_iter.next();
+                let (items_opt, len, map_opt) = self.array_like_parts(this_arg.clone());
+                if !Self::is_callable_value(&cb) {
+                    self.throw_not_a_function(&format!("{name} callback"));
+                    return JsValue::Undefined;
+                }
+                let iter_len = items_opt.as_ref().map(|v| v.len() as u32).unwrap_or(len);
+                // Visit order: left-to-right for reduce, right-to-left for reduceRight.
+                let order: Vec<u32> = if right {
+                    (0..iter_len).rev().collect()
+                } else {
+                    (0..iter_len).collect()
+                };
+                let mut cursor = 0usize;
+                let mut acc = if has_init {
+                    init.unwrap_or(JsValue::Undefined)
+                } else if order.is_empty() {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        "Reduce of empty array with no initial value".to_owned(),
+                    )));
+                    return JsValue::Undefined;
+                } else {
+                    let first = order[0];
+                    cursor = 1;
+                    self.array_like_get(&items_opt, &map_opt, first)
+                };
+                while cursor < order.len() {
+                    if self.execution_budget_exhausted {
+                        break;
+                    }
+                    let i = order[cursor];
+                    let item = self.array_like_get(&items_opt, &map_opt, i);
+                    acc = self.call_value(
+                        cb.clone(),
+                        JsValue::Undefined,
+                        vec![acc, item, JsValue::Number(i as f64), this_arg.clone()],
+                    );
+                    if self.early_exit.is_some() {
+                        break;
+                    }
+                    cursor += 1;
+                }
+                acc
+            }
+            "Array.prototype.find"
+            | "Array.prototype.findIndex"
+            | "Array.prototype.findLast"
+            | "Array.prototype.findLastIndex" => {
+                let want_index =
+                    name == "Array.prototype.findIndex" || name == "Array.prototype.findLastIndex";
+                let reverse =
+                    name == "Array.prototype.findLast" || name == "Array.prototype.findLastIndex";
+                let mut args_iter = args.into_iter();
+                let cb = args_iter.next().unwrap_or(JsValue::Undefined);
+                let this_cb = args_iter.next().unwrap_or(JsValue::Undefined);
+                let (items_opt, len, map_opt) = self.array_like_parts(this_arg.clone());
+                if !Self::is_callable_value(&cb) {
+                    self.throw_not_a_function(&format!("{name} callback"));
+                    return JsValue::Undefined;
+                }
+                let iter_len = items_opt.as_ref().map(|v| v.len() as u32).unwrap_or(len);
+                let order: Vec<u32> = if reverse {
+                    (0..iter_len).rev().collect()
+                } else {
+                    (0..iter_len).collect()
+                };
+                for i in order {
+                    if self.execution_budget_exhausted {
+                        break;
+                    }
+                    let item = self.array_like_get(&items_opt, &map_opt, i);
+                    let v = self.call_value(
+                        cb.clone(),
+                        this_cb.clone(),
+                        vec![item.clone(), JsValue::Number(i as f64), this_arg.clone()],
+                    );
+                    if self.early_exit.is_some() {
+                        break;
+                    }
+                    if Self::is_truthy(&v) {
+                        return if want_index {
+                            JsValue::Number(i as f64)
+                        } else {
+                            item
+                        };
+                    }
+                }
+                if want_index {
+                    JsValue::Number(-1.0)
+                } else {
+                    JsValue::Undefined
+                }
+            }
             n if n.starts_with("Math.") => self.call_math_method(&n["Math.".len()..], &args),
             "JSON.parse" => {
                 let s = args.first().map(Self::value_to_string).unwrap_or_default();
@@ -17248,7 +17921,16 @@ impl BrowserExecutionState {
             }
             "JSON.stringify" => {
                 let arg = args.into_iter().next().unwrap_or(JsValue::Undefined);
-                JsValue::String(json_stringify(&arg))
+                match try_json_stringify(&arg, &mut Vec::new()) {
+                    Ok(s) => JsValue::String(s),
+                    Err(()) => {
+                        self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                            "TypeError",
+                            "Converting circular structure to JSON".to_owned(),
+                        )));
+                        JsValue::Undefined
+                    }
+                }
             }
             _ => Self::host_function_default_return(name),
         }
@@ -17262,6 +17944,17 @@ impl BrowserExecutionState {
         val: JsValue,
     ) -> (Option<Vec<JsValue>>, u32, Option<Rc<RefCell<JsObject>>>) {
         match val {
+            // RequireObjectCoercible: Array.prototype methods invoked with a
+            // null/undefined receiver throw instead of iterating nothing.
+            JsValue::Undefined | JsValue::Null => {
+                if self.early_exit.is_none() {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        "Array.prototype method called on null or undefined".to_owned(),
+                    )));
+                }
+                (Some(vec![]), 0, None)
+            }
             JsValue::Array(items) => (Some(items), 0, None),
             JsValue::Object(rc) => {
                 let len = self.to_length_from_obj(&rc);
@@ -17324,6 +18017,17 @@ impl BrowserExecutionState {
     /// ToPrimitive/ToNumber for a value: for Objects calls valueOf() then toString().
     fn coerce_to_number(&mut self, val: JsValue) -> f64 {
         match val {
+            // ToNumber(Symbol) throws TypeError. Symbols are modeled as opaque
+            // "__sym_" strings, so detect them before generic string parsing.
+            JsValue::String(ref s) if s.starts_with("__sym_") => {
+                if self.early_exit.is_none() {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        "Cannot convert a Symbol value to a number".to_owned(),
+                    )));
+                }
+                f64::NAN
+            }
             JsValue::Object(ref rc) => {
                 // Try valueOf first.
                 let value_of = self.obj_get(rc, "valueOf");
@@ -17344,6 +18048,70 @@ impl BrowserExecutionState {
                 f64::NAN
             }
             other => Self::value_to_number(&other),
+        }
+    }
+
+    /// ECMA-262 ToString (§7.1.17) for interpreter contexts: objects run
+    /// OrdinaryToPrimitive with string hint (user `toString` first, then
+    /// `valueOf`), and Symbols throw TypeError. Falls back to the static
+    /// stringifier for primitives and host values. If a user method throws,
+    /// `early_exit` is already set and the partial result is discarded upstream.
+    fn coerce_to_string(&mut self, val: &JsValue) -> String {
+        match val {
+            JsValue::String(s) if s.starts_with("__sym_") => {
+                if self.early_exit.is_none() {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        "Cannot convert a Symbol value to a string".to_owned(),
+                    )));
+                }
+                String::new()
+            }
+            // Primitive-wrapper objects stringify to their underlying value via
+            // the native toString, which obj_get can't reach (wrappers have no
+            // real prototype link). Unwrap the brand value directly.
+            JsValue::Object(rc) if Self::wrapper_class_owner(rc).is_some() => {
+                if let Some(s) = Self::this_string_value(val) {
+                    s
+                } else if let Some(n) = Self::this_number_value(val) {
+                    Self::value_to_string(&JsValue::Number(n))
+                } else if let Some(b) = Self::this_boolean_value(val) {
+                    b.to_string()
+                } else {
+                    Self::value_to_string(val)
+                }
+            }
+            JsValue::Object(rc) => {
+                // OrdinaryToPrimitive(string) consults `toString` first. Since
+                // Object.prototype.toString is always present, `valueOf` is only
+                // reached when the user replaced `toString` with a non-callable.
+                let to_string = self.obj_get(rc, "toString");
+                if Self::is_callable_value(&to_string) {
+                    let result = self.call_value(to_string, JsValue::Object(rc.clone()), vec![]);
+                    if self.early_exit.is_some() {
+                        return String::new();
+                    }
+                    if !matches!(result, JsValue::Object(_)) {
+                        return Self::value_to_string(&result);
+                    }
+                    // toString returned an object: fall through to valueOf.
+                    let value_of = self.obj_get(rc, "valueOf");
+                    if Self::is_callable_value(&value_of) {
+                        let result =
+                            self.call_value(value_of, JsValue::Object(rc.clone()), vec![]);
+                        if self.early_exit.is_some() {
+                            return String::new();
+                        }
+                        if !matches!(result, JsValue::Object(_)) {
+                            return Self::value_to_string(&result);
+                        }
+                    }
+                }
+                // No user toString reachable (the common case): the native
+                // Object.prototype.toString result is the object tag.
+                Self::value_to_string(val)
+            }
+            other => Self::value_to_string(other),
         }
     }
 
@@ -17729,29 +18497,65 @@ impl BrowserExecutionState {
         }
     }
 
+    /// For primitive-wrapper objects (`new String/Number/Boolean(...)`), the
+    /// constructor name that owns their prototype methods. Keyed strictly on
+    /// `class_name` so plain user objects are unaffected.
+    fn wrapper_class_owner(rc: &Rc<RefCell<JsObject>>) -> Option<&'static str> {
+        match rc.borrow().class_name.as_deref() {
+            Some("String") => Some("String"),
+            Some("Number") => Some("Number"),
+            Some("Boolean") => Some("Boolean"),
+            Some("BigInt") => Some("BigInt"),
+            _ => None,
+        }
+    }
+
     fn object_property_or_native_fallback(
         &mut self,
         rc: &Rc<RefCell<JsObject>>,
         property: &str,
     ) -> Option<JsValue> {
         let val = self.obj_get(rc, property);
-        match val {
-            // Soft-shadow: if an own property is explicitly `undefined` for a known
-            // Object.prototype method (toString, valueOf, etc.), prefer the native.
-            JsValue::Undefined if Self::soft_native_shadow_property(property) => self
+        if !matches!(val, JsValue::Undefined) {
+            return Some(val);
+        }
+        // Property missing on the object and its real prototype chain. For
+        // primitive wrappers, resolve against their constructor's prototype
+        // (String/Number/Boolean.prototype) before the generic Object fallback,
+        // and expose the String-exotic `length` / index own-data the wrapper
+        // constructor doesn't materialize.
+        if let Some(owner) = Self::wrapper_class_owner(rc) {
+            if owner == "String" {
+                if let Some(JsValue::String(s)) = rc.borrow().get_own_data("[[PrimitiveValue]]") {
+                    if property == "length" {
+                        return Some(JsValue::Number(s.chars().count() as f64));
+                    }
+                    if let Ok(i) = property.parse::<usize>() {
+                        return Some(
+                            s.chars()
+                                .nth(i)
+                                .map(|c| JsValue::String(c.to_string()))
+                                .unwrap_or(JsValue::Undefined),
+                        );
+                    }
+                }
+            }
+            if let Some(v) = self.native_prototype_property(owner, property) {
+                return Some(v);
+            }
+        }
+        if Self::soft_native_shadow_property(property) {
+            return self
                 .native_prototype_property("Object", property)
                 .inspect(|_| {
                     self.trace_runtime(
                         "prototype.shadowed_undefined",
                         format!("Object.prototype.{property}"),
                     );
-                }),
-            JsValue::Undefined => {
-                // Property missing on object AND prototype chain → native fallback.
-                self.native_prototype_property("Object", property)
-            }
-            other => Some(other),
+                });
         }
+        // Property missing on object AND prototype chain → native fallback.
+        self.native_prototype_property("Object", property)
     }
 
     fn soft_native_shadow_property(property: &str) -> bool {
@@ -17773,8 +18577,11 @@ impl BrowserExecutionState {
             JsValue::ArrayBuffer(_) => Some("ArrayBuffer"),
             JsValue::DataView(_) => Some("DataView"),
             JsValue::TypedArray(view) => Some(view.borrow().kind.constructor_name()),
-            JsValue::Object(_)
-            | JsValue::ElementRef(_)
+            // Primitive-wrapper objects dispatch through their constructor's
+            // prototype (String/Number/Boolean.prototype); other objects use
+            // Object.prototype.
+            JsValue::Object(rc) => Some(Self::wrapper_class_owner(rc).unwrap_or("Object")),
+            JsValue::ElementRef(_)
             | JsValue::NodeList(_)
             | JsValue::StyleRef(_)
             | JsValue::StorageRef(_)
@@ -17789,11 +18596,12 @@ impl BrowserExecutionState {
             | JsValue::XhrInstance { .. }
             | JsValue::Proxy { .. }
             | JsValue::WeakMap(_) => Some("Object"),
-            JsValue::Undefined
-            | JsValue::Null
-            | JsValue::Boolean(_)
-            | JsValue::Number(_)
-            | JsValue::BigInt(_) => None,
+            // Primitive receivers dispatch through their wrapper prototype
+            // (e.g. (5).toString(2), true.valueOf()).
+            JsValue::Boolean(_) => Some("Boolean"),
+            JsValue::Number(_) => Some("Number"),
+            JsValue::BigInt(_) => Some("BigInt"),
+            JsValue::Undefined | JsValue::Null => None,
         }
     }
 
@@ -18080,10 +18888,15 @@ impl BrowserExecutionState {
                 ("configurable".to_owned(), JsValue::Boolean(configurable)),
             ])
         }
-        fn make_accessor(getter: JsValue, enumerable: bool, configurable: bool) -> JsValue {
+        fn make_accessor(
+            getter: JsValue,
+            setter: JsValue,
+            enumerable: bool,
+            configurable: bool,
+        ) -> JsValue {
             JsValue::from_map([
                 ("get".to_owned(), getter),
-                ("set".to_owned(), JsValue::Undefined),
+                ("set".to_owned(), setter),
                 ("enumerable".to_owned(), JsValue::Boolean(enumerable)),
                 ("configurable".to_owned(), JsValue::Boolean(configurable)),
             ])
@@ -18095,11 +18908,12 @@ impl BrowserExecutionState {
                 match obj_borrow.get_own(prop) {
                     Some(Property::Accessor {
                         get,
+                        set,
                         enumerable,
                         configurable,
-                        ..
                     }) => make_accessor(
                         get.clone().unwrap_or(JsValue::Undefined),
+                        set.clone().unwrap_or(JsValue::Undefined),
                         *enumerable && !non_enum,
                         *configurable,
                     ),
@@ -18123,6 +18937,7 @@ impl BrowserExecutionState {
                 {
                     return make_accessor(
                         JsValue::HostFunction(format!("{fn_name}.@@species.get")),
+                        JsValue::Undefined,
                         false,
                         true,
                     );
@@ -18243,11 +19058,12 @@ impl BrowserExecutionState {
                                     ),
                                     Property::Accessor {
                                         get,
-                                        set: _,
+                                        set,
                                         enumerable,
                                         configurable,
                                     } => make_accessor(
                                         get.clone().unwrap_or(JsValue::Undefined),
+                                        set.clone().unwrap_or(JsValue::Undefined),
                                         *enumerable,
                                         *configurable,
                                     ),
@@ -18298,14 +19114,20 @@ impl BrowserExecutionState {
                     Self::native_proto_covers(ctor_name.as_str(), obj)
                 } else {
                     // User-defined prototype: walk obj's prototype chain by Rc pointer.
+                    // Visited guard terminates cyclic chains instead of spinning forever.
                     let mut current = match obj {
                         JsValue::Object(rc) => rc.borrow().prototype.clone(),
                         _ => return false,
                     };
+                    let mut visited: Vec<*const RefCell<JsObject>> = Vec::new();
                     while let Some(p) = current {
                         if Rc::ptr_eq(&p, proto_rc) {
                             return true;
                         }
+                        if visited.contains(&Rc::as_ptr(&p)) {
+                            return false;
+                        }
+                        visited.push(Rc::as_ptr(&p));
                         current = p.borrow().prototype.clone();
                     }
                     false
@@ -19704,17 +20526,19 @@ fn json_parse_number(bytes: &[u8], pos: &mut usize) -> JsValue {
     JsValue::Number(s.parse::<f64>().unwrap_or(0.0))
 }
 
-fn json_stringify(value: &JsValue) -> String {
+// JSON serialization with a circular-reference guard. `seen` holds the identity
+// pointers of Object/RichArray values on the current serialization path; revisiting
+// one means a cycle, which ECMA-262 JSON.stringify reports as a TypeError
+// (surfaced by the call sites that have interpreter access).
+fn try_json_stringify(value: &JsValue, seen: &mut Vec<*const ()>) -> Result<String, ()> {
     match value {
-        JsValue::Null | JsValue::Undefined => "null".to_owned(),
-        JsValue::Boolean(b) => b.to_string(),
-        JsValue::Number(n) => {
-            if n.fract() == 0.0 && n.is_finite() {
-                (*n as i64).to_string()
-            } else {
-                n.to_string()
-            }
-        }
+        JsValue::Null | JsValue::Undefined => Ok("null".to_owned()),
+        JsValue::Boolean(b) => Ok(b.to_string()),
+        JsValue::Number(n) => Ok(if n.fract() == 0.0 && n.is_finite() {
+            (*n as i64).to_string()
+        } else {
+            n.to_string()
+        }),
         JsValue::String(s) => {
             let escaped = s
                 .replace('\\', "\\\\")
@@ -19722,29 +20546,46 @@ fn json_stringify(value: &JsValue) -> String {
                 .replace('\n', "\\n")
                 .replace('\r', "\\r")
                 .replace('\t', "\\t");
-            format!("\"{escaped}\"")
+            Ok(format!("\"{escaped}\""))
         }
         JsValue::Array(items) => {
-            let parts: Vec<String> = items.iter().map(json_stringify).collect();
-            format!("[{}]", parts.join(","))
+            let parts: Vec<String> = items
+                .iter()
+                .map(|v| try_json_stringify(v, seen))
+                .collect::<Result<_, _>>()?;
+            Ok(format!("[{}]", parts.join(",")))
         }
         JsValue::RichArray(rc) => {
-            let parts: Vec<String> = rc.borrow().elements.iter().map(json_stringify).collect();
-            format!("[{}]", parts.join(","))
+            let id = Rc::as_ptr(rc) as *const ();
+            if seen.contains(&id) {
+                return Err(());
+            }
+            seen.push(id);
+            let elements = rc.borrow().elements.clone();
+            let parts: Vec<String> = elements
+                .iter()
+                .map(|v| try_json_stringify(v, seen))
+                .collect::<Result<_, _>>()?;
+            seen.pop();
+            Ok(format!("[{}]", parts.join(",")))
         }
         JsValue::Object(rc) => {
-            let mut pairs: Vec<String> = rc
-                .borrow()
-                .own_enumerable_keys()
-                .into_iter()
-                .filter_map(|k| {
-                    let v = rc.borrow().get_own_data(&k)?;
-                    let key = json_stringify(&JsValue::String(k));
-                    Some(format!("{key}:{}", json_stringify(&v)))
-                })
-                .collect();
+            let id = Rc::as_ptr(rc) as *const ();
+            if seen.contains(&id) {
+                return Err(());
+            }
+            seen.push(id);
+            let mut pairs: Vec<String> = Vec::new();
+            for k in rc.borrow().own_enumerable_keys() {
+                let Some(v) = rc.borrow().get_own_data(&k) else {
+                    continue;
+                };
+                let key = try_json_stringify(&JsValue::String(k), seen)?;
+                pairs.push(format!("{key}:{}", try_json_stringify(&v, seen)?));
+            }
+            seen.pop();
             pairs.sort(); // stable key order for deterministic output
-            format!("{{{}}}", pairs.join(","))
+            Ok(format!("{{{}}}", pairs.join(",")))
         }
         JsValue::Function(_)
         | JsValue::ElementRef(_)
@@ -19767,8 +20608,8 @@ fn json_stringify(value: &JsValue) -> String {
         | JsValue::XhrInstance { .. }
         | JsValue::Proxy { .. }
         | JsValue::WeakMap(_)
-        | JsValue::GeneratorObject(_) => "null".to_owned(),
-        JsValue::BigInt(n) => n.to_string(),
+        | JsValue::GeneratorObject(_) => Ok("null".to_owned()),
+        JsValue::BigInt(n) => Ok(n.to_string()),
     }
 }
 
@@ -21315,12 +22156,18 @@ mod tests {
 
     #[test]
     fn function_prototype_host_fallbacks_are_callable() {
+        // Detached bind stays callable on callable receivers; a non-callable
+        // receiver throws TypeError like real browsers.
         let effects = run(r#"
             let bind = Function.prototype.bind;
-            document.getElementById("result").textContent = String(bind.call(null));
+            let bound = bind.call(Object.prototype.hasOwnProperty, { x: 1 });
+            let threw = "no";
+            try { bind.call(null); } catch (e) { threw = e.name; }
+            document.getElementById("result").textContent =
+                String(bound({ })) + ":" + bound("x") + ":" + threw;
             "#);
 
-        assert_eq!(effects, vec![text("result", "[object Function]")]);
+        assert_eq!(effects, vec![text("result", "false:true:TypeError")]);
     }
 
     #[test]

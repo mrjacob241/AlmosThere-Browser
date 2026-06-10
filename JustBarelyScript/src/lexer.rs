@@ -457,6 +457,56 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Decode a `\uXXXX` or `\u{H...}` escape. Assumes `current()` is `'u'`
+    /// (not yet consumed). Leaves the cursor just past the escape. Returns the
+    /// scalar value, or `None` for malformed/out-of-range (e.g. lone surrogate)
+    /// sequences, which the caller drops.
+    fn read_unicode_escape(&mut self) -> Option<char> {
+        self.bump(); // consume 'u'
+        let hex = if self.current() == Some('{') {
+            self.bump(); // consume '{'
+            let mut hex = String::new();
+            while let Some(c) = self.current() {
+                if c == '}' {
+                    self.bump();
+                    break;
+                }
+                hex.push(c);
+                self.bump();
+            }
+            hex
+        } else {
+            let mut hex = String::new();
+            for _ in 0..4 {
+                match self.current() {
+                    Some(c) if c.is_ascii_hexdigit() => {
+                        hex.push(c);
+                        self.bump();
+                    }
+                    _ => break,
+                }
+            }
+            hex
+        };
+        u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
+    }
+
+    /// Decode a `\xXX` escape. Assumes `current()` is `'x'` (not yet consumed).
+    fn read_hex_escape(&mut self) -> Option<char> {
+        self.bump(); // consume 'x'
+        let mut hex = String::new();
+        for _ in 0..2 {
+            match self.current() {
+                Some(c) if c.is_ascii_hexdigit() => {
+                    hex.push(c);
+                    self.bump();
+                }
+                _ => break,
+            }
+        }
+        u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
+    }
+
     fn string(&mut self, span: Span, quote: char) -> Token {
         let mut value = String::new();
         self.bump(); // consume opening quote
@@ -467,6 +517,22 @@ impl<'a> Lexer<'a> {
             }
             if ch == '\\' {
                 self.bump();
+                // `\u` / `\x` consume their own hex digits via helpers.
+                match self.current() {
+                    Some('u') => {
+                        if let Some(c) = self.read_unicode_escape() {
+                            value.push(c);
+                        }
+                        continue;
+                    }
+                    Some('x') => {
+                        if let Some(c) = self.read_hex_escape() {
+                            value.push(c);
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
                 let escaped = match self.current() {
                     Some('n') => '\n',
                     Some('r') => '\r',
@@ -504,6 +570,21 @@ impl<'a> Lexer<'a> {
                 }
                 Some('\\') => {
                     self.bump();
+                    match self.current() {
+                        Some('u') => {
+                            if let Some(c) = self.read_unicode_escape() {
+                                current_str.push(c);
+                            }
+                            continue;
+                        }
+                        Some('x') => {
+                            if let Some(c) = self.read_hex_escape() {
+                                current_str.push(c);
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
                     let ch = match self.current() {
                         Some('n') => '\n',
                         Some('r') => '\r',

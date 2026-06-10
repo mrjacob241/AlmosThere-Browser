@@ -237,6 +237,9 @@ static UNSUPPORTED_FEATURES: &[&str] = &[
     "async-functions",
     "async-iteration",
     // Reflection / meta
+    // NOTE: un-gating "Reflect"/"Proxy" was tried and reverted — it caused a
+    // 7,193-test worker-crash cascade (net -473). The runtime dispatch exists but
+    // Proxy/Reflect tests hit process aborts; gate stays until those are guarded.
     "Proxy",
     "Reflect",
     "Reflect.construct",
