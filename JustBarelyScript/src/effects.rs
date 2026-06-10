@@ -1712,6 +1712,295 @@ impl BrowserExecutionState {
         }
     }
 
+    /// Unwrap a Number/String/Boolean wrapper object to its `[[PrimitiveValue]]`.
+    /// Returns `None` for non-wrapper objects.
+    fn json_unwrap_wrapper(rc: &Rc<RefCell<JsObject>>) -> Option<JsValue> {
+        let obj = rc.borrow();
+        match obj.class_name.as_deref() {
+            Some("Number") | Some("String") | Some("Boolean") => {
+                Some(obj.get_own_data("[[PrimitiveValue]]").unwrap_or(JsValue::Undefined))
+            }
+            _ => None,
+        }
+    }
+
+    /// Escape a string for JSON output per ECMA-262 §25.5.2.3 (QuoteJSONString).
+    fn json_quote_string(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for ch in s.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{0008}' => out.push_str("\\b"),
+                '\u{000C}' => out.push_str("\\f"),
+                c if (c as u32) < 0x20 => {
+                    out.push_str(&format!("\\u{:04x}", c as u32));
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    /// Serialize a JSON number per ECMA-262 (NaN/Infinity → null).
+    fn json_number(n: f64) -> String {
+        if !n.is_finite() {
+            "null".to_owned()
+        } else if n.fract() == 0.0 && n.abs() < 1e21 {
+            (n as i64).to_string()
+        } else {
+            n.to_string()
+        }
+    }
+
+    /// SerializeJSONProperty (ECMA-262 §25.5.2). Returns `Ok(None)` when the value
+    /// serializes to nothing (undefined/function/symbol), `Ok(Some(text))` otherwise,
+    /// and `Err(())` on a circular structure (caller throws TypeError).
+    ///
+    /// `holder` is the object/array containing `value` at `key`, used as `this` for
+    /// `toJSON` and the replacer function. `indent` is the current accumulated
+    /// indentation, `gap` the per-level indentation unit, `replacer` the optional
+    /// function/allowlist passed to `JSON.stringify`.
+    #[allow(clippy::too_many_arguments)]
+    fn try_json_stringify(
+        &mut self,
+        key: &str,
+        mut value: JsValue,
+        holder: Option<&JsValue>,
+        seen: &mut Vec<*const ()>,
+        indent: &str,
+        gap: &str,
+        replacer: &Option<JsValue>,
+    ) -> Result<Option<String>, ()> {
+        // 1. toJSON: if value is an object with a callable toJSON, call it.
+        if let JsValue::Object(rc) = &value {
+            let to_json = self.obj_get(rc, "toJSON");
+            if Self::is_callable_value(&to_json) {
+                let this = value.clone();
+                value = self.call_value(to_json, this, vec![JsValue::String(key.to_owned())]);
+            }
+        }
+
+        // 2. Replacer function: call replacer(key, value) with holder as `this`.
+        if let Some(rep) = replacer {
+            if Self::is_callable_value(rep) {
+                let this = holder.cloned().unwrap_or(JsValue::Undefined);
+                value = self.call_value(
+                    rep.clone(),
+                    this,
+                    vec![JsValue::String(key.to_owned()), value],
+                );
+            }
+        }
+
+        // 3. Unwrap Number/String/Boolean wrapper objects to their primitive.
+        if let JsValue::Object(rc) = &value {
+            if let Some(prim) = Self::json_unwrap_wrapper(rc) {
+                value = prim;
+            }
+        }
+
+        match value {
+            JsValue::Null => Ok(Some("null".to_owned())),
+            JsValue::Boolean(b) => Ok(Some(b.to_string())),
+            JsValue::Number(n) => Ok(Some(Self::json_number(n))),
+            JsValue::BigInt(n) => Ok(Some(n.to_string())),
+            JsValue::String(s) => Ok(Some(Self::json_quote_string(&s))),
+            JsValue::Array(items) => {
+                self.json_serialize_array(&items, None, seen, indent, gap, replacer)
+            }
+            JsValue::RichArray(rc) => {
+                let items = rc.borrow().elements.clone();
+                self.json_serialize_array(
+                    &items,
+                    Some(Rc::as_ptr(&rc) as *const ()),
+                    seen,
+                    indent,
+                    gap,
+                    replacer,
+                )
+            }
+            JsValue::Object(rc) => {
+                self.json_serialize_object(&rc, seen, indent, gap, replacer)
+            }
+            // undefined/functions/symbols and other non-serializable host values
+            // serialize to nothing.
+            _ => Ok(None),
+        }
+    }
+
+    fn json_serialize_array(
+        &mut self,
+        items: &[JsValue],
+        ptr: Option<*const ()>,
+        seen: &mut Vec<*const ()>,
+        indent: &str,
+        gap: &str,
+        replacer: &Option<JsValue>,
+    ) -> Result<Option<String>, ()> {
+        if let Some(p) = ptr {
+            if seen.contains(&p) {
+                return Err(());
+            }
+            seen.push(p);
+        }
+        let new_indent = format!("{indent}{gap}");
+        let mut parts: Vec<String> = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            let serialized = self.try_json_stringify(
+                &i.to_string(),
+                item.clone(),
+                None,
+                seen,
+                &new_indent,
+                gap,
+                replacer,
+            )?;
+            parts.push(serialized.unwrap_or_else(|| "null".to_owned()));
+        }
+        if let Some(p) = ptr {
+            seen.retain(|x| *x != p);
+        }
+        if parts.is_empty() {
+            return Ok(Some("[]".to_owned()));
+        }
+        if gap.is_empty() {
+            Ok(Some(format!("[{}]", parts.join(","))))
+        } else {
+            Ok(Some(format!(
+                "[\n{new_indent}{}\n{indent}]",
+                parts.join(&format!(",\n{new_indent}"))
+            )))
+        }
+    }
+
+    fn json_serialize_object(
+        &mut self,
+        rc: &Rc<RefCell<JsObject>>,
+        seen: &mut Vec<*const ()>,
+        indent: &str,
+        gap: &str,
+        replacer: &Option<JsValue>,
+    ) -> Result<Option<String>, ()> {
+        let ptr = Rc::as_ptr(rc) as *const ();
+        if seen.contains(&ptr) {
+            return Err(());
+        }
+        seen.push(ptr);
+
+        // Key list: allowlist from an array replacer, else own enumerable keys.
+        let keys: Vec<String> = match replacer {
+            Some(JsValue::Array(allow)) => allow
+                .iter()
+                .filter_map(|v| match v {
+                    JsValue::String(s) => Some(s.clone()),
+                    JsValue::Number(n) => Some(Self::json_number(*n)),
+                    _ => None,
+                })
+                .collect(),
+            Some(JsValue::RichArray(arc)) => arc
+                .borrow()
+                .elements
+                .iter()
+                .filter_map(|v| match v {
+                    JsValue::String(s) => Some(s.clone()),
+                    JsValue::Number(n) => Some(Self::json_number(*n)),
+                    _ => None,
+                })
+                .collect(),
+            _ => rc.borrow().own_enumerable_keys(),
+        };
+
+        let holder = JsValue::Object(rc.clone());
+        let new_indent = format!("{indent}{gap}");
+        let mut pairs: Vec<String> = Vec::with_capacity(keys.len());
+        for key in keys {
+            let v = self.obj_get(rc, &key);
+            let serialized = self.try_json_stringify(
+                &key,
+                v,
+                Some(&holder),
+                seen,
+                &new_indent,
+                gap,
+                replacer,
+            )?;
+            if let Some(text) = serialized {
+                let quoted = Self::json_quote_string(&key);
+                if gap.is_empty() {
+                    pairs.push(format!("{quoted}:{text}"));
+                } else {
+                    pairs.push(format!("{quoted}: {text}"));
+                }
+            }
+        }
+        seen.retain(|x| *x != ptr);
+        if pairs.is_empty() {
+            return Ok(Some("{}".to_owned()));
+        }
+        if gap.is_empty() {
+            Ok(Some(format!("{{{}}}", pairs.join(","))))
+        } else {
+            Ok(Some(format!(
+                "{{\n{new_indent}{}\n{indent}}}",
+                pairs.join(&format!(",\n{new_indent}"))
+            )))
+        }
+    }
+
+    /// Compute the `gap` indentation unit from the `space` argument to JSON.stringify.
+    fn json_gap_from_space(space: &JsValue) -> String {
+        // Unwrap Number/String wrapper objects.
+        let space = match space {
+            JsValue::Object(rc) => Self::json_unwrap_wrapper(rc).unwrap_or(JsValue::Undefined),
+            other => other.clone(),
+        };
+        match space {
+            JsValue::Number(n) => {
+                let count = if n.is_nan() { 0 } else { n.trunc() as i64 };
+                let count = count.clamp(0, 10) as usize;
+                " ".repeat(count)
+            }
+            JsValue::String(s) => s.chars().take(10).collect(),
+            _ => String::new(),
+        }
+    }
+
+    /// Top-level entry for JSON.stringify. Returns `JsValue::String` on success,
+    /// `JsValue::Undefined` when the root serializes to nothing, and throws a
+    /// TypeError (via early_exit) on a circular structure.
+    fn json_stringify_value(
+        &mut self,
+        value: JsValue,
+        replacer: Option<JsValue>,
+        space: &JsValue,
+    ) -> JsValue {
+        let gap = Self::json_gap_from_space(space);
+        let mut seen: Vec<*const ()> = Vec::new();
+        // Root holder is a synthetic { "": value }; for our purposes we pass the
+        // value directly with key "".
+        let replacer = replacer.filter(|r| {
+            Self::is_callable_value(r)
+                || matches!(r, JsValue::Array(_) | JsValue::RichArray(_))
+        });
+        match self.try_json_stringify("", value, None, &mut seen, "", &gap, &replacer) {
+            Ok(Some(text)) => JsValue::String(text),
+            Ok(None) => JsValue::Undefined,
+            Err(()) => {
+                self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                    "TypeError",
+                    "Converting circular structure to JSON".to_owned(),
+                )));
+                JsValue::Undefined
+            }
+        }
+    }
+
     fn obj_has_property(rc: &Rc<RefCell<JsObject>>, key: &str) -> bool {
         let mut current = rc.clone();
         let mut visited: Vec<*const RefCell<JsObject>> = Vec::new();
@@ -1741,12 +2030,24 @@ impl BrowserExecutionState {
             }
             Some(Property::Accessor { set: None, .. }) => {
                 // No setter — silently fail in sloppy mode (ECMA-262 §10.1.9).
+                if self.current_code_is_strict() {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        format!("Cannot set property {key} which has only a getter"),
+                    )));
+                }
                 return;
             }
             Some(Property::Data {
                 writable: false, ..
             }) => {
                 // Non-writable data property — silently fail in sloppy mode.
+                if self.current_code_is_strict() {
+                    self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                        "TypeError",
+                        format!("Cannot assign to read only property '{key}'"),
+                    )));
+                }
                 return;
             }
             Some(Property::Data {
@@ -1770,6 +2071,12 @@ impl BrowserExecutionState {
         }
         if own.is_none() && !rc.borrow().extensible {
             // Non-extensible objects reject new own properties in sloppy mode.
+            if self.current_code_is_strict() {
+                self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                    "TypeError",
+                    format!("Cannot add property {key}, object is not extensible"),
+                )));
+            }
             return;
         }
         // Check prototype chain for inherited setter.
@@ -2018,6 +2325,238 @@ impl BrowserExecutionState {
     /// Create a new empty ordinary object (JsValue convenience).
     fn new_obj() -> JsValue {
         JsValue::new_object()
+    }
+
+    /// Conservatively validate a regex pattern, returning `Err(message)` only for
+    /// clearly-invalid / unsupported constructs. JBS has no real regex engine, so this
+    /// exists to surface a graceful `SyntaxError` for patterns that are definitely bad
+    /// (per ECMA-262 Annex B semantics). The bias is strongly toward NOT throwing: when
+    /// a construct is ambiguous or possibly valid, we accept it to avoid false positives.
+    fn validate_regex_pattern(pattern: &str, _flags: &str) -> Result<(), String> {
+        let chars: Vec<char> = pattern.chars().collect();
+        let n = chars.len();
+        let mut i = 0usize;
+        let mut paren_depth: i32 = 0;
+        // Did we have a quantifiable atom immediately preceding the current position
+        // (at the top level of the current alternative)?
+        let mut have_atom = false;
+        // Was the immediately-preceding token a quantifier (`*`, `+`, `?`, or `{..}`)?
+        let mut prev_was_quantifier = false;
+
+        while i < n {
+            let c = chars[i];
+            match c {
+                '\\' => {
+                    // Backslash escape. The next char is taken literally / as an escape.
+                    if i + 1 >= n {
+                        // Trailing backslash: `\` at end of pattern is a SyntaxError.
+                        return Err("\\ at end of pattern".to_owned());
+                    }
+                    let next = chars[i + 1];
+                    if next == 'p' || next == 'P' {
+                        // `\p{...}` / `\P{...}` property escapes are unsupported.
+                        if i + 2 < n && chars[i + 2] == '{' {
+                            return Err(
+                                "Unicode property escapes are not supported".to_owned()
+                            );
+                        }
+                    }
+                    i += 2;
+                    have_atom = true;
+                    prev_was_quantifier = false;
+                }
+                '[' => {
+                    // Character class. Scan to the closing `]`, validating literal ranges.
+                    i += 1;
+                    if i < n && chars[i] == '^' {
+                        i += 1;
+                    }
+                    // A leading `]` is treated as a literal in JS.
+                    let mut closed = false;
+                    // Track the previous literal char (if any) for range detection.
+                    // None means "no plain literal pending" (start, or after an escape/range).
+                    let mut prev_literal: Option<char> = None;
+                    let mut prev_was_class_escape = false;
+                    while i < n {
+                        let cc = chars[i];
+                        if cc == '\\' {
+                            if i + 1 >= n {
+                                return Err("\\ at end of pattern".to_owned());
+                            }
+                            let esc = chars[i + 1];
+                            if (esc == 'p' || esc == 'P') && i + 2 < n && chars[i + 2] == '{' {
+                                return Err(
+                                    "Unicode property escapes are not supported".to_owned()
+                                );
+                            }
+                            prev_was_class_escape =
+                                matches!(esc, 'd' | 'D' | 'w' | 'W' | 's' | 'S');
+                            prev_literal = None;
+                            i += 2;
+                            continue;
+                        }
+                        if cc == ']' {
+                            closed = true;
+                            i += 1;
+                            break;
+                        }
+                        if cc == '-' {
+                            // Possible range `X-Y`. Look at the previous and next atoms.
+                            // Only flag out-of-order ranges where BOTH sides are single
+                            // literal chars; be conservative for escape-adjacent ranges.
+                            let next_idx = i + 1;
+                            if let (Some(lo), true) = (prev_literal, next_idx < n) {
+                                let hi_c = chars[next_idx];
+                                if hi_c != ']' && hi_c != '\\' {
+                                    // hi is a plain literal char.
+                                    if (lo as u32) > (hi_c as u32) {
+                                        return Err(format!(
+                                            "Range out of order in character class: {}-{}",
+                                            lo, hi_c
+                                        ));
+                                    }
+                                    // Consume `-` and the high char; range done.
+                                    i += 2;
+                                    prev_literal = None;
+                                    prev_was_class_escape = false;
+                                    continue;
+                                }
+                            }
+                            // `-` not forming a literal-literal range: treat as literal.
+                            prev_literal = None;
+                            prev_was_class_escape = false;
+                            i += 1;
+                            continue;
+                        }
+                        // Plain literal char inside the class.
+                        let _ = prev_was_class_escape;
+                        prev_literal = Some(cc);
+                        prev_was_class_escape = false;
+                        i += 1;
+                    }
+                    if !closed {
+                        return Err("Unterminated character class".to_owned());
+                    }
+                    have_atom = true;
+                    prev_was_quantifier = false;
+                }
+                '(' => {
+                    paren_depth += 1;
+                    // Handle group prefixes `(?...)`:
+                    //   `(?<` → lookbehind / named group — unsupported, throw.
+                    //   `(?:` non-capturing, `(?=` / `(?!` lookahead — accepted; consume
+                    //     the `?X` so the `?` is not misread as a stray quantifier below.
+                    if i + 1 < n && chars[i + 1] == '?' {
+                        if i + 2 < n && chars[i + 2] == '<' {
+                            // `(?<=` and `(?<!` are lookbehind; otherwise named group.
+                            return Err(
+                                "Lookbehind and named groups are not supported".to_owned()
+                            );
+                        }
+                        // Consume `(?` plus the single prefix marker (`:`, `=`, `!`).
+                        i += 3;
+                    } else {
+                        i += 1;
+                    }
+                    // Opening a group resets the "preceding atom" at the new alternative.
+                    have_atom = false;
+                    prev_was_quantifier = false;
+                }
+                ')' => {
+                    if paren_depth == 0 {
+                        return Err("Unmatched ')'".to_owned());
+                    }
+                    paren_depth -= 1;
+                    i += 1;
+                    // A closed group is itself a quantifiable atom.
+                    have_atom = true;
+                    prev_was_quantifier = false;
+                }
+                '|' => {
+                    i += 1;
+                    have_atom = false;
+                    prev_was_quantifier = false;
+                }
+                '*' | '+' => {
+                    // A `*`/`+` requires a quantifiable atom; it cannot stack on another
+                    // quantifier (e.g. `a**`, `a+*`) or appear with nothing to repeat.
+                    if !have_atom || prev_was_quantifier {
+                        return Err("Nothing to repeat".to_owned());
+                    }
+                    i += 1;
+                    prev_was_quantifier = true;
+                    // have_atom stays true: the whole quantified unit is still an atom,
+                    // but a following `*`/`+`/`{}` is illegal (caught by prev_was_quantifier).
+                }
+                '?' => {
+                    // `?` after a quantifier is the lazy modifier and is VALID (`a*?`).
+                    // Otherwise it is itself a quantifier requiring an atom.
+                    if prev_was_quantifier {
+                        // Lazy modifier; consumes, and ends the quantifier sequence.
+                        i += 1;
+                        prev_was_quantifier = false;
+                        have_atom = true;
+                    } else if !have_atom {
+                        return Err("Nothing to repeat".to_owned());
+                    } else {
+                        i += 1;
+                        prev_was_quantifier = true;
+                    }
+                }
+                '{' => {
+                    // Only treat `{n}`, `{n,}`, `{n,m}` shapes as quantifiers; a bare `{`
+                    // (e.g. `a{`) is a literal brace in Annex B and is valid.
+                    if let Some(end) = Self::regex_quantifier_brace_end(&chars, i) {
+                        if !have_atom || prev_was_quantifier {
+                            return Err("Nothing to repeat".to_owned());
+                        }
+                        i = end + 1;
+                        prev_was_quantifier = true;
+                    } else {
+                        // Literal `{`.
+                        i += 1;
+                        have_atom = true;
+                        prev_was_quantifier = false;
+                    }
+                }
+                _ => {
+                    i += 1;
+                    have_atom = true;
+                    prev_was_quantifier = false;
+                }
+            }
+        }
+
+        if paren_depth != 0 {
+            return Err("Unterminated group".to_owned());
+        }
+        Ok(())
+    }
+
+    /// If `chars[start]` is `{` and begins a quantifier `{n}`, `{n,}`, or `{n,m}`,
+    /// return the index of the closing `}`; otherwise `None` (literal brace).
+    fn regex_quantifier_brace_end(chars: &[char], start: usize) -> Option<usize> {
+        let n = chars.len();
+        let mut j = start + 1;
+        let mut saw_digit = false;
+        while j < n && chars[j].is_ascii_digit() {
+            saw_digit = true;
+            j += 1;
+        }
+        if !saw_digit {
+            return None;
+        }
+        if j < n && chars[j] == ',' {
+            j += 1;
+            while j < n && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+        }
+        if j < n && chars[j] == '}' {
+            Some(j)
+        } else {
+            None
+        }
     }
 
     /// Create an Error-shaped object: non-enumerable `name`, `message`, `stack`;
@@ -5345,6 +5884,11 @@ impl BrowserExecutionState {
                         .map(|argument| self.execute_expression(argument))
                         .map(|value| Self::value_to_string(&value))
                         .unwrap_or_default();
+                    if let Err(msg) = Self::validate_regex_pattern(&pattern, &flags) {
+                        self.early_exit =
+                            Some(EarlyExit::Throw(Self::make_error_obj("SyntaxError", msg)));
+                        return JsValue::Undefined;
+                    }
                     JsValue::RegExp { pattern, flags }
                 } else if matches!(callee.as_ref(), Expression::Identifier(name) if name == "XMLHttpRequest")
                 {
@@ -5568,6 +6112,11 @@ impl BrowserExecutionState {
             Expression::String(value) => JsValue::String(value.clone()),
             Expression::Regex(value) => {
                 let (pattern, flags) = parse_regex_literal(value);
+                if let Err(msg) = Self::validate_regex_pattern(&pattern, &flags) {
+                    self.early_exit =
+                        Some(EarlyExit::Throw(Self::make_error_obj("SyntaxError", msg)));
+                    return JsValue::Undefined;
+                }
                 JsValue::RegExp { pattern, flags }
             }
             Expression::Boolean(value) => JsValue::Boolean(*value),
@@ -5699,6 +6248,11 @@ impl BrowserExecutionState {
                 .map(|argument| self.execute_expression(argument))
                 .map(|value| Self::value_to_string(&value))
                 .unwrap_or_default();
+            if let Err(msg) = Self::validate_regex_pattern(&pattern, &flags) {
+                self.early_exit =
+                    Some(EarlyExit::Throw(Self::make_error_obj("SyntaxError", msg)));
+                return JsValue::Undefined;
+            }
             return JsValue::RegExp { pattern, flags };
         }
 
@@ -5732,17 +6286,12 @@ impl BrowserExecutionState {
                             .first()
                             .map(|a| self.execute_expression(a))
                             .unwrap_or(JsValue::Undefined);
-                        return match try_json_stringify(&arg, &mut Vec::new()) {
-                            Ok(s) => JsValue::String(s),
-                            Err(()) => {
-                                self.early_exit =
-                                    Some(EarlyExit::Throw(Self::make_error_obj(
-                                        "TypeError",
-                                        "Converting circular structure to JSON".to_owned(),
-                                    )));
-                                JsValue::Undefined
-                            }
-                        };
+                        let replacer = arguments.get(1).map(|a| self.execute_expression(a));
+                        let space = arguments
+                            .get(2)
+                            .map(|a| self.execute_expression(a))
+                            .unwrap_or(JsValue::Undefined);
+                        return self.json_stringify_value(arg, replacer, &space);
                     }
                     _ => {}
                 }
@@ -8626,22 +9175,59 @@ impl BrowserExecutionState {
                     JsValue::Array(vec![])
                 }
             }
-            "assign" => {
+            "assign" | "Object.assign" => {
                 let mut iter = args.into_iter();
-                let target_rc = match iter.next() {
-                    Some(JsValue::Object(rc)) => rc,
-                    _ => return JsValue::Undefined,
+                let target = iter.next().unwrap_or(JsValue::Undefined);
+                // ToObject(target): null/undefined throw, primitives box.
+                let target_rc = match target {
+                    JsValue::Object(rc) => rc,
+                    JsValue::Undefined | JsValue::Null => {
+                        self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
+                            "TypeError",
+                            "Cannot convert undefined or null to object".to_owned(),
+                        )));
+                        return JsValue::Undefined;
+                    }
+                    other => match Self::object_function_coerce(other) {
+                        JsValue::Object(rc) => rc,
+                        _ => return JsValue::Undefined,
+                    },
                 };
                 for src in iter {
-                    if let JsValue::Object(src_rc) = src {
-                        let pairs: Vec<(String, JsValue)> = src_rc
-                            .borrow()
-                            .own_enumerable_keys()
-                            .into_iter()
-                            .filter_map(|k| src_rc.borrow().get_own_data(&k).map(|v| (k, v)))
-                            .collect();
-                        for (k, v) in pairs {
-                            target_rc.borrow_mut().set(k, v);
+                    // Skip null/undefined sources.
+                    let source_rc = match src {
+                        JsValue::Undefined | JsValue::Null => continue,
+                        JsValue::Object(rc) => rc,
+                        JsValue::String(s) => {
+                            // String sources expose their index chars as own
+                            // enumerable properties; copy them directly since the
+                            // boxed-String wrapper marks them non-enumerable.
+                            for (index, ch) in s.chars().enumerate() {
+                                self.obj_set(
+                                    &target_rc,
+                                    &index.to_string(),
+                                    JsValue::String(ch.to_string()),
+                                );
+                                if self.early_exit.is_some() {
+                                    return JsValue::Undefined;
+                                }
+                            }
+                            continue;
+                        }
+                        other => match Self::object_function_coerce(other) {
+                            JsValue::Object(rc) => rc,
+                            _ => continue,
+                        },
+                    };
+                    let keys: Vec<String> = source_rc.borrow().own_enumerable_keys();
+                    for key in keys {
+                        let value = self.obj_get(&source_rc, &key);
+                        if self.early_exit.is_some() {
+                            return JsValue::Undefined;
+                        }
+                        self.obj_set(&target_rc, &key, value);
+                        if self.early_exit.is_some() {
+                            return JsValue::Undefined;
                         }
                     }
                 }
@@ -17046,8 +17632,17 @@ impl BrowserExecutionState {
                         receiver,
                     )),
                     JsValue::Object(rc) => {
+                        // Reflect.set performs [[Set]] with Throw=false: it reports
+                        // success/failure as a boolean and never propagates a strict
+                        // [[Set]] TypeError. Swallow any throw obj_set raised.
+                        let had_exit = self.early_exit.is_some();
                         self.obj_set(&rc, &prop, value);
-                        JsValue::Boolean(self.early_exit.is_none())
+                        if !had_exit && self.early_exit.is_some() {
+                            self.early_exit = None;
+                            JsValue::Boolean(false)
+                        } else {
+                            JsValue::Boolean(self.early_exit.is_none())
+                        }
                     }
                     _ => JsValue::Boolean(false),
                 }
@@ -17920,17 +18515,11 @@ impl BrowserExecutionState {
                 json_parse_str(&s)
             }
             "JSON.stringify" => {
-                let arg = args.into_iter().next().unwrap_or(JsValue::Undefined);
-                match try_json_stringify(&arg, &mut Vec::new()) {
-                    Ok(s) => JsValue::String(s),
-                    Err(()) => {
-                        self.early_exit = Some(EarlyExit::Throw(Self::make_error_obj(
-                            "TypeError",
-                            "Converting circular structure to JSON".to_owned(),
-                        )));
-                        JsValue::Undefined
-                    }
-                }
+                let mut it = args.into_iter();
+                let arg = it.next().unwrap_or(JsValue::Undefined);
+                let replacer = it.next();
+                let space = it.next().unwrap_or(JsValue::Undefined);
+                self.json_stringify_value(arg, replacer, &space)
             }
             _ => Self::host_function_default_return(name),
         }
@@ -20524,93 +21113,6 @@ fn json_parse_number(bytes: &[u8], pos: &mut usize) -> JsValue {
     }
     let s = std::str::from_utf8(&bytes[start..*pos]).unwrap_or("0");
     JsValue::Number(s.parse::<f64>().unwrap_or(0.0))
-}
-
-// JSON serialization with a circular-reference guard. `seen` holds the identity
-// pointers of Object/RichArray values on the current serialization path; revisiting
-// one means a cycle, which ECMA-262 JSON.stringify reports as a TypeError
-// (surfaced by the call sites that have interpreter access).
-fn try_json_stringify(value: &JsValue, seen: &mut Vec<*const ()>) -> Result<String, ()> {
-    match value {
-        JsValue::Null | JsValue::Undefined => Ok("null".to_owned()),
-        JsValue::Boolean(b) => Ok(b.to_string()),
-        JsValue::Number(n) => Ok(if n.fract() == 0.0 && n.is_finite() {
-            (*n as i64).to_string()
-        } else {
-            n.to_string()
-        }),
-        JsValue::String(s) => {
-            let escaped = s
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace('\n', "\\n")
-                .replace('\r', "\\r")
-                .replace('\t', "\\t");
-            Ok(format!("\"{escaped}\""))
-        }
-        JsValue::Array(items) => {
-            let parts: Vec<String> = items
-                .iter()
-                .map(|v| try_json_stringify(v, seen))
-                .collect::<Result<_, _>>()?;
-            Ok(format!("[{}]", parts.join(",")))
-        }
-        JsValue::RichArray(rc) => {
-            let id = Rc::as_ptr(rc) as *const ();
-            if seen.contains(&id) {
-                return Err(());
-            }
-            seen.push(id);
-            let elements = rc.borrow().elements.clone();
-            let parts: Vec<String> = elements
-                .iter()
-                .map(|v| try_json_stringify(v, seen))
-                .collect::<Result<_, _>>()?;
-            seen.pop();
-            Ok(format!("[{}]", parts.join(",")))
-        }
-        JsValue::Object(rc) => {
-            let id = Rc::as_ptr(rc) as *const ();
-            if seen.contains(&id) {
-                return Err(());
-            }
-            seen.push(id);
-            let mut pairs: Vec<String> = Vec::new();
-            for k in rc.borrow().own_enumerable_keys() {
-                let Some(v) = rc.borrow().get_own_data(&k) else {
-                    continue;
-                };
-                let key = try_json_stringify(&JsValue::String(k), seen)?;
-                pairs.push(format!("{key}:{}", try_json_stringify(&v, seen)?));
-            }
-            seen.pop();
-            pairs.sort(); // stable key order for deterministic output
-            Ok(format!("{{{}}}", pairs.join(",")))
-        }
-        JsValue::Function(_)
-        | JsValue::ElementRef(_)
-        | JsValue::NodeList(_)
-        | JsValue::StyleRef(_)
-        | JsValue::StorageRef(_)
-        | JsValue::DocumentRef
-        | JsValue::WindowRef
-        | JsValue::NavigatorRef
-        | JsValue::HostFunction(_)
-        | JsValue::BoundHostFunction { .. }
-        | JsValue::HostObject(_)
-        | JsValue::RegExp { .. }
-        | JsValue::CanvasContextRef(_)
-        | JsValue::DateInstance
-        | JsValue::Promise(_)
-        | JsValue::ArrayBuffer(_)
-        | JsValue::TypedArray(_)
-        | JsValue::DataView(_)
-        | JsValue::XhrInstance { .. }
-        | JsValue::Proxy { .. }
-        | JsValue::WeakMap(_)
-        | JsValue::GeneratorObject(_) => Ok("null".to_owned()),
-        JsValue::BigInt(n) => Ok(n.to_string()),
-    }
 }
 
 fn js_style_prop_to_css(prop: &str) -> String {
