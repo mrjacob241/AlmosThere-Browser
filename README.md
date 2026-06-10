@@ -23,8 +23,8 @@ This project has been built from scratch in Rust and it is not related or endors
 
 ## 📊 Benchmarks (Provisional) 📊
 
-- [ ] JBS: ECMAScripts completion: 9965/53526 (18.6%)
-- [ ] JBS: ECMAScripts completion (built-ins only): 4917/23585 (20.8%)
+- [ ] JBS: ECMAScripts completion: 11516/53526 (21.5%)
+- [ ] JBS: ECMAScripts completion (built-ins only): 6095/23585 (25.8%)
 
 Stay Tuned!
 
