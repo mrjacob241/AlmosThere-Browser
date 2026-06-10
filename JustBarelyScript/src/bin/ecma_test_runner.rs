@@ -514,6 +514,10 @@ fn run_test(
 
     let mut full = String::new();
 
+    if only_strict {
+        full.push_str("\"use strict\";\n");
+    }
+
     if !is_raw {
         full.push_str(JBS_HARNESS);
         full.push('\n');
@@ -524,10 +528,6 @@ fn run_test(
                 full.push('\n');
             }
         }
-    }
-
-    if only_strict {
-        full.push_str("\"use strict\";\n");
     }
 
     full.push_str(&source);

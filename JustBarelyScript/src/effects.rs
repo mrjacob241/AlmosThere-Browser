@@ -106,6 +106,8 @@ pub struct JsFunction {
     pub is_generator: bool,
     /// True only for class constructors built by execute_class_decl.
     pub is_class_ctor: bool,
+    /// True when the function body starts with a "use strict" directive.
+    pub is_strict: bool,
     /// True for the synthesized `constructor(...args) { super(...args); }`.
     pub default_derived_ctor: bool,
     /// Superclass constructor for `super()` calls inside class constructors.
@@ -131,6 +133,7 @@ impl JsFunction {
         body: FunctionBody,
         captured: Vec<StackFrame>,
     ) -> Self {
+        let is_strict = Self::function_body_is_strict(&body);
         JsFunction {
             name,
             params,
@@ -140,6 +143,7 @@ impl JsFunction {
             is_async: false,
             is_generator: false,
             is_class_ctor: false,
+            is_strict,
             default_derived_ctor: false,
             super_ctor: None,
             instance_fields: Vec::new(),
@@ -147,6 +151,22 @@ impl JsFunction {
             module_base_url: None,
             id: next_fn_id(),
         }
+    }
+
+    fn function_body_is_strict(body: &FunctionBody) -> bool {
+        let FunctionBody::Block(block) = body else {
+            return false;
+        };
+        for statement in &block.body {
+            match statement {
+                Statement::Expression(Expression::String(value)) if value == "use strict" => {
+                    return true;
+                }
+                Statement::Expression(Expression::String(_)) => {}
+                _ => break,
+            }
+        }
+        false
     }
 }
 
@@ -528,6 +548,7 @@ struct StackFrame {
     kind: EnvKind,
     locals: Rc<RefCell<HashMap<String, Slot>>>,
     module_base_url: Option<String>,
+    strict: bool,
 }
 
 impl Default for StackFrame {
@@ -536,6 +557,7 @@ impl Default for StackFrame {
             kind: EnvKind::Block,
             locals: Rc::new(RefCell::new(HashMap::new())),
             module_base_url: None,
+            strict: false,
         }
     }
 }
@@ -546,6 +568,7 @@ impl StackFrame {
             kind: EnvKind::Function,
             locals: Rc::new(RefCell::new(HashMap::new())),
             module_base_url: None,
+            strict: false,
         }
     }
     fn global_scope() -> Self {
@@ -553,6 +576,7 @@ impl StackFrame {
             kind: EnvKind::Global,
             locals: Rc::new(RefCell::new(HashMap::new())),
             module_base_url: None,
+            strict: false,
         }
     }
     fn block_scope() -> Self {
@@ -560,6 +584,7 @@ impl StackFrame {
             kind: EnvKind::Block,
             locals: Rc::new(RefCell::new(HashMap::new())),
             module_base_url: None,
+            strict: false,
         }
     }
     /// True for environments where `var` declarations land (function and global).
@@ -2744,6 +2769,11 @@ impl BrowserExecutionState {
     pub fn execute_program(&mut self, program: &Program) {
         let default_budget = self.install_default_script_budget();
         self.ensure_global_frame();
+        let script_strict = Self::statement_list_has_strict_directive(&program.body);
+        let previous_global_strict = self.stack.last().map(|frame| frame.strict).unwrap_or(false);
+        if let Some(frame) = self.stack.last_mut() {
+            frame.strict = script_strict;
+        }
         self.hoist_function_declarations(&program.body);
         for statement in &program.body {
             self.execute_statement(statement);
@@ -2752,7 +2782,33 @@ impl BrowserExecutionState {
             }
         }
         self.drain_and_run_microtasks();
+        if let Some(frame) = self.stack.last_mut() {
+            frame.strict = previous_global_strict;
+        }
         self.restore_default_script_budget(default_budget);
+    }
+
+    fn statement_list_has_strict_directive(statements: &[Statement]) -> bool {
+        for statement in statements {
+            match statement {
+                Statement::Expression(Expression::String(value)) if value == "use strict" => {
+                    return true;
+                }
+                Statement::Expression(Expression::String(_)) => {}
+                _ => break,
+            }
+        }
+        false
+    }
+
+    fn current_code_is_strict(&self) -> bool {
+        self.stack.iter().rev().any(|frame| frame.strict)
+    }
+
+    fn inherit_current_strictness(&self, func: &mut JsFunction) {
+        if self.current_code_is_strict() {
+            func.is_strict = true;
+        }
     }
 
     pub fn execute_module_program_with_loader<F>(
@@ -2951,6 +3007,7 @@ impl BrowserExecutionState {
                             FunctionBody::Block(func_decl.body.clone()),
                             self.stack.clone(),
                         );
+                        self.inherit_current_strictness(&mut func);
                         func.is_async = func_decl.is_async;
                         func.is_generator = func_decl.is_generator;
                         self.stamp_function_module_base(&mut func);
@@ -4551,6 +4608,7 @@ impl BrowserExecutionState {
                     FunctionBody::Block(decl.body.clone()),
                     self.stack.clone(),
                 );
+                self.inherit_current_strictness(&mut func);
                 func.is_async = decl.is_async;
                 func.is_generator = decl.is_generator;
                 self.stamp_function_module_base(&mut func);
@@ -4837,6 +4895,7 @@ impl BrowserExecutionState {
                         FunctionBody::Block(decl.body.clone()),
                         self.stack.clone(),
                     );
+                    self.inherit_current_strictness(&mut func);
                     func.is_async = decl.is_async;
                     func.is_generator = decl.is_generator;
                     self.stamp_function_module_base(&mut func);
@@ -5104,6 +5163,7 @@ impl BrowserExecutionState {
                     FunctionBody::Block(fe.body.clone()),
                     self.stack.clone(),
                 );
+                self.inherit_current_strictness(&mut func);
                 func.is_async = fe.is_async;
                 func.is_generator = fe.is_generator;
                 self.stamp_function_module_base(&mut func);
@@ -5116,6 +5176,7 @@ impl BrowserExecutionState {
             } => {
                 let mut func =
                     JsFunction::plain(None, params.clone(), *body.clone(), self.stack.clone());
+                self.inherit_current_strictness(&mut func);
                 func.is_async = *is_async;
                 self.stamp_function_module_base(&mut func);
                 JsValue::Function(func)
@@ -8696,25 +8757,11 @@ impl BrowserExecutionState {
         }
     }
 
-    fn call_array_static(&self, name: &str, args: Vec<JsValue>) -> JsValue {
+    fn call_array_static(&mut self, name: &str, args: Vec<JsValue>) -> JsValue {
         match name {
-            "isArray" => JsValue::Boolean(matches!(
-                args.first(),
-                Some(JsValue::Array(_) | JsValue::RichArray(_))
-            )),
-            "from" => match args.into_iter().next() {
-                Some(JsValue::Array(a)) => JsValue::Array(a),
-                Some(JsValue::String(s)) => {
-                    JsValue::Array(s.chars().map(|c| JsValue::String(c.to_string())).collect())
-                }
-                Some(JsValue::NodeList(ids)) => JsValue::Array(
-                    ids.into_iter()
-                        .map(|id| self.element_ref_for_key(&id))
-                        .collect(),
-                ),
-                _ => JsValue::Array(vec![]),
-            },
-            "of" => JsValue::Array(args),
+            "isArray" | "from" | "of" => {
+                self.call_host_function(&format!("Array.{name}"), JsValue::Undefined, args)
+            }
             _ => JsValue::Undefined,
         }
     }
@@ -10411,6 +10458,7 @@ impl BrowserExecutionState {
                     FunctionBody::Block(method.body.clone()),
                     self.stack.clone(),
                 );
+                self.inherit_current_strictness(&mut mfunc);
                 mfunc.super_ctor = super_ctor_for_methods.clone().map(Box::new);
                 self.stamp_function_module_base(&mut mfunc);
                 let mval = JsValue::Function(mfunc);
@@ -10448,6 +10496,7 @@ impl BrowserExecutionState {
             ctor_body,
             self.stack.clone(),
         );
+        self.inherit_current_strictness(&mut ctor_func);
         ctor_func.is_class_ctor = true;
         ctor_func.default_derived_ctor = is_default_derived_ctor;
         ctor_func.super_ctor = super_ctor_val.map(Box::new);
@@ -10466,6 +10515,7 @@ impl BrowserExecutionState {
                 FunctionBody::Block(method.body.clone()),
                 self.stack.clone(),
             );
+            self.inherit_current_strictness(&mut mfunc);
             mfunc.super_ctor = super_ctor_for_methods.clone().map(Box::new);
             self.stamp_function_module_base(&mut mfunc);
             let mval = JsValue::Function(mfunc);
@@ -12464,10 +12514,14 @@ impl BrowserExecutionState {
                 (func, args, state.this_arg.clone())
             };
 
+            let func_is_strict = func.is_strict;
             let mut stack = func.captured;
             let saved_stack = std::mem::replace(&mut self.stack, stack);
             self.ensure_global_frame();
             self.stack.push(StackFrame::function_scope());
+            if let Some(frame) = self.stack.last_mut() {
+                frame.strict = func_is_strict;
+            }
             self.set_local("this", this_arg);
             let arguments_obj = Self::build_arguments_object(&args);
             self.bind_params(&func.params, args);
@@ -13698,6 +13752,11 @@ impl BrowserExecutionState {
         args: Vec<JsValue>,
         this_value: JsValue,
     ) -> (JsValue, JsValue) {
+        let this_value = if func.is_strict {
+            this_value
+        } else {
+            Self::ordinary_function_this_value(this_value)
+        };
         if func.is_generator {
             let generator = self.call_generator_function_with_this(func, args, this_value.clone());
             return (generator, this_value);
@@ -13714,6 +13773,7 @@ impl BrowserExecutionState {
             return (JsValue::Undefined, this_value);
         }
         self.call_depth += 1;
+        let func_is_strict = func.is_strict;
         let super_ctor = func.super_ctor.clone();
         let instance_fields = func.instance_fields.clone();
         let default_derived_ctor = func.default_derived_ctor;
@@ -13729,6 +13789,7 @@ impl BrowserExecutionState {
         self.stack.push(StackFrame::function_scope());
         if let Some(frame) = self.stack.last_mut() {
             frame.module_base_url = func.module_base_url.clone();
+            frame.strict = func_is_strict;
         }
         self.set_local("this", this_value);
         // Inject superclass constructor so `super(args)` can find it.
@@ -13788,6 +13849,16 @@ impl BrowserExecutionState {
         (result, this_after)
     }
 
+    fn ordinary_function_this_value(this_value: JsValue) -> JsValue {
+        match this_value {
+            JsValue::Undefined | JsValue::Null => JsValue::WindowRef,
+            JsValue::String(_) | JsValue::Number(_) | JsValue::Boolean(_) | JsValue::BigInt(_) => {
+                Self::object_function_coerce(this_value)
+            }
+            _ => this_value,
+        }
+    }
+
     fn call_async_function_with_this(
         &mut self,
         func: JsFunction,
@@ -13795,6 +13866,7 @@ impl BrowserExecutionState {
         this_value: JsValue,
     ) -> JsValue {
         let promise = Self::pending_promise();
+        let func_is_strict = func.is_strict;
         let super_ctor = func.super_ctor.clone();
         let instance_fields = func.instance_fields.clone();
         let default_derived_ctor = func.default_derived_ctor;
@@ -13809,6 +13881,7 @@ impl BrowserExecutionState {
         self.stack.push(StackFrame::function_scope());
         if let Some(frame) = self.stack.last_mut() {
             frame.module_base_url = func.module_base_url.clone();
+            frame.strict = func_is_strict;
         }
         self.set_local("this", this_value.clone());
         if let Some(ctor) = super_ctor {
@@ -21452,6 +21525,33 @@ mod tests {
             vec![BrowserEffect::SetTextContent {
                 element_id: "result".to_owned(),
                 value: "AB2".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn array_from_collects_array_like_objects_with_mapper() {
+        let program = crate::parse_script(
+            r#"
+            let source = {0: 41, 1: 42, 2: 43, length: 3};
+            let calls = [];
+            function mapFn(value, index) {
+                calls.push(arguments.length + ":" + value + ":" + index);
+                return value * 2;
+            }
+            let result = Array.from(source, mapFn);
+            document.getElementById("result").textContent =
+                result.length + "/" + result[0] + "/" + result[1] + "/" + result[2] + "/" +
+                calls.join("|");
+            "#,
+        )
+        .expect("script should parse");
+
+        assert_eq!(
+            collect_browser_effects(&program),
+            vec![BrowserEffect::SetTextContent {
+                element_id: "result".to_owned(),
+                value: "3/82/84/86/2:41:0|2:42:1|2:43:2".to_owned(),
             }]
         );
     }

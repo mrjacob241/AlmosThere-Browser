@@ -16,9 +16,15 @@ This project has been built from scratch in Rust and it is not related or endors
 
 - [x] Load HTML 5 Test Page 
 - [x] Make the first search in Ecosia (Press Enter)
+- [x] Support for HTTP/1.1 and HTTP/2
+- [x] First custom Js engine build (JustBarelyScript, AKA JBS)
 - [ ] Load correctly Ecosia
 - [ ] Become an actual browser
 
+## 📊 Benchmarks (Provisional) 📊
+
+- [ ] JBS: ECMAScripts completion: 9965/53526 (18.6%)
+- [ ] JBS: ECMAScripts completion (built-ins only): 4917/23585 (20.8%)
 
 Stay Tuned!
 
