@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Painting, Scrolling, Zoom, And Hit Testing</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="11_render_graph_and_canvas_graph.html">Previous: Render Graph And Canvas Graph</a>
+    <a class="next" href="13_links_forms_text_selection_and_user_input.html">Next: Links, Forms, Text Selection, And User Input</a>
+  </div>
+
+<h1>Painting, Scrolling, Zoom, And Hit Testing</h1>
+<p>Painting turns render objects into pixels. Scrolling changes which part of the document is visible. Zoom changes the scale of the page. Hit testing maps pointer coordinates back to page objects.</p>
+<p>These operations must agree on the same coordinate system. If zoom or scroll is applied in painting but not hit testing, links and selections drift away from visible text.</p>
+<h2>How This Relates To AlmostThere Browser</h2>
+<p>AlmostThere uses the canvas layer as the final page surface. The browser gives it renderable content and viewport state; the canvas paints what is visible and reports interaction events back to the shell or page model.</p>
+<p>Zoom and scroll are browser-level presentation state. They should not rewrite the underlying HTML or CSS. They should transform the page view while preserving content geometry.</p>
+<h2>Painting Order</h2>
+<p>Painting order determines what appears above what. A simplified order is:</p>
+<ul>
+<li>backgrounds,</li>
+<li>borders and separators,</li>
+<li>images and placeholders,</li>
+<li>text,</li>
+<li>controls,</li>
+<li>selection highlights and carets,</li>
+<li>debug overlays.</li>
+</ul>
+<p>Real CSS has more complex stacking rules, but a stable simplified order is better than arbitrary drawing. It prevents text from being hidden behind backgrounds and makes overlays predictable.</p>
+<h2>Scrolling</h2>
+<p>The document may be taller or wider than the viewport. Scrolling changes the viewport origin. The page content keeps its document coordinates; painting subtracts the scroll offset to determine screen position.</p>
+<p>Smooth scrolling is a presentation effect. It should end at the intended final offset and stop cleanly when input ends or when content bounds are reached.</p>
+<h2>Zoom</h2>
+<p>Zoom scales the page. Browser-like zoom should keep the user&#x27;s focus area stable where possible. If the user zooms with the mouse over a paragraph, the scroll offset should adjust so that paragraph remains near the pointer.</p>
+<p>Zoom also changes scroll extents. A zoomed page may need horizontal scrolling even if the unzoomed page fit inside the viewport.</p>
+<h2>Hit Testing</h2>
+<p>Hit testing starts with a screen coordinate and asks what page object is under it. The coordinate must be converted through zoom and scroll into document coordinates.</p>
+<p>Common hit-test targets include:</p>
+<ul>
+<li>links,</li>
+<li>form controls,</li>
+<li>selectable text,</li>
+<li>scrollbars,</li>
+<li>context menu targets,</li>
+<li>debug regions.</li>
+</ul>
+<p>Hit testing should prefer interactive objects where the user expects them. Text selection and link clicks can overlap, so the browser needs clear rules for drag versus click.</p>
+<h2>Debugging This Layer</h2>
+<p>When clicks land in the wrong place, log the screen coordinate, scroll offset, zoom factor, transformed document coordinate, and selected hit object. When zoom feels wrong, inspect whether the scroll offset compensates around the pointer. When text is clipped, inspect both object rectangles and clipping rectangles.</p>
+<h2>Rust Shape</h2>
+<p>Painting and hit testing should use one coordinate transform so visible pixels and interaction regions agree.</p>
+<pre><code>struct ViewTransform {
+    scroll_x: f32,
+    scroll_y: f32,
+    zoom: f32,
+}
+
+impl ViewTransform {
+    fn screen_to_document(&amp;self, point: Point) -&gt; Point {
+        Point {
+            x: point.x / self.zoom + self.scroll_x,
+            y: point.y / self.zoom + self.scroll_y,
+        }
+    }
+
+    fn document_to_screen(&amp;self, point: Point) -&gt; Point {
+        Point {
+            x: (point.x - self.scroll_x) * self.zoom,
+            y: (point.y - self.scroll_y) * self.zoom,
+        }
+    }
+}</code></pre>
+<p>If rendering and hit testing use different transforms, links, selection, and hover states will drift.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="11_render_graph_and_canvas_graph.html">Previous: Render Graph And Canvas Graph</a>
+    <a class="next" href="13_links_forms_text_selection_and_user_input.html">Next: Links, Forms, Text Selection, And User Input</a>
+  </div>
+
+</body>
+</html>

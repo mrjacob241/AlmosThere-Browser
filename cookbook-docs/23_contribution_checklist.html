@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Contribution Checklist</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="22_page_agnostic_fix_strategy.html">Previous: Page-Agnostic Fix Strategy</a>
+    <a class="next" href="24_rust_implementation_reference_for_non_code_readers.html">Next: Rust Implementation Reference For Non-Code Readers</a>
+  </div>
+
+<h1>Contribution Checklist</h1>
+<p>This checklist describes what to verify before considering a browser change complete. It is meant for human contributors and AI coding sessions.</p>
+<p>The goal is not bureaucracy. The goal is to prevent fixes that solve the visible symptom while breaking another part of the pipeline.</p>
+<h2>Before Editing</h2>
+<p>Understand the layer involved:</p>
+<ul>
+<li>loading,</li>
+<li>parsing,</li>
+<li>CSS,</li>
+<li>layout,</li>
+<li>rendering,</li>
+<li>input,</li>
+<li>JavaScript,</li>
+<li>telemetry,</li>
+<li>tests,</li>
+<li>shell behavior.</li>
+</ul>
+<p>Read nearby code and existing docs before adding a new abstraction.</p>
+<h2>During Editing</h2>
+<p>Keep changes scoped. Preserve existing user work. Avoid unrelated refactors. Prefer existing project patterns.</p>
+<p>For behavioral fixes, add or update a focused fixture or test where practical. For observability fixes, make telemetry specific and compact.</p>
+<h2>After Editing</h2>
+<p>Verify the smallest relevant case first. Then verify broader behavior.</p>
+<p>Useful checks:</p>
+<ul>
+<li>run targeted unit tests,</li>
+<li>run fixture generation for affected layout cases,</li>
+<li>inspect paired screenshots,</li>
+<li>rerun the live page if the bug came from one,</li>
+<li>inspect latest JSONL telemetry,</li>
+<li>run built-in JavaScript tests for runtime changes,</li>
+<li>confirm docs reflect the new behavior.</li>
+</ul>
+<h2>Documentation</h2>
+<p>Update documentation when a change affects:</p>
+<ul>
+<li>browser architecture,</li>
+<li>debugging workflow,</li>
+<li>known limitations,</li>
+<li>test procedures,</li>
+<li>telemetry format,</li>
+<li>user-visible behavior,</li>
+<li>JavaScript support status.</li>
+</ul>
+<p>Docs should explain the general rule, not just the page that revealed it.</p>
+<h2>Commit Readiness</h2>
+<p>A commit is ready when:</p>
+<ul>
+<li>the fix is page-agnostic or explicitly justified,</li>
+<li>relevant tests or fixtures were run,</li>
+<li>generated artifacts are either intentionally tracked or ignored,</li>
+<li>docs are updated if needed,</li>
+<li>the commit message explains the problem and the solution,</li>
+<li>no unrelated user changes were reverted.</li>
+</ul>
+<p>If something could not be tested, state that clearly in the final note or commit message.</p>
+<h2>Rust Shape</h2>
+<p>A change can be described as the layers it touched and the checks that were run.</p>
+<pre><code>struct ChangeChecklist {
+    touched_loading: bool,
+    touched_layout: bool,
+    touched_javascript: bool,
+    fixtures_added: Vec&lt;String&gt;,
+    tests_run: Vec&lt;String&gt;,
+    docs_updated: bool,
+}
+
+impl ChangeChecklist {
+    fn ready_for_commit(&amp;self) -&gt; bool {
+        self.docs_updated &amp;&amp; (!self.tests_run.is_empty() || !self.fixtures_added.is_empty())
+    }
+}</code></pre>
+<p>This is not meant to become a literal gate. It captures the habit: know what changed, prove the relevant behavior, and document the result.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="22_page_agnostic_fix_strategy.html">Previous: Page-Agnostic Fix Strategy</a>
+    <a class="next" href="24_rust_implementation_reference_for_non_code_readers.html">Next: Rust Implementation Reference For Non-Code Readers</a>
+  </div>
+
+</body>
+</html>

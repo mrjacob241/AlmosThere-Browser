@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Failure Modes, Crash Isolation, And Recovery</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="19_test262_and_justbarelyscript_compliance.html">Previous: test262 And JustBarelyScript Compliance</a>
+    <a class="next" href="21_common_debugging_workflows.html">Next: Common Debugging Workflows</a>
+  </div>
+
+<h1>Failure Modes, Crash Isolation, And Recovery</h1>
+<p>Browsers run untrusted, complex, and frequently broken content. A page can recurse forever, load too slowly, crash a script, request missing assets, or produce malformed markup.</p>
+<p>The browser should treat failure as a normal state, not as an exceptional surprise.</p>
+<h2>How This Relates To AlmostThere Browser</h2>
+<p>AlmostThere separates the GUI from page work so the user can still interact with the shell when a page fails. A page may show an error, but tabs, menus, history, and diagnostics should remain reachable.</p>
+<p>This is a quality-of-life feature and a debugging feature. If the shell survives, telemetry can be saved and the user can continue testing.</p>
+<h2>Common Failures</h2>
+<p>Common failure modes include:</p>
+<ul>
+<li>network timeout,</li>
+<li>redirect loop,</li>
+<li>stylesheet failure,</li>
+<li>image decode failure,</li>
+<li>script exception,</li>
+<li>script budget exhaustion,</li>
+<li>recursion or stack overflow,</li>
+<li>malformed HTML,</li>
+<li>layout collapse,</li>
+<li>render graph inconsistency,</li>
+<li>stale worker update after navigation.</li>
+</ul>
+<p>Each failure should have a clear diagnostic event where practical.</p>
+<h2>Recovery Behavior</h2>
+<p>Recovery can take several forms:</p>
+<ul>
+<li>continue with missing resource,</li>
+<li>show a placeholder,</li>
+<li>disable a failing script,</li>
+<li>stop loading one page,</li>
+<li>show a tab-level error,</li>
+<li>ignore late updates from old page id,</li>
+<li>allow reload to try again.</li>
+</ul>
+<p>The user-facing message can be simple, but telemetry should be specific.</p>
+<h2>Isolation Principles</h2>
+<p>One broken page should not crash the entire application. One broken script should not freeze every tab. One failed image should not prevent text from rendering.</p>
+<p>Isolation is not only process-level. Budgets, queues, page ids, tab ids, and cancellation checks also protect the rest of the browser.</p>
+<h2>Debugging This Layer</h2>
+<p>When investigating a crash or hang, identify the last successful boundary:</p>
+<ul>
+<li>UI event,</li>
+<li>navigation start,</li>
+<li>response received,</li>
+<li>parser started,</li>
+<li>CSS computed,</li>
+<li>script entered,</li>
+<li>layout started,</li>
+<li>render graph emitted,</li>
+<li>paint requested.</li>
+</ul>
+<p>The fix belongs at the first boundary where the system stopped behaving defensively.</p>
+<h2>Rust Shape</h2>
+<p>Failure handling should distinguish page-level failure from shell-level failure.</p>
+<pre><code>enum PageFailure {
+    NetworkTimeout,
+    ScriptBudgetExceeded { script_url: Option&lt;String&gt; },
+    WorkerCrashed { detail: String },
+    LayoutFailed { detail: String },
+}
+
+enum RecoveryAction {
+    ContinueWithPlaceholder,
+    ShowTabError(String),
+    StopPageWorker(PageId),
+    IgnoreStaleMessage(PageId),
+}
+
+fn recover_from_failure(failure: PageFailure) -&gt; RecoveryAction {
+    match failure {
+        PageFailure::NetworkTimeout =&gt; RecoveryAction::ShowTabError(&quot;Page load timed out&quot;.into()),
+        PageFailure::ScriptBudgetExceeded { .. } =&gt; RecoveryAction::ContinueWithPlaceholder,
+        PageFailure::WorkerCrashed { detail } =&gt; RecoveryAction::ShowTabError(detail),
+        PageFailure::LayoutFailed { detail } =&gt; RecoveryAction::ShowTabError(detail),
+    }
+}</code></pre>
+<p>The GUI can stay alive even when the page switches to an error state.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="19_test262_and_justbarelyscript_compliance.html">Previous: test262 And JustBarelyScript Compliance</a>
+    <a class="next" href="21_common_debugging_workflows.html">Next: Common Debugging Workflows</a>
+  </div>
+
+</body>
+</html>

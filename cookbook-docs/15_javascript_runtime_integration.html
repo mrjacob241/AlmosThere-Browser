@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JavaScript Runtime Integration</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="14_image_loading_and_late_resource_updates.html">Previous: Image Loading And Late Resource Updates</a>
+    <a class="next" href="16_events_timers_dynamic_scripts_and_page_effects.html">Next: Events, Timers, Dynamic Scripts, And Page Effects</a>
+  </div>
+
+<h1>JavaScript Runtime Integration</h1>
+<p>JavaScript is the language that makes many pages dynamic. HTML creates the initial structure, CSS describes presentation, and JavaScript can inspect the page, respond to events, fetch or reveal content, update styles, and schedule work for later.</p>
+<p>AlmostThere Browser uses a lightweight JavaScript runtime named JustBarelyScript. The aim is practical browser compatibility: implement enough ECMAScript and browser host behavior to support common pages, while keeping script failures isolated and visible.</p>
+<h2>How This Relates To AlmostThere Browser</h2>
+<p>In this browser, JavaScript is not an isolated interpreter bolted onto the side. It is connected to the loaded page through host APIs, events, timers, DOM-like state, style mutation, navigation effects, and telemetry. A script can change what the user sees by adding text, changing <code>display</code>, updating classes, submitting forms, or scheduling later work. The runtime therefore feeds back into parsing-derived state, computed style, layout invalidation, rendering, and user interaction.</p>
+<p>The important implementation rule is that scripts should produce browser effects, not directly paint the page. JustBarelyScript evaluates code and calls host APIs; the browser applies the resulting mutations through the same general document, style, layout, and render pipeline used for static HTML. This keeps fixes page-agnostic: implementing a standard array behavior, timer rule, DOM mutation, or style update helps every page that relies on that behavior.</p>
+<h2>ECMAScript And Browser APIs</h2>
+<p>JavaScript the language is standardized as ECMAScript. It defines values, objects, functions, arrays, promises, typed arrays, classes, strict mode, property descriptors, and the built-in objects such as <code>Array</code>, <code>String</code>, <code>Object</code>, <code>Map</code>, and <code>Promise</code>.</p>
+<p>Browser APIs are a separate layer. They include objects such as <code>window</code>, <code>document</code>, elements, timers, events, storage, location, and network APIs. A script running in a browser normally uses both layers at once:</p>
+<pre><code>document.querySelector(&quot;.temperature&quot;).style.display = &quot;block&quot;;
+setTimeout(() =&gt; console.log(location.href), 1000);</code></pre>
+<p>The first line needs DOM querying and style mutation. The second line needs timers, callbacks, console output, and location state.</p>
+<h2>Why Scripts Matter For Rendering</h2>
+<p>Some pages are mostly static HTML. Others hide important content until a script runs.</p>
+<p>A weather page may ship a table where temperature cells start hidden, then call a helper such as <code>.show()</code> or set <code>style.display</code> after data is prepared. A search page may attach form handlers after loading. A menu may become usable only after a click listener is installed.</p>
+<p>If JavaScript fails, the page can look like a layout bug even when HTML and CSS are correct. That is why script telemetry is important: the browser should record which scripts loaded, which ones ran, which host APIs were called, and which errors stopped execution.</p>
+<h2>Host Objects</h2>
+<p>Host objects are the browser-provided objects exposed to JavaScript. They are not part of the pure ECMAScript language, but web scripts expect them to exist.</p>
+<p>Common examples:</p>
+<ul>
+<li><code>window</code> for global browser state,</li>
+<li><code>document</code> for page structure,</li>
+<li><code>location</code> for the current URL,</li>
+<li><code>console</code> for logs and warnings,</li>
+<li><code>setTimeout</code> and <code>clearTimeout</code> for timers,</li>
+<li>element objects for attributes, style, classes, and events.</li>
+</ul>
+<p>The host layer should be general. If a page calls <code>element.style.display = &quot;none&quot;</code>, the implementation should update element style in a normal way, not check which website made the call.</p>
+<h2>Effects And Mutations</h2>
+<p>The JavaScript runtime should not paint directly. Instead, it should produce browser effects that the page model can apply.</p>
+<p>Examples of effects:</p>
+<ul>
+<li>set an attribute,</li>
+<li>change inline style,</li>
+<li>add or remove a class,</li>
+<li>update text content,</li>
+<li>reveal or hide an element,</li>
+<li>submit a form,</li>
+<li>schedule a timer,</li>
+<li>trigger navigation,</li>
+<li>report a console message.</li>
+</ul>
+<p>This separation makes debugging easier. If a script called <code>.show()</code> and the element stayed hidden, the bug might be in the host method, the effect application, style recomputation, layout invalidation, or painting. Telemetry should make that chain inspectable.</p>
+<h2>Events And Callbacks</h2>
+<p>Pages react to events. A click, key press, input change, timer tick, or load completion can call JavaScript code.</p>
+<p>The browser needs to preserve enough event information for handlers to behave naturally:</p>
+<ul>
+<li>the event type,</li>
+<li>the target element,</li>
+<li>basic pointer or keyboard data,</li>
+<li>whether default behavior was prevented,</li>
+<li>which callback should be invoked.</li>
+</ul>
+<p>Callbacks must also preserve JavaScript semantics. Strict mode, <code>this</code> binding, argument order, return values, and thrown errors all matter. Small deviations can make generic libraries fail in surprising ways.</p>
+<h2>Budgets And Failures</h2>
+<p>Real browsers do not let one broken script permanently freeze the whole browser UI. AlmostThere should follow that principle.</p>
+<p>Script execution needs budgets, recursion guards, and clear failure reporting. If a script runs too long, recurses too deeply, or throws an unsupported-operation error, the browser should record a specific diagnostic event and keep the tab or page shell recoverable where possible.</p>
+<p>A script failure is not always fatal to rendering. The static page may still be useful. The key is to fail visibly in telemetry and conservatively in the UI, rather than silently corrupting later stages.</p>
+<h2>Compliance Work</h2>
+<p>JustBarelyScript is measured partly with built-in tests and test262-derived work. These tests help separate real language conformance from page-specific compatibility.</p>
+<p>When a built-in fails, the fix should usually live in the shared runtime implementation. For example, <code>Array.from</code>, typed arrays, promises, strict callbacks, and property behavior should be implemented according to the standard so many scripts benefit at once.</p>
+<p>The same rule applies to browser APIs. Implement <code>.show()</code>, <code>.hide()</code>, <code>.css()</code>, <code>.each()</code>, or DOM methods because they express common web behavior, not because a single page happens to call them.</p>
+<h2>Debugging This Layer</h2>
+<p>When a page is structurally present but interactive content is missing, inspect JavaScript before changing CSS or layout.</p>
+<p>Useful questions:</p>
+<ul>
+<li>Did the script resource load?</li>
+<li>Did it execute or time out?</li>
+<li>Which exception or unsupported operation occurred?</li>
+<li>Did a host API call produce the expected browser effect?</li>
+<li>Was style recomputed after a mutation?</li>
+<li>Did a timer or event handler run?</li>
+<li>Did telemetry show a script-specific error in the browser console?</li>
+</ul>
+<p>A good JavaScript fix should improve a standard behavior, pass or unlock relevant built-in tests, and leave enough telemetry to diagnose the next unsupported script pattern.</p>
+<h2>Rust Shape</h2>
+<p>The JavaScript runtime should emit effects that the browser applies through normal page systems.</p>
+<pre><code>enum JsValue {
+    Undefined,
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Object(ObjectId),
+}
+
+enum BrowserEffect {
+    SetStyle { node_id: NodeId, property: String, value: String },
+    SetText { node_id: NodeId, text: String },
+    AddEventListener { node_id: NodeId, event: String, callback: ObjectId },
+    ConsoleMessage { level: String, text: String },
+}
+
+fn run_script(source: &amp;str, host: &amp;mut HostContext) -&gt; Result&lt;Vec&lt;BrowserEffect&gt;, JsError&gt; {
+    todo!(&quot;parse and execute JavaScript with browser host APIs&quot;)
+}</code></pre>
+<p>The runtime should not directly paint or lay out content; it asks the browser to mutate page state.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="14_image_loading_and_late_resource_updates.html">Previous: Image Loading And Late Resource Updates</a>
+    <a class="next" href="16_events_timers_dynamic_scripts_and_page_effects.html">Next: Events, Timers, Dynamic Scripts, And Page Effects</a>
+  </div>
+
+</body>
+</html>

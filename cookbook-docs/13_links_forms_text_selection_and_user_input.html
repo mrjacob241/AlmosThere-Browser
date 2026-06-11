@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Links, Forms, Text Selection, And User Input</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="12_painting_scrolling_zoom_and_hit_testing.html">Previous: Painting, Scrolling, Zoom, And Hit Testing</a>
+    <a class="next" href="14_image_loading_and_late_resource_updates.html">Next: Image Loading And Late Resource Updates</a>
+  </div>
+
+<h1>Links, Forms, Text Selection, And User Input</h1>
+<p>User input turns a rendered page back into browser actions. A click can navigate, a form can submit, a drag can select text, a key can edit a field, and a context menu can copy selected content.</p>
+<p>This layer is where visual correctness and behavior meet. A link that looks right but cannot be clicked is still broken. Text that can be selected but copies with fake line breaks is only partially working.</p>
+<h2>How This Relates To AlmostThere Browser</h2>
+<p>AlmostThere maps canvas events back to page objects. Link text is painted as part of rich text flow, while transparent hit boxes provide clickable regions. Text selection uses rendered text geometry to reconstruct the selected string. Forms use parsed metadata and current input state to build navigation requests.</p>
+<p>The goal is browser-like behavior without special casing pages. If a site uses normal anchors, inputs, buttons, or forms, the same implementation should handle it.</p>
+<h2>Links</h2>
+<p>An anchor has two parts:</p>
+<ul>
+<li>visible inline content,</li>
+<li>navigation metadata such as <code>href</code>.</li>
+</ul>
+<p>The visible content should flow like normal text. The clickable region should follow the rendered span. Hover should update cursor and underline behavior where supported. Clicking should resolve the URL against the current page and send a navigation command.</p>
+<h2>Forms</h2>
+<p>Forms collect user input and submit it to a target URL. A basic GET form turns field names and values into query parameters. A POST form sends data in the request body.</p>
+<p>AlmostThere can start with common GET behavior, but the structure should preserve method, action, input names, button intent, and current values so more complete form support can be added later.</p>
+<h2>Text Selection</h2>
+<p>Selection begins at a character boundary and ends at another boundary. It should include the first and last intended characters. It should not add newlines just because a paragraph visually wrapped. Newlines should come from semantic breaks such as block boundaries, explicit line breaks, or preformatted text.</p>
+<p>Copy behavior should reconstruct user-visible text in a browser-like way:</p>
+<ul>
+<li>inline text stays inline,</li>
+<li>block boundaries may become newlines,</li>
+<li>visual wraps alone do not create newlines,</li>
+<li>hidden text is not copied,</li>
+<li>selected link text copies as text, not as URLs unless a separate command asks for that.</li>
+</ul>
+<h2>Context Menus</h2>
+<p>Right clicking selected text should expose text operations such as <code>Copy Text</code>. Context menus should depend on current state: selected text, hovered link, input focus, or empty page area.</p>
+<p>The menu should dispatch commands to the browser model instead of directly modifying hidden state inside the canvas.</p>
+<h2>Debugging This Layer</h2>
+<p>For links, compare painted text rectangles with transparent hit boxes. For selection, inspect character positions and copied output. For forms, log the action URL, method, field list, and final navigation URL.</p>
+<p>Small local pages are enough to test most input behavior. A page with one paragraph, one inline link, one input, and one form can catch many regressions.</p>
+<h2>Rust Shape</h2>
+<p>Input handling should convert low-level pointer and keyboard events into page actions.</p>
+<pre><code>enum InputAction {
+    Navigate(String),
+    StartSelection { point: Point },
+    ExtendSelection { point: Point },
+    SubmitForm { form_id: NodeId },
+    FocusInput { node_id: NodeId },
+    CopySelectedText,
+}
+
+fn handle_click(hit: HitTarget) -&gt; Option&lt;InputAction&gt; {
+    match hit {
+        HitTarget::Link { href } =&gt; Some(InputAction::Navigate(href)),
+        HitTarget::Input { node_id } =&gt; Some(InputAction::FocusInput { node_id }),
+        HitTarget::Text { .. } =&gt; None,
+    }
+}</code></pre>
+<p>This keeps link navigation, form work, and text selection from being hidden inside drawing code.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="12_painting_scrolling_zoom_and_hit_testing.html">Previous: Painting, Scrolling, Zoom, And Hit Testing</a>
+    <a class="next" href="14_image_loading_and_late_resource_updates.html">Next: Image Loading And Late Resource Updates</a>
+  </div>
+
+</body>
+</html>

@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AlmostThere Browser Cookbook</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <span class="previous disabled">Previous</span>
+    <a class="next" href="01_introduction.html">Next: Introduction</a>
+  </div>
+
+<h1>AlmostThere Browser Cookbook</h1>
+<p>This cookbook is a human-readable guide to how the AlmostThere Browser works and how its main parts are implemented. It is written for future maintainers, contributors, and AI coding sessions that need to understand the system before changing it.</p>
+<p>The book is organized as small numbered sections. Each section lives in its own Markdown file:</p>
+<pre><code>appdata/cookbook/&lt;two digit section number&gt;_&lt;section title&gt;.md</code></pre>
+<p>The goal is not to restate every implementation detail from the code. The goal is to explain the browser as a working system: what enters each layer, what leaves it, which files usually matter, and which invariants should be preserved when fixing bugs.</p>
+<h2>Reading Order</h2>
+<ul>
+<li><a href="01_introduction.html">Introduction</a></li>
+<li><a href="02_rust_primer_for_this_browser.html">Rust Primer For This Browser</a></li>
+<li><a href="03_workspace_crates_and_dependency_map.html">Workspace Crates And Dependency Map</a></li>
+<li><a href="04_rust_patterns_used_in_the_pipeline.html">Rust Patterns Used In The Pipeline</a></li>
+<li><a href="05_browser_process_and_window_shell.html">Browser Process And Window Shell</a></li>
+<li><a href="06_navigation_tabs_history_and_preferences.html">Navigation, Tabs, History, And Preferences</a></li>
+<li><a href="07_loading_pages_and_resources.html">Loading Pages And Resources</a></li>
+<li><a href="08_html_parsing_and_dom_extraction.html">HTML Parsing And DOM Extraction</a></li>
+<li><a href="09_css_parsing_cascade_and_computed_style.html">CSS Parsing, Cascade, And Computed Style</a></li>
+<li><a href="10_layout_pipeline.html">Layout Pipeline</a></li>
+<li><a href="11_render_graph_and_canvas_graph.html">Render Graph And Canvas Graph</a></li>
+<li><a href="12_painting_scrolling_zoom_and_hit_testing.html">Painting, Scrolling, Zoom, And Hit Testing</a></li>
+<li><a href="13_links_forms_text_selection_and_user_input.html">Links, Forms, Text Selection, And User Input</a></li>
+<li><a href="14_image_loading_and_late_resource_updates.html">Image Loading And Late Resource Updates</a></li>
+<li><a href="15_javascript_runtime_integration.html">JavaScript Runtime Integration</a></li>
+<li><a href="16_events_timers_dynamic_scripts_and_page_effects.html">Events, Timers, Dynamic Scripts, And Page Effects</a></li>
+<li><a href="17_telemetry_debug_socket_and_jsonl_traces.html">Telemetry, Debug Socket, And JSONL Traces</a></li>
+<li><a href="18_color_layout_fixtures_and_screenshot_testing.html">Color Layout Fixtures And Screenshot Testing</a></li>
+<li><a href="19_test262_and_justbarelyscript_compliance.html">test262 And JustBarelyScript Compliance</a></li>
+<li><a href="20_failure_modes_crash_isolation_and_recovery.html">Failure Modes, Crash Isolation, And Recovery</a></li>
+<li><a href="21_common_debugging_workflows.html">Common Debugging Workflows</a></li>
+<li><a href="22_page_agnostic_fix_strategy.html">Page-Agnostic Fix Strategy</a></li>
+<li><a href="23_contribution_checklist.html">Contribution Checklist</a></li>
+<li><a href="24_rust_implementation_reference_for_non_code_readers.html">Rust Implementation Reference For Non-Code Readers</a></li>
+</ul>
+<h2>Current Scope</h2>
+<p>The current browser is a pragmatic experimental browser, not a standards-complete engine. Its implementation favors:</p>
+<ul>
+<li>page-agnostic fixes over site-specific patches,</li>
+<li>readable pipelines over hidden magic,</li>
+<li>telemetry-backed debugging,</li>
+<li>focused fixtures for layout and rendering regressions,</li>
+<li>conservative browser-like behavior when exact standards compliance is not yet possible.</li>
+</ul>
+<h2>Where This Cookbook Fits</h2>
+<p>The existing <code>appdata/docs/</code> files are engineering notes, roadmaps, and debugging records. This cookbook is different: it should read like a guided book. Sections should explain the system step by step, in the order a new maintainer would naturally ask questions.</p>
+<p>When adding future sections, prefer:</p>
+<ul>
+<li>plain explanations before implementation detail,</li>
+<li>concrete input/output examples,</li>
+<li>file and module references only where useful,</li>
+<li>explicit warnings for fragile invariants,</li>
+<li>short &quot;how to debug this layer&quot; notes at the end of each section.</li>
+</ul>
+<h2>Rust Shape</h2>
+<p>The cookbook itself is documentation, but it mirrors the way the Rust workspace is organized: a small set of crates, each owning one part of the browser pipeline.</p>
+<pre><code>struct CookbookSection {
+    number: u8,
+    title: &amp;&#x27;static str,
+    file: &amp;&#x27;static str,
+}
+
+const READING_ORDER: &amp;[CookbookSection] = &amp;[
+    CookbookSection { number: 0, title: &quot;Index&quot;, file: &quot;00_index.md&quot; },
+    CookbookSection { number: 1, title: &quot;Introduction&quot;, file: &quot;01_introduction.md&quot; },
+];</code></pre>
+  <div class="page-nav bottom">
+    <span class="previous disabled">Previous</span>
+    <a class="next" href="01_introduction.html">Next: Introduction</a>
+  </div>
+
+</body>
+</html>

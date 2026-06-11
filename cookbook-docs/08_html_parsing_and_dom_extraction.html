@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HTML Parsing And DOM Extraction</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="07_loading_pages_and_resources.html">Previous: Loading Pages And Resources</a>
+    <a class="next" href="09_css_parsing_cascade_and_computed_style.html">Next: CSS Parsing, Cascade, And Computed Style</a>
+  </div>
+
+<h1>HTML Parsing And DOM Extraction</h1>
+<p>HTML is the language that describes the content structure of a web page. It is not a pixel format. It tells the browser that some text is a heading, some content is a paragraph, some element is a link, and some resource should be loaded, but CSS and layout decide where most things actually appear.</p>
+<p>AlmostThere Browser parses HTML into an internal document representation. That representation is then used by style computation, layout, rendering, JavaScript host APIs, link hit testing, forms, text selection, and telemetry.</p>
+<h2>How This Relates To AlmostThere Browser</h2>
+<p>In this browser, HTML parsing is the point where network bytes become page structure. The loader may have fetched a valid document, but the rest of the browser cannot use it until the parser has identified elements, text, attributes, resource references, controls, links, scripts, and style blocks. The parser is therefore the input contract for CSS, layout, rendering, interaction, JavaScript, and debug output.</p>
+<p>When the parser makes a mistake, the symptom often appears somewhere else. A dropped space around an inline tag becomes awkward text spacing. A lost <code>href</code> becomes a visible link that cannot navigate. A malformed tree becomes a flex or block layout that shifts to the wrong side of the page. A missed <code>&lt;script&gt;</code> means JavaScript never gets a chance to reveal dynamic content. AlmostThere&#x27;s parser should therefore preserve source meaning carefully, even when the renderer only supports part of the full web platform.</p>
+<h2>HTML Is A Tree</h2>
+<p>Most HTML can be understood as a tree of elements and text nodes.</p>
+<pre><code>&lt;article&gt;
+  &lt;h1&gt;Hello world&lt;/h1&gt;
+  &lt;p&gt;Read the &lt;a href=&quot;/wiki/C&quot;&gt;C article&lt;/a&gt;.&lt;/p&gt;
+&lt;/article&gt;</code></pre>
+<p>This becomes a structure like:</p>
+<pre><code>article
+  h1
+    text: &quot;Hello world&quot;
+  p
+    text: &quot;Read the &quot;
+    a href=&quot;/wiki/C&quot;
+      text: &quot;C article&quot;
+    text: &quot;.&quot;</code></pre>
+<p>The distinction between elements and text is important. The <code>&lt;a&gt;</code> element creates link behavior, but the visible words still need to participate in normal inline text flow with the surrounding text.</p>
+<h2>Tags, Attributes, And Text</h2>
+<p>An opening tag starts an element:</p>
+<pre><code>&lt;a href=&quot;/search?q=hello&quot;&gt;hello&lt;/a&gt;</code></pre>
+<p>The tag name is <code>a</code>. The attribute name is <code>href</code>. The attribute value is <code>/search?q=hello</code>. The text content is <code>hello</code>.</p>
+<p>The parser must preserve enough of this information for later stages. If the parser drops a space around a tag, the page may render words too close together. If it loses an <code>href</code>, the text may still be visible but no longer clickable. If it misreads an image <code>src</code>, the browser may show a placeholder forever.</p>
+<h2>HTML Is Forgiving</h2>
+<p>Real HTML is often imperfect. Browsers are expected to recover from missing closing tags, optional tags, unexpected nesting, comments, entities, and mixed casing.</p>
+<p>For example:</p>
+<pre><code>&lt;p&gt;First paragraph
+&lt;p&gt;Second paragraph</code></pre>
+<p>A browser should treat this as two paragraphs even though the first <code>&lt;/p&gt;</code> is missing. A small experimental parser does not need to implement every edge case at once, but it should prefer browser-like recovery over crashing or discarding large parts of the page.</p>
+<h2>Whitespace Matters</h2>
+<p>HTML text whitespace is subtle. In normal flow, multiple spaces often collapse visually to one space, and newlines in the source usually behave like spaces. In preformatted contexts such as <code>&lt;pre&gt;</code>, whitespace should be preserved more literally.</p>
+<p>This matters especially around inline tags:</p>
+<pre><code>The &lt;a href=&quot;/wiki/C&quot;&gt;C language&lt;/a&gt; is standardized.</code></pre>
+<p>The visible result should contain natural spacing around the link. The parser should not delete the space before or after the anchor just because an element boundary exists there. Later text layout should handle wrapping and spacing as a single inline flow, not as disconnected text boxes that accidentally create gaps or overlaps.</p>
+<h2>Important Elements</h2>
+<p>Some HTML elements carry special meaning for a browser:</p>
+<ul>
+<li><code>&lt;a&gt;</code> creates navigation targets,</li>
+<li><code>&lt;form&gt;</code> groups controls and submission metadata,</li>
+<li><code>&lt;input&gt;</code> and <code>&lt;textarea&gt;</code> create editable controls,</li>
+<li><code>&lt;button&gt;</code> creates clickable actions,</li>
+<li><code>&lt;img&gt;</code> creates replaced content and a resource request,</li>
+<li><code>&lt;script&gt;</code> adds executable JavaScript,</li>
+<li><code>&lt;style&gt;</code> adds embedded CSS,</li>
+<li><code>&lt;link&gt;</code> can add external stylesheets, icons, or metadata,</li>
+<li><code>&lt;pre&gt;</code> changes whitespace handling,</li>
+<li>headings and paragraphs influence default display and spacing.</li>
+</ul>
+<p>The parser should extract these meanings without making page-specific assumptions. A malformed or unsupported element should normally degrade into ordinary content rather than breaking the whole tree.</p>
+<h2>DOM Extraction</h2>
+<p>The DOM in a full browser is a live object model that JavaScript can inspect and mutate. AlmostThere does not need a complete browser DOM to render pages, but it still needs a DOM-like internal structure.</p>
+<p>The extraction layer should answer questions such as:</p>
+<ul>
+<li>What text exists, and in what order?</li>
+<li>Which attributes belong to which element?</li>
+<li>Which URLs should be resolved and loaded?</li>
+<li>Which nodes are links or controls?</li>
+<li>Which scripts and styles should be collected?</li>
+<li>Which nodes should be exposed to JavaScript host APIs?</li>
+</ul>
+<p>That document model is the bridge between parsing and every later browser layer.</p>
+<h2>Debugging This Layer</h2>
+<p>When text is missing, links do not click, forms submit the wrong URL, or image placeholders show filenames instead of loading assets, inspect HTML extraction before changing layout.</p>
+<p>A good parser bug report should identify:</p>
+<ul>
+<li>the original source snippet,</li>
+<li>the internal node or attribute that was produced,</li>
+<li>the expected browser-like interpretation,</li>
+<li>the later symptom caused by the mismatch.</li>
+</ul>
+<p>Focused fixture pages are useful here. A ten-line HTML file can prove whether the parser preserves spaces, attributes, nesting, and resource URLs before a full live page adds unrelated complexity.</p>
+<h2>Rust Shape</h2>
+<p>HTML parsing should preserve element identity, attributes, text, and source order.</p>
+<pre><code>type NodeId = u64;
+
+enum NodeKind {
+    Element(ElementData),
+    Text(String),
+    Comment(String),
+}
+
+struct ElementData {
+    tag_name: String,
+    attributes: Vec&lt;(String, String)&gt;,
+    children: Vec&lt;NodeId&gt;,
+}
+
+struct Document {
+    nodes: Vec&lt;NodeKind&gt;,
+    root: NodeId,
+}</code></pre>
+<p>Later layers can then ask clear questions: which node is an anchor, which node is text, and which node references a resource.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="07_loading_pages_and_resources.html">Previous: Loading Pages And Resources</a>
+    <a class="next" href="09_css_parsing_cascade_and_computed_style.html">Next: CSS Parsing, Cascade, And Computed Style</a>
+  </div>
+
+</body>
+</html>

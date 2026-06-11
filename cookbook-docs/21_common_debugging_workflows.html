@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Common Debugging Workflows</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="20_failure_modes_crash_isolation_and_recovery.html">Previous: Failure Modes, Crash Isolation, And Recovery</a>
+    <a class="next" href="22_page_agnostic_fix_strategy.html">Next: Page-Agnostic Fix Strategy</a>
+  </div>
+
+<h1>Common Debugging Workflows</h1>
+<p>Debugging this browser is easiest when every investigation follows the pipeline. Start from the visible symptom, then walk backward until the first wrong representation appears.</p>
+<p>The goal is to avoid guessing. Screenshots, telemetry, fixtures, and focused tests should point to the responsible layer.</p>
+<h2>Workflow: Page Does Not Load</h2>
+<p>Check:</p>
+<ul>
+<li>URL normalization.</li>
+<li>main document request.</li>
+<li>final URL after redirects.</li>
+<li>response status.</li>
+<li>body size and content type.</li>
+<li>parser start.</li>
+<li>tab state update.</li>
+</ul>
+<p>If the body never arrived, do not inspect CSS yet. If the body arrived but parsing failed, reduce the HTML.</p>
+<h2>Workflow: Page Loads But Looks Wrong</h2>
+<p>Check:</p>
+<ul>
+<li>stylesheet discovery,</li>
+<li>stylesheet loading,</li>
+<li>selector matching,</li>
+<li>computed style,</li>
+<li>layout boxes,</li>
+<li>render graph objects,</li>
+<li>canvas painting.</li>
+</ul>
+<p>Create a color layout fixture when the issue is structural. Use a screenshot when the issue is visual.</p>
+<h2>Workflow: Text Or Links Are Wrong</h2>
+<p>Check:</p>
+<ul>
+<li>source HTML spaces around tags,</li>
+<li>parser text nodes,</li>
+<li>inline style and display,</li>
+<li>rich text spans,</li>
+<li>line layout,</li>
+<li>link hit boxes,</li>
+<li>copied text output.</li>
+</ul>
+<p>If copied text contains visual line wraps as newlines, inspect selection reconstruction rather than paragraph layout.</p>
+<h2>Workflow: Dynamic Content Missing</h2>
+<p>Check:</p>
+<ul>
+<li>script resource loaded,</li>
+<li>script executed,</li>
+<li>exception or timeout,</li>
+<li>host API support,</li>
+<li>emitted browser effect,</li>
+<li>style/layout invalidation,</li>
+<li>repaint.</li>
+</ul>
+<p>If a page works after waiting longer, inspect timers and late resource scheduling.</p>
+<h2>Workflow: Images Missing</h2>
+<p>Check:</p>
+<ul>
+<li>image URL extraction,</li>
+<li>URL resolution,</li>
+<li>request scheduling,</li>
+<li>duplicate or collision policy,</li>
+<li>response status,</li>
+<li>decode result,</li>
+<li>placeholder replacement.</li>
+</ul>
+<p>Use the network graph script when request timing matters.</p>
+<h2>Rust Shape</h2>
+<p>Debugging is easier when every pipeline boundary can produce a compact snapshot.</p>
+<pre><code>struct DebugSnapshot {
+    page_id: PageId,
+    url: String,
+    loaded_resources: usize,
+    node_count: usize,
+    styled_node_count: usize,
+    layout_box_count: usize,
+    render_object_count: usize,
+}
+
+fn snapshot_page(page: &amp;PageState) -&gt; DebugSnapshot {
+    DebugSnapshot {
+        page_id: page.id,
+        url: page.url.clone(),
+        loaded_resources: page.resources.len(),
+        node_count: page.document.node_count(),
+        styled_node_count: page.styles.len(),
+        layout_box_count: page.layout_box_count(),
+        render_object_count: page.render_object_count(),
+    }
+}</code></pre>
+<p>A snapshot will not solve the bug by itself, but it quickly shows which stage stopped producing output.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="20_failure_modes_crash_isolation_and_recovery.html">Previous: Failure Modes, Crash Isolation, And Recovery</a>
+    <a class="next" href="22_page_agnostic_fix_strategy.html">Next: Page-Agnostic Fix Strategy</a>
+  </div>
+
+</body>
+</html>

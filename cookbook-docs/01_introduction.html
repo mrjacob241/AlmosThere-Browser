@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Introduction</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="00_index.html">Previous: AlmostThere Browser Cookbook</a>
+    <a class="next" href="02_rust_primer_for_this_browser.html">Next: Rust Primer For This Browser</a>
+  </div>
+
+<h1>Introduction</h1>
+<p>AlmostThere Browser is a small experimental browser written in Rust. It combines an <code>egui</code> desktop shell, a custom HTML/CSS/rendering pipeline, a browser-adapted canvas layer, and a lightweight JavaScript runtime named JustBarelyScript.</p>
+<p>The project is not trying to become Chrome or Firefox in one jump. Its current purpose is narrower and more useful for development: load real pages, render enough HTML/CSS to inspect them, run enough JavaScript to support common interactions, record detailed telemetry when something breaks, and make every fix as general and page-agnostic as possible.</p>
+<h2>The Big Picture</h2>
+<p>At a high level, the browser works like this:</p>
+<ul>
+<li>The GUI receives a navigation request from the URL bar, a bookmark, a history entry, a link click, or a form submission.</li>
+<li>A page-loading worker fetches the main document without freezing the GUI.</li>
+<li>The loader resolves file, HTTP, and HTTPS resources and records progress.</li>
+<li>HTML is parsed into an internal document representation.</li>
+<li>CSS is collected from inline styles, style tags, linked stylesheets, and fallback cached resources.</li>
+<li>The style layer computes the supported subset of CSS.</li>
+<li>The layout layer turns DOM/style data into positioned boxes.</li>
+<li>The render layer lowers those boxes into render graph and canvas graph objects.</li>
+<li>The canvas paints text, rectangles, images, media placeholders, inputs, links, and hit boxes.</li>
+<li>User input flows back through link hit testing, editable controls, form metadata, text selection, and JavaScript event hooks.</li>
+<li>Telemetry records the important events so failures can be understood after the session ends.</li>
+</ul>
+<p>Each step is intentionally visible. When a page breaks, the preferred workflow is to find which layer lost information or made a wrong decision, then add a focused fixture or test for that class of problem.</p>
+<h2>Main Components</h2>
+<p>The browser has three central implementation areas.</p>
+<p><code>almostthere_browser</code> is the application shell. It owns the desktop window, toolbar, tabs, loading state, history, preferences, debug flags, page worker communication, telemetry, and the glue code that moves data through the browser pipeline.</p>
+<p><code>rich_canvas</code> is the rendering and interaction surface. It paints the final objects, handles scrolling and zooming, supports selectable text, receives pointer events, and provides the canvas primitives used by the browser view.</p>
+<p><code>JustBarelyScript</code> is the JavaScript interpreter. It parses and executes a growing subset of ECMAScript plus browser host APIs. It is used to run page scripts, mutate DOM-like state, dispatch timers/events, and support common browser-bundle patterns.</p>
+<p>There are also important supporting folders:</p>
+<ul>
+<li><code>sample_pages/</code> contains local HTML pages and diagnostics used during debugging.</li>
+<li><code>color_layout_test/</code> contains embedded HTML/CSS fixtures for layout comparison.</li>
+<li><code>target/</code> contains generated screenshots, paired references, telemetry outputs, and other build artifacts.</li>
+<li><code>appdata/docs/</code> contains engineering notes and roadmaps.</li>
+<li><code>appdata/cookbook/</code> contains this book.</li>
+</ul>
+<h2>Design Principles</h2>
+<p>The browser is built around a few recurring rules.</p>
+<p>General fixes are preferred. If a page breaks, the first question is not &quot;how do we patch this site?&quot; but &quot;which browser rule or layout invariant did we miss?&quot;</p>
+<p>The pipeline should stay inspectable. A rendered page is the result of HTML parsing, CSS cascade, layout, render graph lowering, canvas graph painting, and event mapping. Debugging is faster when each layer can be inspected separately.</p>
+<p>The GUI should stay responsive. Page loading and script work can be slow or broken, so the browser isolates page work from the main GUI enough that buttons, tabs, progress labels, and loading indicators can continue to respond.</p>
+<p>Telemetry matters. Many bugs only become obvious after reading JSONL traces, screenshots, render dumps, or network timelines. The browser should make those artifacts easy to generate and compare.</p>
+<p>Tests should explain the bug. Color layout fixtures, focused Rust tests, and screenshot comparisons are used not just to prevent regressions, but to describe the layout or runtime rule that was missing.</p>
+<h2>What &quot;Page-Agnostic&quot; Means Here</h2>
+<p>A page-agnostic fix is a fix that improves a general browser behavior instead of recognizing a specific page or domain.</p>
+<p>Good examples:</p>
+<ul>
+<li>flex auto sizing should consider child preferred sizes,</li>
+<li><code>Array.from</code> should use the same implementation for direct and indirect static calls,</li>
+<li>links should share text flow with surrounding text and use transparent hit boxes,</li>
+<li>image placeholders should update when late image loading completes,</li>
+<li>strict JavaScript callbacks should preserve strict <code>this</code> behavior.</li>
+</ul>
+<p>Bad examples:</p>
+<ul>
+<li>if the URL contains <code>ecosia.org</code>, move a button by 20 pixels,</li>
+<li>if a Wikipedia title appears, force a custom line height,</li>
+<li>if an image filename matches one page, skip normal loading rules.</li>
+</ul>
+<p>The project has sometimes used site-specific diagnostics to understand a bug, but the final fix should normally live in a general parser, CSS, layout, rendering, network, or runtime rule.</p>
+<h2>How To Read The Codebase</h2>
+<p>Start from behavior, not from files. For example, if a link is visible but not clickable, trace it through:</p>
+<ul>
+<li>HTML anchor extraction.</li>
+<li>CSS display and text style.</li>
+<li>inline text shaping and line layout.</li>
+<li>render graph link span creation.</li>
+<li>canvas graph transparent hit box creation.</li>
+<li>pointer hit testing.</li>
+<li>navigation dispatch.</li>
+</ul>
+<p>If text is too narrow, trace DOM content into CSS width rules, flex/grid constraints, preferred child size, layout boxes, render graph objects, and final canvas rectangles.</p>
+<p>If JavaScript behaves incorrectly, trace parsing, function creation, strictness, host function dispatch, object/property semantics, and emitted browser effects.</p>
+<p>This layered approach is slower than guessing, but it produces fixes that survive the next page.</p>
+<h2>Section Overview</h2>
+<p>Section 00, Index, is the map of the cookbook. It lists the intended reading order, explains the naming convention for files in <code>appdata/cookbook/</code>, and gives the reader a quick way to find the part of the browser they need.</p>
+<p>Section 01, Introduction, frames the project as a practical experimental browser. It explains the main pipeline, the major components, the page-agnostic debugging philosophy, and the way later sections should be read.</p>
+<p>Section 02, Rust Primer For This Browser, introduces the Rust concepts used throughout the project. It covers ownership, borrowing, structs, enums, <code>Result</code>, <code>Option</code>, and pattern matching in the context of browser data flow.</p>
+<p>Section 03, Workspace Crates And Dependency Map, explains the Cargo workspace and the role of each first-party crate. It also lists the important external crates and describes the dependency direction between the browser shell, canvas, and JavaScript runtime.</p>
+<p>Section 04, Rust Patterns Used In The Pipeline, explains the implementation style used across the browser. It covers typed stage outputs, commands, effects, stable ids, small error types, and snapshot-friendly data structures.</p>
+<p>Section 05, Browser Process And Window Shell, explains how the desktop application starts, how the <code>egui</code> shell owns the visible window, and how browser state is separated from page-loading work so the interface can stay responsive.</p>
+<p>Section 06, Navigation, Tabs, History, And Preferences, describes how addresses move through the browser. It covers the URL bar, tab creation, selected-tab state, back and forward history, persisted history entries, preferences, homepage settings, and tab-page defaults.</p>
+<p>Section 07, Loading Pages And Resources, describes the network and file-loading path. It explains how the main document is fetched, how redirects and fallback behavior are handled, how HTTP/1 and HTTP/2 fit into the loader, and how loading status is reported back to the GUI.</p>
+<p>Section 08, HTML Parsing And DOM Extraction, explains how raw HTML becomes the browser&#x27;s internal document representation. It covers tag parsing, text preservation, attributes, links, forms, images, scripts, styles, and parser rules that protect later layout stages from malformed markup.</p>
+<p>Section 09, CSS Parsing, Cascade, And Computed Style, describes how CSS enters the system and becomes computed style. It covers inline styles, style tags, linked stylesheets, selector matching, inherited properties, default styles, unsupported declarations, and how computed values are passed into layout.</p>
+<p>Section 10, Layout Pipeline, explains how styled document nodes become positioned boxes. It covers block flow, inline flow, flex, grid-like behavior, auto sizing, child-aware preferred sizes, min and max constraints, percentage resolution, replaced elements, and standards-oriented layout rules.</p>
+<p>Section 11, Render Graph And Canvas Graph, describes the lowering step between layout and painting. It explains why the browser keeps intermediate render objects, how text runs, rectangles, images, links, inputs, placeholders, and debug overlays are represented, and how this layer makes failures easier to trace.</p>
+<p>Section 12, Painting, Scrolling, Zoom, And Hit Testing, explains how the canvas turns render data into pixels and interaction regions. It covers viewport offsets, smooth scrolling, zoom scaling, horizontal scrolling, clipping, pointer coordinates, and the relationship between painted objects and hit-test boxes.</p>
+<p>Section 13, Links, Forms, Text Selection, And User Input, describes how the browser handles interactive page content. It covers anchor navigation, hover and cursor behavior, form submission, input editing, selectable text, copied text reconstruction, context menus, and transparent link hit boxes.</p>
+<p>Section 14, Image Loading And Late Resource Updates, explains how image assets are discovered, scheduled, requested, decoded, and inserted into the page. It covers placeholders, late image completion, retry behavior, conservative request pacing, telemetry, and cleanup when a page or tab closes.</p>
+<p>Section 15, JavaScript Runtime Integration, describes how JustBarelyScript is connected to the browser. It covers script discovery, execution budgets, host objects, DOM-like APIs, browser effects, error reporting, and the boundary between the JavaScript engine and the page model.</p>
+<p>Section 16, Events, Timers, Dynamic Scripts, And Page Effects, explains the dynamic side of page execution. It covers event dispatch, callbacks, timers, deferred work, dynamic script loading, page mutations, and the rules that prevent one script from freezing the rest of the browser.</p>
+<p>Section 17, Telemetry, Debug Socket, And JSONL Traces, describes the observability system. It covers debug flags, recorded events, JSONL sessions, render and network traces, image loading statistics, script telemetry, and the usual process for turning a failure report into a concrete fix.</p>
+<p>Section 18, Color Layout Fixtures And Screenshot Testing, explains the fixture system used to isolate layout bugs. It covers color-coded HTML/CSS pages, synthetic and actual-browser rendering modes, paired screenshots, reference comparisons, and the reason focused fixtures are added before layout changes.</p>
+<p>Section 19, test262 And JustBarelyScript Compliance, describes the JavaScript conformance work. It explains how built-in tests are grouped, how percentages are computed, which ECMAScript areas are currently important, and how compliance fixes should be implemented without tailoring behavior to one page.</p>
+<p>Section 20, Failure Modes, Crash Isolation, And Recovery, explains what happens when page work fails. It covers script crashes, page-worker failures, stack overflows, resource timeouts, tab-level recovery, user-visible error states, and the design goal that the main GUI should survive broken content.</p>
+<p>Section 21, Common Debugging Workflows, provides repeatable recipes for investigating bugs. It covers reading telemetry, starting the debug client, inspecting screenshots, building focused fixtures, comparing reference output, tracing layout objects, and reducing a live-page failure into a small test case.</p>
+<p>Section 22, Page-Agnostic Fix Strategy, collects the engineering rules used throughout the project. It explains how to move from a site-specific symptom to a general parser, layout, rendering, network, or JavaScript rule, and how to reject fixes that only recognize one URL or one page structure.</p>
+<p>Section 23, Contribution Checklist, is the practical exit checklist for a change. It covers what to test, what telemetry or screenshots to inspect, which docs to update, how to keep generated files and ignored files under control, and what makes a commit ready for review.</p>
+<p>Section 24, Rust Implementation Reference For Non-Code Readers, gives a code-shaped overview for readers who cannot inspect the repository. It collects focused Rust snippets for the browser state, page pipeline, resources, DOM, CSS, layout, rendering, input, images, JavaScript effects, telemetry, errors, and tests.</p>
+<p>By the end of the cookbook, a reader should understand how a URL becomes pixels, how a click becomes navigation or script execution, and how to debug the path when one layer gets it wrong.</p>
+<h2>Rust Shape</h2>
+<p>The whole browser can be understood as typed stages. Each stage receives one representation and returns the next one.</p>
+<pre><code>fn load(url: &amp;str) -&gt; Result&lt;LoadedDocument, LoadError&gt; {
+    todo!(&quot;fetch or read the main document&quot;)
+}
+
+fn render_page(loaded: LoadedDocument) -&gt; Result&lt;CanvasScene, BrowserError&gt; {
+    let document = parse_html(&amp;loaded.html)?;
+    let styles = compute_styles(&amp;document)?;
+    let layout = build_layout(&amp;document, &amp;styles)?;
+    let render_graph = lower_to_render_graph(&amp;layout)?;
+    Ok(build_canvas_scene(&amp;render_graph))
+}</code></pre>
+<p>The real code has more state and more error cases, but this shape is the mental model: keep every boundary explicit enough to inspect.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="00_index.html">Previous: AlmostThere Browser Cookbook</a>
+    <a class="next" href="02_rust_primer_for_this_browser.html">Next: Rust Primer For This Browser</a>
+  </div>
+
+</body>
+</html>

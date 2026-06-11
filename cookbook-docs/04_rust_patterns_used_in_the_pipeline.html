@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rust Patterns Used In The Pipeline</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="03_workspace_crates_and_dependency_map.html">Previous: Workspace Crates And Dependency Map</a>
+    <a class="next" href="05_browser_process_and_window_shell.html">Next: Browser Process And Window Shell</a>
+  </div>
+
+<h1>Rust Patterns Used In The Pipeline</h1>
+<p>The browser pipeline is easier to maintain when each layer uses a few consistent Rust patterns. This section describes the patterns that should show up repeatedly in loader, parser, style, layout, rendering, JavaScript, and telemetry code.</p>
+<h2>Typed Stage Outputs</h2>
+<p>Each stage should return a typed output instead of mutating a vague global state.</p>
+<pre><code>struct LoadedDocument {
+    final_url: String,
+    html: String,
+    resources: Vec&lt;ResourceRef&gt;,
+}
+
+struct ParsedDocument {
+    nodes: Vec&lt;Node&gt;,
+}
+
+fn parse_document(loaded: &amp;LoadedDocument) -&gt; ParsedDocument {
+    ParsedDocument { nodes: Vec::new() }
+}</code></pre>
+<p>This makes it possible to inspect the boundary between stages. If layout is wrong, you can check whether parsing and style already produced the wrong input.</p>
+<h2>Commands And Effects</h2>
+<p>User input and JavaScript should produce commands or effects. The browser shell can then decide how to apply them.</p>
+<pre><code>enum BrowserCommand {
+    Navigate { tab_id: u64, url: String },
+    Reload { tab_id: u64 },
+    OpenTab { url: String },
+}
+
+enum PageEffect {
+    SetInlineStyle { node_id: u64, name: String, value: String },
+    SetText { node_id: u64, text: String },
+    RequestImage { node_id: u64, url: String },
+}</code></pre>
+<p>This avoids hidden side effects. A click, form submit, timer callback, and script mutation can all become explicit data.</p>
+<h2>Stable Ids</h2>
+<p>Tabs, pages, resources, nodes, and telemetry events often need stable ids.</p>
+<pre><code>struct TabId(u64);
+struct PageId(u64);
+struct NodeId(u64);
+struct ResourceId(u64);</code></pre>
+<p>Newtype wrappers prevent accidentally passing a node id where a tab id is expected.</p>
+<h2>Small Error Types</h2>
+<p>Not every error needs a giant hierarchy, but errors should identify the failed layer.</p>
+<pre><code>enum LoadError {
+    InvalidUrl(String),
+    Network(String),
+    UnsupportedScheme(String),
+}
+
+type LoadResult&lt;T&gt; = Result&lt;T, LoadError&gt;;</code></pre>
+<p>A good error type helps telemetry say what failed without parsing human-only strings.</p>
+<h2>Snapshot-Friendly Data</h2>
+<p>Debugging is easier when structures can be logged or dumped. Avoid storing important state only in closures or backend objects that cannot be inspected.</p>
+<pre><code>#[derive(Debug, Clone)]
+struct LayoutBox {
+    node_id: NodeId,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}</code></pre>
+<p>Layout boxes, render objects, resource attempts, and script effects should be easy to summarize.</p>
+<h2>How This Relates To AlmostThere Browser</h2>
+<p>AlmostThere&#x27;s main engineering problem is not one algorithm. It is coordination across many partial implementations. Typed commands, stage outputs, ids, and errors make the coordination visible.</p>
+<p>When adding a feature, ask which stage owns it, what data it receives, what data it emits, and what telemetry should prove it worked.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="03_workspace_crates_and_dependency_map.html">Previous: Workspace Crates And Dependency Map</a>
+    <a class="next" href="05_browser_process_and_window_shell.html">Next: Browser Process And Window Shell</a>
+  </div>
+
+</body>
+</html>

@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CSS Parsing, Cascade, And Computed Style</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="08_html_parsing_and_dom_extraction.html">Previous: HTML Parsing And DOM Extraction</a>
+    <a class="next" href="10_layout_pipeline.html">Next: Layout Pipeline</a>
+  </div>
+
+<h1>CSS Parsing, Cascade, And Computed Style</h1>
+<p>CSS is the language that tells the browser how HTML should look and how boxes should behave. HTML says &quot;this is a paragraph&quot; or &quot;this is a link&quot;; CSS says whether that paragraph is block-level, how wide it is, what font it uses, what color it has, and how it participates in flex, grid, or normal document flow.</p>
+<p>AlmostThere Browser supports a practical subset of CSS. The goal is not to implement the entire platform at once, but to keep the supported subset coherent, child-aware, and close to browser behavior.</p>
+<h2>How This Relates To AlmostThere Browser</h2>
+<p>In this browser, CSS is the bridge between parsed structure and physical layout. HTML tells the browser that a node exists; computed CSS tells layout what kind of box that node should create, which text style it should use, how it should size itself, and how it should interact with siblings and children. The layout engine should receive clear computed style data instead of guessing from raw attributes or page-specific patterns.</p>
+<p>Most visible page failures pass through this layer. If a selector does not match, the page may lose its intended display mode. If inherited text style is wrong, links, headings, or table cells may look incorrect. If <code>auto</code>, flex, grid, min-width, or percentage behavior is oversimplified, containers can collapse, columns can become too thin, or content can shift across the page. AlmostThere uses focused color layout fixtures because they make this CSS-to-layout contract visible.</p>
+<h2>Rules And Declarations</h2>
+<p>A CSS rule has a selector and declarations:</p>
+<pre><code>.result-title {
+  display: block;
+  color: #1a0dab;
+  margin-bottom: 4px;
+}</code></pre>
+<p>The selector <code>.result-title</code> chooses matching elements. Each declaration assigns a property value. Here, the matching element should be displayed as a block, painted blue, and given bottom margin.</p>
+<p>Inline styles are declarations written directly on an element:</p>
+<pre><code>&lt;div style=&quot;display: flex; gap: 12px&quot;&gt;</code></pre>
+<p>Linked stylesheets come from external files:</p>
+<pre><code>&lt;link rel=&quot;stylesheet&quot; href=&quot;/assets/site.css&quot;&gt;</code></pre>
+<p>The browser must collect all of these sources before it can compute final style.</p>
+<h2>The Cascade</h2>
+<p>The cascade is the rule system that decides which CSS declaration wins when more than one declaration applies.</p>
+<p>For example:</p>
+<pre><code>a { color: blue; }
+.warning a { color: red; }</code></pre>
+<p>A link inside an element with class <code>warning</code> should be red because the more specific selector wins. Inline styles usually outrank stylesheet rules. Later rules can override earlier rules when specificity is equal. Some properties inherit from parents, while others do not.</p>
+<p>Even a partial browser needs a disciplined cascade. If declarations are applied in arbitrary order, pages may look correct only by accident.</p>
+<h2>Computed Style</h2>
+<p>Computed style is the resolved style object that layout consumes. It answers questions like:</p>
+<ul>
+<li>Is this node <code>display: block</code>, <code>inline</code>, <code>flex</code>, <code>grid</code>, or <code>none</code>?</li>
+<li>What are its margins, padding, and borders?</li>
+<li>What font size, weight, color, and line height should text use?</li>
+<li>Is width <code>auto</code>, fixed, percentage-based, or constrained by min/max rules?</li>
+<li>Does the element create a replaced box, such as an image?</li>
+</ul>
+<p>The important point is that layout should not repeatedly reinterpret raw CSS strings. It should receive normalized values where possible, while preserving enough information to resolve context-dependent values such as percentages and <code>auto</code>.</p>
+<h2>Display Types</h2>
+<p>The <code>display</code> property decides what kind of layout behavior an element uses.</p>
+<p><code>block</code> elements normally stack vertically and occupy available inline space. Paragraphs, headings, and many containers behave this way by default.</p>
+<p><code>inline</code> elements participate in text flow. Links, spans, and emphasized text should usually sit inside the same line box as surrounding text.</p>
+<p><code>flex</code> elements lay out their children along a main axis. Flex sizing is child-aware: auto sizes, min-content sizes, and available container space all influence where children go.</p>
+<p><code>grid</code> is also child-aware, but uses rows and columns. Even when the implementation only supports part of grid behavior, it should not collapse tracks to zero when children have real content.</p>
+<p><code>none</code> means the element should not create a visible box and should usually not participate in layout.</p>
+<h2>Auto Sizing</h2>
+<p><code>auto</code> does not mean &quot;zero&quot;. In CSS, many automatic sizes are inferred from context and from children.</p>
+<p>A block with <code>width: auto</code> inside a normal container usually fills available width. A flex item with automatic size may use its content size, min-content size, flex basis, available space, and min/max constraints. An image without explicit width may use its intrinsic image dimensions. A text container may need enough width to avoid collapsing every word into a vertical column.</p>
+<p>This is one of the most important rules in AlmostThere layout work: automatic sizes must be children-aware. If an auto dimension is guessed too early, later layout can collapse, shift right, overflow, or produce columns that are too narrow.</p>
+<h2>Inheritance And Defaults</h2>
+<p>Some CSS properties inherit. Text color, font family, font size, and line-height commonly flow from parent to child unless overridden. Box properties such as margin, padding, width, and border usually do not inherit.</p>
+<p>Browsers also have default styles. A link is typically blue and underlined on hover, headings are bold and larger, paragraphs have block spacing, and lists have markers. These defaults matter when a page has little CSS or when a stylesheet fails to load.</p>
+<p>The default stylesheet should be boring and predictable. It should provide browser-like behavior without hiding bugs from the real cascade.</p>
+<h2>Debugging This Layer</h2>
+<p>When layout looks wrong, inspect computed style before blaming the layout algorithm.</p>
+<p>Useful checks:</p>
+<ul>
+<li>Did the expected selector match?</li>
+<li>Did the winning declaration have the right specificity and order?</li>
+<li>Did inline style override the stylesheet?</li>
+<li>Was <code>display</code> parsed correctly?</li>
+<li>Did inherited text properties reach child nodes?</li>
+<li>Did <code>auto</code>, percentage, min, and max values survive into layout?</li>
+</ul>
+<p>Color layout fixtures are especially useful for CSS bugs. If every box has a visible background color, it becomes obvious whether a size, margin, padding, flex row, or grid track disappeared before painting.</p>
+<h2>Rust Shape</h2>
+<p>CSS should be normalized into computed values before layout. Raw strings are useful at parse time, but layout wants typed properties.</p>
+<pre><code>enum Display {
+    None,
+    Block,
+    Inline,
+    Flex,
+    Grid,
+}
+
+enum Length {
+    Auto,
+    Px(f32),
+    Percent(f32),
+}
+
+struct ComputedStyle {
+    display: Display,
+    width: Length,
+    min_width: Length,
+    color: Color,
+    font_size_px: f32,
+}</code></pre>
+<p>This makes unsupported or unknown values explicit and keeps the layout layer from reparsing CSS text.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="08_html_parsing_and_dom_extraction.html">Previous: HTML Parsing And DOM Extraction</a>
+    <a class="next" href="10_layout_pipeline.html">Next: Layout Pipeline</a>
+  </div>
+
+</body>
+</html>

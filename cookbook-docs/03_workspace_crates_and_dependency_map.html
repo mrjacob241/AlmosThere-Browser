@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Workspace Crates And Dependency Map</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="02_rust_primer_for_this_browser.html">Previous: Rust Primer For This Browser</a>
+    <a class="next" href="04_rust_patterns_used_in_the_pipeline.html">Next: Rust Patterns Used In The Pipeline</a>
+  </div>
+
+<h1>Workspace Crates And Dependency Map</h1>
+<p>AlmostThere is a Cargo workspace. A workspace lets several related Rust crates share one dependency lockfile, edition, version, and build command.</p>
+<p>The root <code>Cargo.toml</code> currently defines three first-party crates:</p>
+<pre><code>[workspace]
+members = [&quot;almostthere_browser&quot;, &quot;rich_canvas&quot;, &quot;JustBarelyScript&quot;]
+default-members = [&quot;almostthere_browser&quot;]
+resolver = &quot;2&quot;</code></pre>
+<h2>First-Party Crates</h2>
+<p><code>almostthere_browser</code> is the application crate. It owns the GUI shell, tabs, navigation, loading, preferences, telemetry, browser pipeline integration, and executable entry point.</p>
+<p><code>rich_canvas</code> is the rendering surface crate. It provides canvas-oriented drawing and interaction primitives used by the browser view.</p>
+<p><code>justbarelyscript</code> is the JavaScript runtime crate. It implements the ECMAScript subset, built-ins, execution model, and browser-facing host integration points.</p>
+<h2>Dependency Direction</h2>
+<p>The dependency direction should stay simple:</p>
+<pre><code>almostthere_browser
+  -&gt; rich_canvas
+  -&gt; justbarelyscript</code></pre>
+<p>In practice, <code>almostthere_browser</code> depends on both <code>rich_canvas</code> and <code>justbarelyscript</code>. The canvas crate should not depend on the browser shell, and the JavaScript runtime should remain usable as a runtime crate instead of knowing about one page&#x27;s layout code.</p>
+<h2>Important External Crates</h2>
+<p>The root workspace dependencies include:</p>
+<pre><code>eframe = &quot;0.33&quot;
+egui = &quot;0.33&quot;
+image = { version = &quot;0.25&quot;, features = [&quot;avif-native&quot;] }
+libc = &quot;0.2&quot;
+reqwest = { version = &quot;0.12&quot;, default-features = false, features = [&quot;blocking&quot;, &quot;rustls-tls&quot;, &quot;http2&quot;] }
+winit = &quot;0.30&quot;</code></pre>
+<p><code>eframe</code> and <code>egui</code> provide the desktop GUI surface. <code>winit</code> supports window/event integration. <code>reqwest</code> performs HTTP and HTTPS requests with Rustls TLS and HTTP/2 support. <code>image</code> decodes image assets. <code>libc</code> is available to the JavaScript runtime for low-level integration needs.</p>
+<h2>HTTP Library And Browser Architecture</h2>
+<p>AlmostThere uses <code>reqwest</code> as its HTTP client library:</p>
+<pre><code>reqwest = { version = &quot;0.12&quot;, default-features = false, features = [&quot;blocking&quot;, &quot;rustls-tls&quot;, &quot;http2&quot;] }</code></pre>
+<p>The selected features are part of the architecture:</p>
+<ul>
+<li><code>blocking</code> means page workers can perform straightforward synchronous request code without making the GUI event loop async-aware.</li>
+<li><code>rustls-tls</code> provides HTTPS without depending on platform-native TLS bindings.</li>
+<li><code>http2</code> allows the loader to negotiate HTTP/2 when the server supports it, while still keeping HTTP/1 behavior as the fallback.</li>
+<li><code>default-features = false</code> keeps the dependency surface explicit instead of silently enabling unrelated networking features.</li>
+</ul>
+<p><code>reqwest</code> should stay inside the browser loading layer. The GUI should not issue HTTP requests directly. The canvas should not know that HTTP exists. The JavaScript runtime should request network-like effects through browser host APIs rather than importing <code>reqwest</code> itself.</p>
+<p>The intended dependency relationship looks like this:</p>
+<pre><code>egui shell
+  -&gt; browser loading service
+      -&gt; reqwest HTTP client
+      -&gt; file loader
+  -&gt; HTML/CSS/JS/page pipeline
+  -&gt; rich_canvas</code></pre>
+<p>This separation keeps networking replaceable. If the project later adds a more advanced HTTP/2 scheduler, cache layer, service worker model, or async loader, the rest of the browser should still receive the same typed resource responses.</p>
+<pre><code>struct HttpClientConfig {
+    user_agent: String,
+    accept_language: String,
+    timeout_ms: u64,
+    enable_http2: bool,
+}
+
+struct BrowserHttpClient {
+    config: HttpClientConfig,
+}
+
+impl BrowserHttpClient {
+    fn fetch(&amp;self, request: ResourceRequest) -&gt; Result&lt;ResourceResponse, LoadError&gt; {
+        todo!(&quot;wrap reqwest and return browser-owned response data&quot;)
+    }
+}</code></pre>
+<p>The wrapper is important. Most browser code should work with <code>ResourceRequest</code>, <code>ResourceResponse</code>, and <code>LoadError</code>, not with raw <code>reqwest</code> types.</p>
+<p>The application crate also uses <code>tiny-skia</code> for raster-oriented drawing support:</p>
+<pre><code>tiny-skia = { version = &quot;0.11.4&quot;, default-features = false, features = [&quot;std&quot;, &quot;simd&quot;] }</code></pre>
+<p><code>justbarelyscript</code> currently uses <code>rayon</code> for parallel test or runtime support where appropriate:</p>
+<pre><code>rayon = &quot;1&quot;</code></pre>
+<h2>How This Relates To AlmostThere Browser</h2>
+<p>Crate boundaries should reflect architectural boundaries. The browser shell can coordinate everything, but rendering primitives belong in <code>rich_canvas</code>, and JavaScript semantics belong in <code>justbarelyscript</code>.</p>
+<p>When a feature crosses crates, prefer a small typed API between crates. For example, JavaScript can emit browser effects, and the browser can apply those effects to page state. The JS crate should not directly paint pixels, and the canvas crate should not fetch web pages.</p>
+<h2>Cargo Commands</h2>
+<p>Common workspace commands:</p>
+<pre><code>cargo build
+cargo test
+cargo run -p almostthere_browser
+cargo run -p almostthere_browser -- --debug-socket --record-events --event-trace</code></pre>
+<p>Use package-specific commands when you only need one crate. Use workspace commands when checking integration.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="02_rust_primer_for_this_browser.html">Previous: Rust Primer For This Browser</a>
+    <a class="next" href="04_rust_patterns_used_in_the_pipeline.html">Next: Rust Patterns Used In The Pipeline</a>
+  </div>
+
+</body>
+</html>

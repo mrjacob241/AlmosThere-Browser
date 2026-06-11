@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Telemetry, Debug Socket, And JSONL Traces</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="16_events_timers_dynamic_scripts_and_page_effects.html">Previous: Events, Timers, Dynamic Scripts, And Page Effects</a>
+    <a class="next" href="18_color_layout_fixtures_and_screenshot_testing.html">Next: Color Layout Fixtures And Screenshot Testing</a>
+  </div>
+
+<h1>Telemetry, Debug Socket, And JSONL Traces</h1>
+<p>Telemetry is the browser&#x27;s memory of what happened. It records loading, parsing, script execution, layout, rendering, image scheduling, and user interactions so failures can be inspected after a session ends.</p>
+<p>JSONL traces are especially useful because each line is an independent event. A broken session can still leave readable data before a crash or termination.</p>
+<h2>How This Relates To AlmostThere Browser</h2>
+<p>AlmostThere relies on telemetry as part of the development workflow. Many bugs are not obvious from the screenshot alone. A page may be blank because the network failed, scripts crashed, layout collapsed, render graph objects were clipped, or the canvas never received an update.</p>
+<p>Telemetry provides the timeline needed to identify which layer first diverged.</p>
+<h2>Debug Socket</h2>
+<p>The debug socket lets an external client observe or control a running browser session. It is useful for automated runs, repeated page loads, screenshots, and event capture.</p>
+<p>The socket should expose useful state without making normal browsing depend on the debug client. If the client disconnects, the browser should continue or fail gracefully.</p>
+<h2>JSONL Events</h2>
+<p>A JSONL event should be small, timestamped, and specific. Good event names describe what happened:</p>
+<ul>
+<li>navigation_started,</li>
+<li>main_document_loaded,</li>
+<li>stylesheet_failed,</li>
+<li>script_budget_exceeded,</li>
+<li>image_request_started,</li>
+<li>image_request_finished,</li>
+<li>layout_completed,</li>
+<li>render_graph_built,</li>
+<li>link_hit_tested.</li>
+</ul>
+<p>Events should include ids when possible: tab id, page id, resource id, URL, or node id.</p>
+<h2>Screenshots And Dumps</h2>
+<p>Telemetry pairs well with screenshots, render dumps, and network graphs. A screenshot shows the symptom. JSONL shows the sequence. A render dump shows geometry. A network graph shows resource timing.</p>
+<p>Together they make it possible to debug without guessing.</p>
+<h2>Debugging This Layer</h2>
+<p>If telemetry is too vague, add a more precise event at the boundary where information is lost. Avoid logging huge blobs by default. Prefer compact events that can be correlated by id and timestamp.</p>
+<p>When adding telemetry, ask which future question it answers. If it does not help diagnose a likely failure, it may become noise.</p>
+<h2>Rust Shape</h2>
+<p>Telemetry events should be typed in code and serialized at the boundary.</p>
+<pre><code>enum TelemetryEvent {
+    NavigationStarted { tab_id: TabId, url: String },
+    ResourceLoaded { page_id: PageId, url: String, status: u16, elapsed_ms: u64 },
+    ScriptError { page_id: PageId, message: String },
+    LayoutCompleted { page_id: PageId, box_count: usize },
+}
+
+fn record_event(writer: &amp;mut dyn std::io::Write, event: &amp;TelemetryEvent) {
+    let line = format!(&quot;{event:?}\n&quot;);
+    let _ = writer.write_all(line.as_bytes());
+}</code></pre>
+<p>The production serializer can use JSONL; the important design point is that events are structured before they become text.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="16_events_timers_dynamic_scripts_and_page_effects.html">Previous: Events, Timers, Dynamic Scripts, And Page Effects</a>
+    <a class="next" href="18_color_layout_fixtures_and_screenshot_testing.html">Next: Color Layout Fixtures And Screenshot Testing</a>
+  </div>
+
+</body>
+</html>

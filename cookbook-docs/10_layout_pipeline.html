@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Layout Pipeline</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="09_css_parsing_cascade_and_computed_style.html">Previous: CSS Parsing, Cascade, And Computed Style</a>
+    <a class="next" href="11_render_graph_and_canvas_graph.html">Next: Render Graph And Canvas Graph</a>
+  </div>
+
+<h1>Layout Pipeline</h1>
+<p>Layout turns styled document nodes into boxes with positions and sizes. It is the stage where abstract content becomes spatial: paragraphs get line boxes, flex containers place children, images reserve area, and the page receives a scrollable height.</p>
+<p>Most visual browser bugs pass through layout. If a column is too narrow, a block starts too far right, a line collapses to zero height, or table-like content overlaps, the layout pipeline is usually involved.</p>
+<h2>How This Relates To AlmostThere Browser</h2>
+<p>AlmostThere receives parsed HTML and computed CSS, then builds a layout representation that later becomes render graph objects. Layout is responsible for preserving browser-like relationships between parent boxes, child boxes, inline text, replaced elements, and available viewport width.</p>
+<p>The layout layer should not guess page intent from URLs. It should apply general rules: block formatting, inline text flow, flex sizing, grid-like child awareness, margin and padding constraints, min/max sizing, and intrinsic sizes.</p>
+<h2>Inputs And Outputs</h2>
+<p>Inputs:</p>
+<ul>
+<li>document tree,</li>
+<li>computed style,</li>
+<li>viewport size,</li>
+<li>image intrinsic sizes when available,</li>
+<li>text measurement from the canvas/font layer,</li>
+<li>form and replaced-element metadata.</li>
+</ul>
+<p>Outputs:</p>
+<ul>
+<li>positioned boxes,</li>
+<li>line boxes and text fragments,</li>
+<li>scrollable document size,</li>
+<li>intrinsic or preferred sizes,</li>
+<li>renderable rectangles and content boundaries,</li>
+<li>hit-test source regions.</li>
+</ul>
+<h2>Block And Inline Flow</h2>
+<p>Block layout stacks boxes vertically. Each block usually uses the available width of its containing block unless CSS says otherwise.</p>
+<p>Inline layout places text and inline elements into line boxes. A link inside a sentence should share line flow with surrounding text. It should not be laid out as a disconnected block unless CSS makes it block-level.</p>
+<p>The line layout must decide where words fit, when to wrap, and how tall each line is. It should preserve normal spaces while avoiding fake newlines in copied text caused only by visual wrapping.</p>
+<h2>Flex And Grid-Like Layout</h2>
+<p>Flex and grid are child-aware systems. A parent cannot choose correct dimensions without considering what its children need. Auto sizing must account for content, preferred size, min-content size, max constraints, and available space.</p>
+<p>A recurring failure mode is treating <code>auto</code> as zero or as a fixed arbitrary value. That can collapse columns, push content to the right, or make text render as a vertical stack of words. A better implementation computes preferred child sizes first, then resolves the parent.</p>
+<h2>Intrinsic And Preferred Sizes</h2>
+<p>Intrinsic size comes from content. Text has a preferred width based on words and measurement. Images have natural dimensions after decoding. Inputs and buttons have default usable sizes. Replaced elements often need aspect-ratio behavior.</p>
+<p>Preferred size is not always final size. A box may prefer to be wide but shrink due to available space. It may also have a minimum size that prevents complete collapse.</p>
+<h2>Debugging This Layer</h2>
+<p>When diagnosing layout:</p>
+<ul>
+<li>inspect computed display and width values first,</li>
+<li>compare parent and child boxes,</li>
+<li>check whether auto sizes used child measurements,</li>
+<li>verify line boxes against text fragments,</li>
+<li>inspect margins, padding, and gap handling,</li>
+<li>reduce the issue into a color layout fixture.</li>
+</ul>
+<p>If a fixture passes but a live page fails, the fixture is probably missing a critical parent style, percentage, nested flex rule, or intrinsic-size dependency.</p>
+<h2>Rust Shape</h2>
+<p>Layout code should turn styled nodes into explicit geometry. Auto sizing should be resolved with child measurements, not guessed as zero.</p>
+<pre><code>struct LayoutInput&lt;&#x27;a&gt; {
+    document: &amp;&#x27;a Document,
+    styles: &amp;&#x27;a StyleMap,
+    viewport_width: f32,
+}
+
+#[derive(Debug, Clone)]
+struct LayoutBox {
+    node_id: NodeId,
+    rect: Rect,
+    children: Vec&lt;LayoutBox&gt;,
+}
+
+fn layout_node(input: &amp;LayoutInput&lt;&#x27;_&gt;, node_id: NodeId, available: Size) -&gt; LayoutBox {
+    let preferred = measure_children(input, node_id, available);
+    let rect = resolve_box_rect(input.styles, node_id, available, preferred);
+    LayoutBox { node_id, rect, children: Vec::new() }
+}</code></pre>
+<p>The important pattern is measuring children before finalizing parent dimensions when CSS requires child-aware behavior.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="09_css_parsing_cascade_and_computed_style.html">Previous: CSS Parsing, Cascade, And Computed Style</a>
+    <a class="next" href="11_render_graph_and_canvas_graph.html">Next: Render Graph And Canvas Graph</a>
+  </div>
+
+</body>
+</html>

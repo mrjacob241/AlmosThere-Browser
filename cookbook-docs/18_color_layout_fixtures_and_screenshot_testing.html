@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Color Layout Fixtures And Screenshot Testing</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="17_telemetry_debug_socket_and_jsonl_traces.html">Previous: Telemetry, Debug Socket, And JSONL Traces</a>
+    <a class="next" href="19_test262_and_justbarelyscript_compliance.html">Next: test262 And JustBarelyScript Compliance</a>
+  </div>
+
+<h1>Color Layout Fixtures And Screenshot Testing</h1>
+<p>Color layout fixtures are small HTML/CSS pages that replace real content with colored blocks. They make layout geometry visible without needing to interpret text or images.</p>
+<p>This technique is useful when a real page has too much complexity. A focused fixture can isolate one layout rule: flex auto sizing, grid columns, inline links, image placeholders, percentage widths, or nested blocks.</p>
+<h2>How This Relates To AlmostThere Browser</h2>
+<p>AlmostThere uses fixtures to turn live-page symptoms into repeatable tests. If Ecosia, Wikipedia, or a weather page breaks, the goal is not to hardcode that site. The goal is to extract the general HTML/CSS pattern and preserve it in <code>color_layout_test/</code>.</p>
+<p>The same fixture can be rendered by the browser and by a reference browser. Paired images make differences visible.</p>
+<h2>Fixture Design</h2>
+<p>A good fixture is:</p>
+<ul>
+<li>small,</li>
+<li>focused on one behavior,</li>
+<li>visually obvious,</li>
+<li>close enough to the real page pattern,</li>
+<li>not copied wholesale from copyrighted pages,</li>
+<li>stable across test runs.</li>
+</ul>
+<p>Use colored backgrounds, labels where useful, and simple dimensions. Avoid importing remote assets.</p>
+<h2>Synthetic And Actual Rendering</h2>
+<p>Synthetic rendering is fast and useful for testing the internal renderer directly. Actual-browser rendering is slower but catches whether changes reach the visible browser path.</p>
+<p>Both modes are useful. A fixture passing synthetically but failing in the actual browser suggests the bug is after fixture generation or in the real rendering path.</p>
+<h2>Reference Comparisons</h2>
+<p>Reference screenshots from Chrome or Firefox show expected browser behavior. Manual inspection is still important because exact pixel matching can overfocus on fonts or antialiasing while missing the real structural issue.</p>
+<p>Paired images should clearly separate &quot;This browser&quot; and &quot;Reference&quot;, with an unmistakable divider.</p>
+<h2>Debugging This Layer</h2>
+<p>When a fixture fails, inspect:</p>
+<ul>
+<li>the HTML/CSS pattern,</li>
+<li>computed style,</li>
+<li>layout boxes,</li>
+<li>render graph,</li>
+<li>paired screenshot,</li>
+<li>whether the fixture faithfully represents the live page.</li>
+</ul>
+<p>If the fixture passes but the live page still fails, add a more faithful fixture rather than weakening the fix.</p>
+<h2>Rust Shape</h2>
+<p>Fixture tests should describe the fixture, render mode, and generated artifacts explicitly.</p>
+<pre><code>struct LayoutFixture {
+    id: u32,
+    name: String,
+    html_path: PathBuf,
+}
+
+enum FixtureRenderMode {
+    Synthetic,
+    ActualBrowser,
+}
+
+struct FixtureResult {
+    fixture_id: u32,
+    screenshot_path: PathBuf,
+    reference_path: Option&lt;PathBuf&gt;,
+    paired_path: Option&lt;PathBuf&gt;,
+}
+
+fn render_fixture(fixture: &amp;LayoutFixture, mode: FixtureRenderMode) -&gt; Result&lt;FixtureResult, TestError&gt; {
+    todo!(&quot;render the fixture and write screenshots&quot;)
+}</code></pre>
+<p>Keeping artifact paths in the result makes it easier to inspect failures manually.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="17_telemetry_debug_socket_and_jsonl_traces.html">Previous: Telemetry, Debug Socket, And JSONL Traces</a>
+    <a class="next" href="19_test262_and_justbarelyscript_compliance.html">Next: test262 And JustBarelyScript Compliance</a>
+  </div>
+
+</body>
+</html>

@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Events, Timers, Dynamic Scripts, And Page Effects</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="15_javascript_runtime_integration.html">Previous: JavaScript Runtime Integration</a>
+    <a class="next" href="17_telemetry_debug_socket_and_jsonl_traces.html">Next: Telemetry, Debug Socket, And JSONL Traces</a>
+  </div>
+
+<h1>Events, Timers, Dynamic Scripts, And Page Effects</h1>
+<p>Dynamic pages change after the initial HTML is parsed. Events, timers, and scripts are the mechanisms that make those changes happen.</p>
+<p>This section focuses on the flow from a browser event to JavaScript execution and then back into page state.</p>
+<h2>How This Relates To AlmostThere Browser</h2>
+<p>AlmostThere receives input and loading events from the shell and page worker. Some events have default browser behavior, and some are delivered to JavaScript. JavaScript may then emit effects such as style changes, text updates, or new resource requests.</p>
+<p>The browser should keep this loop explicit:</p>
+<pre><code>browser event -&gt; script callback -&gt; browser effect -&gt; style/layout/render update</code></pre>
+<h2>Events</h2>
+<p>Common events include:</p>
+<ul>
+<li>click,</li>
+<li>input,</li>
+<li>keydown,</li>
+<li>submit,</li>
+<li>load,</li>
+<li>error,</li>
+<li>timeout callbacks.</li>
+</ul>
+<p>Each event needs a type, a target, and enough metadata for common handlers. The target should usually be the relevant element, not just the global window.</p>
+<h2>Timers</h2>
+<p>Timers schedule work for later. <code>setTimeout</code> runs once after a delay. <code>setInterval</code> repeats. A basic implementation can begin with bounded queues and predictable execution order.</p>
+<p>Timer callbacks should be budgeted. A timer should not become a hidden infinite loop that freezes the browser.</p>
+<h2>Dynamic Scripts</h2>
+<p>Pages can create script elements or request additional scripts after the initial document load. A browser-like implementation treats this as another resource load plus an execution step.</p>
+<p>Dynamic script support should preserve ordering where required and report failures clearly. Unsupported dynamic behavior should produce telemetry rather than silent missing content.</p>
+<h2>Page Effects</h2>
+<p>Script effects should be applied through the page model:</p>
+<ul>
+<li>change style,</li>
+<li>change classes,</li>
+<li>change attributes,</li>
+<li>insert or remove nodes,</li>
+<li>update text,</li>
+<li>trigger navigation,</li>
+<li>schedule resource loading.</li>
+</ul>
+<p>After effects are applied, the browser may need to recompute style, rerun layout, rebuild render graph objects, and repaint.</p>
+<h2>Debugging This Layer</h2>
+<p>If a click does nothing, check whether the event target was found, whether a listener existed, whether the callback ran, and whether it emitted effects. If content appears too late or never appears, inspect timer queues and dynamic script loads.</p>
+<h2>Rust Shape</h2>
+<p>Events and timers are queues of scheduled script work plus resulting page effects.</p>
+<pre><code>struct Event {
+    kind: String,
+    target: NodeId,
+}
+
+struct TimerTask {
+    due_ms: u64,
+    callback: ObjectId,
+}
+
+fn dispatch_event(runtime: &amp;mut JsRuntime, event: Event) -&gt; Result&lt;Vec&lt;BrowserEffect&gt;, JsError&gt; {
+    runtime.call_event_listeners(event)
+}
+
+fn run_due_timers(runtime: &amp;mut JsRuntime, now_ms: u64) -&gt; Vec&lt;BrowserEffect&gt; {
+    runtime.take_due_timers(now_ms)
+        .into_iter()
+        .flat_map(|task| runtime.call_timer(task).unwrap_or_default())
+        .collect()
+}</code></pre>
+<p>The browser can then apply effects and trigger style/layout/render invalidation.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="15_javascript_runtime_integration.html">Previous: JavaScript Runtime Integration</a>
+    <a class="next" href="17_telemetry_debug_socket_and_jsonl_traces.html">Next: Telemetry, Debug Socket, And JSONL Traces</a>
+  </div>
+
+</body>
+</html>

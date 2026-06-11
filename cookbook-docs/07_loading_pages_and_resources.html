@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Loading Pages And Resources</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="06_navigation_tabs_history_and_preferences.html">Previous: Navigation, Tabs, History, And Preferences</a>
+    <a class="next" href="08_html_parsing_and_dom_extraction.html">Next: HTML Parsing And DOM Extraction</a>
+  </div>
+
+<h1>Loading Pages And Resources</h1>
+<p>Loading is the part of the browser that turns an address into bytes. It is where a URL such as <code>https://www.example.org/page.html</code> becomes an HTML document, where linked stylesheets and scripts are discovered, and where image resources are scheduled for later decoding and display.</p>
+<p>In AlmostThere Browser this layer has two jobs. First, it must behave enough like a normal browser that real pages can load. Second, it must stay observable, because loading bugs often look like layout bugs until telemetry shows that a stylesheet, script, image, redirect, or response header never arrived.</p>
+<h2>How This Relates To AlmostThere Browser</h2>
+<p>In this browser, loading is the first half of navigation. The GUI asks for a URL, but the page worker does the expensive work: resolve the address, fetch the document, collect dependent resources, and report progress back to the tab. The output of this layer is not pixels; it is a loaded document plus resource data that can be handed to HTML parsing, CSS collection, JavaScript execution, image scheduling, history updates, and telemetry.</p>
+<p>This means a loading bug can damage every later stage. If the main response is wrong, the parser receives the wrong HTML. If a stylesheet is missing, layout may look broken even though the layout code did what it was told. If an image request is delayed or fails, the renderer should show a placeholder and later replace it when the image arrives. If a script resource fails, dynamic content may never appear. For that reason, AlmostThere treats the loader as both a data pipeline and a diagnostic boundary.</p>
+<h2>What A URL Means</h2>
+<p>A URL is not just a string for the address bar. It is a structured identifier with a scheme, host, path, query, and sometimes a fragment.</p>
+<p>For example:</p>
+<pre><code>https://www.ecosia.org/search?method=index&amp;q=hello+world</code></pre>
+<p>The scheme is <code>https</code>, the host is <code>www.ecosia.org</code>, the path is <code>/search</code>, and the query is <code>method=index&amp;q=hello+world</code>. The browser uses those parts to decide which loader to use, how to resolve relative links, and what should be shown in history or telemetry.</p>
+<p>Local files use a different scheme:</p>
+<pre><code>file:///home/user/sample_pages/page.html</code></pre>
+<p>For a <code>file:</code> URL, the browser reads from disk. For <code>http:</code> and <code>https:</code>, it opens a network connection. For relative links such as <code>../style.css</code>, the browser resolves the link against the current document URL before fetching it.</p>
+<h2>HTTP In Plain Terms</h2>
+<p>HTTP is a request-response protocol. The browser sends a request that says, roughly, &quot;give me this resource&quot;, and the server sends back a response containing a status code, headers, and an optional body.</p>
+<p>A simplified request looks like this:</p>
+<pre><code>GET /wiki/Hello_world HTTP/1.1
+Host: it.wikipedia.org
+User-Agent: AlmostThere
+Accept: text/html
+Accept-Language: it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7</code></pre>
+<p>A simplified response looks like this:</p>
+<pre><code>HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+Content-Length: 12345
+
+&lt;!doctype html&gt;
+&lt;html&gt;...&lt;/html&gt;</code></pre>
+<p>The status code says what happened. <code>200</code> means success, <code>301</code> and <code>302</code> usually mean redirect, <code>404</code> means not found, and <code>500</code> means the server failed. Headers describe the response. The body contains the actual HTML, CSS, JavaScript, image bytes, or other resource data.</p>
+<h2>HTTP/1 And HTTP/2</h2>
+<p>HTTP/1 usually treats each request as a mostly independent exchange, even when connections are reused. This is simple but can be slow when a page has many small assets.</p>
+<p>HTTP/2 lets multiple requests share one connection more efficiently. It can reduce connection overhead and allows multiplexing, where more than one response can be in flight at the same time. In a browser, HTTP/2 is useful for pages with many images, scripts, and stylesheets, but it must still be managed carefully so the browser does not flood a server or lose track of resource completion.</p>
+<p>AlmostThere keeps HTTP/1 behavior as the fallback path. HTTP/2 support should improve loading when available, but a failed HTTP/2 attempt must not make a page unloadable if HTTP/1 would work.</p>
+<h2>HTTP Library Used By The Browser</h2>
+<p>AlmostThere uses the Rust crate <code>reqwest</code> for HTTP and HTTPS transport. In the workspace it is configured like this:</p>
+<pre><code>reqwest = { version = &quot;0.12&quot;, default-features = false, features = [&quot;blocking&quot;, &quot;rustls-tls&quot;, &quot;http2&quot;] }</code></pre>
+<p>This choice means the browser does not implement TCP, TLS, redirects, header parsing, or HTTP/2 framing directly. Those transport concerns are delegated to <code>reqwest</code>. The browser still owns browser-level policy: which URL to request, which headers to send, how long to wait, how to classify the resource, how to schedule image requests, how to record telemetry, and what to do with the response body.</p>
+<p>The feature choices are deliberate:</p>
+<ul>
+<li><code>blocking</code> fits the current page-worker model. The GUI remains responsive because blocking requests happen away from the GUI frame loop.</li>
+<li><code>rustls-tls</code> handles HTTPS in a cross-platform Rust TLS stack.</li>
+<li><code>http2</code> lets <code>reqwest</code> negotiate HTTP/2 for servers that support it.</li>
+<li><code>default-features = false</code> keeps the enabled networking behavior visible in <code>Cargo.toml</code>.</li>
+</ul>
+<p>The architecture should wrap <code>reqwest</code> behind browser-owned types:</p>
+<pre><code>struct BrowserLoader {
+    http: BrowserHttpClient,
+    file_loader: FileLoader,
+    telemetry: TelemetrySink,
+}
+
+impl BrowserLoader {
+    fn load(&amp;self, request: ResourceRequest) -&gt; Result&lt;ResourceResponse, LoadError&gt; {
+        match request.scheme() {
+            &quot;file&quot; =&gt; self.file_loader.load(request),
+            &quot;http&quot; | &quot;https&quot; =&gt; self.http.fetch(request),
+            scheme =&gt; Err(LoadError::UnsupportedScheme(scheme.to_string())),
+        }
+    }
+}</code></pre>
+<p>That wrapper is the contract between the HTTP library and the browser. <code>reqwest</code> returns network responses; the browser converts them into page-pipeline data. After conversion, HTML parsing, CSS collection, JavaScript loading, image decoding, and telemetry should not need to depend on <code>reqwest</code> details.</p>
+<h2>Request And Response Mapping</h2>
+<p>A browser request contains more information than a URL. It includes the resource kind, page id, tab id or page id for stale-update protection, headers, timeout policy, and debug metadata.</p>
+<pre><code>struct ResourceRequest {
+    id: ResourceId,
+    page_id: PageId,
+    url: String,
+    kind: ResourceKind,
+    headers: Vec&lt;(String, String)&gt;,
+    timeout_ms: u64,
+}
+
+struct ResourceResponse {
+    id: ResourceId,
+    page_id: PageId,
+    final_url: String,
+    status: u16,
+    content_type: Option&lt;String&gt;,
+    body: Vec&lt;u8&gt;,
+    protocol: NetworkProtocol,
+}</code></pre>
+<p>The HTTP client fills in transport-level facts such as status, final URL, content type, body bytes, and negotiated protocol. The browser then decides how to interpret the bytes. A <code>text/html</code> main document goes to the HTML parser. A stylesheet goes to CSS parsing. An image response goes to image decoding. A script response goes to the JavaScript loading path.</p>
+<h2>HTTP Client Construction</h2>
+<p>The browser should construct the HTTP client once per loader or worker context, not rebuild it for every asset. That lets connection reuse and HTTP/2 negotiation work as intended.</p>
+<pre><code>struct BrowserHttpClient {
+    client: reqwest::blocking::Client,
+    config: HttpClientConfig,
+}
+
+struct HttpClientConfig {
+    user_agent: String,
+    accept_language: String,
+    connect_timeout_ms: u64,
+    request_timeout_ms: u64,
+}
+
+impl BrowserHttpClient {
+    fn new(config: HttpClientConfig) -&gt; Result&lt;Self, LoadError&gt; {
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(config.user_agent.clone())
+            .connect_timeout(std::time::Duration::from_millis(config.connect_timeout_ms))
+            .timeout(std::time::Duration::from_millis(config.request_timeout_ms))
+            .https_only(false)
+            .build()
+            .map_err(|err| LoadError::ClientBuild(err.to_string()))?;
+
+        Ok(Self { client, config })
+    }
+}</code></pre>
+<p>The GUI should not own this client directly. It belongs to the loading service or page worker because that is where blocking work is allowed.</p>
+<h2>Browser Headers</h2>
+<p>Headers are part of browser identity and resource policy. They should be generated in one place so document, stylesheet, script, and image requests stay consistent.</p>
+<pre><code>fn default_headers(config: &amp;HttpClientConfig, kind: ResourceKind) -&gt; Vec&lt;(String, String)&gt; {
+    let accept = match kind {
+        ResourceKind::Document =&gt; &quot;text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8&quot;,
+        ResourceKind::Stylesheet =&gt; &quot;text/css,*/*;q=0.1&quot;,
+        ResourceKind::Script =&gt; &quot;*/*&quot;,
+        ResourceKind::Image =&gt; &quot;image/avif,image/webp,image/png,image/svg+xml,image/*,*/*;q=0.8&quot;,
+    };
+
+    vec![
+        (&quot;Accept&quot;.to_string(), accept.to_string()),
+        (&quot;Accept-Language&quot;.to_string(), config.accept_language.clone()),
+        (&quot;Connection&quot;.to_string(), &quot;keep-alive&quot;.to_string()),
+    ]
+}
+
+fn apply_headers(
+    mut builder: reqwest::blocking::RequestBuilder,
+    headers: &amp;[(String, String)],
+) -&gt; reqwest::blocking::RequestBuilder {
+    for (name, value) in headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    builder
+}</code></pre>
+<p>Request headers should be visible in telemetry when debugging is enabled, but sensitive values should not be logged casually if the browser later supports cookies or authentication.</p>
+<h2>Dispatching A Request</h2>
+<p>The request dispatcher converts browser-owned <code>ResourceRequest</code> into a <code>reqwest</code> request, then converts the <code>reqwest</code> response back into browser-owned data.</p>
+<pre><code>impl BrowserHttpClient {
+    fn fetch(&amp;self, request: ResourceRequest) -&gt; Result&lt;ResourceResponse, LoadError&gt; {
+        let started = now_ms();
+        let headers = merge_headers(
+            default_headers(&amp;self.config, request.kind),
+            request.headers.clone(),
+        );
+
+        let builder = self.client.get(&amp;request.url);
+        let builder = apply_headers(builder, &amp;headers);
+        let response = builder
+            .send()
+            .map_err(|err| LoadError::Network(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        let final_url = response.url().to_string();
+        let protocol = classify_protocol(response.version());
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+
+        let body = response
+            .bytes()
+            .map_err(|err| LoadError::BodyRead(err.to_string()))?
+            .to_vec();
+
+        Ok(ResourceResponse {
+            id: request.id,
+            page_id: request.page_id,
+            final_url,
+            status,
+            content_type,
+            body,
+            protocol,
+            elapsed_ms: now_ms().saturating_sub(started),
+        })
+    }
+}</code></pre>
+<p>This shape keeps <code>reqwest</code> at the edge. The parser never sees <code>reqwest::Response</code>; it sees bytes plus metadata.</p>
+<h2>Protocol Classification</h2>
+<p>Protocol classification is useful for telemetry and performance analysis. It should be observational: the browser records what happened, then can later choose different scheduling policies.</p>
+<pre><code>fn classify_protocol(version: reqwest::Version) -&gt; NetworkProtocol {
+    match version {
+        reqwest::Version::HTTP_09
+        | reqwest::Version::HTTP_10
+        | reqwest::Version::HTTP_11 =&gt; NetworkProtocol::Http1,
+        reqwest::Version::HTTP_2 =&gt; NetworkProtocol::Http2,
+        reqwest::Version::HTTP_3 =&gt; NetworkProtocol::Http3,
+        _ =&gt; NetworkProtocol::Unknown,
+    }
+}
+
+enum NetworkProtocol {
+    File,
+    Http1,
+    Http2,
+    Http3,
+    Unknown,
+}</code></pre>
+<p>If the browser later adds HTTP/3 or a custom HTTP/2 scheduler, this enum can grow without changing HTML, CSS, layout, or rendering code.</p>
+<h2>HTTP/2-Specific Shape</h2>
+<p>HTTP/2 is still accessed through <code>reqwest</code>, but the browser should treat it as a different scheduling situation. The important difference is that one connection can carry multiple streams for the same origin. The browser does not need to implement HTTP/2 frames directly, but it should record when HTTP/2 is used and avoid policies that assume every request is a separate HTTP/1-style connection.</p>
+<pre><code>#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct OriginKey {
+    scheme: String,
+    host: String,
+    port: Option&lt;u16&gt;,
+}
+
+impl OriginKey {
+    fn from_url(url: &amp;str) -&gt; Result&lt;Self, LoadError&gt; {
+        let parsed = parse_url(url)?;
+        Ok(Self {
+            scheme: parsed.scheme,
+            host: parsed.host,
+            port: parsed.port,
+        })
+    }
+}</code></pre>
+<p>The loader can keep lightweight per-origin protocol state. This is not a replacement for <code>reqwest</code> connection pooling; it is browser-side knowledge used for scheduling and telemetry.</p>
+<pre><code>struct OriginNetworkState {
+    protocol: Option&lt;NetworkProtocol&gt;,
+    in_flight: usize,
+    completed: usize,
+    failed: usize,
+    last_request_started_ms: u64,
+}
+
+struct NetworkScheduler {
+    origins: std::collections::HashMap&lt;OriginKey, OriginNetworkState&gt;,
+}</code></pre>
+<p>When a response arrives, the browser updates the origin state with the negotiated protocol.</p>
+<pre><code>impl NetworkScheduler {
+    fn observe_response(&amp;mut self, url: &amp;str, protocol: NetworkProtocol, ok: bool) {
+        if let Ok(origin) = OriginKey::from_url(url) {
+            let state = self.origins.entry(origin).or_insert(OriginNetworkState {
+                protocol: None,
+                in_flight: 0,
+                completed: 0,
+                failed: 0,
+                last_request_started_ms: 0,
+            });
+
+            state.protocol = Some(protocol);
+            state.in_flight = state.in_flight.saturating_sub(1);
+            if ok {
+                state.completed += 1;
+            } else {
+                state.failed += 1;
+            }
+        }
+    }
+}</code></pre>
+<p>HTTP/2 should allow more overlap than conservative HTTP/1 pacing, but the browser can still keep a polite cap to avoid flooding servers or starving page work.</p>
+<pre><code>fn max_in_flight_for(protocol: Option&lt;NetworkProtocol&gt;, kind: ResourceKind) -&gt; usize {
+    match (protocol, kind) {
+        (Some(NetworkProtocol::Http2), ResourceKind::Image) =&gt; 6,
+        (Some(NetworkProtocol::Http2), _) =&gt; 4,
+        (_, ResourceKind::Image) =&gt; 1,
+        _ =&gt; 2,
+    }
+}
+
+fn can_start_request(state: &amp;OriginNetworkState, kind: ResourceKind) -&gt; bool {
+    state.in_flight &lt; max_in_flight_for(state.protocol, kind)
+}</code></pre>
+<p>The browser should also record HTTP/2 stream-style behavior in telemetry, even though stream ids are not exposed by the high-level HTTP client.</p>
+<pre><code>enum NetworkTelemetry {
+    RequestQueued {
+        resource_id: ResourceId,
+        origin: OriginKey,
+        kind: ResourceKind,
+    },
+    RequestStarted {
+        resource_id: ResourceId,
+        origin: OriginKey,
+        in_flight_for_origin: usize,
+    },
+    ProtocolObserved {
+        resource_id: ResourceId,
+        origin: OriginKey,
+        protocol: NetworkProtocol,
+    },
+    ResponseCompleted {
+        resource_id: ResourceId,
+        status: u16,
+        elapsed_ms: u64,
+        protocol: NetworkProtocol,
+    },
+}</code></pre>
+<p>Fallback should be boring. If HTTP/2 negotiation does not happen, <code>reqwest</code> returns an HTTP/1.x response version and the browser schedules future requests with HTTP/1 assumptions. The page pipeline should not care which protocol delivered the bytes.</p>
+<pre><code>fn scheduling_policy_after_response(
+    scheduler: &amp;mut NetworkScheduler,
+    response: &amp;ResourceResponse,
+) {
+    scheduler.observe_response(
+        &amp;response.final_url,
+        response.protocol,
+        (200..400).contains(&amp;response.status),
+    );
+}</code></pre>
+<h2>Redirects And Final URLs</h2>
+<p>The final URL matters because relative links and subresources should resolve against the document that actually loaded, not necessarily the URL the user typed.</p>
+<pre><code>struct LoadedDocument {
+    requested_url: String,
+    final_url: String,
+    html: String,
+    content_type: Option&lt;String&gt;,
+}
+
+fn base_url_for_document(document: &amp;LoadedDocument) -&gt; &amp;str {
+    &amp;document.final_url
+}</code></pre>
+<p>The loader should also record redirects in telemetry when possible:</p>
+<pre><code>enum LoadTelemetry {
+    RequestStarted { id: ResourceId, url: String, kind: ResourceKind },
+    ResponseReceived { id: ResourceId, status: u16, protocol: NetworkProtocol },
+    RedirectObserved { id: ResourceId, from: String, to: String },
+    RequestFailed { id: ResourceId, reason: String },
+}</code></pre>
+<h2>Connecting Responses To The Pipeline</h2>
+<p>After a response is loaded, the browser dispatches it by resource kind.</p>
+<pre><code>fn consume_resource(page: &amp;mut PageState, response: ResourceResponse) -&gt; Result&lt;(), PageFailure&gt; {
+    match response.kind {
+        ResourceKind::Document =&gt; {
+            let html = decode_text(&amp;response)?;
+            page.document = Some(parse_html(&amp;html)?);
+            page.base_url = response.final_url;
+        }
+        ResourceKind::Stylesheet =&gt; {
+            let css = decode_text(&amp;response)?;
+            page.stylesheets.push(parse_css(&amp;css)?);
+        }
+        ResourceKind::Script =&gt; {
+            let source = decode_text(&amp;response)?;
+            page.pending_scripts.push(source);
+        }
+        ResourceKind::Image =&gt; {
+            page.image_results.push(decode_image(response.body)?);
+        }
+    }
+    Ok(())
+}</code></pre>
+<p>This is the key architecture rule: HTTP is transport. The browser pipeline interprets the response.</p>
+<h2>Main Document Loading</h2>
+<p>The main document is the first resource fetched for a navigation. If the user enters an address, clicks a link, submits a form, or selects a history entry, the browser starts by loading the main document for that navigation.</p>
+<p>The GUI should not block while this happens. Page loading can be slow, a server can stall, and a script can later fail. The window shell should remain able to update tabs, loading labels, progress bars, menus, and navigation buttons while the page worker performs network and parsing work.</p>
+<p>The output of main document loading is usually:</p>
+<ul>
+<li>the final URL after redirects,</li>
+<li>the response status and headers,</li>
+<li>the HTML text or error body,</li>
+<li>a base URL for resolving relative resources,</li>
+<li>telemetry describing what happened.</li>
+</ul>
+<h2>Subresources</h2>
+<p>Subresources are files referenced by the main document. Common examples are:</p>
+<ul>
+<li>CSS files from <code>&lt;link rel=&quot;stylesheet&quot; href=&quot;...&quot;&gt;</code>,</li>
+<li>JavaScript files from <code>&lt;script src=&quot;...&quot;&gt;</code>,</li>
+<li>images from <code>&lt;img src=&quot;...&quot;&gt;</code>,</li>
+<li>icons and metadata from <code>&lt;link&gt;</code> elements.</li>
+</ul>
+<p>Stylesheets and scripts can affect page structure or appearance, so they are often part of the initial page analysis. Images can be loaded late: the page can first paint gray placeholders, then replace those placeholders when image bytes arrive and decode successfully.</p>
+<p>This split matters for responsiveness. A browser should not wait forever for every image before showing text. At the same time, it should continue loading images after the page first appears, and it should update the visible page when late image loading completes.</p>
+<h2>Loading Policy</h2>
+<p>The loading policy is the set of practical rules used when the ideal browser behavior would be too expensive or not implemented yet.</p>
+<p>AlmostThere uses conservative resource pacing for image requests so it does not send too many nearly simultaneous requests to the same server. It records image attempts, failures, retry pauses, and completion in telemetry. When a page or tab closes, the pending image queue should be cleared so stale requests do not update the wrong page later.</p>
+<p>For scripts and other blocking resources, the browser uses budgets and timeout-like policies to avoid letting one broken resource freeze the whole page forever. When a resource times out or fails, the browser should prefer a clear error event in telemetry over a silent hang.</p>
+<h2>Debugging This Layer</h2>
+<p>When a page looks wrong, first ask whether the bytes arrived.</p>
+<p>Useful questions:</p>
+<ul>
+<li>Did the main document load successfully?</li>
+<li>Was there a redirect?</li>
+<li>Was the final URL the expected one?</li>
+<li>Did the stylesheet load, or is the page using fallback/default styles?</li>
+<li>Did the script load but fail during execution?</li>
+<li>Are images missing because the URLs were wrong, the requests failed, or decoding failed?</li>
+<li>Did late image loading update the page after first paint?</li>
+</ul>
+<p>If the answer is not visible from the screen, inspect JSONL telemetry before changing layout or rendering code. A missing stylesheet can look like a CSS bug, and a failed script can look like an HTML parsing bug.</p>
+<h2>Rust Shape</h2>
+<p>Loading code should describe what was requested, what came back, and which dependent resources were discovered.</p>
+<pre><code>enum ResourceKind {
+    Document,
+    Stylesheet,
+    Script,
+    Image,
+}
+
+struct ResourceRequest {
+    url: String,
+    kind: ResourceKind,
+}
+
+struct ResourceResponse {
+    final_url: String,
+    status: u16,
+    content_type: Option&lt;String&gt;,
+    body: Vec&lt;u8&gt;,
+}
+
+fn load_resource(request: ResourceRequest) -&gt; Result&lt;ResourceResponse, LoadError&gt; {
+    todo!(&quot;use file, HTTP/1, or HTTP/2 loading&quot;)
+}</code></pre>
+<p>The loader should return data and errors, not directly repair layout or rendering symptoms.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="06_navigation_tabs_history_and_preferences.html">Previous: Navigation, Tabs, History, And Preferences</a>
+    <a class="next" href="08_html_parsing_and_dom_extraction.html">Next: HTML Parsing And DOM Extraction</a>
+  </div>
+
+</body>
+</html>

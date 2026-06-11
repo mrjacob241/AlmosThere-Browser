@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Render Graph And Canvas Graph</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="10_layout_pipeline.html">Previous: Layout Pipeline</a>
+    <a class="next" href="12_painting_scrolling_zoom_and_hit_testing.html">Next: Painting, Scrolling, Zoom, And Hit Testing</a>
+  </div>
+
+<h1>Render Graph And Canvas Graph</h1>
+<p>The render graph is the intermediate representation between layout and painting. It describes what should be drawn without immediately drawing it. The canvas graph is the lower-level representation used by the rendering surface for painting and interaction.</p>
+<p>Keeping these layers visible makes debugging much easier. A layout box may be correct while the render graph loses a link span, or the render graph may be correct while the canvas graph creates the wrong hit box.</p>
+<h2>How This Relates To AlmostThere Browser</h2>
+<p>AlmostThere lowers layout output into renderable objects: text lines, rich text spans, rectangles, images, placeholders, inputs, buttons, debug overlays, and link hit regions. The canvas then paints those objects and handles user interaction.</p>
+<p>This split lets the browser ask precise questions. Did layout produce the right rectangle? Did render graph preserve it? Did canvas graph paint it? Did hit testing attach the expected URL?</p>
+<h2>Render Objects</h2>
+<p>Common render objects include:</p>
+<ul>
+<li>background rectangles,</li>
+<li>borders and separators,</li>
+<li>rich text lines,</li>
+<li>image draws,</li>
+<li>gray image placeholders,</li>
+<li>form controls,</li>
+<li>transparent link hit boxes,</li>
+<li>selection highlights,</li>
+<li>debug overlays.</li>
+</ul>
+<p>Each object should carry enough geometry and metadata to diagnose later problems. A link span should know its target. An image placeholder should know its resource id or URL. A text line should preserve copy behavior metadata.</p>
+<h2>Rich Text</h2>
+<p>Rich text allows one visual line to contain spans with different colors, weights, styles, or underline states. This is important for links inside paragraphs, code snippets with colored spans, and inline emphasis.</p>
+<p>The text should be shaped as one flow where possible. Splitting every anchor into a separate text box can create spacing bugs, clipped links, and selection problems.</p>
+<h2>Canvas Graph</h2>
+<p>The canvas graph is closer to the drawing backend. It turns render objects into paint calls and interactive regions. It must apply viewport scrolling, zoom scaling, clipping, and selection state consistently.</p>
+<p>The canvas graph also owns hit-test behavior. Transparent link boxes may not be visible, but they must line up with the painted text. Debug flags can tint these boxes to make alignment problems visible.</p>
+<h2>Debugging This Layer</h2>
+<p>If a box is present in layout but invisible on screen, inspect render graph lowering. If it appears but cannot be clicked, inspect canvas graph hit boxes. If debug link boxes do not match text, fix the mapping between rich text spans and hit regions.</p>
+<p>Useful dumps include:</p>
+<ul>
+<li>layout box rectangle,</li>
+<li>render object rectangle,</li>
+<li>canvas object rectangle,</li>
+<li>text span content,</li>
+<li>link target,</li>
+<li>clipping rectangle,</li>
+<li>zoom and scroll offsets.</li>
+</ul>
+<h2>Rust Shape</h2>
+<p>The render graph should preserve visible geometry and interaction metadata before the canvas paints it.</p>
+<pre><code>enum RenderObject {
+    Rect { rect: Rect, color: Color },
+    TextLine { rect: Rect, spans: Vec&lt;TextSpan&gt; },
+    Image { rect: Rect, image_id: ImageId },
+    Placeholder { rect: Rect, label: Option&lt;String&gt; },
+    LinkHitBox { rect: Rect, href: String },
+}
+
+struct TextSpan {
+    text: String,
+    color: Color,
+    underline: bool,
+    href: Option&lt;String&gt;,
+}</code></pre>
+<p>Text and link hit boxes can then be compared directly when debugging hover or click alignment.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="10_layout_pipeline.html">Previous: Layout Pipeline</a>
+    <a class="next" href="12_painting_scrolling_zoom_and_hit_testing.html">Next: Painting, Scrolling, Zoom, And Hit Testing</a>
+  </div>
+
+</body>
+</html>

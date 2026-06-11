@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>test262 And JustBarelyScript Compliance</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="18_color_layout_fixtures_and_screenshot_testing.html">Previous: Color Layout Fixtures And Screenshot Testing</a>
+    <a class="next" href="20_failure_modes_crash_isolation_and_recovery.html">Next: Failure Modes, Crash Isolation, And Recovery</a>
+  </div>
+
+<h1>test262 And JustBarelyScript Compliance</h1>
+<p>JustBarelyScript is the JavaScript engine used by the browser. It needs enough ECMAScript behavior to run real page scripts and enough test coverage to avoid regressing language semantics.</p>
+<p>test262 is the official ECMAScript conformance test suite. AlmostThere may run subsets or derived built-in tests to measure practical progress.</p>
+<h2>How This Relates To AlmostThere Browser</h2>
+<p>Browser pages often depend on standard JavaScript behavior indirectly through libraries. A site may not look like it uses typed arrays, promises, descriptors, or strict mode, but its bundled code may rely on them.</p>
+<p>Improving JustBarelyScript compliance makes page-specific scripts less fragile. It also reduces the need for ad hoc host API patches.</p>
+<h2>Built-Ins</h2>
+<p>Built-ins are standard objects and functions such as:</p>
+<ul>
+<li><code>Object</code>,</li>
+<li><code>Array</code>,</li>
+<li><code>String</code>,</li>
+<li><code>Number</code>,</li>
+<li><code>Promise</code>,</li>
+<li><code>Map</code>,</li>
+<li><code>Set</code>,</li>
+<li><code>ArrayBuffer</code>,</li>
+<li><code>TypedArray</code>,</li>
+<li><code>DataView</code>.</li>
+</ul>
+<p>Each built-in has detailed semantics. A method may care about <code>this</code>, constructor behavior, property descriptors, iteration order, species constructors, or abrupt completions.</p>
+<h2>Test Percentages</h2>
+<p>Percentages are only meaningful if the denominator is clear. A score over a small selected subset is not the same as total ECMAScript compliance.</p>
+<p>Always state whether a percentage refers to:</p>
+<ul>
+<li>all discovered tests,</li>
+<li>enabled built-in tests,</li>
+<li>a specific block,</li>
+<li>passing tests after exclusions,</li>
+<li>runtime-reachable browser tests.</li>
+</ul>
+<h2>Standards-Oriented Fixes</h2>
+<p>JavaScript fixes should follow ECMAScript semantics where possible. If exact compliance is too large for one change, implement the most general correct subset and document the limitation.</p>
+<p>Avoid fixing only the call shape seen on one page. For example, an <code>Array.from</code> fix should work through the shared function behavior, not just through one bundled library pattern.</p>
+<h2>Debugging This Layer</h2>
+<p>When a built-in test fails, inspect:</p>
+<ul>
+<li>expected value,</li>
+<li>actual value,</li>
+<li>thrown exception,</li>
+<li>strict mode,</li>
+<li><code>this</code> binding,</li>
+<li>property attributes,</li>
+<li>iterator behavior,</li>
+<li>constructor path.</li>
+</ul>
+<p>After a fix, rerun the smallest relevant test block first, then broader built-in tests.</p>
+<h2>Rust Shape</h2>
+<p>JavaScript compliance work benefits from small test records with clear expected outcomes.</p>
+<pre><code>struct BuiltinTest {
+    name: String,
+    source: String,
+    expected: ExpectedOutcome,
+}
+
+enum ExpectedOutcome {
+    Value(String),
+    Throws(String),
+    Pass,
+}
+
+struct TestSummary {
+    total: usize,
+    passed: usize,
+    failed: usize,
+    skipped: usize,
+}
+
+fn run_builtin_test(runtime: &amp;mut JsRuntime, test: &amp;BuiltinTest) -&gt; TestResult {
+    todo!(&quot;execute source and compare with expected outcome&quot;)
+}</code></pre>
+<p>Always report which test set produced a percentage; otherwise the number is easy to misread.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="18_color_layout_fixtures_and_screenshot_testing.html">Previous: Color Layout Fixtures And Screenshot Testing</a>
+    <a class="next" href="20_failure_modes_crash_isolation_and_recovery.html">Next: Failure Modes, Crash Isolation, And Recovery</a>
+  </div>
+
+</body>
+</html>

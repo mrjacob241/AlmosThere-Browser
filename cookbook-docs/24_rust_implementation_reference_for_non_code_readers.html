@@ -1,0 +1,781 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rust Implementation Reference For Non-Code Readers</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="23_contribution_checklist.html">Previous: Contribution Checklist</a>
+    <span class="next disabled">Next</span>
+  </div>
+
+<h1>Rust Implementation Reference For Non-Code Readers</h1>
+<p>This section is written for a reader who cannot open the Rust codebase. The snippets are implementation-shaped examples that explain the important data structures and flows used by AlmostThere Browser. They are not a promise that every identifier matches the current source exactly, but they describe the architecture the code should follow.</p>
+<p>The browser is easiest to understand as a typed pipeline:</p>
+<pre><code>fn navigate(command: NavigationCommand, app: &amp;mut BrowserApp) {
+    let tab_id = app.ensure_target_tab(command);
+    app.spawn_page_worker(tab_id);
+}
+
+fn page_worker(url: String) -&gt; Result&lt;PageOutput, PageFailure&gt; {
+    let loaded = load_main_document(&amp;url)?;
+    let document = parse_html(&amp;loaded.html)?;
+    let stylesheets = load_stylesheets(&amp;loaded, &amp;document)?;
+    let computed = compute_styles(&amp;document, &amp;stylesheets)?;
+    let script_effects = run_initial_scripts(&amp;document)?;
+    let page = apply_effects(document, script_effects)?;
+    let layout = build_layout(&amp;page, &amp;computed)?;
+    let render_graph = build_render_graph(&amp;layout)?;
+    let canvas_scene = build_canvas_scene(&amp;render_graph)?;
+    Ok(PageOutput { canvas_scene, discovered_images: layout.images })
+}</code></pre>
+<h2>Browser Application State</h2>
+<p>The application state belongs to the GUI shell. It knows about tabs, selected tab, preferences, history, pending page messages, and debug options.</p>
+<pre><code>struct BrowserApp {
+    tabs: Vec&lt;TabState&gt;,
+    selected_tab: Option&lt;TabId&gt;,
+    preferences: Preferences,
+    history: BrowserHistory,
+    debug: DebugOptions,
+    pending_messages: Vec&lt;PageMessage&gt;,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct TabId(u64);
+
+struct TabState {
+    id: TabId,
+    title: String,
+    current_url: String,
+    status: TabStatus,
+    history: TabHistory,
+    scene: Option&lt;CanvasScene&gt;,
+    page_id: Option&lt;PageId&gt;,
+    zoom: f32,
+    scroll: ScrollOffset,
+}
+
+enum TabStatus {
+    Idle,
+    Loading { label: String, progress: f32 },
+    Ready,
+    Error(String),
+}</code></pre>
+<p>The shell should only apply page messages to the matching tab and page id. This prevents a slow old navigation from overwriting a newer page.</p>
+<pre><code>impl BrowserApp {
+    fn apply_page_message(&amp;mut self, message: PageMessage) {
+        match message {
+            PageMessage::RenderReady { tab_id, page_id, scene } =&gt; {
+                if let Some(tab) = self.tab_mut(tab_id) {
+                    if tab.page_id == Some(page_id) {
+                        tab.scene = Some(scene);
+                        tab.status = TabStatus::Ready;
+                    }
+                }
+            }
+            PageMessage::PageFailed { tab_id, page_id, reason } =&gt; {
+                if let Some(tab) = self.tab_mut(tab_id) {
+                    if tab.page_id == Some(page_id) {
+                        tab.status = TabStatus::Error(reason);
+                    }
+                }
+            }
+        }
+    }
+}</code></pre>
+<h2>Navigation And History</h2>
+<p>Navigation commands should be explicit data. This lets URL bar input, link clicks, form submissions, bookmarks, history menu entries, and JavaScript navigation share the same path.</p>
+<pre><code>enum NavigationCommand {
+    OpenCurrent { tab_id: TabId, url: String },
+    OpenNewTab { url: String },
+    Back { tab_id: TabId },
+    Forward { tab_id: TabId },
+    Reload { tab_id: TabId },
+}
+
+struct HistoryEntry {
+    url: String,
+    title: String,
+    timestamp_ms: i64,
+}
+
+struct TabHistory {
+    entries: Vec&lt;HistoryEntry&gt;,
+    position: usize,
+}</code></pre>
+<p>Back and forward should move the per-tab history position. Browser-wide history is a separate list used by the history menu.</p>
+<pre><code>impl TabHistory {
+    fn push(&amp;mut self, entry: HistoryEntry) {
+        self.entries.truncate(self.position + 1);
+        self.entries.push(entry);
+        self.position = self.entries.len().saturating_sub(1);
+    }
+
+    fn current(&amp;self) -&gt; Option&lt;&amp;HistoryEntry&gt; {
+        self.entries.get(self.position)
+    }
+}</code></pre>
+<h2>Resource Loading</h2>
+<p>The loader turns URLs into bytes and metadata. It should not know about text layout or painting.</p>
+<p>AlmostThere uses <code>reqwest</code> as the underlying HTTP/HTTPS library, configured with blocking requests, Rustls TLS, and HTTP/2 support:</p>
+<pre><code>reqwest = { version = &quot;0.12&quot;, default-features = false, features = [&quot;blocking&quot;, &quot;rustls-tls&quot;, &quot;http2&quot;] }</code></pre>
+<p>The browser should wrap that library instead of spreading <code>reqwest</code> types through the whole application. The wrapper owns browser headers, timeout policy, protocol telemetry, and conversion into browser resource responses.</p>
+<pre><code>enum ResourceKind {
+    MainDocument,
+    Stylesheet,
+    Script,
+    Image,
+}
+
+struct ResourceRequest {
+    id: ResourceId,
+    page_id: PageId,
+    url: String,
+    kind: ResourceKind,
+    headers: Vec&lt;(String, String)&gt;,
+}
+
+struct ResourceResponse {
+    id: ResourceId,
+    final_url: String,
+    status: u16,
+    content_type: Option&lt;String&gt;,
+    body: Vec&lt;u8&gt;,
+    protocol: NetworkProtocol,
+}
+
+enum NetworkProtocol {
+    File,
+    Http1,
+    Http2,
+}</code></pre>
+<pre><code>struct BrowserHttpClient {
+    user_agent: String,
+    accept_language: String,
+}
+
+impl BrowserHttpClient {
+    fn fetch(&amp;self, request: ResourceRequest) -&gt; Result&lt;ResourceResponse, LoadError&gt; {
+        let response = self.send_with_reqwest(&amp;request)?;
+        Ok(ResourceResponse {
+            id: request.id,
+            page_id: request.page_id,
+            final_url: response.final_url,
+            status: response.status,
+            content_type: response.content_type,
+            body: response.body,
+            protocol: response.protocol,
+        })
+    }
+
+    fn send_with_reqwest(&amp;self, request: &amp;ResourceRequest) -&gt; Result&lt;RawHttpResponse, LoadError&gt; {
+        todo!(&quot;call reqwest, follow configured policy, and record protocol details&quot;)
+    }
+}</code></pre>
+<p>The rest of the browser should receive <code>ResourceResponse</code>, not raw <code>reqwest::Response</code>. This keeps the architecture clean: networking belongs to the loading layer, while parsing, styling, layout, rendering, and JavaScript consume browser-owned data.</p>
+<p>A more complete HTTP wrapper has three steps: build a stable client, generate browser headers, and translate the response.</p>
+<pre><code>impl BrowserHttpClient {
+    fn new(user_agent: String, accept_language: String) -&gt; Result&lt;Self, LoadError&gt; {
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(user_agent.clone())
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|err| LoadError::ClientBuild(err.to_string()))?;
+
+        Ok(Self { user_agent, accept_language, client })
+    }
+
+    fn request_builder(&amp;self, request: &amp;ResourceRequest) -&gt; reqwest::blocking::RequestBuilder {
+        self.client
+            .get(&amp;request.url)
+            .header(&quot;Accept-Language&quot;, self.accept_language.as_str())
+            .header(&quot;Accept&quot;, accept_header_for(request.kind))
+    }
+}</code></pre>
+<pre><code>fn accept_header_for(kind: ResourceKind) -&gt; &amp;&#x27;static str {
+    match kind {
+        ResourceKind::MainDocument =&gt; {
+            &quot;text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8&quot;
+        }
+        ResourceKind::Stylesheet =&gt; &quot;text/css,*/*;q=0.1&quot;,
+        ResourceKind::Script =&gt; &quot;*/*&quot;,
+        ResourceKind::Image =&gt; &quot;image/avif,image/webp,image/png,image/svg+xml,image/*,*/*;q=0.8&quot;,
+    }
+}</code></pre>
+<pre><code>fn translate_response(
+    request: ResourceRequest,
+    response: reqwest::blocking::Response,
+    started_ms: u64,
+) -&gt; Result&lt;ResourceResponse, LoadError&gt; {
+    let status = response.status().as_u16();
+    let final_url = response.url().to_string();
+    let protocol = match response.version() {
+        reqwest::Version::HTTP_2 =&gt; NetworkProtocol::Http2,
+        _ =&gt; NetworkProtocol::Http1,
+    };
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = response
+        .bytes()
+        .map_err(|err| LoadError::BodyRead(err.to_string()))?
+        .to_vec();
+
+    Ok(ResourceResponse {
+        id: request.id,
+        page_id: request.page_id,
+        final_url,
+        status,
+        content_type,
+        body,
+        protocol,
+        elapsed_ms: now_ms().saturating_sub(started_ms),
+    })
+}</code></pre>
+<p>The loader then routes each response by resource kind:</p>
+<pre><code>fn route_loaded_resource(page: &amp;mut PageState, response: ResourceResponse) -&gt; Result&lt;(), PageFailure&gt; {
+    match response.kind {
+        ResourceKind::MainDocument =&gt; page.set_html(decode_text(&amp;response)?),
+        ResourceKind::Stylesheet =&gt; page.add_stylesheet(decode_text(&amp;response)?),
+        ResourceKind::Script =&gt; page.queue_script(decode_text(&amp;response)?),
+        ResourceKind::Image =&gt; page.complete_image(decode_image(response.body)?),
+    }
+    Ok(())
+}</code></pre>
+<p>For HTTP/2, the browser still uses <code>reqwest</code> for transport. The browser-side concern is tracking per-origin protocol state and choosing a scheduling policy that allows more overlap when HTTP/2 is observed.</p>
+<pre><code>#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct OriginKey {
+    scheme: String,
+    host: String,
+    port: Option&lt;u16&gt;,
+}
+
+struct OriginState {
+    protocol: Option&lt;NetworkProtocol&gt;,
+    in_flight: usize,
+    last_started_ms: u64,
+}
+
+struct HttpScheduler {
+    origins: std::collections::HashMap&lt;OriginKey, OriginState&gt;,
+}</code></pre>
+<pre><code>impl HttpScheduler {
+    fn may_start(&amp;self, origin: &amp;OriginKey, kind: ResourceKind) -&gt; bool {
+        let Some(state) = self.origins.get(origin) else {
+            return true;
+        };
+
+        let limit = match (state.protocol, kind) {
+            (Some(NetworkProtocol::Http2), ResourceKind::Image) =&gt; 6,
+            (Some(NetworkProtocol::Http2), _) =&gt; 4,
+            (_, ResourceKind::Image) =&gt; 1,
+            _ =&gt; 2,
+        };
+
+        state.in_flight &lt; limit
+    }
+
+    fn observe_protocol(&amp;mut self, origin: OriginKey, protocol: NetworkProtocol) {
+        self.origins
+            .entry(origin)
+            .or_insert(OriginState {
+                protocol: None,
+                in_flight: 0,
+                last_started_ms: 0,
+            })
+            .protocol = Some(protocol);
+    }
+}</code></pre>
+<p>The actual protocol is learned from the response version:</p>
+<pre><code>fn protocol_from_reqwest(response: &amp;reqwest::blocking::Response) -&gt; NetworkProtocol {
+    match response.version() {
+        reqwest::Version::HTTP_2 =&gt; NetworkProtocol::Http2,
+        reqwest::Version::HTTP_09
+        | reqwest::Version::HTTP_10
+        | reqwest::Version::HTTP_11 =&gt; NetworkProtocol::Http1,
+        _ =&gt; NetworkProtocol::Unknown,
+    }
+}</code></pre>
+<p>The rest of the browser should treat HTTP/2 as an optimization, not as a different content model. HTML bytes are still HTML bytes, CSS bytes are still CSS bytes, and image bytes still go through the image decoder.</p>
+<p>HTTP errors, missing files, and unsupported schemes should return typed failures.</p>
+<pre><code>enum LoadError {
+    InvalidUrl(String),
+    UnsupportedScheme(String),
+    Network(String),
+    Timeout,
+    TooManyRedirects,
+}
+
+type LoadResult&lt;T&gt; = Result&lt;T, LoadError&gt;;</code></pre>
+<h2>HTML Document Model</h2>
+<p>The parser should preserve source order, text, elements, attributes, and relationships.</p>
+<pre><code>#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct NodeId(u64);
+
+struct Document {
+    root: NodeId,
+    nodes: Vec&lt;Node&gt;,
+    links: Vec&lt;LinkRef&gt;,
+    forms: Vec&lt;FormRef&gt;,
+    resources: Vec&lt;ResourceRef&gt;,
+}
+
+struct Node {
+    id: NodeId,
+    parent: Option&lt;NodeId&gt;,
+    children: Vec&lt;NodeId&gt;,
+    kind: NodeKind,
+}
+
+enum NodeKind {
+    Element(ElementData),
+    Text(String),
+    Comment(String),
+}
+
+struct ElementData {
+    tag: String,
+    attributes: Vec&lt;Attribute&gt;,
+}
+
+struct Attribute {
+    name: String,
+    value: String,
+}</code></pre>
+<p>Common helpers should hide raw attribute scanning from later layers.</p>
+<pre><code>impl ElementData {
+    fn attr(&amp;self, name: &amp;str) -&gt; Option&lt;&amp;str&gt; {
+        self.attributes
+            .iter()
+            .find(|attr| attr.name.eq_ignore_ascii_case(name))
+            .map(|attr| attr.value.as_str())
+    }
+}</code></pre>
+<h2>CSS And Computed Style</h2>
+<p>CSS parsing produces rules; cascade and inheritance produce computed style.</p>
+<pre><code>struct Stylesheet {
+    rules: Vec&lt;CssRule&gt;,
+}
+
+struct CssRule {
+    selector: Selector,
+    declarations: Vec&lt;Declaration&gt;,
+    order: usize,
+}
+
+struct Declaration {
+    property: String,
+    value: CssValue,
+    important: bool,
+}
+
+enum CssValue {
+    Keyword(String),
+    Length(Length),
+    Color(Color),
+    Number(f32),
+    Text(String),
+}</code></pre>
+<p>Layout should consume normalized style, not raw CSS strings.</p>
+<pre><code>struct ComputedStyle {
+    display: Display,
+    position: Position,
+    width: Length,
+    height: Length,
+    min_width: Length,
+    max_width: Length,
+    margin: Edges&lt;Length&gt;,
+    padding: Edges&lt;Length&gt;,
+    font: FontStyle,
+    color: Color,
+    background: Option&lt;Color&gt;,
+}
+
+enum Display {
+    None,
+    Block,
+    Inline,
+    InlineBlock,
+    Flex,
+    Grid,
+}
+
+enum Length {
+    Auto,
+    Px(f32),
+    Percent(f32),
+}</code></pre>
+<h2>Layout Objects</h2>
+<p>Layout converts document nodes and computed style into rectangles. The important rule is that automatic sizes are often child-aware.</p>
+<pre><code>#[derive(Clone, Copy, Debug)]
+struct Rect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+struct LayoutBox {
+    node_id: NodeId,
+    rect: Rect,
+    content_rect: Rect,
+    style: ComputedStyle,
+    children: Vec&lt;LayoutBox&gt;,
+    fragments: Vec&lt;InlineFragment&gt;,
+}
+
+enum InlineFragment {
+    Text { text: String, rect: Rect, style: TextStyle },
+    LinkText { text: String, rect: Rect, style: TextStyle, href: String },
+    Replaced { node_id: NodeId, rect: Rect },
+}</code></pre>
+<p>A child-aware sizing pass can be sketched like this:</p>
+<pre><code>fn preferred_size(node: NodeId, document: &amp;Document, styles: &amp;StyleMap) -&gt; Size {
+    let style = styles.get(node);
+    match style.display {
+        Display::None =&gt; Size::zero(),
+        Display::Inline =&gt; measure_inline_content(node, document, styles),
+        Display::Block | Display::Flex | Display::Grid | Display::InlineBlock =&gt; {
+            let children = document.children(node);
+            let child_sizes = children
+                .iter()
+                .map(|child| preferred_size(*child, document, styles))
+                .collect::&lt;Vec&lt;_&gt;&gt;();
+            resolve_container_preferred_size(style, &amp;child_sizes)
+        }
+    }
+}</code></pre>
+<h2>Render Graph</h2>
+<p>The render graph is an inspectable list of things to paint and hit-test.</p>
+<pre><code>struct RenderGraph {
+    objects: Vec&lt;RenderObject&gt;,
+    document_size: Size,
+}
+
+enum RenderObject {
+    Background { rect: Rect, color: Color },
+    Border { rect: Rect, color: Color, width: f32 },
+    RichTextLine { rect: Rect, spans: Vec&lt;TextSpan&gt;, copy_break: CopyBreak },
+    Image { rect: Rect, image_id: ImageId },
+    ImagePlaceholder { rect: Rect, state: PlaceholderState },
+    Input { rect: Rect, node_id: NodeId, value: String },
+    LinkHitBox { rect: Rect, href: String },
+}
+
+struct TextSpan {
+    text: String,
+    style: TextStyle,
+    href: Option&lt;String&gt;,
+}</code></pre>
+<p>Inline links should usually be text spans plus transparent hit boxes, not separate disconnected text objects.</p>
+<h2>Canvas Scene And View Transform</h2>
+<p>The canvas scene is the paintable representation. The view transform maps document coordinates to screen coordinates and back.</p>
+<pre><code>struct CanvasScene {
+    objects: Vec&lt;CanvasObject&gt;,
+    document_size: Size,
+}
+
+enum CanvasObject {
+    FillRect { rect: Rect, color: Color },
+    DrawText { position: Point, spans: Vec&lt;TextSpan&gt; },
+    DrawImage { rect: Rect, image_id: ImageId },
+    HitBox { rect: Rect, target: HitTarget },
+}
+
+struct ViewTransform {
+    scroll: Point,
+    zoom: f32,
+}
+
+impl ViewTransform {
+    fn to_document(&amp;self, screen: Point) -&gt; Point {
+        Point {
+            x: screen.x / self.zoom + self.scroll.x,
+            y: screen.y / self.zoom + self.scroll.y,
+        }
+    }
+}</code></pre>
+<p>Painting and hit testing must use the same transform.</p>
+<h2>Input, Links, Forms, And Selection</h2>
+<p>Pointer and keyboard events should become browser actions.</p>
+<pre><code>enum HitTarget {
+    Link { href: String },
+    Text { node_id: NodeId, char_index: usize },
+    Input { node_id: NodeId },
+    Button { node_id: NodeId },
+    PageBackground,
+}
+
+enum BrowserAction {
+    Navigate(String),
+    FocusInput(NodeId),
+    SubmitForm(NodeId),
+    StartSelection(SelectionAnchor),
+    ExtendSelection(SelectionAnchor),
+    CopySelection,
+}
+
+struct SelectionAnchor {
+    node_id: NodeId,
+    char_index: usize,
+}</code></pre>
+<p>Copied text should be reconstructed from semantic flow, not from visual line wrapping alone.</p>
+<pre><code>fn copy_selection(selection: &amp;Selection, document: &amp;Document, layout: &amp;LayoutTree) -&gt; String {
+    let fragments = layout.fragments_in_selection(selection);
+    fragments
+        .into_iter()
+        .map(|fragment| fragment.copy_text())
+        .collect::&lt;Vec&lt;_&gt;&gt;()
+        .join(&quot;&quot;)
+}</code></pre>
+<h2>Image Queue</h2>
+<p>Images are discovered during parsing and layout but may complete after first paint.</p>
+<pre><code>enum ImageState {
+    Discovered,
+    Queued,
+    Loading { started_ms: u64 },
+    Loaded { size: Size, pixels: ImagePixels },
+    Failed { reason: String },
+}
+
+struct ImageJob {
+    image_id: ImageId,
+    page_id: PageId,
+    node_id: NodeId,
+    url: String,
+    state: ImageState,
+    retry_count: u8,
+}
+
+struct ImageQueue {
+    jobs: VecDeque&lt;ImageJob&gt;,
+    in_flight: HashMap&lt;ImageId, ImageJob&gt;,
+    cooldown_until_ms: u64,
+}</code></pre>
+<p>When a late image completes, the browser applies it only to the matching live page.</p>
+<pre><code>fn complete_image(app: &amp;mut BrowserApp, result: ImageResult) {
+    if let Some(tab) = app.tab_for_page_mut(result.page_id) {
+        tab.update_image(result.image_id, result.state);
+        tab.request_repaint();
+    }
+}</code></pre>
+<h2>JavaScript Runtime Boundary</h2>
+<p>JustBarelyScript should produce effects. The browser applies those effects through the normal document/style/layout/render path.</p>
+<pre><code>enum JsEffect {
+    SetAttribute { node_id: NodeId, name: String, value: String },
+    SetInlineStyle { node_id: NodeId, property: String, value: String },
+    SetTextContent { node_id: NodeId, text: String },
+    AddClass { node_id: NodeId, class_name: String },
+    RemoveClass { node_id: NodeId, class_name: String },
+    RegisterEventListener { node_id: NodeId, event: String, callback: JsObjectId },
+    ScheduleTimer { delay_ms: u64, callback: JsObjectId },
+    Console { level: ConsoleLevel, message: String },
+}
+
+fn apply_js_effect(page: &amp;mut PageState, effect: JsEffect) {
+    match effect {
+        JsEffect::SetInlineStyle { node_id, property, value } =&gt; {
+            page.document.set_inline_style(node_id, property, value);
+            page.invalidate_style();
+        }
+        JsEffect::SetTextContent { node_id, text } =&gt; {
+            page.document.set_text(node_id, text);
+            page.invalidate_layout();
+        }
+        _ =&gt; page.record_pending_effect(effect),
+    }
+}</code></pre>
+<p>The JavaScript runtime should not directly call paint routines.</p>
+<h2>Events And Timers</h2>
+<p>Events and timers are scheduled work.</p>
+<pre><code>struct EventListener {
+    node_id: NodeId,
+    event_type: String,
+    callback: JsObjectId,
+}
+
+struct Timer {
+    id: TimerId,
+    due_ms: u64,
+    interval_ms: Option&lt;u64&gt;,
+    callback: JsObjectId,
+}
+
+struct EventLoopState {
+    listeners: Vec&lt;EventListener&gt;,
+    timers: Vec&lt;Timer&gt;,
+}
+
+fn dispatch_click(page: &amp;mut PageState, target: NodeId) -&gt; Result&lt;Vec&lt;JsEffect&gt;, JsError&gt; {
+    let listeners = page.event_loop.listeners_for(target, &quot;click&quot;);
+    page.runtime.call_listeners(listeners)
+}</code></pre>
+<p>Script callbacks should be budgeted so one page script cannot freeze the whole browser.</p>
+<h2>Telemetry</h2>
+<p>Telemetry should be structured before it becomes JSONL text.</p>
+<pre><code>enum TelemetryEvent {
+    NavigationStarted { tab_id: TabId, url: String, at_ms: u64 },
+    MainDocumentLoaded { page_id: PageId, status: u16, bytes: usize, elapsed_ms: u64 },
+    ResourceFailed { page_id: PageId, url: String, kind: ResourceKind, reason: String },
+    ScriptError { page_id: PageId, message: String },
+    LayoutCompleted { page_id: PageId, boxes: usize, elapsed_ms: u64 },
+    ImageQueueStats { page_id: PageId, queued: usize, loaded: usize, failed: usize },
+}
+
+fn write_jsonl(event: &amp;TelemetryEvent, out: &amp;mut dyn std::io::Write) -&gt; std::io::Result&lt;()&gt; {
+    let line = serialize_event_as_json(event);
+    writeln!(out, &quot;{line}&quot;)
+}</code></pre>
+<p>Every difficult bug should be explainable by a sequence of telemetry events.</p>
+<h2>Failure And Recovery</h2>
+<p>Failures should describe the layer that failed and the recovery decision.</p>
+<pre><code>enum PageFailure {
+    Load(LoadError),
+    Parse(String),
+    ScriptBudgetExceeded { script_url: Option&lt;String&gt; },
+    Layout(String),
+    WorkerCrashed(String),
+}
+
+enum RecoveryDecision {
+    Continue,
+    ContinueWithPlaceholder,
+    ShowTabError(String),
+    StopWorker,
+}
+
+fn decide_recovery(failure: &amp;PageFailure) -&gt; RecoveryDecision {
+    match failure {
+        PageFailure::Load(_) =&gt; RecoveryDecision::ShowTabError(&quot;Page failed to load&quot;.into()),
+        PageFailure::ScriptBudgetExceeded { .. } =&gt; RecoveryDecision::Continue,
+        PageFailure::Layout(message) =&gt; RecoveryDecision::ShowTabError(message.clone()),
+        PageFailure::Parse(_) =&gt; RecoveryDecision::ContinueWithPlaceholder,
+        PageFailure::WorkerCrashed(message) =&gt; RecoveryDecision::ShowTabError(message.clone()),
+    }
+}</code></pre>
+<p>The main GUI should survive page failures and preserve enough diagnostics to continue debugging.</p>
+<h2>Tests And Fixtures</h2>
+<p>Tests should preserve the browser rule that was missing.</p>
+<pre><code>struct ColorLayoutFixture {
+    id: u32,
+    name: String,
+    html: String,
+    expected_rule: String,
+}
+
+struct FixtureRun {
+    fixture: ColorLayoutFixture,
+    browser_png: PathBuf,
+    reference_png: Option&lt;PathBuf&gt;,
+    paired_png: PathBuf,
+}
+
+fn run_fixture(fixture: ColorLayoutFixture) -&gt; Result&lt;FixtureRun, TestError&gt; {
+    let browser_png = render_with_almostthere(&amp;fixture.html)?;
+    let reference_png = render_with_reference_browser(&amp;fixture.html).ok();
+    let paired_png = build_paired_image(&amp;browser_png, reference_png.as_ref())?;
+    Ok(FixtureRun { fixture, browser_png, reference_png, paired_png })
+}</code></pre>
+<p>JavaScript built-in tests should similarly state the language behavior they protect.</p>
+<pre><code>struct JsBuiltinTest {
+    name: String,
+    source: String,
+    expected: JsExpected,
+}
+
+enum JsExpected {
+    Pass,
+    Throws(&amp;&#x27;static str),
+    Value(&amp;&#x27;static str),
+}</code></pre>
+<h2>Practical Reading Rule</h2>
+<p>If you cannot inspect the codebase, read every Rust snippet as a contract:</p>
+<ul>
+<li>which data enters the layer,</li>
+<li>which data leaves the layer,</li>
+<li>which errors can happen,</li>
+<li>which ids keep work attached to the right tab or page,</li>
+<li>which telemetry event proves the step happened.</li>
+</ul>
+<p>That contract is more important than any single function name.</p>
+  <div class="page-nav bottom">
+    <a class="previous" href="23_contribution_checklist.html">Previous: Contribution Checklist</a>
+    <span class="next disabled">Next</span>
+  </div>
+
+</body>
+</html>

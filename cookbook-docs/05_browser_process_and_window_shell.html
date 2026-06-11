@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Browser Process And Window Shell</title>
+  <style>
+body {
+  max-width: 920px;
+  margin: 40px auto;
+  padding: 0 24px 64px;
+  color: #202124;
+  background: #fffdf7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}
+a { color: #1558d6; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { margin-top: 0; border-bottom: 2px solid #d8d2c4; padding-bottom: 12px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #e6dfd0; padding-bottom: 6px; }
+code {
+  background: #f2ecdd;
+  border-radius: 4px;
+  padding: 0.12em 0.32em;
+}
+pre {
+  overflow-x: auto;
+  background: #1f2328;
+  color: #f6f8fa;
+  border-radius: 8px;
+  padding: 16px;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+}
+blockquote {
+  border-left: 4px solid #d8d2c4;
+  margin-left: 0;
+  padding-left: 16px;
+  color: #555;
+}
+nav {
+  margin: 0 0 28px;
+  padding: 10px 0 18px;
+  border-bottom: 1px solid #e6dfd0;
+}
+nav a { margin-right: 16px; }
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 20px 0 28px;
+  padding: 12px 0;
+  border-top: 1px solid #e6dfd0;
+  border-bottom: 1px solid #e6dfd0;
+}
+.page-nav.bottom {
+  margin-top: 44px;
+}
+.page-nav a,
+.page-nav span {
+  min-width: 0;
+}
+.page-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+.page-nav .disabled {
+  color: #8a8172;
+}
+</style>
+</head>
+<body>
+  <nav>
+    <a href="00_index.html">Index</a>
+    <a href="01_introduction.html">Introduction</a>
+  </nav>
+  <div class="page-nav top">
+    <a class="previous" href="04_rust_patterns_used_in_the_pipeline.html">Previous: Rust Patterns Used In The Pipeline</a>
+    <a class="next" href="06_navigation_tabs_history_and_preferences.html">Next: Navigation, Tabs, History, And Preferences</a>
+  </div>
+
+<h1>Browser Process And Window Shell</h1>
+<p>The browser shell is the visible application around the page. It owns the window, toolbar, tabs, menus, loading indicators, status labels, and the connection between user commands and page work.</p>
+<p>AlmostThere Browser uses this shell as the stable part of the application. Pages can be slow, malformed, script-heavy, or crash-prone, but the user should still be able to see progress, switch tabs, stop using a broken page, and inspect diagnostics.</p>
+<h2>How This Relates To AlmostThere Browser</h2>
+<p>The shell is where browser state becomes interactive. It stores the current tabs, selected tab, navigation controls, preferences, debug flags, and loading progress. It does not need to know every detail of HTML or CSS, but it needs clear messages from page workers: page loaded, resource failed, image updated, script errored, render tree ready, or page apparently crashed.</p>
+<p>The important boundary is responsiveness. The GUI thread should spend its time drawing controls and applying completed updates. Expensive work such as network fetches, parsing, JavaScript execution, image loading, and layout should happen in page-oriented workers or in bounded chunks.</p>
+<h2>Shell Responsibilities</h2>
+<p>The shell typically handles:</p>
+<ul>
+<li>URL bar input,</li>
+<li>back, forward, reload, and debug controls,</li>
+<li>tab creation and selection,</li>
+<li>menus for history and preferences,</li>
+<li>loading labels and progress bars,</li>
+<li>scroll and zoom input,</li>
+<li>context menu commands,</li>
+<li>debug flags and telemetry options,</li>
+<li>routing completed page output into the visible canvas.</li>
+</ul>
+<p>The shell should not become a second layout engine. It should host the browser view and controls, then delegate page content to the page pipeline.</p>
+<h2>Page Work Boundary</h2>
+<p>A page worker performs the work that belongs to one page or tab. That includes loading the document, resolving resources, parsing HTML, collecting CSS, running scripts, laying out content, and returning renderable output.</p>
+<p>The shell and page worker should communicate through explicit state updates. Good messages are concrete: navigation started, loading progress changed, image completed, layout finished, script failed, or worker crashed. Vague shared state makes race conditions harder to debug.</p>
+<p>When a tab is closed, its page work should stop or become ignored. Late resource completion must not update a tab that no longer exists.</p>
+<h2>Failure Isolation</h2>
+<p>The shell is the fallback when page work fails. If a script overflows the stack, a resource hangs, or a page worker crashes, the shell should be able to show an error state rather than disappearing with the page.</p>
+<p>This is why the process model matters. Browser-like applications separate the stable UI from unreliable page content. AlmostThere does not need the full sophistication of Chrome&#x27;s process model, but it should preserve the same design principle: broken content should not take down the whole browser interface.</p>
+<h2>Debugging This Layer</h2>
+<p>If the UI freezes, first check whether page work is running on the same path as UI updates. If a tab shows stale content, check whether a late page-worker message was applied to the wrong selected tab. If progress labels are misleading, check whether they are tied to real loading state or to timeout counters.</p>
+<p>Good shell bugs usually include:</p>
+<ul>
+<li>the selected tab before and after the action,</li>
+<li>the page-worker message that arrived,</li>
+<li>whether the GUI remained repainting,</li>
+<li>whether the action affected the intended tab,</li>
+<li>whether telemetry was flushed before failure.</li>
+</ul>
+<h2>Rust Shape</h2>
+<p>The shell is usually a stateful object updated once per GUI frame. Page work arrives as messages that mutate tab state.</p>
+<pre><code>struct BrowserApp {
+    tabs: Vec&lt;TabState&gt;,
+    selected_tab: Option&lt;TabId&gt;,
+    pending_messages: Vec&lt;PageMessage&gt;,
+}
+
+enum PageMessage {
+    LoadingProgress { tab_id: TabId, label: String, percent: f32 },
+    RenderReady { tab_id: TabId, scene: CanvasScene },
+    PageCrashed { tab_id: TabId, reason: String },
+}
+
+impl BrowserApp {
+    fn apply_message(&amp;mut self, message: PageMessage) {
+        match message {
+            PageMessage::RenderReady { tab_id, scene } =&gt; {
+                if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                    tab.scene = Some(scene);
+                }
+            }
+            PageMessage::LoadingProgress { .. } | PageMessage::PageCrashed { .. } =&gt; {
+                todo!(&quot;update tab status&quot;)
+            }
+        }
+    }
+}</code></pre>
+  <div class="page-nav bottom">
+    <a class="previous" href="04_rust_patterns_used_in_the_pipeline.html">Previous: Rust Patterns Used In The Pipeline</a>
+    <a class="next" href="06_navigation_tabs_history_and_preferences.html">Next: Navigation, Tabs, History, And Preferences</a>
+  </div>
+
+</body>
+</html>
